@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::dirs;
+use crate::{db, dirs};
 
 #[derive(Debug, Clone, Default)]
 pub struct ConfigOverrides {
@@ -24,7 +24,7 @@ impl RuntimeConfig {
         let state_dir = dirs::default_state_dir()?;
         let db_path = overrides
             .db_path
-            .unwrap_or_else(|| state_dir.join("usage.sqlite3"));
+            .unwrap_or_else(|| state_dir.join(db::DEFAULT_DB_FILENAME));
         let source_root = match overrides.source_root {
             Some(path) => path,
             None => dirs::default_source_root()?,

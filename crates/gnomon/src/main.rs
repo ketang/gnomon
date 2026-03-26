@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
+use gnomon_core::db::Database;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -27,6 +28,7 @@ fn main() -> Result<()> {
         source_root: cli.source_root,
     })?;
     config.ensure_dirs()?;
+    let _database = Database::open(&config.db_path)?;
 
     gnomon_tui::run(&config)
 }

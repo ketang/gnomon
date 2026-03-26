@@ -29,6 +29,7 @@ thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 walkdir = "2.5.0"
+tempfile = "3.10.1"
 
 [workspace.lints.clippy]
 dbg_macro = "deny"
@@ -37,4 +38,3 @@ unwrap_used = "deny"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
-
