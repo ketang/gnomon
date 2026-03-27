@@ -30,6 +30,16 @@ docs/
   v1-design.md
 ```
 
+## Branch And Worktree Workflow
+
+- Do not implement on `main`.
+- Start each task on a feature branch or the existing task branch.
+- Use a dedicated worktree for active implementation work whenever practical,
+  and especially for parallel efforts.
+- If you land on `main`, stop and switch to a feature branch before editing.
+- Repo-local worktrees live under `.worktrees/`. Treat that directory as local
+  orchestration state, not product source.
+
 ## Planned Core Stack
 
 - TUI: `ratatui` + `crossterm`
