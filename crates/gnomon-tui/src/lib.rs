@@ -9,7 +9,13 @@ pub fn run(
     config: &RuntimeConfig,
     snapshot: SnapshotBounds,
     startup_open_reason: StartupOpenReason,
-    startup_error: Option<String>,
+    startup_status_message: Option<String>,
 ) -> Result<()> {
-    app::App::new(config.clone(), snapshot, startup_open_reason, startup_error)?.run()
+    app::App::new(
+        config.clone(),
+        snapshot,
+        startup_open_reason,
+        startup_status_message,
+    )?
+    .run()
 }

@@ -24,13 +24,12 @@ const IMPORTER_THREAD_NAME: &str = "gnomon-importer";
 pub enum StartupOpenReason {
     Last24hReady,
     TimedOut,
-    Failed,
 }
 
 pub struct StartupImport {
     pub snapshot: SnapshotBounds,
     pub open_reason: StartupOpenReason,
-    pub startup_error: Option<String>,
+    pub startup_status_message: Option<String>,
     worker: Option<JoinHandle<Result<()>>>,
 }
 
@@ -54,8 +53,9 @@ struct ImportWorkerOptions {
 
 #[derive(Debug)]
 enum StartupWorkerEvent {
-    StartupReady,
-    Failed(String),
+    StartupSettled {
+        startup_status_message: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,7 +211,7 @@ fn start_startup_import_with_options(
         return Ok(StartupImport {
             snapshot: SnapshotBounds::load(conn)?,
             open_reason: StartupOpenReason::Last24hReady,
-            startup_error: None,
+            startup_status_message: None,
             worker: None,
         });
     }
@@ -244,17 +244,11 @@ fn start_startup_import_with_options(
         }
     };
 
-    let open_reason = match receiver.recv_timeout(wait_timeout) {
-        Ok(StartupWorkerEvent::StartupReady) => StartupOpenReason::Last24hReady,
-        Ok(StartupWorkerEvent::Failed(message)) => {
-            return Ok(StartupImport {
-                snapshot: SnapshotBounds::load(conn)?,
-                open_reason: StartupOpenReason::Failed,
-                startup_error: Some(message),
-                worker: Some(worker),
-            });
-        }
-        Err(RecvTimeoutError::Timeout) => StartupOpenReason::TimedOut,
+    let (open_reason, startup_status_message) = match receiver.recv_timeout(wait_timeout) {
+        Ok(StartupWorkerEvent::StartupSettled {
+            startup_status_message,
+        }) => (StartupOpenReason::Last24hReady, startup_status_message),
+        Err(RecvTimeoutError::Timeout) => (StartupOpenReason::TimedOut, None),
         Err(RecvTimeoutError::Disconnected) => {
             let worker_result = join_worker(Some(worker));
             return Err(worker_result.err().unwrap_or_else(|| {
@@ -266,7 +260,7 @@ fn start_startup_import_with_options(
     Ok(StartupImport {
         snapshot: SnapshotBounds::load(conn)?,
         open_reason,
-        startup_error: None,
+        startup_status_message,
         worker: Some(worker),
     })
 }
@@ -544,37 +538,51 @@ fn run_import_worker(
 ) -> Result<()> {
     let mut database =
         Database::open(db_path).with_context(|| format!("unable to open {}", db_path.display()))?;
+    let mut startup_failures = Vec::new();
 
     if plan.startup_chunks.is_empty() {
-        let _ = sender.send(StartupWorkerEvent::StartupReady);
+        let _ = sender.send(StartupWorkerEvent::StartupSettled {
+            startup_status_message: None,
+        });
     }
 
     for chunk in &plan.startup_chunks {
         if let Err(err) = import_chunk(&mut database, source_root, chunk, options) {
-            let _ = sender.send(StartupWorkerEvent::Failed(format!("{err:#}")));
-            return Err(err).with_context(|| {
-                format!(
-                    "unable to import startup chunk {}:{}",
-                    chunk.project_key, chunk.chunk_day_local
-                )
-            });
+            error!(
+                "unable to import startup chunk {}:{}: {err:#}",
+                chunk.project_key, chunk.chunk_day_local
+            );
+            startup_failures.push(format!("{err:#}"));
         }
     }
 
     if !plan.startup_chunks.is_empty() {
-        let _ = sender.send(StartupWorkerEvent::StartupReady);
+        let _ = sender.send(StartupWorkerEvent::StartupSettled {
+            startup_status_message: summarize_startup_failures(&startup_failures),
+        });
     }
 
     for chunk in &plan.deferred_chunks {
-        import_chunk(&mut database, source_root, chunk, options).with_context(|| {
-            format!(
-                "unable to import deferred chunk {}:{}",
+        if let Err(err) = import_chunk(&mut database, source_root, chunk, options) {
+            error!(
+                "unable to import deferred chunk {}:{}: {err:#}",
                 chunk.project_key, chunk.chunk_day_local
-            )
-        })?;
+            );
+        }
     }
 
     Ok(())
+}
+
+fn summarize_startup_failures(failures: &[String]) -> Option<String> {
+    match failures {
+        [] => None,
+        [failure] => Some(format!("startup import failed: {failure}")),
+        [first, ..] => Some(format!(
+            "startup import failed for {} chunks; first error: {first}",
+            failures.len()
+        )),
+    }
 }
 
 fn import_chunk(
@@ -600,14 +608,26 @@ fn import_chunk(
                     import_chunk_id: chunk.import_chunk_id,
                     path,
                 },
-            )?;
+            )
+            .with_context(|| {
+                format!(
+                    "unable to normalize source file {}",
+                    source_root.join(&source_file.relative_path).display()
+                )
+            })?;
 
             let _ = build_actions(
                 database.connection_mut(),
                 &BuildActionsParams {
                     conversation_id: conversation.conversation_id,
                 },
-            )?;
+            )
+            .with_context(|| {
+                format!(
+                    "unable to build actions for source file {}",
+                    source_root.join(&source_file.relative_path).display()
+                )
+            })?;
         }
 
         finalize_chunk_import(database.connection_mut(), chunk)?;
@@ -923,8 +943,8 @@ mod tests {
         )?;
 
         assert_eq!(startup.open_reason, StartupOpenReason::Last24hReady);
-        assert_eq!(startup.startup_error, None);
         assert_eq!(startup.snapshot.max_publish_seq, 1);
+        assert_eq!(startup.startup_status_message, None);
         startup.wait_for_completion()?;
 
         let state: (String, Option<i64>) = db.connection().query_row(
@@ -999,8 +1019,8 @@ mod tests {
         )?;
 
         assert_eq!(startup.open_reason, StartupOpenReason::TimedOut);
-        assert_eq!(startup.startup_error, None);
         assert_eq!(startup.snapshot.max_publish_seq, 0);
+        assert_eq!(startup.startup_status_message, None);
         startup.wait_for_completion()?;
 
         let complete_count: i64 = db.connection().query_row(
@@ -1014,36 +1034,53 @@ mod tests {
     }
 
     #[test]
-    fn startup_import_failure_is_non_fatal_and_reports_source_context() -> Result<()> {
+    fn startup_import_failure_is_non_fatal_and_reports_source_file_and_line() -> Result<()> {
         let temp = tempdir()?;
         let db_path = temp.path().join("usage.sqlite3");
         let source_root = temp.path().join("source");
-        let project_root = temp.path().join("project");
-        fs::create_dir_all(&project_root)?;
+        let bad_project_root = temp.path().join("bad-project");
+        let good_project_root = temp.path().join("good-project");
+        fs::create_dir_all(&bad_project_root)?;
+        fs::create_dir_all(&good_project_root)?;
 
-        let relative_path = "recent/session.jsonl";
-        let source_path = source_root.join(relative_path);
-        let size_bytes = write_session_fixture(&source_path, "session-failure")?;
+        let bad_relative_path = "bad/recent/session.jsonl";
+        let good_relative_path = "good/recent/session.jsonl";
+        let bad_source_path = source_root.join(bad_relative_path);
+        let good_source_path = source_root.join(good_relative_path);
+        let bad_size = write_malformed_session_fixture(&bad_source_path, "session-bad")?;
+        let good_size = write_session_fixture(&good_source_path, "session-good")?;
 
         let recent = Timestamp::now()
             .checked_sub(1_i64.hours())
-            .context("unable to construct recent failure test timestamp")?
+            .context("unable to construct recent startup test timestamp")?
             .to_string();
 
         let mut db = Database::open(&db_path)?;
-        replace_message_table_without_stream_id(db.connection_mut())?;
-        let project_id = insert_project_with_root(
+        let bad_project_id = insert_project_with_root(
             db.connection_mut(),
-            "path:/startup-failure",
-            "startup-failure",
-            &project_root,
+            "path:/bad-project",
+            "bad-project",
+            &bad_project_root,
+        )?;
+        let good_project_id = insert_project_with_root(
+            db.connection_mut(),
+            "path:/good-project",
+            "good-project",
+            &good_project_root,
         )?;
         let _ = insert_seeded_source_file(
             db.connection_mut(),
-            project_id,
-            relative_path,
+            bad_project_id,
+            bad_relative_path,
             &recent,
-            size_bytes,
+            bad_size,
+        )?;
+        let _ = insert_seeded_source_file(
+            db.connection_mut(),
+            good_project_id,
+            good_relative_path,
+            &recent,
+            good_size,
         )?;
 
         let startup = start_startup_import_with_options(
@@ -1054,30 +1091,28 @@ mod tests {
             ImportWorkerOptions::default(),
         )?;
 
-        assert_eq!(startup.open_reason, StartupOpenReason::Failed);
-        assert_eq!(startup.snapshot.max_publish_seq, 0);
-        let startup_error = startup
-            .startup_error
+        assert_eq!(startup.open_reason, StartupOpenReason::Last24hReady);
+        assert_eq!(startup.snapshot.max_publish_seq, 1);
+        let status_message = startup
+            .startup_status_message
             .clone()
-            .context("startup failure should expose an error message")?;
-        assert!(startup_error.contains(&source_path.display().to_string()));
-        assert!(startup_error.contains("line 1"));
-        assert!(startup_error.contains("unable to insert normalized message"));
+            .context("missing startup failure status message")?;
+        assert!(status_message.contains("startup import failed"));
+        assert!(status_message.contains(&bad_source_path.display().to_string()));
+        assert!(status_message.contains("line 2"));
+        startup.wait_for_completion()?;
 
-        let worker_error = startup
-            .wait_for_completion()
-            .expect_err("worker should still report the import failure");
-        let worker_error_text = format!("{worker_error:#}");
-        assert!(worker_error_text.contains(&source_path.display().to_string()));
-        assert!(worker_error_text.contains("line 1"));
-
-        let state: (String, Option<i64>) = db.connection().query_row(
-            "SELECT state, publish_seq FROM import_chunk",
+        let counts: (i64, i64) = db.connection().query_row(
+            "
+            SELECT
+                COUNT(*) FILTER (WHERE state = 'complete'),
+                COUNT(*) FILTER (WHERE state = 'failed')
+            FROM import_chunk
+            ",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        assert_eq!(state.0, "failed");
-        assert_eq!(state.1, None);
+        assert_eq!(counts, (1, 1));
 
         Ok(())
     }
@@ -1163,31 +1198,20 @@ mod tests {
         i64::try_from(content.len()).context("fixture size exceeded i64")
     }
 
-    fn replace_message_table_without_stream_id(conn: &mut Connection) -> Result<()> {
-        conn.execute_batch(
-            "
-            DROP TABLE message;
-            CREATE TABLE message (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                import_chunk_id INTEGER NOT NULL,
-                external_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                message_kind TEXT NOT NULL,
-                sequence_no INTEGER NOT NULL,
-                created_at_utc TEXT,
-                completed_at_utc TEXT,
-                input_tokens INTEGER,
-                cache_creation_input_tokens INTEGER,
-                cache_read_input_tokens INTEGER,
-                output_tokens INTEGER,
-                model_name TEXT,
-                stop_reason TEXT,
-                usage_source TEXT
-            );
-            ",
-        )
-        .context("unable to replace the message table for the startup failure test")?;
-        Ok(())
+    fn write_malformed_session_fixture(path: &Path, session_id: &str) -> Result<i64> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let content = format!(
+            concat!(
+                "{{\"type\":\"user\",\"uuid\":\"{session_id}-user\",\"timestamp\":\"2026-03-26T10:00:00Z\",\"sessionId\":\"{session_id}\",\"message\":{{\"role\":\"user\",\"content\":\"Inspect the project\"}}}}\n",
+                "{{\"type\":\"assistant\",\"uuid\":\"{session_id}-assistant\",\"timestamp\":\"2026-03-26T10:00:01Z\",\"sessionId\":\"{session_id}\",\"message\":{{\"id\":\"msg-{session_id}\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"broken\"}}]"
+            ),
+            session_id = session_id,
+        );
+
+        fs::write(path, &content).with_context(|| format!("unable to write {}", path.display()))?;
+        i64::try_from(content.len()).context("fixture size exceeded i64")
     }
 }

@@ -99,6 +99,8 @@ Shell commands do not create path attribution.
 - Open the TUI when:
   - last 24 hours are ready, or
   - 10 seconds have elapsed
+- Failed startup chunks do not block the TUI; mark them failed and surface the
+  first actionable error in the UI status area
 - Continue importing in one background worker after the UI opens
 - Do not auto-apply new data to the visible UI
 - Instead, show `new data available`
@@ -161,4 +163,3 @@ crates/
 7. Table-first TUI with filtering and global jump
 8. Radial view synchronized with table selection
 9. Performance and scale validation against roughly `10x` the current corpus
-

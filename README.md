@@ -16,8 +16,11 @@ SQLite cache, and opens a pinned TUI against the latest published import
 snapshot. The TUI now includes synchronized radial and table panes, persistent
 UI state, current-view filtering, global jump, and manual snapshot refresh.
 Startup prioritizes the last 24 hours of chunks before the UI opens and
-continues older imports in one background worker after launch. The checked-in
-design document captures the agreed `v1` architecture and backlog.
+continues older imports in one background worker after launch. Startup import
+errors are reported in the UI status area and do not abort launch; failed
+chunks remain excluded from the pinned snapshot until a later successful
+re-import. The checked-in design document captures the agreed `v1`
+architecture and backlog.
 
 ## Workspace Layout
 

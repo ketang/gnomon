@@ -181,9 +181,9 @@ fn run_app(config: &RuntimeConfig) -> Result<()> {
         start_startup_import(database.connection(), &config.db_path, &config.source_root)?;
     let snapshot = startup_import.snapshot.clone();
     let open_reason = startup_import.open_reason;
-    let startup_error = startup_import.startup_error.clone();
+    let startup_status_message = startup_import.startup_status_message.clone();
 
-    gnomon_tui::run(config, snapshot, open_reason, startup_error)
+    gnomon_tui::run(config, snapshot, open_reason, startup_status_message)
 }
 
 fn run_db_command(config: &RuntimeConfig, command: DbSubcommand) -> Result<()> {

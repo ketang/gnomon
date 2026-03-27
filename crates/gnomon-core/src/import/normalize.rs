@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -70,9 +70,7 @@ pub fn normalize_jsonl_file(
             }
         }
 
-        state
-            .process_record(&mut tx, record, line_no as i64)
-            .with_context(|| state.source_line_context(line_no as i64))?;
+        state.process_record(&mut tx, record, line_no as i64)?;
     }
 
     if state.conversation.is_none() {
@@ -83,17 +81,11 @@ pub fn normalize_jsonl_file(
     }
 
     if !state.buffered_records.is_empty() {
-        state
-            .flush_buffered_records(&mut tx)
-            .with_context(|| format!("unable to finish {}", state.source_path_display()))?;
+        state.flush_buffered_records(&mut tx)?;
     }
 
-    let turn_count = state
-        .build_turns(&mut tx)
-        .with_context(|| format!("unable to build turns for {}", state.source_path_display()))?;
-    state
-        .finish_import(&mut tx)
-        .with_context(|| format!("unable to finalize {}", state.source_path_display()))?;
+    let turn_count = state.build_turns(&mut tx)?;
+    state.finish_import(&mut tx)?;
     tx.commit().context("unable to commit normalized import")?;
 
     Ok(NormalizeJsonlFileResult {
@@ -196,6 +188,7 @@ impl Usage {
 #[derive(Debug, Clone)]
 struct ExtractedMessage {
     external_id: String,
+    source_line_no: i64,
     role: String,
     message_kind: &'static str,
     recorded_at_utc: Option<String>,
@@ -256,6 +249,8 @@ impl ImportState {
     fn initialize_context(&mut self, tx: &mut Transaction<'_>, record: &Value) -> Result<()> {
         let session_id = extract_session_id(record)
             .ok_or_else(|| anyhow!("cannot initialize import context without sessionId"))?;
+        let conversation_external_id =
+            conversation_external_id(session_id, self.params.source_file_id);
         let timestamp = extract_record_timestamp(record).map(ToOwned::to_owned);
 
         let conversation_id = tx
@@ -274,7 +269,7 @@ impl ImportState {
                 params![
                     self.params.project_id,
                     self.params.source_file_id,
-                    session_id,
+                    conversation_external_id,
                     timestamp
                 ],
                 |row| row.get(0),
@@ -336,8 +331,7 @@ impl ImportState {
     fn flush_buffered_records(&mut self, tx: &mut Transaction<'_>) -> Result<()> {
         let buffered_records = std::mem::take(&mut self.buffered_records);
         for record in buffered_records {
-            self.process_record(tx, record.value, record.source_line_no)
-                .with_context(|| self.source_line_context(record.source_line_no))?;
+            self.process_record(tx, record.value, record.source_line_no)?;
         }
         Ok(())
     }
@@ -400,8 +394,7 @@ impl ImportState {
         self.record_count += 1;
 
         if let Some(message) = extract_message(&record, source_line_no) {
-            self.upsert_message(tx, message, source_line_no)
-                .with_context(|| self.source_line_context(source_line_no))?;
+            self.upsert_message(tx, message)?;
         }
 
         Ok(())
@@ -411,9 +404,7 @@ impl ImportState {
         &mut self,
         tx: &mut Transaction<'_>,
         extracted: ExtractedMessage,
-        source_line_no: i64,
     ) -> Result<()> {
-        let source_context = self.source_line_context(source_line_no);
         let conversation_id = self
             .conversation
             .as_ref()
@@ -454,8 +445,9 @@ impl ImportState {
             )
             .with_context(|| {
                 format!(
-                    "unable to update logical message during dedupe merge for {}",
-                    source_context
+                    "unable to update normalized message on line {} from {}",
+                    extracted.source_line_no,
+                    self.params.path.display()
                 )
             })?;
 
@@ -474,9 +466,9 @@ impl ImportState {
                         state.id,
                         state.next_part_ordinal,
                         &part,
-                        source_line_no,
-                    )
-                    .with_context(|| source_context.clone())?;
+                        extracted.source_line_no,
+                        &self.params.path,
+                    )?;
                     state.next_part_ordinal += 1;
                 }
             }
@@ -530,7 +522,11 @@ impl ImportState {
                 |row| row.get(0),
             )
             .with_context(|| {
-                format!("unable to insert normalized message for {}", source_context)
+                format!(
+                    "unable to insert normalized message on line {} from {}",
+                    extracted.source_line_no,
+                    self.params.path.display()
+                )
             })?;
 
         let mut state = MessageState {
@@ -544,8 +540,14 @@ impl ImportState {
 
         for part in extracted.parts {
             if state.seen_part_keys.insert(part.dedupe_key.clone()) {
-                insert_message_part(tx, state.id, state.next_part_ordinal, &part, source_line_no)
-                    .with_context(|| source_context.clone())?;
+                insert_message_part(
+                    tx,
+                    state.id,
+                    state.next_part_ordinal,
+                    &part,
+                    extracted.source_line_no,
+                    &self.params.path,
+                )?;
                 state.next_part_ordinal += 1;
             }
         }
@@ -674,14 +676,6 @@ impl ImportState {
         .context("unable to update import chunk counters after normalization")?;
 
         Ok(())
-    }
-
-    fn source_line_context(&self, source_line_no: i64) -> String {
-        format!("{} line {}", self.source_path_display(), source_line_no)
-    }
-
-    fn source_path_display(&self) -> String {
-        self.params.path.display().to_string()
     }
 }
 
@@ -816,6 +810,7 @@ fn insert_message_part(
     ordinal: i64,
     part: &ExtractedMessagePart,
     source_line_no: i64,
+    source_path: &Path,
 ) -> Result<()> {
     tx.execute(
         "
@@ -845,7 +840,11 @@ fn insert_message_part(
         ],
     )
     .with_context(|| {
-        format!("unable to insert normalized message part for source line {source_line_no}")
+        format!(
+            "unable to insert normalized message part on line {} from {}",
+            source_line_no,
+            source_path.display()
+        )
     })?;
 
     Ok(())
@@ -871,6 +870,7 @@ fn extract_top_level_assistant(record: &Value, source_line_no: i64) -> Option<Ex
 
     Some(ExtractedMessage {
         external_id,
+        source_line_no,
         role: message_role(wrapper)?,
         message_kind: "assistant_message",
         recorded_at_utc: extract_record_timestamp(record).map(ToOwned::to_owned),
@@ -902,6 +902,7 @@ fn extract_top_level_user(record: &Value, source_line_no: i64) -> Option<Extract
 
     Some(ExtractedMessage {
         external_id,
+        source_line_no,
         role,
         message_kind,
         recorded_at_utc: extract_record_timestamp(record).map(ToOwned::to_owned),
@@ -949,6 +950,7 @@ fn extract_relay_message(record: &Value, source_line_no: i64) -> Option<Extracte
 
     Some(ExtractedMessage {
         external_id,
+        source_line_no,
         role,
         message_kind,
         recorded_at_utc: relay_wrapper
@@ -1113,6 +1115,10 @@ fn message_role(message_wrapper: &Value) -> Option<String> {
 
 fn extract_session_id(record: &Value) -> Option<&str> {
     record.get("sessionId").and_then(Value::as_str)
+}
+
+fn conversation_external_id(session_id: &str, source_file_id: i64) -> String {
+    format!("source-file:{source_file_id}:session:{session_id}")
 }
 
 fn extract_record_timestamp(record: &Value) -> Option<&str> {
@@ -1318,30 +1324,163 @@ mod tests {
     }
 
     #[test]
-    fn normalization_errors_report_source_path_and_line() -> Result<()> {
+    fn insert_message_errors_include_source_file_and_line() -> Result<()> {
         let temp = tempdir()?;
-        let db_path = temp.path().join("usage.sqlite3");
         let fixture_path = temp.path().join("session.jsonl");
         std::fs::write(&fixture_path, MAIN_SESSION_FIXTURE)?;
 
-        let mut db = Database::open(&db_path)?;
-        replace_message_table_without_stream_id(db.connection_mut())?;
-        let ids = seed_import_context(db.connection_mut(), "session.jsonl")?;
+        let mut conn = Connection::open(temp.path().join("legacy.sqlite3"))?;
+        conn.execute_batch(
+            "
+            CREATE TABLE conversation (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                source_file_id INTEGER NOT NULL,
+                external_id TEXT,
+                title TEXT,
+                started_at_utc TEXT,
+                ended_at_utc TEXT,
+                imported_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE stream (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                import_chunk_id INTEGER NOT NULL,
+                external_id TEXT,
+                stream_kind TEXT NOT NULL,
+                sequence_no INTEGER NOT NULL,
+                opened_at_utc TEXT,
+                closed_at_utc TEXT
+            );
+
+            CREATE TABLE record (
+                id INTEGER PRIMARY KEY,
+                import_chunk_id INTEGER NOT NULL,
+                source_file_id INTEGER NOT NULL,
+                conversation_id INTEGER NOT NULL,
+                stream_id INTEGER,
+                source_line_no INTEGER NOT NULL,
+                sequence_no INTEGER NOT NULL,
+                record_kind TEXT NOT NULL,
+                recorded_at_utc TEXT
+            );
+
+            CREATE TABLE message (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                import_chunk_id INTEGER NOT NULL,
+                external_id TEXT,
+                role TEXT NOT NULL,
+                message_kind TEXT NOT NULL,
+                sequence_no INTEGER NOT NULL,
+                created_at_utc TEXT,
+                completed_at_utc TEXT,
+                input_tokens INTEGER,
+                cache_creation_input_tokens INTEGER,
+                cache_read_input_tokens INTEGER,
+                output_tokens INTEGER,
+                model_name TEXT,
+                stop_reason TEXT,
+                usage_source TEXT
+            );
+
+            CREATE TABLE import_warning (
+                id INTEGER PRIMARY KEY,
+                import_chunk_id INTEGER NOT NULL,
+                source_file_id INTEGER,
+                conversation_id INTEGER,
+                code TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'warning',
+                message TEXT NOT NULL,
+                created_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            ",
+        )?;
+
         let error = normalize_jsonl_file(
-            db.connection_mut(),
+            &mut conn,
             &NormalizeJsonlFileParams {
-                project_id: ids.project_id,
-                source_file_id: ids.source_file_id,
-                import_chunk_id: ids.import_chunk_id,
+                project_id: 1,
+                source_file_id: 1,
+                import_chunk_id: 1,
                 path: fixture_path.clone(),
             },
         )
-        .expect_err("normalization should fail against a malformed message table");
+        .expect_err("legacy message schema should fail during insert");
 
-        let error_text = format!("{error:#}");
-        assert!(error_text.contains(&fixture_path.display().to_string()));
-        assert!(error_text.contains("line 2"));
-        assert!(error_text.contains("unable to insert normalized message"));
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(&fixture_path.display().to_string()));
+        assert!(rendered.contains("line 2"));
+        assert!(rendered.contains("unable to insert normalized message"));
+        assert!(rendered.contains("stream_id"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn normalization_allows_duplicate_session_ids_across_source_files() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let first_fixture_path = temp.path().join("first.jsonl");
+        let second_fixture_path = temp.path().join("second.jsonl");
+        std::fs::write(&first_fixture_path, MAIN_SESSION_FIXTURE)?;
+        std::fs::write(&second_fixture_path, MAIN_SESSION_FIXTURE)?;
+
+        let mut db = Database::open(&db_path)?;
+        let first_ids = seed_import_context(db.connection_mut(), "first.jsonl")?;
+        let second_ids = seed_second_source_file(
+            db.connection_mut(),
+            first_ids.project_id,
+            "second.jsonl",
+            first_ids.import_chunk_id,
+        )?;
+
+        let first_result = normalize_jsonl_file(
+            db.connection_mut(),
+            &NormalizeJsonlFileParams {
+                project_id: first_ids.project_id,
+                source_file_id: first_ids.source_file_id,
+                import_chunk_id: first_ids.import_chunk_id,
+                path: first_fixture_path,
+            },
+        )?;
+        let second_result = normalize_jsonl_file(
+            db.connection_mut(),
+            &NormalizeJsonlFileParams {
+                project_id: second_ids.project_id,
+                source_file_id: second_ids.source_file_id,
+                import_chunk_id: second_ids.import_chunk_id,
+                path: second_fixture_path,
+            },
+        )?;
+
+        let conversations: Vec<(i64, i64, String)> = {
+            let mut stmt = db.connection().prepare(
+                "
+                SELECT id, source_file_id, external_id
+                FROM conversation
+                ORDER BY source_file_id
+                ",
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        assert_eq!(first_result.conversation_id, conversations[0].0);
+        assert_eq!(second_result.conversation_id, conversations[1].0);
+        assert_eq!(conversations.len(), 2);
+        assert_eq!(
+            conversations[0].2,
+            format!("source-file:{}:session:session-1", first_ids.source_file_id)
+        );
+        assert_eq!(
+            conversations[1].2,
+            format!(
+                "source-file:{}:session:session-1",
+                second_ids.source_file_id
+            )
+        );
 
         Ok(())
     }
@@ -1390,30 +1529,26 @@ mod tests {
         })
     }
 
-    fn replace_message_table_without_stream_id(conn: &mut Connection) -> Result<()> {
-        conn.execute_batch(
+    fn seed_second_source_file(
+        conn: &mut Connection,
+        project_id: i64,
+        relative_path: &str,
+        import_chunk_id: i64,
+    ) -> Result<SeededIds> {
+        let source_file_id = conn.query_row(
             "
-            DROP TABLE message;
-            CREATE TABLE message (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                import_chunk_id INTEGER NOT NULL,
-                external_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                message_kind TEXT NOT NULL,
-                sequence_no INTEGER NOT NULL,
-                created_at_utc TEXT,
-                completed_at_utc TEXT,
-                input_tokens INTEGER,
-                cache_creation_input_tokens INTEGER,
-                cache_read_input_tokens INTEGER,
-                output_tokens INTEGER,
-                model_name TEXT,
-                stop_reason TEXT,
-                usage_source TEXT
-            );
+            INSERT INTO source_file (project_id, relative_path, size_bytes)
+            VALUES (?1, ?2, 0)
+            RETURNING id
             ",
+            params![project_id, relative_path],
+            |row| row.get(0),
         )?;
-        Ok(())
+
+        Ok(SeededIds {
+            project_id,
+            source_file_id,
+            import_chunk_id,
+        })
     }
 }
