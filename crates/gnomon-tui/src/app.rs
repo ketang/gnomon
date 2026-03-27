@@ -40,6 +40,7 @@ pub struct App {
     ui_state_path: PathBuf,
     ui_state: PersistedUiState,
     snapshot: SnapshotBounds,
+    latest_snapshot: SnapshotBounds,
     startup_open_reason: StartupOpenReason,
     has_newer_snapshot: bool,
     filter_options: FilterOptions,
@@ -88,6 +89,7 @@ impl App {
             database,
             ui_state_path,
             ui_state,
+            latest_snapshot: snapshot.clone(),
             snapshot,
             startup_open_reason,
             has_newer_snapshot: false,
@@ -110,7 +112,7 @@ impl App {
         };
 
         app.reload_view()?;
-        app.refresh_newer_snapshot_flag()?;
+        app.refresh_snapshot_status()?;
         Ok(app)
     }
 
@@ -119,7 +121,7 @@ impl App {
 
         loop {
             if self.last_refresh_check.elapsed() >= REFRESH_CHECK_INTERVAL {
-                self.refresh_newer_snapshot_flag()?;
+                self.refresh_snapshot_status()?;
                 self.last_refresh_check = Instant::now();
             }
 
@@ -147,7 +149,7 @@ impl App {
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5),
+                Constraint::Length(7),
                 Constraint::Min(10),
                 Constraint::Length(4),
             ])
@@ -165,20 +167,6 @@ impl App {
     }
 
     fn render_header(&self, frame: &mut Frame<'_>, area: Rect) {
-        let status = if self.has_newer_snapshot {
-            "new data available"
-        } else {
-            "pinned"
-        };
-        let snapshot_summary = if self.snapshot.is_bootstrap() {
-            "snapshot: bootstrap".to_string()
-        } else {
-            format!(
-                "snapshot: publish_seq <= {} ({})",
-                self.snapshot.max_publish_seq, status
-            )
-        };
-
         let mut lines = vec![
             Line::from(vec![
                 Span::styled("gnomon", Style::default().add_modifier(Modifier::BOLD)),
@@ -186,18 +174,17 @@ impl App {
             ]),
             Line::from(format!(
                 "{}  |  lens: {}  |  focus: {}",
-                snapshot_summary,
+                snapshot_summary_text(&self.snapshot, self.has_newer_snapshot),
                 metric_lens_label(self.ui_state.lens),
                 self.focused_pane.label()
             )),
-            Line::from(match self.startup_open_reason {
-                StartupOpenReason::Last24hReady => {
-                    "startup gate: last-24h import slice settled before the TUI opened"
-                }
-                StartupOpenReason::TimedOut => {
-                    "startup gate: opened on the 10s deadline while import continues in the background"
-                }
-            }),
+            Line::from(snapshot_coverage_text(&self.snapshot)),
+            Line::from(snapshot_refresh_text(
+                &self.snapshot,
+                &self.latest_snapshot,
+                self.startup_open_reason,
+                self.has_newer_snapshot,
+            )),
             Line::from(format!(
                 "path: {}",
                 describe_browse_path(
@@ -679,10 +666,11 @@ impl App {
 
         self.snapshot = self.query_engine().latest_snapshot_bounds()?;
         self.reload_view()?;
-        self.refresh_newer_snapshot_flag()?;
+        self.refresh_snapshot_status()?;
         self.status_message = Some(StatusMessage::info(format!(
-            "Adopted publish_seq <= {}.",
-            self.snapshot.max_publish_seq
+            "Adopted publish_seq <= {} covering {}.",
+            self.snapshot.max_publish_seq,
+            snapshot_coverage_tail(&self.snapshot)
         )));
         Ok(())
     }
@@ -729,8 +717,10 @@ impl App {
         Ok(())
     }
 
-    fn refresh_newer_snapshot_flag(&mut self) -> Result<()> {
-        self.has_newer_snapshot = self.query_engine().has_newer_snapshot(&self.snapshot)?;
+    fn refresh_snapshot_status(&mut self) -> Result<()> {
+        self.latest_snapshot = self.query_engine().latest_snapshot_bounds()?;
+        self.has_newer_snapshot =
+            self.latest_snapshot.max_publish_seq > self.snapshot.max_publish_seq;
         Ok(())
     }
 
@@ -1484,6 +1474,74 @@ impl TimeWindowPreset {
             start_at_utc: Some(start.to_string()),
             end_at_utc: None,
         }))
+    }
+}
+
+fn snapshot_summary_text(snapshot: &SnapshotBounds, has_newer_snapshot: bool) -> String {
+    if snapshot.is_bootstrap() {
+        return if has_newer_snapshot {
+            "snapshot: bootstrap (refresh available)".to_string()
+        } else {
+            "snapshot: bootstrap".to_string()
+        };
+    }
+
+    let status = if has_newer_snapshot {
+        "refresh available"
+    } else {
+        "pinned"
+    };
+    format!(
+        "snapshot: publish_seq <= {} ({status})",
+        snapshot.max_publish_seq
+    )
+}
+
+fn snapshot_coverage_text(snapshot: &SnapshotBounds) -> String {
+    if snapshot.is_bootstrap() {
+        return "coverage: no published chunks are visible yet".to_string();
+    }
+
+    format!(
+        "coverage: {} published chunk(s) {}",
+        snapshot.published_chunk_count,
+        snapshot_coverage_tail(snapshot)
+    )
+}
+
+fn snapshot_coverage_tail(snapshot: &SnapshotBounds) -> String {
+    match snapshot.upper_bound_timestamp().ok().flatten() {
+        Some(timestamp) => format!("through {timestamp}"),
+        None => snapshot
+            .upper_bound_utc
+            .as_deref()
+            .map(|upper_bound| format!("through {upper_bound}"))
+            .unwrap_or_else(|| "with an unknown upper bound".to_string()),
+    }
+}
+
+fn snapshot_refresh_text(
+    snapshot: &SnapshotBounds,
+    latest_snapshot: &SnapshotBounds,
+    startup_open_reason: StartupOpenReason,
+    has_newer_snapshot: bool,
+) -> String {
+    if has_newer_snapshot {
+        return format!(
+            "refresh: publish_seq <= {} is ready; current drill-down stays on publish_seq <= {} until you press r",
+            latest_snapshot.max_publish_seq, snapshot.max_publish_seq
+        );
+    }
+
+    match startup_open_reason {
+        StartupOpenReason::Last24hReady => {
+            "refresh: manual only; background import never changes the visible scope automatically"
+                .to_string()
+        }
+        StartupOpenReason::TimedOut => {
+            "startup gate: opened before the last-24h import slice settled; visible coverage may be partial"
+                .to_string()
+        }
     }
 }
 
@@ -2934,15 +2992,19 @@ mod tests {
         }
     }
 
-    fn render_to_string(config: RuntimeConfig) -> Result<String> {
+    fn render_to_string(
+        config: RuntimeConfig,
+        snapshot: SnapshotBounds,
+        startup_open_reason: StartupOpenReason,
+        latest_snapshot: Option<SnapshotBounds>,
+    ) -> Result<String> {
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend)?;
-        let mut app = App::new(
-            config,
-            SnapshotBounds::bootstrap(),
-            StartupOpenReason::Last24hReady,
-            None,
-        )?;
+        let mut app = App::new(config, snapshot.clone(), startup_open_reason, None)?;
+        if let Some(latest_snapshot) = latest_snapshot {
+            app.latest_snapshot = latest_snapshot;
+            app.has_newer_snapshot = app.latest_snapshot.max_publish_seq > snapshot.max_publish_seq;
+        }
         terminal.draw(|frame| app.render(frame))?;
         let content = terminal
             .backend()
@@ -2957,7 +3019,12 @@ mod tests {
     #[test]
     fn render_produces_three_pane_layout() -> Result<()> {
         let temp = tempdir()?;
-        let content = render_to_string(make_test_config(temp.path()))?;
+        let content = render_to_string(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+        )?;
         assert!(
             content.contains("Status"),
             "Status pane header not rendered"
@@ -2973,7 +3040,12 @@ mod tests {
     #[test]
     fn render_shows_startup_context_in_header() -> Result<()> {
         let temp = tempdir()?;
-        let content = render_to_string(make_test_config(temp.path()))?;
+        let content = render_to_string(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+        )?;
         assert!(
             content.contains("gnomon"),
             "app name not rendered in header"
@@ -2983,8 +3055,8 @@ mod tests {
             "bootstrap state not rendered in header"
         );
         assert!(
-            content.contains("last-24h"),
-            "startup open reason not rendered in header"
+            content.contains("manual only"),
+            "refresh policy not rendered in header"
         );
         Ok(())
     }
@@ -2992,7 +3064,12 @@ mod tests {
     #[test]
     fn render_footer_contains_quit_hint() -> Result<()> {
         let temp = tempdir()?;
-        let content = render_to_string(make_test_config(temp.path()))?;
+        let content = render_to_string(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+        )?;
         assert!(
             content.contains("quit"),
             "footer should contain 'quit' key hint"
@@ -3014,6 +3091,66 @@ mod tests {
                 start_at_utc: Some("2026-03-26T18:28:38Z".to_string()),
                 end_at_utc: None,
             })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn render_shows_partial_coverage_when_startup_times_out() -> Result<()> {
+        let temp = tempdir()?;
+        let content = render_to_string(
+            make_test_config(temp.path()),
+            SnapshotBounds {
+                max_publish_seq: 2,
+                published_chunk_count: 2,
+                upper_bound_utc: Some("2026-03-27 18:28:38".to_string()),
+            },
+            StartupOpenReason::TimedOut,
+            None,
+        )?;
+
+        assert!(
+            content.contains("coverage: 2 published chunk"),
+            "snapshot coverage count not rendered in header"
+        );
+        assert!(
+            content.contains("visible coverage may be partial"),
+            "partial-data state not rendered in header"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn render_shows_refresh_target_without_auto_applying_it() -> Result<()> {
+        let temp = tempdir()?;
+        let content = render_to_string(
+            make_test_config(temp.path()),
+            SnapshotBounds {
+                max_publish_seq: 2,
+                published_chunk_count: 2,
+                upper_bound_utc: Some("2026-03-27T18:28:38Z".to_string()),
+            },
+            StartupOpenReason::Last24hReady,
+            Some(SnapshotBounds {
+                max_publish_seq: 3,
+                published_chunk_count: 3,
+                upper_bound_utc: Some("2026-03-27T19:45:00Z".to_string()),
+            }),
+        )?;
+
+        assert!(
+            content.contains("snapshot: publish_seq <= 2 (refresh available)"),
+            "current pinned snapshot summary not rendered"
+        );
+        assert!(
+            content.contains("publish_seq <= 3 is ready"),
+            "newer snapshot target not rendered"
+        );
+        assert!(
+            content.contains("stays on publish_seq <= 2 until you press r"),
+            "manual refresh guarantee not rendered"
         );
 
         Ok(())
