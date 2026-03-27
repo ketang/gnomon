@@ -168,7 +168,7 @@ pub fn run_scale_validation(
     let filter_options_ms = filter_options_started_at.elapsed().as_millis();
 
     let project_root_started_at = Instant::now();
-    let project_root_rows = engine.browse(&BrowseRequest {
+    let project_root_report = engine.browse_report(BrowseRequest {
         snapshot: final_snapshot.clone(),
         root: RootView::ProjectHierarchy,
         lens: MetricLens::UncachedInput,
@@ -178,7 +178,7 @@ pub fn run_scale_validation(
     let project_root_browse_ms = project_root_started_at.elapsed().as_millis();
 
     let category_root_started_at = Instant::now();
-    let category_root_rows = engine.browse(&BrowseRequest {
+    let category_root_report = engine.browse_report(BrowseRequest {
         snapshot: final_snapshot.clone(),
         root: RootView::CategoryHierarchy,
         lens: MetricLens::UncachedInput,
@@ -193,7 +193,7 @@ pub fn run_scale_validation(
         .map(|project| project.id)
         .ok_or_else(|| anyhow::anyhow!("scale validation produced no visible projects"))?;
     let project_drill_started_at = Instant::now();
-    let project_drill_rows = engine.browse(&BrowseRequest {
+    let project_drill_report = engine.browse_report(BrowseRequest {
         snapshot: final_snapshot.clone(),
         root: RootView::ProjectHierarchy,
         lens: MetricLens::UncachedInput,
@@ -223,9 +223,9 @@ pub fn run_scale_validation(
         project_root_browse_ms,
         category_root_browse_ms,
         project_drill_ms,
-        project_root_row_count: project_root_rows.len(),
-        category_root_row_count: category_root_rows.len(),
-        project_drill_row_count: project_drill_rows.len(),
+        project_root_row_count: project_root_report.rows.len(),
+        category_root_row_count: category_root_report.rows.len(),
+        project_drill_row_count: project_drill_report.rows.len(),
     })
 }
 
