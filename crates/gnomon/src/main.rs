@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
 use gnomon_core::db::Database;
+use gnomon_core::import::scan_source_manifest;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -28,7 +29,8 @@ fn main() -> Result<()> {
         source_root: cli.source_root,
     })?;
     config.ensure_dirs()?;
-    let _database = Database::open(&config.db_path)?;
+    let mut database = Database::open(&config.db_path)?;
+    let _scan_report = scan_source_manifest(&mut database, &config.source_root)?;
 
     gnomon_tui::run(&config)
 }
