@@ -2153,4 +2153,13 @@ mod tests {
             |row| row.get(0),
         )?)
     }
+
+    #[test]
+    fn snapshot_bounds_bootstrap_has_zero_publish_seq() {
+        let bounds = SnapshotBounds::bootstrap();
+        assert_eq!(bounds.max_publish_seq, 0);
+        assert_eq!(bounds.published_chunk_count, 0);
+        assert!(bounds.upper_bound_utc.is_none());
+        assert!(bounds.is_bootstrap());
+    }
 }
