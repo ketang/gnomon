@@ -1,3 +1,4 @@
+use std::f64::consts::{FRAC_PI_2, TAU};
 use std::fs;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -13,18 +14,19 @@ use gnomon_core::config::RuntimeConfig;
 use gnomon_core::db::Database;
 use gnomon_core::import::StartupOpenReason;
 use gnomon_core::query::{
-    ActionKey, BrowseFilters, BrowsePath, BrowseRequest, FilterOptions, MetricLens, QueryEngine,
-    RollupRow, RollupRowKind, RootView, SnapshotBounds, TimeWindowFilter,
+    ActionKey, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState, FilterOptions,
+    MetricLens, QueryEngine, RollupRow, RollupRowKind, RootView, SnapshotBounds, TimeWindowFilter,
 };
 use jiff::{Timestamp, ToSpan};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as MatcherConfig, Matcher};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState, Wrap,
+    Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState, Widget, Wrap,
 };
 use ratatui::{Frame, Terminal};
 use serde::{Deserialize, Serialize};
@@ -45,6 +47,9 @@ pub struct App {
     visible_rows: Vec<RollupRow>,
     table_state: TableState,
     input_mode: InputMode,
+    focused_pane: PaneFocus,
+    radial_context: RadialContext,
+    radial_model: RadialModel,
     jump_state: JumpState,
     status_message: Option<StatusMessage>,
     last_refresh_check: Instant,
@@ -67,6 +72,7 @@ impl App {
                 ))),
             ),
         };
+        let focused_pane = PaneFocus::from_pane_mode(ui_state.pane_mode);
 
         let database = Database::open(&config.db_path)?;
         let mut app = Self {
@@ -86,6 +92,9 @@ impl App {
             visible_rows: Vec::new(),
             table_state: TableState::default(),
             input_mode: InputMode::Normal,
+            focused_pane,
+            radial_context: RadialContext::default(),
+            radial_model: RadialModel::default(),
             jump_state: JumpState::default(),
             status_message,
             last_refresh_check: Instant::now(),
@@ -164,13 +173,13 @@ impl App {
         let mut lines = vec![
             Line::from(vec![
                 Span::styled("gnomon", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw("  table-first explorer"),
+                Span::raw("  radial + table explorer"),
             ]),
             Line::from(format!(
-                "{}  |  lens: {}  |  pane: {}",
+                "{}  |  lens: {}  |  focus: {}",
                 snapshot_summary,
                 metric_lens_label(self.ui_state.lens),
-                self.ui_state.pane_mode.label()
+                self.focused_pane.label()
             )),
             Line::from(match self.startup_open_reason {
                 StartupOpenReason::Last24hReady => {
@@ -210,23 +219,19 @@ impl App {
     }
 
     fn render_body(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let show_split =
-            area.width >= WIDE_LAYOUT_WIDTH && matches!(self.ui_state.pane_mode, PaneMode::Details);
-
-        if show_split {
+        if area.width >= WIDE_LAYOUT_WIDTH {
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
+                .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
                 .split(area);
-            self.render_table(frame, panes[0]);
-            self.render_details(frame, panes[1]);
+            self.render_radial(frame, panes[0]);
+            self.render_table(frame, panes[1]);
             return;
         }
 
-        if matches!(self.ui_state.pane_mode, PaneMode::Details) {
-            self.render_details(frame, area);
-        } else {
-            self.render_table(frame, area);
+        match self.ui_state.pane_mode {
+            PaneMode::Table => self.render_table(frame, area),
+            PaneMode::Radial => self.render_radial(frame, area),
         }
     }
 
@@ -278,7 +283,7 @@ impl App {
 
         let table = Table::new(rows, widths)
             .header(header)
-            .block(Block::default().borders(Borders::ALL).title("Rows"))
+            .block(pane_block("Table", self.focused_pane == PaneFocus::Table))
             .row_highlight_style(
                 Style::default()
                     .bg(Color::DarkGray)
@@ -288,42 +293,26 @@ impl App {
         frame.render_stateful_widget(table, area, &mut self.table_state);
     }
 
-    fn render_details(&self, frame: &mut Frame<'_>, area: Rect) {
-        let block = Block::default().borders(Borders::ALL).title("Details");
-
-        let lines = if let Some(row) = self.selected_row() {
-            detail_lines(row, self.ui_state.lens, &self.filter_options)
-        } else {
-            vec![
-                Line::from("No row selected."),
-                Line::from("Use the arrow keys to move through the current view."),
-                Line::from("Press Enter to drill down and Backspace to move up."),
-            ]
-        };
-
-        let paragraph = Paragraph::new(Text::from(lines))
-            .block(block)
-            .wrap(Wrap { trim: true });
-        frame.render_widget(paragraph, area);
+    fn render_radial(&self, frame: &mut Frame<'_>, area: Rect) {
+        frame.render_widget(
+            &RadialPane {
+                model: &self.radial_model,
+                focused: self.focused_pane == PaneFocus::Radial,
+            },
+            area,
+        );
     }
 
     fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
         let lines = match self.input_mode {
             InputMode::Normal => vec![
                 Line::from(
-                    "Enter/right drill  Backspace/left up  1/2 hierarchy  l lens  Tab pane  o columns  q quit",
+                    "Enter drill  Backspace up  1/2 hierarchy  l lens  Tab focus/pane  o columns  q quit",
                 ),
                 Line::from(
-                    "t time  m model  p project  c category  a action  0 clear  / row filter  g jump  r refresh",
+                    "table focus: up/down rows. radial focus: left/right siblings. t/m/p/c/a filters  0 clear  / row filter  g jump  r refresh",
                 ),
-                Line::from(format!(
-                    "row filter: {}",
-                    if self.ui_state.row_filter.is_empty() {
-                        "(none)".to_string()
-                    } else {
-                        self.ui_state.row_filter.clone()
-                    }
-                )),
+                Line::from(self.selection_footer_text()),
             ],
             InputMode::FilterInput => vec![
                 Line::from("Editing current-view filter. Type to filter rows immediately."),
@@ -428,35 +417,11 @@ impl App {
     fn handle_normal_key(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => Ok(true),
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_selection(-1);
-                Ok(false)
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_selection(1);
-                Ok(false)
-            }
-            KeyCode::PageUp => {
-                self.move_selection(-10);
-                Ok(false)
-            }
-            KeyCode::PageDown => {
-                self.move_selection(10);
-                Ok(false)
-            }
-            KeyCode::Home => {
-                self.select_first();
-                Ok(false)
-            }
-            KeyCode::End => {
-                self.select_last();
-                Ok(false)
-            }
-            KeyCode::Enter | KeyCode::Right => {
+            KeyCode::Enter => {
                 self.descend_into_selection()?;
                 Ok(false)
             }
-            KeyCode::Backspace | KeyCode::Left => {
+            KeyCode::Backspace => {
                 self.navigate_up()?;
                 Ok(false)
             }
@@ -474,7 +439,8 @@ impl App {
                 Ok(false)
             }
             KeyCode::Tab => {
-                self.ui_state.pane_mode = self.ui_state.pane_mode.toggle();
+                self.focused_pane = self.focused_pane.toggle();
+                self.ui_state.pane_mode = PaneMode::from_focus(self.focused_pane);
                 self.save_state();
                 Ok(false)
             }
@@ -535,8 +501,41 @@ impl App {
                 self.input_mode = InputMode::ColumnChooser;
                 Ok(false)
             }
-            _ => Ok(false),
+            _ if self.focused_pane == PaneFocus::Table => self.handle_table_navigation_key(key),
+            _ => self.handle_radial_navigation_key(key),
         }
+    }
+
+    fn handle_table_navigation_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            KeyCode::PageUp => self.move_selection(-10),
+            KeyCode::PageDown => self.move_selection(10),
+            KeyCode::Home => self.select_first(),
+            KeyCode::End => self.select_last(),
+            KeyCode::Right => self.descend_into_selection()?,
+            KeyCode::Left => self.navigate_up()?,
+            _ => {}
+        }
+
+        Ok(false)
+    }
+
+    fn handle_radial_navigation_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => {
+                self.move_selection(-1)
+            }
+            KeyCode::Right | KeyCode::Down | KeyCode::Char('l') | KeyCode::Char('j') => {
+                self.move_selection(1)
+            }
+            KeyCode::Home => self.select_first(),
+            KeyCode::End => self.select_last(),
+            _ => {}
+        }
+
+        Ok(false)
     }
 
     fn handle_filter_input(&mut self, key: KeyEvent) -> Result<bool> {
@@ -714,6 +713,7 @@ impl App {
             path = parent;
         }
 
+        self.radial_context = self.build_radial_context(&filters)?;
         self.apply_row_filter();
         self.restore_selection(selected_key);
         self.save_state();
@@ -800,6 +800,7 @@ impl App {
     fn restore_selection(&mut self, preferred_key: Option<String>) {
         if self.visible_rows.is_empty() {
             self.table_state.select(None);
+            self.rebuild_radial_model();
             return;
         }
 
@@ -810,6 +811,7 @@ impl App {
                 .position(|row| row.key == preferred_key)
             {
                 self.table_state.select(Some(index));
+                self.rebuild_radial_model();
                 return;
             }
         }
@@ -820,6 +822,7 @@ impl App {
             .unwrap_or(0)
             .min(self.visible_rows.len().saturating_sub(1));
         self.table_state.select(Some(selected));
+        self.rebuild_radial_model();
     }
 
     fn selected_row(&self) -> Option<&RollupRow> {
@@ -834,6 +837,7 @@ impl App {
         } else {
             self.table_state.select(Some(0));
         }
+        self.rebuild_radial_model();
     }
 
     fn select_last(&mut self) {
@@ -843,11 +847,13 @@ impl App {
             self.table_state
                 .select(Some(self.visible_rows.len().saturating_sub(1)));
         }
+        self.rebuild_radial_model();
     }
 
     fn move_selection(&mut self, delta: isize) {
         if self.visible_rows.is_empty() {
             self.table_state.select(None);
+            self.rebuild_radial_model();
             return;
         }
 
@@ -855,6 +861,7 @@ impl App {
         let max_index = self.visible_rows.len().saturating_sub(1) as isize;
         let next = (current + delta).clamp(0, max_index) as usize;
         self.table_state.select(Some(next));
+        self.rebuild_radial_model();
     }
 
     fn update_jump_matches(&mut self) -> Result<()> {
@@ -1070,6 +1077,72 @@ impl App {
         parts.join("  |  ")
     }
 
+    fn selection_footer_text(&self) -> String {
+        let filter = if self.ui_state.row_filter.is_empty() {
+            "(none)".to_string()
+        } else {
+            self.ui_state.row_filter.clone()
+        };
+        let focus = self.focused_pane.label();
+
+        let selected = self
+            .selected_row()
+            .map(|row| {
+                format!(
+                    "{} ({}, {} {})",
+                    row.label,
+                    row_kind_label(row.kind),
+                    metric_lens_label(self.ui_state.lens),
+                    format_metric(row.metrics.lens_value(self.ui_state.lens))
+                )
+            })
+            .unwrap_or_else(|| "none".to_string());
+
+        format!("focus: {focus}  |  selected: {selected}  |  row filter: {filter}")
+    }
+
+    fn build_radial_context(&self, filters: &BrowseFilters) -> Result<RadialContext> {
+        let project_root = match project_id_from_path(&self.ui_state.path) {
+            Some(project_id) => self.project_root_for(project_id)?,
+            None => None,
+        };
+        let steps = radial_ancestor_steps(
+            &self.ui_state.root,
+            &self.ui_state.path,
+            project_root.as_deref(),
+        );
+        let mut ancestor_layers = Vec::new();
+
+        for step in steps {
+            let rows = self.query_engine().browse(&BrowseRequest {
+                snapshot: self.snapshot.clone(),
+                root: self.ui_state.root,
+                lens: self.ui_state.lens,
+                filters: filters.clone(),
+                path: step.query_path,
+            })?;
+            ancestor_layers.push(build_radial_layer(
+                &rows,
+                self.ui_state.lens,
+                Some(&step.selected_child),
+            ));
+        }
+
+        Ok(RadialContext { ancestor_layers })
+    }
+
+    fn rebuild_radial_model(&mut self) {
+        self.radial_model = build_radial_model(
+            &self.radial_context,
+            &self.visible_rows,
+            self.selected_row(),
+            &self.ui_state.root,
+            &self.ui_state.path,
+            &self.filter_options,
+            self.ui_state.lens,
+        );
+    }
+
     fn save_state(&mut self) {
         if let Err(error) = self.ui_state.save(&self.ui_state_path) {
             self.status_message = Some(StatusMessage::error(format!(
@@ -1174,23 +1247,187 @@ impl PersistedUiState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum PaneMode {
     Table,
-    Details,
+    #[serde(alias = "Details")]
+    Radial,
 }
 
 impl PaneMode {
+    fn from_focus(focus: PaneFocus) -> Self {
+        match focus {
+            PaneFocus::Table => Self::Table,
+            PaneFocus::Radial => Self::Radial,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneFocus {
+    Table,
+    Radial,
+}
+
+impl PaneFocus {
     fn toggle(self) -> Self {
         match self {
-            Self::Table => Self::Details,
-            Self::Details => Self::Table,
+            Self::Table => Self::Radial,
+            Self::Radial => Self::Table,
         }
     }
 
     fn label(self) -> &'static str {
         match self {
             Self::Table => "table",
-            Self::Details => "inspect",
+            Self::Radial => "radial",
         }
     }
+
+    fn from_pane_mode(mode: PaneMode) -> Self {
+        match mode {
+            PaneMode::Table => Self::Table,
+            PaneMode::Radial => Self::Radial,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct RadialContext {
+    ancestor_layers: Vec<RadialLayer>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RadialModel {
+    center: RadialCenter,
+    layers: Vec<RadialLayer>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RadialCenter {
+    scope_label: String,
+    lens_label: String,
+    selection_label: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RadialLayer {
+    segments: Vec<RadialSegment>,
+    total_value: f64,
+}
+
+#[derive(Debug, Clone)]
+struct RadialSegment {
+    value: f64,
+    cached_ratio: f64,
+    bucket: RadialBucket,
+    is_selected: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RadialBucket {
+    Project,
+    Category,
+    Classified,
+    Mixed,
+    Unclassified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RadialAncestorStep {
+    query_path: BrowsePath,
+    selected_child: String,
+}
+
+struct RadialPane<'a> {
+    model: &'a RadialModel,
+    focused: bool,
+}
+
+impl Widget for &RadialPane<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let block = pane_block("Radial", self.focused);
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        if inner.width < 12 || inner.height < 8 {
+            return;
+        }
+
+        let layer_count = self.model.layers.len();
+        if layer_count > 0 {
+            let center_x = f64::from(inner.x) + f64::from(inner.width) / 2.0;
+            let center_y = f64::from(inner.y) + f64::from(inner.height) / 2.0;
+            let radius_x = (f64::from(inner.width) / 2.0).max(1.0);
+            let radius_y = (f64::from(inner.height) / 2.0).max(1.0);
+            let center_radius = 0.24;
+            let ring_band = (0.96 - center_radius) / layer_count as f64;
+
+            for y in inner.y..inner.y + inner.height {
+                for x in inner.x..inner.x + inner.width {
+                    let normalized_x = (f64::from(x) + 0.5 - center_x) / radius_x;
+                    let normalized_y = (f64::from(y) + 0.5 - center_y) / radius_y;
+                    let radius = (normalized_x.powi(2) + normalized_y.powi(2)).sqrt();
+
+                    if !(center_radius..=0.96).contains(&radius) {
+                        continue;
+                    }
+
+                    let layer_index = ((radius - center_radius) / ring_band)
+                        .floor()
+                        .clamp(0.0, (layer_count - 1) as f64)
+                        as usize;
+                    let Some(layer) = self.model.layers.get(layer_index) else {
+                        continue;
+                    };
+                    let Some(segment) = radial_segment_at_angle(
+                        layer,
+                        (normalized_y.atan2(normalized_x) + FRAC_PI_2).rem_euclid(TAU),
+                    ) else {
+                        continue;
+                    };
+
+                    if let Some(cell) = buf.cell_mut((x, y)) {
+                        cell.set_style(radial_segment_style(segment, self.focused));
+                        cell.set_char(radial_texture(segment));
+                    }
+                }
+            }
+        }
+
+        let center_width = inner.width.clamp(16, 32);
+        let center_height = inner.height.clamp(5, 7);
+        let center_area = Rect::new(
+            inner.x + inner.width.saturating_sub(center_width) / 2,
+            inner.y + inner.height.saturating_sub(center_height) / 2,
+            center_width,
+            center_height,
+        );
+        let center_lines = vec![
+            Line::from(self.model.center.scope_label.clone()),
+            Line::from(self.model.center.selection_label.clone()),
+            Line::from(format!(
+                "lens: {}  |  texture: uncached->cached",
+                self.model.center.lens_label
+            )),
+        ];
+        Paragraph::new(Text::from(center_lines))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .render(center_area, buf);
+    }
+}
+
+fn pane_block(title: &str, focused: bool) -> Block<'static> {
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(title.to_string());
+    if focused {
+        block = block.border_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+
+    block
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1519,6 +1756,405 @@ fn row_kind_label(kind: RollupRowKind) -> &'static str {
         RollupRowKind::Action => "action",
         RollupRowKind::Directory => "dir",
         RollupRowKind::File => "file",
+    }
+}
+
+fn build_radial_model(
+    context: &RadialContext,
+    visible_rows: &[RollupRow],
+    selected_row: Option<&RollupRow>,
+    root: &RootView,
+    path: &BrowsePath,
+    filter_options: &FilterOptions,
+    lens: MetricLens,
+) -> RadialModel {
+    let mut layers = context.ancestor_layers.clone();
+    if !visible_rows.is_empty() {
+        layers.push(build_radial_layer(
+            visible_rows,
+            lens,
+            selected_row.map(|row| row.key.as_str()),
+        ));
+    }
+
+    let selection_label = selected_row
+        .map(|row| {
+            format!(
+                "selected: {} ({}, {} {})",
+                row.label,
+                row_kind_label(row.kind),
+                metric_lens_label(lens),
+                format_metric(row.metrics.lens_value(lens))
+            )
+        })
+        .unwrap_or_else(|| "selected: none".to_string());
+
+    RadialModel {
+        center: RadialCenter {
+            scope_label: describe_browse_path(root, path, filter_options),
+            lens_label: metric_lens_label(lens).to_string(),
+            selection_label,
+        },
+        layers,
+    }
+}
+
+fn build_radial_layer(
+    rows: &[RollupRow],
+    lens: MetricLens,
+    selected_key: Option<&str>,
+) -> RadialLayer {
+    let segments = rows
+        .iter()
+        .map(|row| RadialSegment {
+            value: row.metrics.lens_value(lens),
+            cached_ratio: cached_ratio(row),
+            bucket: radial_bucket(row),
+            is_selected: selected_key.is_some_and(|key| key == row.key),
+        })
+        .collect::<Vec<_>>();
+    let total_value = segments.iter().map(|segment| segment.value.max(0.0)).sum();
+
+    RadialLayer {
+        segments,
+        total_value,
+    }
+}
+
+fn radial_ancestor_steps(
+    root: &RootView,
+    path: &BrowsePath,
+    project_root: Option<&str>,
+) -> Vec<RadialAncestorStep> {
+    match (root, path) {
+        (_, BrowsePath::Root) => Vec::new(),
+        (RootView::ProjectHierarchy, BrowsePath::Project { project_id }) => {
+            vec![RadialAncestorStep {
+                query_path: BrowsePath::Root,
+                selected_child: project_row_key(*project_id),
+            }]
+        }
+        (
+            RootView::ProjectHierarchy,
+            BrowsePath::ProjectCategory {
+                project_id,
+                category,
+            },
+        ) => vec![
+            RadialAncestorStep {
+                query_path: BrowsePath::Root,
+                selected_child: project_row_key(*project_id),
+            },
+            RadialAncestorStep {
+                query_path: BrowsePath::Project {
+                    project_id: *project_id,
+                },
+                selected_child: category_row_key(category),
+            },
+        ],
+        (
+            RootView::ProjectHierarchy,
+            BrowsePath::ProjectAction {
+                project_id,
+                category,
+                action,
+                parent_path,
+            },
+        ) => {
+            let mut steps = vec![
+                RadialAncestorStep {
+                    query_path: BrowsePath::Root,
+                    selected_child: project_row_key(*project_id),
+                },
+                RadialAncestorStep {
+                    query_path: BrowsePath::Project {
+                        project_id: *project_id,
+                    },
+                    selected_child: category_row_key(category),
+                },
+                RadialAncestorStep {
+                    query_path: BrowsePath::ProjectCategory {
+                        project_id: *project_id,
+                        category: category.clone(),
+                    },
+                    selected_child: action_row_key(action),
+                },
+            ];
+            steps.extend(project_path_ancestor_steps(
+                *project_id,
+                category,
+                action,
+                parent_path.as_deref(),
+                project_root,
+            ));
+            steps
+        }
+        (RootView::CategoryHierarchy, BrowsePath::Category { category }) => {
+            vec![RadialAncestorStep {
+                query_path: BrowsePath::Root,
+                selected_child: category_row_key(category),
+            }]
+        }
+        (RootView::CategoryHierarchy, BrowsePath::CategoryAction { category, action }) => vec![
+            RadialAncestorStep {
+                query_path: BrowsePath::Root,
+                selected_child: category_row_key(category),
+            },
+            RadialAncestorStep {
+                query_path: BrowsePath::Category {
+                    category: category.clone(),
+                },
+                selected_child: action_row_key(action),
+            },
+        ],
+        (
+            RootView::CategoryHierarchy,
+            BrowsePath::CategoryActionProject {
+                category,
+                action,
+                project_id,
+                parent_path,
+            },
+        ) => {
+            let mut steps = vec![
+                RadialAncestorStep {
+                    query_path: BrowsePath::Root,
+                    selected_child: category_row_key(category),
+                },
+                RadialAncestorStep {
+                    query_path: BrowsePath::Category {
+                        category: category.clone(),
+                    },
+                    selected_child: action_row_key(action),
+                },
+                RadialAncestorStep {
+                    query_path: BrowsePath::CategoryAction {
+                        category: category.clone(),
+                        action: action.clone(),
+                    },
+                    selected_child: project_row_key(*project_id),
+                },
+            ];
+            steps.extend(category_project_path_ancestor_steps(
+                category,
+                action,
+                *project_id,
+                parent_path.as_deref(),
+                project_root,
+            ));
+            steps
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn project_path_ancestor_steps(
+    project_id: i64,
+    category: &str,
+    action: &ActionKey,
+    parent_path: Option<&str>,
+    project_root: Option<&str>,
+) -> Vec<RadialAncestorStep> {
+    let Some(project_root) = project_root else {
+        return Vec::new();
+    };
+    let Some(parent_path) = parent_path else {
+        return Vec::new();
+    };
+
+    let mut query_parent = None;
+    path_chain(project_root, parent_path)
+        .into_iter()
+        .map(|selected_path| {
+            let step = RadialAncestorStep {
+                query_path: BrowsePath::ProjectAction {
+                    project_id,
+                    category: category.to_string(),
+                    action: action.clone(),
+                    parent_path: query_parent.clone(),
+                },
+                selected_child: path_row_key(&selected_path),
+            };
+            query_parent = Some(selected_path);
+            step
+        })
+        .collect()
+}
+
+fn category_project_path_ancestor_steps(
+    category: &str,
+    action: &ActionKey,
+    project_id: i64,
+    parent_path: Option<&str>,
+    project_root: Option<&str>,
+) -> Vec<RadialAncestorStep> {
+    let Some(project_root) = project_root else {
+        return Vec::new();
+    };
+    let Some(parent_path) = parent_path else {
+        return Vec::new();
+    };
+
+    let mut query_parent = None;
+    path_chain(project_root, parent_path)
+        .into_iter()
+        .map(|selected_path| {
+            let step = RadialAncestorStep {
+                query_path: BrowsePath::CategoryActionProject {
+                    category: category.to_string(),
+                    action: action.clone(),
+                    project_id,
+                    parent_path: query_parent.clone(),
+                },
+                selected_child: path_row_key(&selected_path),
+            };
+            query_parent = Some(selected_path);
+            step
+        })
+        .collect()
+}
+
+fn path_chain(project_root: &str, parent_path: &str) -> Vec<String> {
+    let project_root = Path::new(project_root);
+    let parent_path = Path::new(parent_path);
+    let Ok(relative_path) = parent_path.strip_prefix(project_root) else {
+        return Vec::new();
+    };
+
+    let mut current = project_root.to_path_buf();
+    let mut paths = Vec::new();
+    for component in relative_path.components() {
+        current.push(component.as_os_str());
+        paths.push(current.to_string_lossy().to_string());
+    }
+
+    paths
+}
+
+fn radial_segment_at_angle(layer: &RadialLayer, angle: f64) -> Option<&RadialSegment> {
+    if layer.segments.is_empty() {
+        return None;
+    }
+
+    let total_weight = if layer.total_value > 0.0 {
+        layer.total_value
+    } else {
+        layer.segments.len() as f64
+    };
+
+    let mut cursor = 0.0;
+    for (index, segment) in layer.segments.iter().enumerate() {
+        let weight = if layer.total_value > 0.0 {
+            segment.value.max(0.0)
+        } else {
+            1.0
+        };
+        let next = cursor + (weight / total_weight) * TAU;
+        if angle < next || index + 1 == layer.segments.len() {
+            return Some(segment);
+        }
+        cursor = next;
+    }
+
+    None
+}
+
+fn radial_segment_style(segment: &RadialSegment, focused: bool) -> Style {
+    let mut style = Style::default()
+        .bg(radial_bucket_color(segment.bucket))
+        .fg(Color::Black);
+
+    if segment.is_selected {
+        style = style.fg(Color::White).add_modifier(Modifier::BOLD);
+        if focused {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
+    }
+
+    style
+}
+
+fn radial_texture(segment: &RadialSegment) -> char {
+    if segment.is_selected {
+        return '#';
+    }
+
+    match segment.cached_ratio {
+        ratio if ratio >= 0.75 => '*',
+        ratio if ratio >= 0.45 => ';',
+        ratio if ratio >= 0.2 => ':',
+        ratio if ratio > 0.0 => '.',
+        _ => ' ',
+    }
+}
+
+fn radial_bucket(row: &RollupRow) -> RadialBucket {
+    match row
+        .action
+        .as_ref()
+        .map(|action| action.classification_state)
+    {
+        Some(ClassificationState::Classified) => RadialBucket::Classified,
+        Some(ClassificationState::Mixed) => RadialBucket::Mixed,
+        Some(ClassificationState::Unclassified) => RadialBucket::Unclassified,
+        None => match row.kind {
+            RollupRowKind::Project => RadialBucket::Project,
+            RollupRowKind::ActionCategory => RadialBucket::Category,
+            RollupRowKind::Action => RadialBucket::Unclassified,
+            RollupRowKind::Directory | RollupRowKind::File => RadialBucket::Project,
+        },
+    }
+}
+
+fn radial_bucket_color(bucket: RadialBucket) -> Color {
+    match bucket {
+        RadialBucket::Project => Color::LightBlue,
+        RadialBucket::Category => Color::LightCyan,
+        RadialBucket::Classified => Color::LightGreen,
+        RadialBucket::Mixed => Color::LightYellow,
+        RadialBucket::Unclassified => Color::Gray,
+    }
+}
+
+fn cached_ratio(row: &RollupRow) -> f64 {
+    if row.metrics.gross_input <= 0.0 {
+        0.0
+    } else {
+        (row.metrics.cached_input / row.metrics.gross_input).clamp(0.0, 1.0)
+    }
+}
+
+fn project_row_key(project_id: i64) -> String {
+    format!("project:{project_id}")
+}
+
+fn category_row_key(category: &str) -> String {
+    format!("category:{category}")
+}
+
+fn action_row_key(action: &ActionKey) -> String {
+    format!("action:{}", stable_action_key(action))
+}
+
+fn path_row_key(path: &str) -> String {
+    format!("path:{path}")
+}
+
+fn stable_action_key(action: &ActionKey) -> String {
+    [
+        classification_state_key(action.classification_state),
+        action.normalized_action.as_deref().unwrap_or_default(),
+        action.command_family.as_deref().unwrap_or_default(),
+        action.base_command.as_deref().unwrap_or_default(),
+    ]
+    .join("|")
+}
+
+fn classification_state_key(state: ClassificationState) -> &'static str {
+    match state {
+        ClassificationState::Classified => "classified",
+        ClassificationState::Mixed => "mixed",
+        ClassificationState::Unclassified => "unclassified",
     }
 }
 
@@ -1952,66 +2588,6 @@ fn format_metric(value: f64) -> String {
     }
 }
 
-fn detail_lines(
-    row: &RollupRow,
-    lens: MetricLens,
-    filter_options: &FilterOptions,
-) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("label: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(row.label.clone()),
-        ]),
-        Line::from(vec![
-            Span::styled("kind: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(row_kind_label(row.kind)),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "selected lens: ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(
-                "{} = {}",
-                metric_lens_label(lens),
-                format_metric(row.metrics.lens_value(lens))
-            )),
-        ]),
-        Line::from(format!(
-            "uncached {}  |  gross {}  |  output {}  |  total {}",
-            format_metric(row.metrics.uncached_input),
-            format_metric(row.metrics.gross_input),
-            format_metric(row.metrics.output),
-            format_metric(row.metrics.total)
-        )),
-        Line::from(format!(
-            "5h {}  |  1w {}  |  ref {}  |  items {}",
-            format_metric(row.indicators.selected_lens_last_5_hours),
-            format_metric(row.indicators.selected_lens_last_week),
-            format_metric(row.indicators.uncached_input_reference),
-            row.item_count
-        )),
-    ];
-
-    if let Some(project_id) = row.project_id {
-        lines.push(Line::from(format!(
-            "project: {}",
-            project_name(project_id, filter_options)
-        )));
-    }
-    if let Some(category) = &row.category {
-        lines.push(Line::from(format!("category: {category}")));
-    }
-    if let Some(action) = &row.action {
-        lines.push(Line::from(format!("action: {}", action_label(action))));
-    }
-    if let Some(path) = &row.full_path {
-        lines.push(Line::from(format!("path: {path}")));
-    }
-
-    lines
-}
-
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let popup_width = width.min(area.width.saturating_sub(4)).max(10);
     let popup_height = height.min(area.height.saturating_sub(4)).max(6);
@@ -2052,7 +2628,7 @@ mod tests {
                 category: "Editing".to_string(),
             },
             lens: MetricLens::Total,
-            pane_mode: PaneMode::Details,
+            pane_mode: PaneMode::Radial,
             time_window: TimeWindowPreset::LastWeek,
             model: Some("claude-opus".to_string()),
             project_id: Some(7),
@@ -2066,11 +2642,37 @@ mod tests {
         let loaded = PersistedUiState::load(&path)?.context("missing persisted state")?;
         assert_eq!(loaded.row_filter, "src");
         assert_eq!(loaded.lens, MetricLens::Total);
-        assert_eq!(loaded.pane_mode, PaneMode::Details);
+        assert_eq!(loaded.pane_mode, PaneMode::Radial);
         assert_eq!(
             loaded.enabled_columns,
             vec![OptionalColumn::Kind, OptionalColumn::Items]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_state_loads_legacy_details_pane_name() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("tui-state.json");
+        fs::write(
+            &path,
+            r#"{
+  "root": "ProjectHierarchy",
+  "path": "Root",
+  "lens": "UncachedInput",
+  "pane_mode": "Details",
+  "time_window": "All",
+  "model": null,
+  "project_id": null,
+  "action_category": null,
+  "action": null,
+  "row_filter": "",
+  "enabled_columns": ["Kind"]
+}"#,
+        )?;
+
+        let loaded = PersistedUiState::load(&path)?.context("missing persisted state")?;
+        assert_eq!(loaded.pane_mode, PaneMode::Radial);
         Ok(())
     }
 
@@ -2145,6 +2747,117 @@ mod tests {
         assert_eq!(columns[1].key, ColumnKey::SelectedLens);
     }
 
+    #[test]
+    fn pane_focus_round_trips_through_pane_mode() {
+        assert_eq!(
+            PaneFocus::from_pane_mode(PaneMode::from_focus(PaneFocus::Table)),
+            PaneFocus::Table
+        );
+        assert_eq!(
+            PaneFocus::from_pane_mode(PaneMode::from_focus(PaneFocus::Radial)),
+            PaneFocus::Radial
+        );
+    }
+
+    #[test]
+    fn radial_ancestor_steps_include_directory_chain() {
+        let action = sample_action("read file");
+        let steps = radial_ancestor_steps(
+            &RootView::ProjectHierarchy,
+            &BrowsePath::ProjectAction {
+                project_id: 1,
+                category: "Editing".to_string(),
+                action: action.clone(),
+                parent_path: Some("/tmp/project-a/src/lib".to_string()),
+            },
+            Some("/tmp/project-a"),
+        );
+
+        assert_eq!(steps.len(), 5);
+        assert_eq!(
+            steps[0],
+            RadialAncestorStep {
+                query_path: BrowsePath::Root,
+                selected_child: "project:1".to_string(),
+            }
+        );
+        assert_eq!(
+            steps[1],
+            RadialAncestorStep {
+                query_path: BrowsePath::Project { project_id: 1 },
+                selected_child: "category:Editing".to_string(),
+            }
+        );
+        assert_eq!(
+            steps[2],
+            RadialAncestorStep {
+                query_path: BrowsePath::ProjectCategory {
+                    project_id: 1,
+                    category: "Editing".to_string(),
+                },
+                selected_child: action_row_key(&action),
+            }
+        );
+        assert_eq!(
+            steps[3],
+            RadialAncestorStep {
+                query_path: BrowsePath::ProjectAction {
+                    project_id: 1,
+                    category: "Editing".to_string(),
+                    action: action.clone(),
+                    parent_path: None,
+                },
+                selected_child: "path:/tmp/project-a/src".to_string(),
+            }
+        );
+        assert_eq!(
+            steps[4],
+            RadialAncestorStep {
+                query_path: BrowsePath::ProjectAction {
+                    project_id: 1,
+                    category: "Editing".to_string(),
+                    action,
+                    parent_path: Some("/tmp/project-a/src".to_string()),
+                },
+                selected_child: "path:/tmp/project-a/src/lib".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn radial_model_marks_selected_outer_segment() {
+        let rows = vec![
+            sample_row("src", Some("/tmp/project/src".to_string())),
+            sample_row("tests", Some("/tmp/project/tests".to_string())),
+        ];
+        let filter_options = sample_filter_options();
+        let model = build_radial_model(
+            &RadialContext::default(),
+            &rows,
+            rows.get(1),
+            &RootView::ProjectHierarchy,
+            &BrowsePath::Project { project_id: 1 },
+            &filter_options,
+            MetricLens::UncachedInput,
+        );
+
+        assert_eq!(model.layers.len(), 1);
+        assert_eq!(
+            model.layers[0]
+                .segments
+                .iter()
+                .filter(|segment| segment.is_selected)
+                .count(),
+            1
+        );
+        assert_eq!(
+            model.center.selection_label,
+            "selected: tests (dir, uncached 5)"
+        );
+        assert!(model.layers[0].segments[1].is_selected);
+        assert_eq!(model.center.scope_label, "project-a");
+    }
+
     fn sample_row(label: &str, full_path: Option<String>) -> RollupRow {
         RollupRow {
             kind: RollupRowKind::Directory,
@@ -2167,6 +2880,18 @@ mod tests {
             category: Some("Editing".to_string()),
             action: Some(sample_action("read file")),
             full_path,
+        }
+    }
+
+    fn sample_filter_options() -> FilterOptions {
+        FilterOptions {
+            projects: vec![gnomon_core::query::ProjectFilterOption {
+                id: 1,
+                display_name: "project-a".to_string(),
+            }],
+            models: Vec::new(),
+            categories: Vec::new(),
+            actions: Vec::new(),
         }
     }
 
