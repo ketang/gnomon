@@ -62,7 +62,7 @@ pub(crate) fn run_git<const N: usize>(repo_root: &Path, args: [&str; N]) -> Resu
 /// Returns a `PathBuf` guaranteed not to exist in the filesystem.
 /// Useful for testing "path does not exist" branches.
 pub(crate) fn nonexistent_path() -> PathBuf {
-    PathBuf::from("/tmp/__gnomon_test_nonexistent_path_that_should_never_exist__")
+    std::env::temp_dir().join("__gnomon_test_nonexistent_path_that_should_never_exist__")
 }
 
 #[cfg(test)]
@@ -98,7 +98,7 @@ mod tests {
         let cwd = Path::new("/some/project");
         make_jsonl_file(&jsonl, cwd)?;
         let contents = std::fs::read_to_string(&jsonl)?;
-        assert!(contents.contains("/some/project"));
+        assert!(contents.contains(&cwd.display().to_string()));
         Ok(())
     }
 
