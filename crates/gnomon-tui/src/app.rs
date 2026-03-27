@@ -2621,10 +2621,14 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
+    use gnomon_core::config::RuntimeConfig;
+    use gnomon_core::import::StartupOpenReason;
+    use gnomon_core::query::{ClassificationState, SnapshotBounds};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use tempfile::tempdir;
 
     use super::*;
-    use gnomon_core::query::ClassificationState;
 
     #[test]
     fn persisted_state_round_trips() -> Result<()> {
@@ -2910,5 +2914,79 @@ mod tests {
             command_family: None,
             base_command: None,
         }
+    }
+
+    fn make_test_config(dir: &std::path::Path) -> RuntimeConfig {
+        RuntimeConfig {
+            app_name: "gnomon",
+            state_dir: dir.to_path_buf(),
+            db_path: dir.join("test.sqlite3"),
+            source_root: dir.join("source"),
+        }
+    }
+
+    fn render_to_string(config: RuntimeConfig) -> Result<String> {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend)?;
+        let mut app = App::new(
+            config,
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+        )?;
+        terminal.draw(|frame| app.render(frame))?;
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect::<String>();
+        Ok(content)
+    }
+
+    #[test]
+    fn render_produces_three_pane_layout() -> Result<()> {
+        let temp = tempdir()?;
+        let content = render_to_string(make_test_config(temp.path()))?;
+        assert!(
+            content.contains("Status"),
+            "Status pane header not rendered"
+        );
+        assert!(
+            content.contains("snapshot: bootstrap"),
+            "bootstrap snapshot state not rendered in header"
+        );
+        assert!(content.contains("Keys"), "Keys pane header not rendered");
+        Ok(())
+    }
+
+    #[test]
+    fn render_shows_startup_context_in_header() -> Result<()> {
+        let temp = tempdir()?;
+        let content = render_to_string(make_test_config(temp.path()))?;
+        assert!(
+            content.contains("gnomon"),
+            "app name not rendered in header"
+        );
+        assert!(
+            content.contains("snapshot: bootstrap"),
+            "bootstrap state not rendered in header"
+        );
+        assert!(
+            content.contains("last-24h"),
+            "startup open reason not rendered in header"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn render_footer_contains_quit_hint() -> Result<()> {
+        let temp = tempdir()?;
+        let content = render_to_string(make_test_config(temp.path()))?;
+        assert!(
+            content.contains("quit"),
+            "footer should contain 'quit' key hint"
+        );
+        Ok(())
     }
 }

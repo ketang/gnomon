@@ -19,3 +19,31 @@ pub fn default_source_root() -> Result<PathBuf> {
     let base_dirs = BaseDirs::new().context("unable to resolve the current home directory")?;
     Ok(base_dirs.home_dir().join(".claude").join("projects"))
 }
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+
+    use super::{default_source_root, default_state_dir};
+
+    #[test]
+    fn default_source_root_ends_with_claude_projects() -> Result<()> {
+        let root = default_source_root()?;
+        let root_str = root.to_string_lossy();
+        assert!(
+            root_str.ends_with(".claude/projects") || root_str.ends_with(".claude\\projects"),
+            "expected path ending with .claude/projects, got: {root_str}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn default_state_dir_is_nonempty() -> Result<()> {
+        let dir = default_state_dir()?;
+        assert!(
+            !dir.as_os_str().is_empty(),
+            "expected a non-empty state dir path"
+        );
+        Ok(())
+    }
+}

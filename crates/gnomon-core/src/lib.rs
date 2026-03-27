@@ -6,3 +6,6 @@ pub mod import;
 pub mod query;
 pub mod validation;
 pub mod vcs;
+
+#[cfg(test)]
+pub(crate) mod test_helpers;

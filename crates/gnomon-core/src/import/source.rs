@@ -503,7 +503,7 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{ScanReport, ScanWarning, scan_source_manifest};
+    use super::{ScanReport, ScanWarning, WARNING_INVALID_JSON, scan_source_manifest};
     use crate::db::Database;
     use crate::vcs::{PATH_REASON_GIT_ROOT_NOT_FOUND, resolve_project_from_cwd};
 
@@ -738,6 +738,141 @@ mod tests {
         assert_eq!(project.root_path, repo_root.clone());
         assert_eq!(project.git_root_path, Some(repo_root));
 
+        Ok(())
+    }
+
+    #[test]
+    fn scan_empty_source_root_returns_zero_counts() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        fs::create_dir_all(&source_root)?;
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let report = scan_source_manifest(&mut db, &source_root)?;
+
+        assert_eq!(report, ScanReport::default());
+        Ok(())
+    }
+
+    #[test]
+    fn scan_with_multiple_files_in_same_project_counts_correctly() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        let repo_root = temp.path().join("repo");
+        let cwd = repo_root.join("work");
+
+        init_git_repo(&repo_root)?;
+        fs::create_dir_all(&cwd)?;
+        write_jsonl(&source_root.join("session1.jsonl"), &cwd)?;
+        write_jsonl(&source_root.join("session2.jsonl"), &cwd)?;
+        write_jsonl(&source_root.join("session3.jsonl"), &cwd)?;
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let report = scan_source_manifest(&mut db, &source_root)?;
+
+        assert_eq!(report.discovered_source_files, 3);
+        assert_eq!(
+            report.inserted_projects, 1,
+            "all three files share one project"
+        );
+        assert_eq!(report.updated_projects, 0);
+        assert_eq!(report.inserted_source_files, 3);
+        assert_eq!(report.updated_source_files, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn deleted_files_are_removed_on_rescan() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        let repo_root = temp.path().join("repo");
+        let cwd = repo_root.join("work");
+
+        init_git_repo(&repo_root)?;
+        fs::create_dir_all(&cwd)?;
+
+        let file1 = source_root.join("session1.jsonl");
+        let file2 = source_root.join("session2.jsonl");
+        write_jsonl(&file1, &cwd)?;
+        write_jsonl(&file2, &cwd)?;
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let first = scan_source_manifest(&mut db, &source_root)?;
+        assert_eq!(first.inserted_source_files, 2);
+
+        fs::remove_file(&file2)?;
+        let second = scan_source_manifest(&mut db, &source_root)?;
+
+        assert_eq!(second.discovered_source_files, 1);
+        assert_eq!(second.deleted_source_files, 1);
+
+        let remaining: i64 =
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM source_file", [], |row| row.get(0))?;
+        assert_eq!(
+            remaining, 1,
+            "deleted file should be removed from source_file table"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn second_scan_inserts_new_file_without_reinserting_project() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        let repo_root = temp.path().join("repo");
+        let cwd = repo_root.join("work");
+
+        init_git_repo(&repo_root)?;
+        fs::create_dir_all(&cwd)?;
+        write_jsonl(&source_root.join("session1.jsonl"), &cwd)?;
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let first = scan_source_manifest(&mut db, &source_root)?;
+        assert_eq!(first.inserted_projects, 1);
+        assert_eq!(first.inserted_source_files, 1);
+
+        // Add a second file belonging to the same project.
+        write_jsonl(&source_root.join("session2.jsonl"), &cwd)?;
+        let second = scan_source_manifest(&mut db, &source_root)?;
+
+        assert_eq!(
+            second.inserted_projects, 0,
+            "project already exists; must not re-insert"
+        );
+        assert_eq!(
+            second.inserted_source_files, 1,
+            "only the new file should be inserted"
+        );
+        assert_eq!(second.discovered_source_files, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_jsonl_produces_scan_warning() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        fs::create_dir_all(&source_root)?;
+
+        // Write a file whose only line is not valid JSON.
+        fs::write(source_root.join("bad.jsonl"), "not valid json at all\n")?;
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let report = scan_source_manifest(&mut db, &source_root)?;
+
+        // The file is discovered and stored, but with warnings.
+        assert_eq!(report.discovered_source_files, 1);
+
+        let warnings_json: String =
+            db.connection()
+                .query_row("SELECT scan_warnings_json FROM source_file", [], |row| {
+                    row.get(0)
+                })?;
+        let warnings: Vec<ScanWarning> = serde_json::from_str(&warnings_json)?;
+        assert!(
+            warnings.iter().any(|w| w.code == WARNING_INVALID_JSON),
+            "expected an invalid_json warning; got: {warnings:?}"
+        );
         Ok(())
     }
 

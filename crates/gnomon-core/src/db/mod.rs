@@ -147,4 +147,50 @@ mod tests {
 
         Ok(exists == Some(1))
     }
+
+    #[test]
+    fn schema_version_returns_initial_schema_version() -> Result<()> {
+        let temp = tempdir()?;
+        let db = Database::open(temp.path().join(DEFAULT_DB_FILENAME))?;
+        assert_eq!(db.schema_version()?, INITIAL_SCHEMA_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_key_constraint_is_enforced() -> Result<()> {
+        let temp = tempdir()?;
+        let db = Database::open(temp.path().join(DEFAULT_DB_FILENAME))?;
+
+        // Insert a source_file referencing a project_id that does not exist.
+        // Must fail because PRAGMA foreign_keys = ON is set at open time.
+        let result = db.connection().execute(
+            "INSERT INTO source_file (project_id, relative_path) VALUES (99999, 'orphan.jsonl')",
+            [],
+        );
+
+        assert!(result.is_err(), "expected a foreign key violation error");
+        Ok(())
+    }
+
+    #[test]
+    fn database_can_be_reopened_and_retains_data() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join(DEFAULT_DB_FILENAME);
+
+        {
+            let db = Database::open(&db_path)?;
+            db.connection().execute(
+                "INSERT INTO project (identity_kind, canonical_key, display_name, root_path)
+                 VALUES ('path', 'path:/tmp/retain-test', 'retain-test', '/tmp/retain-test')",
+                [],
+            )?;
+        } // db dropped here, connection closed
+
+        let db = Database::open(&db_path)?;
+        let count: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM project", [], |row| row.get(0))?;
+        assert_eq!(count, 1, "project row should persist after reopening");
+        Ok(())
+    }
 }
