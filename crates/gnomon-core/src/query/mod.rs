@@ -897,7 +897,7 @@ struct Windows {
 
 impl Windows {
     fn from_snapshot(snapshot: &SnapshotBounds) -> Result<Self> {
-        let Some(upper_bound) = parse_timestamp(snapshot.upper_bound_utc.as_deref())? else {
+        let Some(upper_bound) = snapshot.upper_bound_timestamp()? else {
             return Ok(Self {
                 last_5_hours_start: None,
                 last_week_start: None,
@@ -1255,7 +1255,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use anyhow::Result;
+    use anyhow::{Context, Result};
     use rusqlite::{Connection, OptionalExtension, params};
     use tempfile::tempdir;
 
@@ -2185,5 +2185,21 @@ mod tests {
         assert_eq!(bounds.published_chunk_count, 0);
         assert!(bounds.upper_bound_utc.is_none());
         assert!(bounds.is_bootstrap());
+    }
+
+    #[test]
+    fn snapshot_bounds_parse_sqlite_timestamp_upper_bound() -> Result<()> {
+        let bounds = SnapshotBounds {
+            max_publish_seq: 1,
+            published_chunk_count: 1,
+            upper_bound_utc: Some("2026-03-27 18:28:38".to_string()),
+        };
+
+        let timestamp = bounds
+            .upper_bound_timestamp()?
+            .context("expected parsed upper bound")?;
+
+        assert_eq!(timestamp.to_string(), "2026-03-27T18:28:38Z");
+        Ok(())
     }
 }
