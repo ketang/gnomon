@@ -41,8 +41,9 @@ asks.
 
 - Do not implement on `main`
 - If the current branch is `main`, stop and ask before editing
-- Prefer feature branches or the existing task branch
-- Prefer worktrees for parallel work
+- Use a feature branch or the existing task branch for every implementation task
+- Use a dedicated worktree for implementation work whenever practical, and for
+  all parallel work
 - This repo does not currently document a canonical issue tracker
 - Do not assume `beads`
 - If the user references an issue or tracker explicitly, follow that context;

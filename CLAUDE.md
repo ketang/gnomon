@@ -17,10 +17,12 @@ repository.
 
 ### Branch and worktree policy
 
-- Do not implement on `main`. Use a feature branch or the existing task branch.
+- Do not implement on `main`.
+- Use a feature branch or the existing task branch for every implementation
+  task.
 - If the current branch is `main`, stop and ask before editing files.
-- Prefer worktrees for parallel work. Repo-local worktrees live under
-  `.worktrees/`.
+- Use a dedicated worktree for implementation work whenever practical, and for
+  all parallel work. Repo-local worktrees live under `.worktrees/`.
 - `.worktrees/` is local orchestration state, not product source. Do not commit
   or clean it up unless the user explicitly asks.
 
