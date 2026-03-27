@@ -812,6 +812,60 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn second_scan_inserts_new_file_without_reinserting_project() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        let repo_root = temp.path().join("repo");
+        let cwd = repo_root.join("work");
+
+        init_git_repo(&repo_root)?;
+        fs::create_dir_all(&cwd)?;
+        write_jsonl(&source_root.join("session1.jsonl"), &cwd)?;
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let first = scan_source_manifest(&mut db, &source_root)?;
+        assert_eq!(first.inserted_projects, 1);
+        assert_eq!(first.inserted_source_files, 1);
+
+        // Add a second file belonging to the same project.
+        write_jsonl(&source_root.join("session2.jsonl"), &cwd)?;
+        let second = scan_source_manifest(&mut db, &source_root)?;
+
+        assert_eq!(second.inserted_projects, 0, "project already exists; must not re-insert");
+        assert_eq!(second.inserted_source_files, 1, "only the new file should be inserted");
+        assert_eq!(second.discovered_source_files, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_jsonl_produces_scan_warning() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        fs::create_dir_all(&source_root)?;
+
+        // Write a file whose only line is not valid JSON.
+        fs::write(source_root.join("bad.jsonl"), "not valid json at all\n")?;
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let report = scan_source_manifest(&mut db, &source_root)?;
+
+        // The file is discovered and stored, but with warnings.
+        assert_eq!(report.discovered_source_files, 1);
+
+        let warnings_json: String = db.connection().query_row(
+            "SELECT scan_warnings_json FROM source_file",
+            [],
+            |row| row.get(0),
+        )?;
+        let warnings: Vec<ScanWarning> = serde_json::from_str(&warnings_json)?;
+        assert!(
+            warnings.iter().any(|w| w.code == "invalid_json"),
+            "expected an invalid_json warning; got: {warnings:?}"
+        );
+        Ok(())
+    }
+
     fn write_jsonl(path: &Path, cwd: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
