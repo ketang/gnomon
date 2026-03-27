@@ -1614,6 +1614,7 @@ dependencies = [
  "clap",
  "gnomon-core",
  "gnomon-tui",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

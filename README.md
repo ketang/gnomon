@@ -46,6 +46,23 @@ cargo run -p gnomon
 
 Press `q` or `Esc` to exit the bootstrap TUI.
 
+## Scale Validation
+
+Synthetic scale validation, the current Linux timing baseline from March 27,
+2026, and release-build guidance live in `docs/scale-validation.md`.
+
+Quick validation:
+
+```bash
+cargo run -p gnomon --bin validate-scale -- --profile quick
+```
+
+Larger issue-10 validation:
+
+```bash
+cargo run -p gnomon --release --bin validate-scale -- --profile ten-x --root /tmp/gnomon-scale
+```
+
 ## Agent Instructions
 
 Shared agent standards are vendored via the `.agents/` git submodule:
