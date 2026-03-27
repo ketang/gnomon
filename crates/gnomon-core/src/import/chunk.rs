@@ -123,6 +123,12 @@ struct SourceFileRow {
     imported_modified_at_utc: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportExecutionReport {
+    pub startup_chunk_count: usize,
+    pub deferred_chunk_count: usize,
+}
+
 pub fn start_startup_import(
     conn: &Connection,
     db_path: &Path,
@@ -135,6 +141,56 @@ pub fn start_startup_import(
         Duration::from_secs(STARTUP_OPEN_DEADLINE_SECS),
         ImportWorkerOptions::default(),
     )
+}
+
+pub fn import_all(
+    conn: &Connection,
+    db_path: &Path,
+    source_root: &Path,
+) -> Result<ImportExecutionReport> {
+    let now = Timestamp::now();
+    let time_zone = TimeZone::system();
+    let plan = build_import_plan(conn, now, &time_zone)?;
+    let prepared = prepare_import_plan(conn, &plan)?;
+    let report = ImportExecutionReport {
+        startup_chunk_count: prepared.startup_chunks.len(),
+        deferred_chunk_count: prepared.deferred_chunks.len(),
+    };
+
+    let mut database =
+        Database::open(db_path).with_context(|| format!("unable to open {}", db_path.display()))?;
+
+    for chunk in &prepared.startup_chunks {
+        import_chunk(
+            &mut database,
+            source_root,
+            chunk,
+            &ImportWorkerOptions::default(),
+        )
+        .with_context(|| {
+            format!(
+                "unable to import startup chunk {}:{}",
+                chunk.project_key, chunk.chunk_day_local
+            )
+        })?;
+    }
+
+    for chunk in &prepared.deferred_chunks {
+        import_chunk(
+            &mut database,
+            source_root,
+            chunk,
+            &ImportWorkerOptions::default(),
+        )
+        .with_context(|| {
+            format!(
+                "unable to import deferred chunk {}:{}",
+                chunk.project_key, chunk.chunk_day_local
+            )
+        })?;
+    }
+
+    Ok(report)
 }
 
 fn start_startup_import_with_options(

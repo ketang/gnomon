@@ -9,5 +9,7 @@ pub const IMPORT_CHUNK_UNIT: &str = "project x day";
 mod chunk;
 mod normalize;
 
-pub use chunk::{StartupImport, StartupOpenReason, start_startup_import};
+pub use chunk::{
+    ImportExecutionReport, StartupImport, StartupOpenReason, import_all, start_startup_import,
+};
 pub use normalize::{NormalizeJsonlFileParams, NormalizeJsonlFileResult, normalize_jsonl_file};

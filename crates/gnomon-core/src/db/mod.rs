@@ -1,6 +1,8 @@
 mod migrations;
 
+use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -9,6 +11,12 @@ use rusqlite::Connection;
 pub const INITIAL_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_DB_FILENAME: &str = "usage.sqlite3";
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetReport {
+    pub removed_paths: Vec<PathBuf>,
+    pub missing_paths: Vec<PathBuf>,
+}
 
 pub struct Database {
     conn: Connection,
@@ -48,6 +56,45 @@ impl Database {
     }
 }
 
+pub fn reset_sqlite_database(path: impl AsRef<Path>) -> Result<ResetReport> {
+    let mut report = ResetReport {
+        removed_paths: Vec::new(),
+        missing_paths: Vec::new(),
+    };
+
+    for candidate in sqlite_artifact_paths(path.as_ref()) {
+        match fs::remove_file(&candidate) {
+            Ok(()) => report.removed_paths.push(candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                report.missing_paths.push(candidate);
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("unable to remove sqlite artifact {}", candidate.display())
+                });
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+fn sqlite_artifact_paths(path: &Path) -> [PathBuf; 3] {
+    let db_path = path.to_path_buf();
+    let wal_path = sqlite_sidecar_path(path, "wal");
+    let shm_path = sqlite_sidecar_path(path, "shm");
+    [db_path, wal_path, shm_path]
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| DEFAULT_DB_FILENAME.to_string());
+    let sidecar_name = format!("{file_name}-{suffix}");
+    path.with_file_name(sidecar_name)
+}
+
 fn configure_connection(conn: &mut Connection) -> Result<()> {
     conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)
         .context("unable to configure sqlite busy timeout")?;
@@ -71,11 +118,16 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use anyhow::Result;
     use rusqlite::{Connection, OptionalExtension};
     use tempfile::tempdir;
 
-    use super::{DEFAULT_BUSY_TIMEOUT, DEFAULT_DB_FILENAME, Database, INITIAL_SCHEMA_VERSION};
+    use super::{
+        DEFAULT_BUSY_TIMEOUT, DEFAULT_DB_FILENAME, Database, INITIAL_SCHEMA_VERSION, ResetReport,
+        reset_sqlite_database,
+    };
 
     const REQUIRED_TABLES: [&str; 15] = [
         "project",
@@ -118,6 +170,54 @@ mod tests {
 
         let reopened = Database::open(&db_path)?;
         assert_eq!(reopened.schema_version()?, INITIAL_SCHEMA_VERSION);
+
+        Ok(())
+    }
+
+    #[test]
+    fn reset_sqlite_database_removes_primary_and_sidecar_files() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join(DEFAULT_DB_FILENAME);
+        fs::write(&db_path, "db")?;
+        fs::write(temp.path().join("usage.sqlite3-wal"), "wal")?;
+        fs::write(temp.path().join("usage.sqlite3-shm"), "shm")?;
+
+        let report = reset_sqlite_database(&db_path)?;
+
+        assert_eq!(
+            report,
+            ResetReport {
+                removed_paths: vec![
+                    db_path.clone(),
+                    temp.path().join("usage.sqlite3-wal"),
+                    temp.path().join("usage.sqlite3-shm"),
+                ],
+                missing_paths: Vec::new(),
+            }
+        );
+        assert!(!db_path.exists());
+        assert!(!temp.path().join("usage.sqlite3-wal").exists());
+        assert!(!temp.path().join("usage.sqlite3-shm").exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn reset_sqlite_database_reports_missing_files_gracefully() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join(DEFAULT_DB_FILENAME);
+
+        let report = reset_sqlite_database(&db_path)?;
+
+        assert!(report.removed_paths.is_empty());
+        assert_eq!(
+            report.missing_paths,
+            vec![
+                db_path,
+                temp.path().join("usage.sqlite3-wal"),
+                temp.path().join("usage.sqlite3-shm"),
+            ]
+        );
 
         Ok(())
     }

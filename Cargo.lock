@@ -1614,6 +1614,8 @@ dependencies = [
  "clap",
  "gnomon-core",
  "gnomon-tui",
+ "rusqlite",
+ "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",

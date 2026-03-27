@@ -48,6 +48,19 @@ cargo run -p gnomon
 
 Press `q` or `Esc` to exit the bootstrap TUI.
 
+## Database Maintenance
+
+The SQLite cache is derived data and can be maintained from the CLI:
+
+```bash
+cargo run -p gnomon -- db reset --force
+cargo run -p gnomon -- db rebuild
+```
+
+Both commands honor the existing `--db` and `--source-root` overrides.
+`reset` is destructive and requires `--force`. `rebuild` recreates the cache
+from the source manifest and session history without opening the TUI.
+
 ## Scale Validation
 
 Synthetic scale validation, the current Linux timing baseline from March 27,
