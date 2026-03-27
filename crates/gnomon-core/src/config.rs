@@ -108,9 +108,15 @@ mod tests {
             db_path: state_dir.join(DEFAULT_DB_FILENAME),
             source_root: temp.path().join("source"),
         };
-        assert!(!state_dir.exists(), "state_dir should not exist before ensure_dirs");
+        assert!(
+            !state_dir.exists(),
+            "state_dir should not exist before ensure_dirs"
+        );
         config.ensure_dirs()?;
-        assert!(state_dir.exists(), "state_dir should exist after ensure_dirs");
+        assert!(
+            state_dir.exists(),
+            "state_dir should exist after ensure_dirs"
+        );
         Ok(())
     }
 }

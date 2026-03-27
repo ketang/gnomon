@@ -187,11 +187,9 @@ mod tests {
         } // db dropped here, connection closed
 
         let db = Database::open(&db_path)?;
-        let count: i64 = db.connection().query_row(
-            "SELECT COUNT(*) FROM project",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM project", [], |row| row.get(0))?;
         assert_eq!(count, 1, "project row should persist after reopening");
         Ok(())
     }

@@ -771,7 +771,10 @@ mod tests {
         let report = scan_source_manifest(&mut db, &source_root)?;
 
         assert_eq!(report.discovered_source_files, 3);
-        assert_eq!(report.inserted_projects, 1, "all three files share one project");
+        assert_eq!(
+            report.inserted_projects, 1,
+            "all three files share one project"
+        );
         assert_eq!(report.updated_projects, 0);
         assert_eq!(report.inserted_source_files, 3);
         assert_eq!(report.updated_source_files, 0);
@@ -803,12 +806,13 @@ mod tests {
         assert_eq!(second.discovered_source_files, 1);
         assert_eq!(second.deleted_source_files, 1);
 
-        let remaining: i64 = db.connection().query_row(
-            "SELECT COUNT(*) FROM source_file",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(remaining, 1, "deleted file should be removed from source_file table");
+        let remaining: i64 =
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM source_file", [], |row| row.get(0))?;
+        assert_eq!(
+            remaining, 1,
+            "deleted file should be removed from source_file table"
+        );
         Ok(())
     }
 
@@ -832,8 +836,14 @@ mod tests {
         write_jsonl(&source_root.join("session2.jsonl"), &cwd)?;
         let second = scan_source_manifest(&mut db, &source_root)?;
 
-        assert_eq!(second.inserted_projects, 0, "project already exists; must not re-insert");
-        assert_eq!(second.inserted_source_files, 1, "only the new file should be inserted");
+        assert_eq!(
+            second.inserted_projects, 0,
+            "project already exists; must not re-insert"
+        );
+        assert_eq!(
+            second.inserted_source_files, 1,
+            "only the new file should be inserted"
+        );
         assert_eq!(second.discovered_source_files, 2);
         Ok(())
     }
@@ -853,11 +863,11 @@ mod tests {
         // The file is discovered and stored, but with warnings.
         assert_eq!(report.discovered_source_files, 1);
 
-        let warnings_json: String = db.connection().query_row(
-            "SELECT scan_warnings_json FROM source_file",
-            [],
-            |row| row.get(0),
-        )?;
+        let warnings_json: String =
+            db.connection()
+                .query_row("SELECT scan_warnings_json FROM source_file", [], |row| {
+                    row.get(0)
+                })?;
         let warnings: Vec<ScanWarning> = serde_json::from_str(&warnings_json)?;
         assert!(
             warnings.iter().any(|w| w.code == WARNING_INVALID_JSON),

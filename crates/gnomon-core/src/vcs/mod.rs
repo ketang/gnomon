@@ -112,8 +112,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        PATH_REASON_GIT_ROOT_NOT_FOUND, ProjectIdentityKind, path_project,
-        resolve_project_from_cwd,
+        PATH_REASON_GIT_ROOT_NOT_FOUND, ProjectIdentityKind, path_project, resolve_project_from_cwd,
     };
     use crate::test_helpers::make_git_repo;
 
