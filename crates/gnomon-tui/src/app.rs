@@ -1182,6 +1182,7 @@ impl App {
             project_root.as_deref(),
         );
         let mut ancestor_layers = Vec::new();
+        let mut current_span = RadialSpan::full();
 
         for step in steps {
             let rows = self.query_engine().browse(&BrowseRequest {
@@ -1191,14 +1192,20 @@ impl App {
                 filters: filters.clone(),
                 path: step.query_path,
             })?;
-            ancestor_layers.push(build_radial_layer(
+            let layer = build_radial_layer(
                 &rows,
                 self.ui_state.lens,
                 Some(&step.selected_child),
-            ));
+                current_span,
+            );
+            current_span = radial_selected_child_span(&layer);
+            ancestor_layers.push(layer);
         }
 
-        Ok(RadialContext { ancestor_layers })
+        Ok(RadialContext {
+            ancestor_layers,
+            current_span,
+        })
     }
 
     fn rebuild_radial_model(&mut self) {
@@ -1374,6 +1381,7 @@ impl PaneFocus {
 #[derive(Debug, Clone, Default)]
 struct RadialContext {
     ancestor_layers: Vec<RadialLayer>,
+    current_span: RadialSpan,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1391,8 +1399,50 @@ struct RadialCenter {
 
 #[derive(Debug, Clone, Default)]
 struct RadialLayer {
+    span: RadialSpan,
     segments: Vec<RadialSegment>,
     total_value: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RadialSpan {
+    start: f64,
+    sweep: f64,
+}
+
+impl Default for RadialSpan {
+    fn default() -> Self {
+        Self::full()
+    }
+}
+
+impl RadialSpan {
+    fn full() -> Self {
+        Self {
+            start: 0.0,
+            sweep: TAU,
+        }
+    }
+
+    fn child_span(self, start_offset: f64, sweep: f64) -> Self {
+        Self {
+            start: (self.start + start_offset).rem_euclid(TAU),
+            sweep,
+        }
+    }
+
+    fn local_angle(self, angle: f64) -> Option<f64> {
+        if self.sweep <= 0.0 {
+            return None;
+        }
+
+        let offset = (angle - self.start).rem_euclid(TAU);
+        if offset > self.sweep {
+            None
+        } else {
+            Some(offset)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1972,6 +2022,7 @@ fn build_radial_model(
             visible_rows,
             lens,
             selected_row.map(|row| row.key.as_str()),
+            context.current_span,
         ));
     }
 
@@ -2001,6 +2052,7 @@ fn build_radial_layer(
     rows: &[RollupRow],
     lens: MetricLens,
     selected_key: Option<&str>,
+    span: RadialSpan,
 ) -> RadialLayer {
     let segments = rows
         .iter()
@@ -2014,6 +2066,7 @@ fn build_radial_layer(
     let total_value = segments.iter().map(|segment| segment.value.max(0.0)).sum();
 
     RadialLayer {
+        span,
         segments,
         total_value,
     }
@@ -2230,6 +2283,11 @@ fn path_chain(project_root: &str, parent_path: &str) -> Vec<String> {
 }
 
 fn radial_segment_at_angle(layer: &RadialLayer, angle: f64) -> Option<&RadialSegment> {
+    let local_angle = layer.span.local_angle(angle)?;
+    radial_segment_at_local_angle(layer, local_angle)
+}
+
+fn radial_segment_at_local_angle(layer: &RadialLayer, local_angle: f64) -> Option<&RadialSegment> {
     if layer.segments.is_empty() {
         return None;
     }
@@ -2247,14 +2305,45 @@ fn radial_segment_at_angle(layer: &RadialLayer, angle: f64) -> Option<&RadialSeg
         } else {
             1.0
         };
-        let next = cursor + (weight / total_weight) * TAU;
-        if angle < next || index + 1 == layer.segments.len() {
+        let next = cursor + (weight / total_weight) * layer.span.sweep;
+        if local_angle < next || index + 1 == layer.segments.len() {
             return Some(segment);
         }
         cursor = next;
     }
 
     None
+}
+
+fn radial_selected_child_span(layer: &RadialLayer) -> RadialSpan {
+    if layer.segments.is_empty() {
+        return layer.span;
+    }
+
+    let total_weight = if layer.total_value > 0.0 {
+        layer.total_value
+    } else {
+        layer.segments.len() as f64
+    };
+
+    let mut cursor = 0.0;
+    for (index, segment) in layer.segments.iter().enumerate() {
+        let weight = if layer.total_value > 0.0 {
+            segment.value.max(0.0)
+        } else {
+            1.0
+        };
+        let next = cursor + (weight / total_weight) * layer.span.sweep;
+        if segment.is_selected {
+            return layer.span.child_span(cursor, next - cursor);
+        }
+        cursor = next;
+        if index + 1 == layer.segments.len() {
+            break;
+        }
+    }
+
+    layer.span
 }
 
 fn radial_segment_style(segment: &RadialSegment, focused: bool) -> Style {
@@ -3070,6 +3159,146 @@ mod tests {
     }
 
     #[test]
+    fn radial_selected_child_span_tracks_nested_drilldown_arcs() {
+        let project_layer = build_radial_layer(
+            &[
+                radial_row(RadialRowSpec {
+                    key: "project:1",
+                    label: "project-a",
+                    kind: RollupRowKind::Project,
+                    value: 10.0,
+                    project_id: Some(1),
+                    category: None,
+                    action: None,
+                    full_path: None,
+                }),
+                radial_row(RadialRowSpec {
+                    key: "project:2",
+                    label: "project-b",
+                    kind: RollupRowKind::Project,
+                    value: 10.0,
+                    project_id: Some(2),
+                    category: None,
+                    action: None,
+                    full_path: None,
+                }),
+            ],
+            MetricLens::UncachedInput,
+            Some("project:1"),
+            RadialSpan::full(),
+        );
+        assert_span_close(radial_selected_child_span(&project_layer), 0.0, TAU / 2.0);
+
+        let category_layer = build_radial_layer(
+            &[
+                radial_row(RadialRowSpec {
+                    key: "category:Editing",
+                    label: "Editing",
+                    kind: RollupRowKind::ActionCategory,
+                    value: 8.0,
+                    project_id: Some(1),
+                    category: Some("Editing"),
+                    action: None,
+                    full_path: None,
+                }),
+                radial_row(RadialRowSpec {
+                    key: "category:Documentation",
+                    label: "Documentation",
+                    kind: RollupRowKind::ActionCategory,
+                    value: 8.0,
+                    project_id: Some(1),
+                    category: Some("Documentation"),
+                    action: None,
+                    full_path: None,
+                }),
+            ],
+            MetricLens::UncachedInput,
+            Some("category:Documentation"),
+            radial_selected_child_span(&project_layer),
+        );
+        assert_span_close(
+            radial_selected_child_span(&category_layer),
+            TAU / 4.0,
+            TAU / 4.0,
+        );
+
+        let action_layer = build_radial_layer(
+            &[
+                radial_row(RadialRowSpec {
+                    key: "action:read",
+                    label: "read",
+                    kind: RollupRowKind::Action,
+                    value: 4.0,
+                    project_id: Some(1),
+                    category: Some("Documentation"),
+                    action: Some(sample_action("read file")),
+                    full_path: None,
+                }),
+                radial_row(RadialRowSpec {
+                    key: "action:write",
+                    label: "write",
+                    kind: RollupRowKind::Action,
+                    value: 4.0,
+                    project_id: Some(1),
+                    category: Some("Documentation"),
+                    action: Some(sample_action("write file")),
+                    full_path: None,
+                }),
+            ],
+            MetricLens::UncachedInput,
+            Some("action:write"),
+            radial_selected_child_span(&category_layer),
+        );
+        assert_span_close(
+            radial_selected_child_span(&action_layer),
+            3.0 * TAU / 8.0,
+            TAU / 8.0,
+        );
+
+        let directory_layer = build_radial_layer(
+            &[
+                radial_row(RadialRowSpec {
+                    key: "path:/tmp/project-a/src",
+                    label: "src",
+                    kind: RollupRowKind::Directory,
+                    value: 2.0,
+                    project_id: Some(1),
+                    category: Some("Documentation"),
+                    action: Some(sample_action("read file")),
+                    full_path: Some("/tmp/project-a/src"),
+                }),
+                radial_row(RadialRowSpec {
+                    key: "path:/tmp/project-a/src/lib",
+                    label: "lib",
+                    kind: RollupRowKind::Directory,
+                    value: 2.0,
+                    project_id: Some(1),
+                    category: Some("Documentation"),
+                    action: Some(sample_action("read file")),
+                    full_path: Some("/tmp/project-a/src/lib"),
+                }),
+            ],
+            MetricLens::UncachedInput,
+            Some("path:/tmp/project-a/src/lib"),
+            radial_selected_child_span(&action_layer),
+        );
+        let directory_span = radial_selected_child_span(&directory_layer);
+        assert_span_close(directory_span, 7.0 * TAU / 16.0, TAU / 16.0);
+        assert!(
+            radial_segment_at_angle(&directory_layer, 0.1).is_none(),
+            "child layer should not render outside the inherited arc"
+        );
+        assert!(
+            radial_segment_at_angle(
+                &directory_layer,
+                directory_span.start + directory_span.sweep / 2.0
+            )
+            .is_some(),
+            "child layer should render inside the inherited arc"
+        );
+    }
+
+    #[test]
     fn radial_center_labels_stay_inside_fit_area_on_narrow_layout() -> Result<()> {
         let model = RadialModel {
             center: RadialCenter {
@@ -3078,6 +3307,7 @@ mod tests {
                 selection_label: "ZZZZZZZZZZ".to_string(),
             },
             layers: vec![RadialLayer {
+                span: RadialSpan::full(),
                 segments: vec![
                     RadialSegment {
                         value: 8.0,
@@ -3162,6 +3392,42 @@ mod tests {
         }
     }
 
+    struct RadialRowSpec<'a> {
+        key: &'a str,
+        label: &'a str,
+        kind: RollupRowKind,
+        value: f64,
+        project_id: Option<i64>,
+        category: Option<&'a str>,
+        action: Option<ActionKey>,
+        full_path: Option<&'a str>,
+    }
+
+    fn radial_row(spec: RadialRowSpec<'_>) -> RollupRow {
+        RollupRow {
+            kind: spec.kind,
+            key: spec.key.to_string(),
+            label: spec.label.to_string(),
+            metrics: gnomon_core::query::MetricTotals {
+                uncached_input: spec.value,
+                cached_input: 0.0,
+                gross_input: spec.value,
+                output: 0.0,
+                total: spec.value,
+            },
+            indicators: gnomon_core::query::MetricIndicators {
+                selected_lens_last_5_hours: spec.value,
+                selected_lens_last_week: spec.value,
+                uncached_input_reference: spec.value,
+            },
+            item_count: 1,
+            project_id: spec.project_id,
+            category: spec.category.map(str::to_string),
+            action: spec.action,
+            full_path: spec.full_path.map(str::to_string),
+        }
+    }
+
     fn sample_filter_options() -> FilterOptions {
         FilterOptions {
             projects: vec![gnomon_core::query::ProjectFilterOption {
@@ -3172,6 +3438,21 @@ mod tests {
             categories: Vec::new(),
             actions: Vec::new(),
         }
+    }
+
+    fn assert_span_close(span: RadialSpan, expected_start: f64, expected_sweep: f64) {
+        assert!(
+            (span.start - expected_start).abs() < 1e-9,
+            "unexpected span start: {} != {}",
+            span.start,
+            expected_start
+        );
+        assert!(
+            (span.sweep - expected_sweep).abs() < 1e-9,
+            "unexpected span sweep: {} != {}",
+            span.sweep,
+            expected_sweep
+        );
     }
 
     fn sample_action(label: &str) -> ActionKey {
