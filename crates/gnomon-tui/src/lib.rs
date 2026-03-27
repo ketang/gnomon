@@ -10,5 +10,5 @@ pub fn run(
     snapshot: SnapshotBounds,
     startup_open_reason: StartupOpenReason,
 ) -> Result<()> {
-    app::App::new(config.clone(), snapshot, startup_open_reason).run()
+    app::App::new(config.clone(), snapshot, startup_open_reason)?.run()
 }

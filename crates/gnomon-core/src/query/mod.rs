@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use jiff::{Timestamp, ToSpan};
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotBounds {
     pub max_publish_seq: u64,
     pub published_chunk_count: usize,
@@ -30,7 +31,7 @@ impl SnapshotBounds {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetricLens {
     UncachedInput,
     GrossInput,
@@ -38,13 +39,13 @@ pub enum MetricLens {
     Total,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TimeWindowFilter {
     pub start_at_utc: Option<String>,
     pub end_at_utc: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BrowseFilters {
     pub time_window: Option<TimeWindowFilter>,
     pub model: Option<String>,
@@ -53,13 +54,13 @@ pub struct BrowseFilters {
     pub action: Option<ActionKey>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RootView {
     ProjectHierarchy,
     CategoryHierarchy,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BrowsePath {
     Root,
     Project {
@@ -99,7 +100,7 @@ pub struct BrowseRequest {
     pub path: BrowsePath,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ClassificationState {
     Classified,
     Mixed,
@@ -116,7 +117,7 @@ impl ClassificationState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ActionKey {
     pub classification_state: ClassificationState,
     pub normalized_action: Option<String>,
