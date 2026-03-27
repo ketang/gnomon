@@ -91,7 +91,7 @@ pub enum BrowsePath {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowseRequest {
     pub snapshot: SnapshotBounds,
     pub root: RootView,
@@ -150,7 +150,7 @@ impl ActionKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RollupRowKind {
     Project,
     ActionCategory,
@@ -159,7 +159,7 @@ pub enum RollupRowKind {
     File,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricTotals {
     pub uncached_input: f64,
     pub cached_input: f64,
@@ -231,14 +231,14 @@ impl MetricTotals {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricIndicators {
     pub selected_lens_last_5_hours: f64,
     pub selected_lens_last_week: f64,
     pub uncached_input_reference: f64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RollupRow {
     pub kind: RollupRowKind,
     pub key: String,
@@ -252,25 +252,32 @@ pub struct RollupRow {
     pub full_path: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectFilterOption {
     pub id: i64,
     pub display_name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionFilterOption {
     pub category: String,
     pub action: ActionKey,
     pub label: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilterOptions {
     pub projects: Vec<ProjectFilterOption>,
     pub models: Vec<String>,
     pub categories: Vec<String>,
     pub actions: Vec<ActionFilterOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BrowseReport {
+    pub snapshot: SnapshotBounds,
+    pub request: BrowseRequest,
+    pub rows: Vec<RollupRow>,
 }
 
 pub struct QueryEngine<'conn> {
@@ -488,6 +495,15 @@ impl<'conn> QueryEngine<'conn> {
         });
 
         Ok(rows)
+    }
+
+    pub fn browse_report(&self, request: BrowseRequest) -> Result<BrowseReport> {
+        let rows = self.browse(&request)?;
+        Ok(BrowseReport {
+            snapshot: request.snapshot.clone(),
+            request,
+            rows,
+        })
     }
 
     fn load_action_facts(&self, snapshot: &SnapshotBounds) -> Result<Vec<ActionFact>> {
