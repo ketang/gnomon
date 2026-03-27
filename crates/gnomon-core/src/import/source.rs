@@ -741,6 +741,77 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn scan_empty_source_root_returns_zero_counts() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        fs::create_dir_all(&source_root)?;
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let report = scan_source_manifest(&mut db, &source_root)?;
+
+        assert_eq!(report, ScanReport::default());
+        Ok(())
+    }
+
+    #[test]
+    fn scan_with_multiple_files_in_same_project_counts_correctly() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        let repo_root = temp.path().join("repo");
+        let cwd = repo_root.join("work");
+
+        init_git_repo(&repo_root)?;
+        fs::create_dir_all(&cwd)?;
+        write_jsonl(&source_root.join("session1.jsonl"), &cwd)?;
+        write_jsonl(&source_root.join("session2.jsonl"), &cwd)?;
+        write_jsonl(&source_root.join("session3.jsonl"), &cwd)?;
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let report = scan_source_manifest(&mut db, &source_root)?;
+
+        assert_eq!(report.discovered_source_files, 3);
+        assert_eq!(report.inserted_projects, 1, "all three files share one project");
+        assert_eq!(report.updated_projects, 0);
+        assert_eq!(report.inserted_source_files, 3);
+        assert_eq!(report.updated_source_files, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn deleted_files_are_removed_on_rescan() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        let repo_root = temp.path().join("repo");
+        let cwd = repo_root.join("work");
+
+        init_git_repo(&repo_root)?;
+        fs::create_dir_all(&cwd)?;
+
+        let file1 = source_root.join("session1.jsonl");
+        let file2 = source_root.join("session2.jsonl");
+        write_jsonl(&file1, &cwd)?;
+        write_jsonl(&file2, &cwd)?;
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let first = scan_source_manifest(&mut db, &source_root)?;
+        assert_eq!(first.inserted_source_files, 2);
+
+        fs::remove_file(&file2)?;
+        let second = scan_source_manifest(&mut db, &source_root)?;
+
+        assert_eq!(second.discovered_source_files, 1);
+        assert_eq!(second.deleted_source_files, 1);
+
+        let remaining: i64 = db.connection().query_row(
+            "SELECT COUNT(*) FROM source_file",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(remaining, 1, "deleted file should be removed from source_file table");
+        Ok(())
+    }
+
     fn write_jsonl(path: &Path, cwd: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
