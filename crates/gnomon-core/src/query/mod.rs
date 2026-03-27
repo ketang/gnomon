@@ -29,6 +29,10 @@ impl SnapshotBounds {
     pub fn load(conn: &Connection) -> Result<Self> {
         QueryEngine::new(conn).latest_snapshot_bounds()
     }
+
+    pub fn upper_bound_timestamp(&self) -> Result<Option<Timestamp>> {
+        parse_timestamp(self.upper_bound_utc.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
