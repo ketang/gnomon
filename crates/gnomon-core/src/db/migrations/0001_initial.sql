@@ -99,19 +99,22 @@ CREATE INDEX idx_record_stream_sequence
 
 CREATE TABLE message (
     id INTEGER PRIMARY KEY,
+    stream_id INTEGER NOT NULL REFERENCES stream(id) ON DELETE CASCADE,
     conversation_id INTEGER NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
     import_chunk_id INTEGER NOT NULL REFERENCES import_chunk(id) ON DELETE CASCADE,
     external_id TEXT,
     role TEXT NOT NULL,
+    message_kind TEXT NOT NULL,
     sequence_no INTEGER NOT NULL CHECK (sequence_no >= 0),
     created_at_utc TEXT,
     completed_at_utc TEXT,
-    input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
-    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_creation_input_tokens >= 0),
-    cache_read_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_read_input_tokens >= 0),
-    output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+    input_tokens INTEGER CHECK (input_tokens >= 0),
+    cache_creation_input_tokens INTEGER CHECK (cache_creation_input_tokens >= 0),
+    cache_read_input_tokens INTEGER CHECK (cache_read_input_tokens >= 0),
+    output_tokens INTEGER CHECK (output_tokens >= 0),
     model_name TEXT,
     stop_reason TEXT,
+    usage_source TEXT,
     UNIQUE (conversation_id, sequence_no),
     UNIQUE (conversation_id, external_id)
 );
@@ -138,15 +141,17 @@ CREATE TABLE message_part (
 
 CREATE TABLE turn (
     id INTEGER PRIMARY KEY,
+    stream_id INTEGER NOT NULL REFERENCES stream(id) ON DELETE CASCADE,
     conversation_id INTEGER NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
     import_chunk_id INTEGER NOT NULL REFERENCES import_chunk(id) ON DELETE CASCADE,
+    root_message_id INTEGER NOT NULL REFERENCES message(id) ON DELETE CASCADE,
     sequence_no INTEGER NOT NULL CHECK (sequence_no >= 0),
     started_at_utc TEXT,
     ended_at_utc TEXT,
-    input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
-    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_creation_input_tokens >= 0),
-    cache_read_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_read_input_tokens >= 0),
-    output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+    input_tokens INTEGER CHECK (input_tokens >= 0),
+    cache_creation_input_tokens INTEGER CHECK (cache_creation_input_tokens >= 0),
+    cache_read_input_tokens INTEGER CHECK (cache_read_input_tokens >= 0),
+    output_tokens INTEGER CHECK (output_tokens >= 0),
     UNIQUE (conversation_id, sequence_no)
 );
 

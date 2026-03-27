@@ -581,6 +581,8 @@ dependencies = [
  "directories",
  "rusqlite",
  "rusqlite_migration",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 
