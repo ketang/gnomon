@@ -503,7 +503,7 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{ScanReport, ScanWarning, scan_source_manifest};
+    use super::{ScanReport, ScanWarning, WARNING_INVALID_JSON, scan_source_manifest};
     use crate::db::Database;
     use crate::vcs::{PATH_REASON_GIT_ROOT_NOT_FOUND, resolve_project_from_cwd};
 
@@ -860,7 +860,7 @@ mod tests {
         )?;
         let warnings: Vec<ScanWarning> = serde_json::from_str(&warnings_json)?;
         assert!(
-            warnings.iter().any(|w| w.code == "invalid_json"),
+            warnings.iter().any(|w| w.code == WARNING_INVALID_JSON),
             "expected an invalid_json warning; got: {warnings:?}"
         );
         Ok(())
