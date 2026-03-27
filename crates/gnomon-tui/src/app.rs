@@ -52,6 +52,8 @@ pub struct App {
     table_state: TableState,
     input_mode: InputMode,
     focused_pane: PaneFocus,
+    breadcrumb_targets: Vec<BreadcrumbTarget>,
+    breadcrumb_picker: BreadcrumbPickerState,
     radial_context: RadialContext,
     radial_model: RadialModel,
     jump_state: JumpState,
@@ -114,6 +116,8 @@ impl App {
             table_state: TableState::default(),
             input_mode: InputMode::Normal,
             focused_pane,
+            breadcrumb_targets: Vec::new(),
+            breadcrumb_picker: BreadcrumbPickerState::default(),
             radial_context: RadialContext::default(),
             radial_model: RadialModel::default(),
             jump_state: JumpState::default(),
@@ -233,6 +237,7 @@ impl App {
 
         match self.input_mode {
             InputMode::JumpInput => self.render_jump_overlay(frame),
+            InputMode::BreadcrumbPicker => self.render_breadcrumb_overlay(frame),
             InputMode::ColumnChooser => self.render_columns_overlay(frame),
             InputMode::Normal | InputMode::FilterInput => {}
         }
@@ -257,14 +262,7 @@ impl App {
                 self.startup_open_reason,
                 self.has_newer_snapshot,
             )),
-            Line::from(format!(
-                "path: {}",
-                describe_browse_path(
-                    &self.ui_state.root,
-                    &self.ui_state.path,
-                    &self.filter_options
-                )
-            )),
+            breadcrumb_line(&self.breadcrumb_targets),
         ];
 
         if let Some(message) = &self.status_message {
@@ -375,7 +373,7 @@ impl App {
         let lines = match self.input_mode {
             InputMode::Normal => vec![
                 Line::from(
-                    "Enter drill  Backspace up  1/2 hierarchy  l lens  Tab focus/pane  o columns  q quit",
+                    "Enter drill  Backspace up  b breadcrumbs  1/2 hierarchy  l lens  Tab focus/pane  o columns  q quit",
                 ),
                 Line::from(
                     "table focus: up/down rows. radial focus: left/right siblings. t/m/p/c/a filters  0 clear  / row filter  g jump  r refresh",
@@ -391,6 +389,17 @@ impl App {
                 Line::from("Global jump is open. Type to fuzzy-match major navigation nodes."),
                 Line::from("Up/down to change selection. Enter jumps. Esc closes."),
                 Line::from(format!("jump> {}", self.jump_state.query)),
+            ],
+            InputMode::BreadcrumbPicker => vec![
+                Line::from("Breadcrumb navigation is open. Choose an ancestor scope to jump to."),
+                Line::from("Up/down or j/k to change selection. Enter jumps. Esc closes."),
+                Line::from(format!(
+                    "breadcrumb> {}",
+                    self.breadcrumb_targets
+                        .get(self.breadcrumb_picker.selected)
+                        .map(|target| target.display.as_str())
+                        .unwrap_or("none")
+                )),
             ],
             InputMode::ColumnChooser => vec![
                 Line::from(
@@ -439,6 +448,37 @@ impl App {
         frame.render_widget(list, area);
     }
 
+    fn render_breadcrumb_overlay(&self, frame: &mut Frame<'_>) {
+        let area = centered_rect(frame.area(), 80, 18);
+        frame.render_widget(Clear, area);
+
+        let mut items = if self.breadcrumb_targets.is_empty() {
+            vec![ListItem::new("No breadcrumb targets available.")]
+        } else {
+            self.breadcrumb_targets
+                .iter()
+                .enumerate()
+                .map(|(index, target)| {
+                    let prefix = if index == self.breadcrumb_picker.selected {
+                        ">> "
+                    } else {
+                        "   "
+                    };
+                    ListItem::new(format!("{prefix}{}", target.display))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        items.insert(
+            0,
+            ListItem::new("Breadcrumb target picker. Enter jumps. Esc closes."),
+        );
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title("Breadcrumbs"))
+            .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+        frame.render_widget(list, area);
+    }
+
     fn render_columns_overlay(&self, frame: &mut Frame<'_>) {
         let area = centered_rect(frame.area(), 60, 12);
         frame.render_widget(Clear, area);
@@ -478,6 +518,7 @@ impl App {
             InputMode::Normal => self.handle_normal_key(key),
             InputMode::FilterInput => self.handle_filter_input(key),
             InputMode::JumpInput => self.handle_jump_input(key),
+            InputMode::BreadcrumbPicker => self.handle_breadcrumb_picker(key),
             InputMode::ColumnChooser => self.handle_column_key(key),
         }
     }
@@ -559,6 +600,10 @@ impl App {
                 self.input_mode = InputMode::JumpInput;
                 self.jump_state.query.clear();
                 self.update_jump_matches()?;
+                Ok(false)
+            }
+            KeyCode::Char('b') => {
+                self.open_breadcrumb_picker();
                 Ok(false)
             }
             KeyCode::Char('r') => {
@@ -670,6 +715,48 @@ impl App {
         Ok(false)
     }
 
+    fn handle_breadcrumb_picker(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_breadcrumb_selection(-1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_breadcrumb_selection(1);
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.move_breadcrumb_selection(-1);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.move_breadcrumb_selection(1);
+            }
+            KeyCode::Home => {
+                if !self.breadcrumb_targets.is_empty() {
+                    self.breadcrumb_picker.selected = 0;
+                }
+            }
+            KeyCode::End => {
+                if !self.breadcrumb_targets.is_empty() {
+                    self.breadcrumb_picker.selected =
+                        self.breadcrumb_targets.len().saturating_sub(1);
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(target) = self.breadcrumb_targets.get(self.breadcrumb_picker.selected) {
+                    self.ui_state.root = target.root;
+                    self.ui_state.path = target.path.clone();
+                    self.input_mode = InputMode::Normal;
+                    self.reload_view()?;
+                }
+            }
+            _ => {}
+        }
+
+        Ok(false)
+    }
+
     fn handle_column_key(&mut self, key: KeyEvent) -> Result<bool> {
         let toggled = match key.code {
             KeyCode::Esc | KeyCode::Enter => {
@@ -708,6 +795,22 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn open_breadcrumb_picker(&mut self) {
+        self.breadcrumb_picker.selected = self.breadcrumb_targets.len().saturating_sub(1);
+        self.input_mode = InputMode::BreadcrumbPicker;
+    }
+
+    fn move_breadcrumb_selection(&mut self, delta: isize) {
+        if self.breadcrumb_targets.is_empty() {
+            self.breadcrumb_picker.selected = 0;
+            return;
+        }
+
+        let current = self.breadcrumb_picker.selected as isize;
+        let max_index = self.breadcrumb_targets.len().saturating_sub(1) as isize;
+        self.breadcrumb_picker.selected = (current + delta).clamp(0, max_index) as usize;
     }
 
     fn navigate_up(&mut self) -> Result<()> {
@@ -782,6 +885,17 @@ impl App {
             path = parent;
         }
 
+        let project_root = match project_id_from_path(&self.ui_state.path) {
+            Some(project_id) => self.project_root_for(project_id)?,
+            None => None,
+        };
+        self.breadcrumb_targets = build_breadcrumb_targets(
+            &self.ui_state.root,
+            &self.ui_state.path,
+            &self.filter_options,
+            project_root.as_deref(),
+        );
+        self.breadcrumb_picker.selected = self.breadcrumb_targets.len().saturating_sub(1);
         self.radial_context = self.build_radial_context(&filters)?;
         self.apply_row_filter();
         self.restore_selection(selected_key);
@@ -1684,6 +1798,31 @@ fn snapshot_coverage_text(snapshot: &SnapshotBounds) -> String {
     )
 }
 
+fn breadcrumb_line(targets: &[BreadcrumbTarget]) -> Line<'static> {
+    if targets.is_empty() {
+        return Line::from("breadcrumbs: none");
+    }
+
+    let mut spans = vec![Span::styled(
+        "breadcrumbs: ",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    for (index, target) in targets.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" > ", Style::default().fg(Color::DarkGray)));
+        }
+
+        let style = if index + 1 == targets.len() {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(target.label.clone(), style));
+    }
+
+    Line::from(spans)
+}
+
 fn snapshot_coverage_tail(snapshot: &SnapshotBounds) -> String {
     match snapshot.upper_bound_timestamp().ok().flatten() {
         Some(timestamp) => format!("through {timestamp}"),
@@ -1725,6 +1864,7 @@ enum InputMode {
     Normal,
     FilterInput,
     JumpInput,
+    BreadcrumbPicker,
     ColumnChooser,
 }
 
@@ -1781,6 +1921,19 @@ struct JumpTarget {
     detail: String,
     root: RootView,
     path: BrowsePath,
+}
+
+#[derive(Debug, Clone)]
+struct BreadcrumbTarget {
+    label: String,
+    display: String,
+    root: RootView,
+    path: BrowsePath,
+}
+
+#[derive(Debug, Default)]
+struct BreadcrumbPickerState {
+    selected: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -2600,6 +2753,210 @@ fn action_key_from_row(row: &RollupRow) -> ActionKey {
     })
 }
 
+fn build_breadcrumb_targets(
+    root: &RootView,
+    path: &BrowsePath,
+    filter_options: &FilterOptions,
+    project_root: Option<&str>,
+) -> Vec<BreadcrumbTarget> {
+    let mut targets = Vec::new();
+    let mut display_parts = Vec::new();
+    let mut push_target = |label: String, root: RootView, path: BrowsePath| {
+        display_parts.push(label.clone());
+        targets.push(BreadcrumbTarget {
+            label,
+            display: display_parts.join(" > "),
+            root,
+            path,
+        });
+    };
+
+    push_target(
+        breadcrumb_root_label(root).to_string(),
+        *root,
+        BrowsePath::Root,
+    );
+
+    match (root, path) {
+        (_, BrowsePath::Root) => {}
+        (RootView::ProjectHierarchy, BrowsePath::Project { project_id }) => {
+            push_target(
+                project_name(*project_id, filter_options),
+                *root,
+                BrowsePath::Project {
+                    project_id: *project_id,
+                },
+            );
+        }
+        (
+            RootView::ProjectHierarchy,
+            BrowsePath::ProjectCategory {
+                project_id,
+                category,
+            },
+        ) => {
+            push_target(
+                project_name(*project_id, filter_options),
+                *root,
+                BrowsePath::Project {
+                    project_id: *project_id,
+                },
+            );
+            push_target(
+                category.clone(),
+                *root,
+                BrowsePath::ProjectCategory {
+                    project_id: *project_id,
+                    category: category.clone(),
+                },
+            );
+        }
+        (
+            RootView::ProjectHierarchy,
+            BrowsePath::ProjectAction {
+                project_id,
+                category,
+                action,
+                parent_path,
+            },
+        ) => {
+            push_target(
+                project_name(*project_id, filter_options),
+                *root,
+                BrowsePath::Project {
+                    project_id: *project_id,
+                },
+            );
+            push_target(
+                category.clone(),
+                *root,
+                BrowsePath::ProjectCategory {
+                    project_id: *project_id,
+                    category: category.clone(),
+                },
+            );
+            push_target(
+                action_label(action),
+                *root,
+                BrowsePath::ProjectAction {
+                    project_id: *project_id,
+                    category: category.clone(),
+                    action: action.clone(),
+                    parent_path: None,
+                },
+            );
+            if let Some(project_root) = project_root {
+                for selected_path in path_chain(project_root, parent_path.as_deref().unwrap_or(""))
+                {
+                    push_target(
+                        breadcrumb_path_label(&selected_path),
+                        *root,
+                        BrowsePath::ProjectAction {
+                            project_id: *project_id,
+                            category: category.clone(),
+                            action: action.clone(),
+                            parent_path: Some(selected_path),
+                        },
+                    );
+                }
+            }
+        }
+        (RootView::CategoryHierarchy, BrowsePath::Category { category }) => {
+            push_target(
+                category.clone(),
+                *root,
+                BrowsePath::Category {
+                    category: category.clone(),
+                },
+            );
+        }
+        (RootView::CategoryHierarchy, BrowsePath::CategoryAction { category, action }) => {
+            push_target(
+                category.clone(),
+                *root,
+                BrowsePath::Category {
+                    category: category.clone(),
+                },
+            );
+            push_target(
+                action_label(action),
+                *root,
+                BrowsePath::CategoryAction {
+                    category: category.clone(),
+                    action: action.clone(),
+                },
+            );
+        }
+        (
+            RootView::CategoryHierarchy,
+            BrowsePath::CategoryActionProject {
+                category,
+                action,
+                project_id,
+                parent_path,
+            },
+        ) => {
+            push_target(
+                category.clone(),
+                *root,
+                BrowsePath::Category {
+                    category: category.clone(),
+                },
+            );
+            push_target(
+                action_label(action),
+                *root,
+                BrowsePath::CategoryAction {
+                    category: category.clone(),
+                    action: action.clone(),
+                },
+            );
+            push_target(
+                project_name(*project_id, filter_options),
+                *root,
+                BrowsePath::CategoryActionProject {
+                    category: category.clone(),
+                    action: action.clone(),
+                    project_id: *project_id,
+                    parent_path: None,
+                },
+            );
+            if let Some(project_root) = project_root {
+                for selected_path in path_chain(project_root, parent_path.as_deref().unwrap_or(""))
+                {
+                    push_target(
+                        breadcrumb_path_label(&selected_path),
+                        *root,
+                        BrowsePath::CategoryActionProject {
+                            category: category.clone(),
+                            action: action.clone(),
+                            project_id: *project_id,
+                            parent_path: Some(selected_path),
+                        },
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+
+    targets
+}
+
+fn breadcrumb_root_label(root: &RootView) -> &'static str {
+    match root {
+        RootView::ProjectHierarchy => "all projects",
+        RootView::CategoryHierarchy => "all categories",
+    }
+}
+
+fn breadcrumb_path_label(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string())
+}
+
 fn next_browse_path(root: &RootView, current: &BrowsePath, row: &RollupRow) -> Option<BrowsePath> {
     match (root, current, row.kind) {
         (RootView::ProjectHierarchy, BrowsePath::Root, RollupRowKind::Project) => row
@@ -3159,6 +3516,114 @@ mod tests {
     }
 
     #[test]
+    fn breadcrumb_targets_include_project_and_directory_ancestors() {
+        let targets = build_breadcrumb_targets(
+            &RootView::ProjectHierarchy,
+            &BrowsePath::ProjectAction {
+                project_id: 1,
+                category: "Editing".to_string(),
+                action: sample_action("read file"),
+                parent_path: Some("/tmp/project-a/src/lib".to_string()),
+            },
+            &sample_filter_options(),
+            Some("/tmp/project-a"),
+        );
+
+        let labels = targets
+            .iter()
+            .map(|target| target.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "all projects",
+                "project-a",
+                "Editing",
+                "read file",
+                "src",
+                "lib",
+            ]
+        );
+        assert_eq!(targets[0].path, BrowsePath::Root);
+        assert_eq!(targets[1].path, BrowsePath::Project { project_id: 1 });
+        assert_eq!(
+            targets[3].path,
+            BrowsePath::ProjectAction {
+                project_id: 1,
+                category: "Editing".to_string(),
+                action: sample_action("read file"),
+                parent_path: None,
+            }
+        );
+        assert_eq!(
+            targets[5].path,
+            BrowsePath::ProjectAction {
+                project_id: 1,
+                category: "Editing".to_string(),
+                action: sample_action("read file"),
+                parent_path: Some("/tmp/project-a/src/lib".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn breadcrumb_targets_include_category_hierarchy_ancestors() {
+        let targets = build_breadcrumb_targets(
+            &RootView::CategoryHierarchy,
+            &BrowsePath::CategoryActionProject {
+                category: "Documentation".to_string(),
+                action: sample_action("write file"),
+                project_id: 2,
+                parent_path: Some("/tmp/project-b/src".to_string()),
+            },
+            &FilterOptions {
+                projects: vec![gnomon_core::query::ProjectFilterOption {
+                    id: 2,
+                    display_name: "project-b".to_string(),
+                }],
+                models: Vec::new(),
+                categories: Vec::new(),
+                actions: Vec::new(),
+            },
+            Some("/tmp/project-b"),
+        );
+
+        let labels = targets
+            .iter()
+            .map(|target| target.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "all categories",
+                "Documentation",
+                "write file",
+                "project-b",
+                "src",
+            ]
+        );
+        assert_eq!(targets[0].path, BrowsePath::Root);
+        assert_eq!(
+            targets[3].path,
+            BrowsePath::CategoryActionProject {
+                category: "Documentation".to_string(),
+                action: sample_action("write file"),
+                project_id: 2,
+                parent_path: None,
+            }
+        );
+        assert_eq!(
+            targets[4].path,
+            BrowsePath::CategoryActionProject {
+                category: "Documentation".to_string(),
+                action: sample_action("write file"),
+                project_id: 2,
+                parent_path: Some("/tmp/project-b/src".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn radial_selected_child_span_tracks_nested_drilldown_arcs() {
         let project_layer = build_radial_layer(
             &[
@@ -3364,6 +3829,48 @@ mod tests {
             saw_center_text,
             "expected the fitted center labels to render"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn render_header_shows_segmented_breadcrumbs() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+        )?;
+        app.breadcrumb_targets = build_breadcrumb_targets(
+            &RootView::ProjectHierarchy,
+            &BrowsePath::ProjectAction {
+                project_id: 1,
+                category: "Editing".to_string(),
+                action: sample_action("read file"),
+                parent_path: Some("/tmp/project-a/src".to_string()),
+            },
+            &sample_filter_options(),
+            Some("/tmp/project-a"),
+        );
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|frame| app.render(frame))?;
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect::<String>();
+        assert!(content.contains("breadcrumbs:"));
+        assert!(content.contains("all projects"));
+        assert!(content.contains("project-a"));
+        assert!(content.contains(" > "));
+
         Ok(())
     }
 
