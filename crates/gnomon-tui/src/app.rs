@@ -144,3 +144,72 @@ impl Drop for TerminalGuard {
         let _ = self.terminal.show_cursor();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use anyhow::Result;
+    use gnomon_core::config::RuntimeConfig;
+    use gnomon_core::import::StartupOpenReason;
+    use gnomon_core::query::SnapshotBounds;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use super::App;
+
+    fn test_config() -> RuntimeConfig {
+        RuntimeConfig {
+            app_name: "gnomon",
+            state_dir: PathBuf::from("/tmp/gnomon-test-state"),
+            db_path: PathBuf::from("/tmp/gnomon-test.sqlite3"),
+            source_root: PathBuf::from("/tmp/gnomon-test-source"),
+        }
+    }
+
+    fn render_to_string(config: RuntimeConfig) -> Result<String> {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend)?;
+        let app = App::new(config, SnapshotBounds::bootstrap(), StartupOpenReason::Last24hReady);
+        terminal.draw(|frame| app.render(frame))?;
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect::<String>();
+        Ok(content)
+    }
+
+    #[test]
+    fn render_produces_three_pane_layout() -> Result<()> {
+        let content = render_to_string(test_config())?;
+        assert!(content.contains("Status"), "Status pane header not rendered");
+        assert!(content.contains("Bootstrap"), "Bootstrap pane header not rendered");
+        assert!(content.contains("Keys"), "Keys pane header not rendered");
+        Ok(())
+    }
+
+    #[test]
+    fn render_shows_config_paths_in_body() -> Result<()> {
+        let config = RuntimeConfig {
+            app_name: "gnomon",
+            state_dir: PathBuf::from("/tmp/unique-state-dir"),
+            db_path: PathBuf::from("/tmp/unique-db.sqlite3"),
+            source_root: PathBuf::from("/tmp/unique-source-root"),
+        };
+        let content = render_to_string(config)?;
+        assert!(content.contains("/tmp/unique-state-dir"), "state_dir not rendered in body");
+        assert!(content.contains("/tmp/unique-db.sqlite3"), "db_path not rendered in body");
+        assert!(content.contains("/tmp/unique-source-root"), "source_root not rendered in body");
+        Ok(())
+    }
+
+    #[test]
+    fn render_footer_contains_quit_hint() -> Result<()> {
+        let content = render_to_string(test_config())?;
+        assert!(content.contains("quit"), "footer should contain 'quit' key hint");
+        Ok(())
+    }
+}
