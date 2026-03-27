@@ -41,3 +41,20 @@ cargo run -p gnomon
 
 Press `q` or `Esc` to exit the bootstrap TUI.
 
+## Agent Instructions
+
+Shared agent standards are vendored via the `.agents/` git submodule:
+
+```bash
+git submodule update --init --recursive
+```
+
+- `CLAUDE.md` imports the project-appropriate shared rules from `.agents/rules/`
+- `AGENTS.md` provides Codex-friendly project instructions and references the
+  same shared standards directly
+
+To refresh the shared standards later:
+
+```bash
+git submodule update --remote --merge .agents
+```
