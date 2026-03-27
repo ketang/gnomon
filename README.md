@@ -61,6 +61,22 @@ Both commands honor the existing `--db` and `--source-root` overrides.
 `reset` is destructive and requires `--force`. `rebuild` recreates the cache
 from the source manifest and session history without opening the TUI.
 
+## Non-Interactive Reports
+
+`gnomon` can emit stable JSON rollups from the current imported snapshot without
+opening the TUI:
+
+```bash
+cargo run -p gnomon -- report
+cargo run -p gnomon -- report --root category --path category
+cargo run -p gnomon -- report --path project --project-id 1
+```
+
+The reporting mode reuses the same aggregate query engine as the TUI. Drill-down
+paths use the existing hierarchy model, with `--project-id`, `--category`, and
+action fields such as `--classification-state` and `--normalized-action`
+supplying the path context when needed.
+
 ## Scale Validation
 
 Synthetic scale validation, the current Linux timing baseline from March 27,

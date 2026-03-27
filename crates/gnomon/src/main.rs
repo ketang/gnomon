@@ -1,10 +1,14 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
-use clap::{Args, Parser, Subcommand};
+use anyhow::{Context, Result, bail};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
 use gnomon_core::db::{Database, ResetReport, reset_sqlite_database};
 use gnomon_core::import::{import_all, scan_source_manifest, start_startup_import};
+use gnomon_core::query::{
+    ActionKey, BrowseFilters, BrowsePath, BrowseReport, BrowseRequest, ClassificationState,
+    MetricLens, QueryEngine, RootView, SnapshotBounds, TimeWindowFilter,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -33,6 +37,8 @@ struct GlobalArgs {
 enum Command {
     #[command(about = "Database maintenance commands: reset, rebuild.")]
     Db(DbCommand),
+    #[command(about = "Return non-interactive aggregate rollups from the current snapshot.")]
+    Report(Box<ReportArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -56,6 +62,97 @@ struct ResetArgs {
     force: bool,
 }
 
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+struct ReportArgs {
+    /// Root hierarchy to browse.
+    #[arg(long, value_enum, default_value_t = RootViewArg::Project)]
+    root: RootViewArg,
+
+    /// Metric lens used for sorting and indicators.
+    #[arg(long, value_enum, default_value_t = MetricLensArg::UncachedInput)]
+    lens: MetricLensArg,
+
+    /// Aggregate path to browse within the chosen root hierarchy.
+    #[arg(long, value_enum, default_value_t = BrowsePathKindArg::Root)]
+    path: BrowsePathKindArg,
+
+    /// Project id used by path or filters.
+    #[arg(long)]
+    project_id: Option<i64>,
+
+    /// Category used by path or filters.
+    #[arg(long)]
+    category: Option<String>,
+
+    /// Optional parent directory path used for path drill-down.
+    #[arg(long)]
+    parent_path: Option<String>,
+
+    /// Start of the inclusive UTC time window filter.
+    #[arg(long)]
+    start_at_utc: Option<String>,
+
+    /// End of the inclusive UTC time window filter.
+    #[arg(long)]
+    end_at_utc: Option<String>,
+
+    /// Restrict rollups to a specific model name.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Restrict rollups to a specific action filter category.
+    #[arg(long = "filter-category")]
+    filter_category: Option<String>,
+
+    /// Classification state for action drill-down paths.
+    #[arg(long, value_enum)]
+    classification_state: Option<ClassificationStateArg>,
+
+    /// Normalized action string for action drill-down paths.
+    #[arg(long)]
+    normalized_action: Option<String>,
+
+    /// Command family for action drill-down paths.
+    #[arg(long)]
+    command_family: Option<String>,
+
+    /// Base command for action drill-down paths.
+    #[arg(long)]
+    base_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RootViewArg {
+    Project,
+    Category,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum MetricLensArg {
+    UncachedInput,
+    GrossInput,
+    Output,
+    Total,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BrowsePathKindArg {
+    Root,
+    Project,
+    ProjectCategory,
+    ProjectAction,
+    Category,
+    CategoryAction,
+    CategoryActionProject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ClassificationStateArg {
+    Classified,
+    Mixed,
+    Unclassified,
+}
+
 fn main() -> Result<()> {
     init_tracing();
 
@@ -72,6 +169,7 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command {
         None => run_app(&config),
         Some(Command::Db(command)) => run_db_command(&config, command.command),
+        Some(Command::Report(args)) => run_report_command(&config, &args),
     }
 }
 
@@ -106,6 +204,27 @@ fn run_db_command(config: &RuntimeConfig, command: DbSubcommand) -> Result<()> {
         }
         DbSubcommand::Rebuild => rebuild_database(config),
     }
+}
+
+fn run_report_command(config: &RuntimeConfig, args: &ReportArgs) -> Result<()> {
+    config.ensure_dirs()?;
+    let report = build_browse_report(config, args)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn build_browse_report(config: &RuntimeConfig, args: &ReportArgs) -> Result<BrowseReport> {
+    let database = Database::open(&config.db_path)?;
+    let engine = QueryEngine::new(database.connection());
+    let snapshot = SnapshotBounds::load(database.connection())?;
+    let request = BrowseRequest {
+        snapshot,
+        root: args.root.into(),
+        lens: args.lens.into(),
+        filters: args.filters(),
+        path: args.build_path()?,
+    };
+    engine.browse_report(request)
 }
 
 fn rebuild_database(config: &RuntimeConfig) -> Result<()> {
@@ -164,6 +283,112 @@ fn init_tracing() {
         .try_init();
 }
 
+impl ReportArgs {
+    fn filters(&self) -> BrowseFilters {
+        let time_window = if self.start_at_utc.is_some() || self.end_at_utc.is_some() {
+            Some(TimeWindowFilter {
+                start_at_utc: self.start_at_utc.clone(),
+                end_at_utc: self.end_at_utc.clone(),
+            })
+        } else {
+            None
+        };
+
+        BrowseFilters {
+            time_window,
+            model: self.model.clone(),
+            project_id: self.project_id,
+            action_category: self.filter_category.clone(),
+            action: None,
+        }
+    }
+
+    fn build_path(&self) -> Result<BrowsePath> {
+        match self.path {
+            BrowsePathKindArg::Root => Ok(BrowsePath::Root),
+            BrowsePathKindArg::Project => Ok(BrowsePath::Project {
+                project_id: self.required_project_id("project path")?,
+            }),
+            BrowsePathKindArg::ProjectCategory => Ok(BrowsePath::ProjectCategory {
+                project_id: self.required_project_id("project-category path")?,
+                category: self.required_category("project-category path")?,
+            }),
+            BrowsePathKindArg::ProjectAction => Ok(BrowsePath::ProjectAction {
+                project_id: self.required_project_id("project-action path")?,
+                category: self.required_category("project-action path")?,
+                action: self.required_action("project-action path")?,
+                parent_path: self.parent_path.clone(),
+            }),
+            BrowsePathKindArg::Category => Ok(BrowsePath::Category {
+                category: self.required_category("category path")?,
+            }),
+            BrowsePathKindArg::CategoryAction => Ok(BrowsePath::CategoryAction {
+                category: self.required_category("category-action path")?,
+                action: self.required_action("category-action path")?,
+            }),
+            BrowsePathKindArg::CategoryActionProject => Ok(BrowsePath::CategoryActionProject {
+                category: self.required_category("category-action-project path")?,
+                action: self.required_action("category-action-project path")?,
+                project_id: self.required_project_id("category-action-project path")?,
+                parent_path: self.parent_path.clone(),
+            }),
+        }
+    }
+
+    fn required_project_id(&self, context: &str) -> Result<i64> {
+        self.project_id
+            .with_context(|| format!("{context} requires --project-id"))
+    }
+
+    fn required_category(&self, context: &str) -> Result<String> {
+        self.category
+            .clone()
+            .with_context(|| format!("{context} requires --category"))
+    }
+
+    fn required_action(&self, context: &str) -> Result<ActionKey> {
+        Ok(ActionKey {
+            classification_state: self
+                .classification_state
+                .map(Into::into)
+                .with_context(|| format!("{context} requires --classification-state"))?,
+            normalized_action: self.normalized_action.clone(),
+            command_family: self.command_family.clone(),
+            base_command: self.base_command.clone(),
+        })
+    }
+}
+
+impl From<RootViewArg> for RootView {
+    fn from(value: RootViewArg) -> Self {
+        match value {
+            RootViewArg::Project => Self::ProjectHierarchy,
+            RootViewArg::Category => Self::CategoryHierarchy,
+        }
+    }
+}
+
+impl From<MetricLensArg> for MetricLens {
+    fn from(value: MetricLensArg) -> Self {
+        match value {
+            MetricLensArg::UncachedInput => Self::UncachedInput,
+            MetricLensArg::GrossInput => Self::GrossInput,
+            MetricLensArg::Output => Self::Output,
+            MetricLensArg::Total => Self::Total,
+        }
+    }
+}
+
+impl From<ClassificationStateArg> for ClassificationState {
+    fn from(value: ClassificationStateArg) -> Self {
+        match value {
+            ClassificationStateArg::Classified => Self::Classified,
+            ClassificationStateArg::Mixed => Self::Mixed,
+            ClassificationStateArg::Unclassified => Self::Unclassified,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -177,10 +402,13 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        Cli, Command, DbSubcommand, GlobalArgs, ResetArgs, count_completed_chunks, run_db_command,
+        BrowsePathKindArg, ClassificationStateArg, Cli, Command, DbSubcommand, GlobalArgs,
+        MetricLensArg, ReportArgs, ResetArgs, RootViewArg, build_browse_report,
+        count_completed_chunks, run_db_command,
     };
     use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
     use gnomon_core::db::Database;
+    use gnomon_core::query::BrowsePath;
 
     #[test]
     fn help_lists_db_subcommands() {
@@ -191,6 +419,7 @@ mod tests {
         let help = String::from_utf8(help).expect("utf8 help");
 
         assert!(help.contains("db"));
+        assert!(help.contains("report"));
         assert!(help.contains("reset"));
         assert!(help.contains("rebuild"));
 
@@ -231,6 +460,7 @@ mod tests {
                 DbSubcommand::Reset(args) => assert!(args.force),
                 DbSubcommand::Rebuild => panic!("expected reset subcommand"),
             },
+            Some(Command::Report(_)) => panic!("expected db command"),
             None => panic!("expected db command"),
         }
     }
@@ -259,7 +489,49 @@ mod tests {
                 DbSubcommand::Rebuild => {}
                 DbSubcommand::Reset(_) => panic!("expected rebuild subcommand"),
             },
+            Some(Command::Report(_)) => panic!("expected db command"),
             None => panic!("expected db command"),
+        }
+    }
+
+    #[test]
+    fn parse_accepts_report_arguments() {
+        let cli = Cli::parse_from([
+            "gnomon",
+            "report",
+            "--root",
+            "category",
+            "--path",
+            "category-action",
+            "--category",
+            "Editing",
+            "--classification-state",
+            "classified",
+            "--normalized-action",
+            "read file",
+            "--db",
+            "/tmp/custom.sqlite3",
+        ]);
+
+        assert_eq!(
+            cli.global,
+            GlobalArgs {
+                db: Some(PathBuf::from("/tmp/custom.sqlite3")),
+                source_root: None,
+            }
+        );
+        match cli.command {
+            Some(Command::Report(args)) => {
+                assert_eq!(args.root, RootViewArg::Category);
+                assert_eq!(args.path, BrowsePathKindArg::CategoryAction);
+                assert_eq!(args.category.as_deref(), Some("Editing"));
+                assert_eq!(
+                    args.classification_state,
+                    Some(ClassificationStateArg::Classified)
+                );
+                assert_eq!(args.normalized_action.as_deref(), Some("read file"));
+            }
+            _ => panic!("expected report command"),
         }
     }
 
@@ -364,6 +636,123 @@ mod tests {
 
         assert!(stale_project.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn report_returns_top_level_rollups_without_launching_tui() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let project_root = temp.path().join("project");
+        init_git_repo(&project_root)?;
+        write_jsonl(&source_root.join("project/session.jsonl"), &project_root)?;
+
+        let config = RuntimeConfig::load(ConfigOverrides {
+            db_path: Some(db_path),
+            source_root: Some(source_root),
+        })?;
+        run_db_command(&config, DbSubcommand::Rebuild)?;
+
+        let report = build_browse_report(
+            &config,
+            &ReportArgs {
+                root: RootViewArg::Project,
+                lens: MetricLensArg::UncachedInput,
+                path: BrowsePathKindArg::Root,
+                project_id: None,
+                category: None,
+                parent_path: None,
+                start_at_utc: None,
+                end_at_utc: None,
+                model: None,
+                filter_category: None,
+                classification_state: None,
+                normalized_action: None,
+                command_family: None,
+                base_command: None,
+            },
+        )?;
+
+        assert_eq!(report.request.path, BrowsePath::Root);
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].label, "project");
+        assert!(report.snapshot.max_publish_seq > 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn report_supports_project_drill_down_queries() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let project_root = temp.path().join("project");
+        init_git_repo(&project_root)?;
+        write_jsonl(&source_root.join("project/session.jsonl"), &project_root)?;
+
+        let config = RuntimeConfig::load(ConfigOverrides {
+            db_path: Some(db_path.clone()),
+            source_root: Some(source_root),
+        })?;
+        run_db_command(&config, DbSubcommand::Rebuild)?;
+
+        let project_id: i64 = Database::open(&db_path)?.connection().query_row(
+            "SELECT id FROM project LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let report = build_browse_report(
+            &config,
+            &ReportArgs {
+                root: RootViewArg::Project,
+                lens: MetricLensArg::UncachedInput,
+                path: BrowsePathKindArg::Project,
+                project_id: Some(project_id),
+                category: None,
+                parent_path: None,
+                start_at_utc: None,
+                end_at_utc: None,
+                model: None,
+                filter_category: None,
+                classification_state: None,
+                normalized_action: None,
+                command_family: None,
+                base_command: None,
+            },
+        )?;
+
+        assert_eq!(report.request.path, BrowsePath::Project { project_id });
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].label, "user input");
+
+        Ok(())
+    }
+
+    #[test]
+    fn report_requires_classification_state_for_action_paths() {
+        let args = ReportArgs {
+            root: RootViewArg::Project,
+            lens: MetricLensArg::UncachedInput,
+            path: BrowsePathKindArg::ProjectAction,
+            project_id: Some(1),
+            category: Some("Editing".to_string()),
+            parent_path: None,
+            start_at_utc: None,
+            end_at_utc: None,
+            model: None,
+            filter_category: None,
+            classification_state: None,
+            normalized_action: Some("read file".to_string()),
+            command_family: None,
+            base_command: None,
+        };
+
+        let err = args
+            .build_path()
+            .expect_err("action paths should require a classification state");
+
+        assert!(err.to_string().contains("--classification-state"));
     }
 
     fn write_jsonl(path: &Path, cwd: &Path) -> Result<()> {
