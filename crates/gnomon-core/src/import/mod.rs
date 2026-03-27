@@ -10,6 +10,7 @@ mod chunk;
 mod normalize;
 
 pub use chunk::{
-    ImportExecutionReport, StartupImport, StartupOpenReason, import_all, start_startup_import,
+    ImportExecutionReport, StartupImport, StartupOpenReason, StartupWorkerEvent, import_all,
+    start_startup_import,
 };
 pub use normalize::{NormalizeJsonlFileParams, NormalizeJsonlFileResult, normalize_jsonl_file};

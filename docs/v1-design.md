@@ -119,6 +119,7 @@ Shell commands do not create path attribution.
   - basic current-view filtering
   - global jump
   - persistent UI state across launches
+  - fresh launches start at the top level unless explicit startup drill-down flags are provided
 
 ## Default Column Priority
 

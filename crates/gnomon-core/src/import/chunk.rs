@@ -1,17 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-
-use anyhow::{Context, Result, anyhow};
-use jiff::{Timestamp, ToSpan, tz::TimeZone};
-use rusqlite::{Connection, Transaction, params};
-use tracing::error;
 
 use crate::classify::{BuildActionsParams, build_actions};
 use crate::db::Database;
 use crate::query::SnapshotBounds;
+use anyhow::{Context, Result, anyhow};
+use jiff::{Timestamp, ToSpan, tz::TimeZone};
+use rusqlite::{Connection, Transaction, params};
 
 use super::{
     NormalizeJsonlFileParams, STARTUP_IMPORT_WINDOW_HOURS, STARTUP_OPEN_DEADLINE_SECS,
@@ -30,10 +28,15 @@ pub struct StartupImport {
     pub snapshot: SnapshotBounds,
     pub open_reason: StartupOpenReason,
     pub startup_status_message: Option<String>,
+    status_updates: Option<Receiver<StartupWorkerEvent>>,
     worker: Option<JoinHandle<Result<()>>>,
 }
 
 impl StartupImport {
+    pub fn take_status_updates(&mut self) -> Option<Receiver<StartupWorkerEvent>> {
+        self.status_updates.take()
+    }
+
     #[cfg(test)]
     fn wait_for_completion(mut self) -> Result<()> {
         join_worker(self.worker.take())
@@ -52,9 +55,12 @@ struct ImportWorkerOptions {
 }
 
 #[derive(Debug)]
-enum StartupWorkerEvent {
+pub enum StartupWorkerEvent {
     StartupSettled {
         startup_status_message: Option<String>,
+    },
+    DeferredFailures {
+        deferred_status_message: Option<String>,
     },
 }
 
@@ -212,6 +218,7 @@ fn start_startup_import_with_options(
             snapshot: SnapshotBounds::load(conn)?,
             open_reason: StartupOpenReason::Last24hReady,
             startup_status_message: None,
+            status_updates: None,
             worker: None,
         });
     }
@@ -225,17 +232,13 @@ fn start_startup_import_with_options(
     let worker = match thread::Builder::new()
         .name(IMPORTER_THREAD_NAME.to_string())
         .spawn(move || {
-            let result = run_import_worker(
+            run_import_worker(
                 &db_path,
                 &source_root,
                 &prepared_for_worker,
                 sender_for_worker,
                 &worker_options,
-            );
-            if let Err(err) = &result {
-                error!("background importer failed: {err:#}");
-            }
-            result
+            )
         }) {
         Ok(worker) => worker,
         Err(err) => {
@@ -244,16 +247,19 @@ fn start_startup_import_with_options(
         }
     };
 
-    let (open_reason, startup_status_message) = match receiver.recv_timeout(wait_timeout) {
-        Ok(StartupWorkerEvent::StartupSettled {
-            startup_status_message,
-        }) => (StartupOpenReason::Last24hReady, startup_status_message),
-        Err(RecvTimeoutError::Timeout) => (StartupOpenReason::TimedOut, None),
-        Err(RecvTimeoutError::Disconnected) => {
-            let worker_result = join_worker(Some(worker));
-            return Err(worker_result.err().unwrap_or_else(|| {
-                anyhow!("background importer exited before signaling startup readiness")
-            }));
+    let (open_reason, startup_status_message) = loop {
+        match receiver.recv_timeout(wait_timeout) {
+            Ok(StartupWorkerEvent::StartupSettled {
+                startup_status_message,
+            }) => break (StartupOpenReason::Last24hReady, startup_status_message),
+            Ok(StartupWorkerEvent::DeferredFailures { .. }) => continue,
+            Err(RecvTimeoutError::Timeout) => break (StartupOpenReason::TimedOut, None),
+            Err(RecvTimeoutError::Disconnected) => {
+                let worker_result = join_worker(Some(worker));
+                return Err(worker_result.err().unwrap_or_else(|| {
+                    anyhow!("background importer exited before signaling startup readiness")
+                }));
+            }
         }
     };
 
@@ -261,6 +267,7 @@ fn start_startup_import_with_options(
         snapshot: SnapshotBounds::load(conn)?,
         open_reason,
         startup_status_message,
+        status_updates: Some(receiver),
         worker: Some(worker),
     })
 }
@@ -539,6 +546,7 @@ fn run_import_worker(
     let mut database =
         Database::open(db_path).with_context(|| format!("unable to open {}", db_path.display()))?;
     let mut startup_failures = Vec::new();
+    let mut deferred_failures = Vec::new();
 
     if plan.startup_chunks.is_empty() {
         let _ = sender.send(StartupWorkerEvent::StartupSettled {
@@ -548,11 +556,7 @@ fn run_import_worker(
 
     for chunk in &plan.startup_chunks {
         if let Err(err) = import_chunk(&mut database, source_root, chunk, options) {
-            error!(
-                "unable to import startup chunk {}:{}: {err:#}",
-                chunk.project_key, chunk.chunk_day_local
-            );
-            startup_failures.push(format!("{err:#}"));
+            startup_failures.push(compact_status_text(format!("{err:#}")));
         }
     }
 
@@ -564,25 +568,40 @@ fn run_import_worker(
 
     for chunk in &plan.deferred_chunks {
         if let Err(err) = import_chunk(&mut database, source_root, chunk, options) {
-            error!(
-                "unable to import deferred chunk {}:{}: {err:#}",
-                chunk.project_key, chunk.chunk_day_local
-            );
+            deferred_failures.push(compact_status_text(format!("{err:#}")));
         }
+    }
+
+    if !deferred_failures.is_empty() {
+        let _ = sender.send(StartupWorkerEvent::DeferredFailures {
+            deferred_status_message: summarize_deferred_failures(&deferred_failures),
+        });
     }
 
     Ok(())
 }
 
 fn summarize_startup_failures(failures: &[String]) -> Option<String> {
+    summarize_failures("startup import failed", failures)
+}
+
+fn summarize_deferred_failures(failures: &[String]) -> Option<String> {
+    summarize_failures("deferred import failed", failures)
+}
+
+fn summarize_failures(prefix: &str, failures: &[String]) -> Option<String> {
     match failures {
         [] => None,
-        [failure] => Some(format!("startup import failed: {failure}")),
+        [failure] => Some(format!("{prefix}: {failure}")),
         [first, ..] => Some(format!(
-            "startup import failed for {} chunks; first error: {first}",
+            "{prefix} for {} chunks; first error: {first}",
             failures.len()
         )),
     }
+}
+
+fn compact_status_text(text: impl Into<String>) -> String {
+    text.into().split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn import_chunk(
@@ -635,14 +654,7 @@ fn import_chunk(
     })();
 
     if let Err(err) = import_result {
-        if let Err(mark_failed_err) =
-            mark_chunk_failed(database.connection_mut(), chunk.import_chunk_id)
-        {
-            error!(
-                "unable to mark failed chunk {}:{} after import error: {mark_failed_err:#}",
-                chunk.project_key, chunk.chunk_day_local
-            );
-        }
+        let _ = mark_chunk_failed(database.connection_mut(), chunk.import_chunk_id);
         return Err(err);
     }
 
@@ -809,7 +821,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ImportWorkerOptions, StartupOpenReason, build_import_plan,
+        ImportWorkerOptions, StartupOpenReason, StartupWorkerEvent, build_import_plan,
         start_startup_import_with_options,
     };
     use crate::db::Database;
@@ -1113,6 +1125,117 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         assert_eq!(counts, (1, 1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_import_failures_are_aggregated_and_surface_through_status_updates() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root)?;
+
+        let startup_relative_path = "startup/recent/session.jsonl";
+        let deferred_one_relative_path = "deferred/older-one/session.jsonl";
+        let deferred_two_relative_path = "deferred/older-two/session.jsonl";
+        let startup_source_path = source_root.join(startup_relative_path);
+        let deferred_one_source_path = source_root.join(deferred_one_relative_path);
+        let deferred_two_source_path = source_root.join(deferred_two_relative_path);
+        let startup_size = write_malformed_session_fixture(&startup_source_path, "startup-bad")?;
+        let deferred_one_size =
+            write_malformed_session_fixture(&deferred_one_source_path, "deferred-bad-one")?;
+        let deferred_two_size =
+            write_malformed_session_fixture(&deferred_two_source_path, "deferred-bad-two")?;
+
+        let recent = Timestamp::now()
+            .checked_sub(1_i64.hours())
+            .context("unable to construct recent startup test timestamp")?
+            .to_string();
+        let older_one = Timestamp::now()
+            .checked_sub(72_i64.hours())
+            .context("unable to construct older deferred test timestamp")?
+            .to_string();
+        let older_two = Timestamp::now()
+            .checked_sub(96_i64.hours())
+            .context("unable to construct second older deferred test timestamp")?
+            .to_string();
+
+        let mut db = Database::open(&db_path)?;
+        let project_id = insert_project_with_root(
+            db.connection_mut(),
+            "path:/deferred-status",
+            "deferred-status",
+            &project_root,
+        )?;
+        let _ = insert_seeded_source_file(
+            db.connection_mut(),
+            project_id,
+            startup_relative_path,
+            &recent,
+            startup_size,
+        )?;
+        let _ = insert_seeded_source_file(
+            db.connection_mut(),
+            project_id,
+            deferred_one_relative_path,
+            &older_one,
+            deferred_one_size,
+        )?;
+        let _ = insert_seeded_source_file(
+            db.connection_mut(),
+            project_id,
+            deferred_two_relative_path,
+            &older_two,
+            deferred_two_size,
+        )?;
+
+        let mut startup = start_startup_import_with_options(
+            db.connection(),
+            &db_path,
+            &source_root,
+            Duration::from_secs(2),
+            ImportWorkerOptions::default(),
+        )?;
+
+        let status_updates = startup
+            .take_status_updates()
+            .context("missing deferred status update receiver")?;
+        let startup_status = startup
+            .startup_status_message
+            .clone()
+            .context("missing startup failure status message")?;
+        assert!(startup_status.contains("startup import failed"));
+        assert!(startup_status.contains(&startup_source_path.display().to_string()));
+        assert!(startup_status.contains("line 2"));
+
+        let deferred_update = status_updates
+            .recv_timeout(Duration::from_secs(2))
+            .context("missing deferred failure status update")?;
+        let deferred_status_message = match deferred_update {
+            StartupWorkerEvent::DeferredFailures {
+                deferred_status_message,
+            } => deferred_status_message.context("missing deferred failure summary")?,
+            other => panic!("expected deferred failure update, got {other:?}"),
+        };
+        assert!(deferred_status_message.contains("deferred import failed for 2 chunks"));
+        assert!(deferred_status_message.contains(&deferred_one_source_path.display().to_string()));
+        assert!(deferred_status_message.contains("line 2"));
+
+        startup.wait_for_completion()?;
+
+        let counts: (i64, i64) = db.connection().query_row(
+            "
+            SELECT
+                COUNT(*) FILTER (WHERE state = 'complete'),
+                COUNT(*) FILTER (WHERE state = 'failed')
+            FROM import_chunk
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(counts, (0, 3));
 
         Ok(())
     }

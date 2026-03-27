@@ -2,8 +2,10 @@ use std::f64::consts::{FRAC_PI_2, TAU};
 use std::fs;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
+use crate::StartupBrowseState;
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::execute;
@@ -12,7 +14,7 @@ use crossterm::terminal::{
 };
 use gnomon_core::config::RuntimeConfig;
 use gnomon_core::db::Database;
-use gnomon_core::import::StartupOpenReason;
+use gnomon_core::import::{StartupOpenReason, StartupWorkerEvent};
 use gnomon_core::query::{
     ActionKey, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState, FilterOptions,
     MetricLens, QueryEngine, RollupRow, RollupRowKind, RootView, SnapshotBounds, TimeWindowFilter,
@@ -35,6 +37,7 @@ const UI_STATE_FILENAME: &str = "tui-state.json";
 const REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const WIDE_LAYOUT_WIDTH: u16 = 120;
 const JUMP_MATCH_LIMIT: usize = 8;
+const RADIAL_CENTER_RADIUS: f64 = 0.24;
 pub struct App {
     database: Database,
     ui_state_path: PathBuf,
@@ -53,6 +56,7 @@ pub struct App {
     radial_model: RadialModel,
     jump_state: JumpState,
     status_message: Option<StatusMessage>,
+    status_updates: Option<Receiver<StartupWorkerEvent>>,
     last_refresh_check: Instant,
 }
 
@@ -62,6 +66,8 @@ impl App {
         snapshot: SnapshotBounds,
         startup_open_reason: StartupOpenReason,
         startup_status_message: Option<String>,
+        startup_browse_state: Option<StartupBrowseState>,
+        status_updates: Option<Receiver<StartupWorkerEvent>>,
     ) -> Result<Self> {
         let ui_state_path = config.state_dir.join(UI_STATE_FILENAME);
         let (ui_state, mut status_message) = match PersistedUiState::load(&ui_state_path) {
@@ -69,19 +75,23 @@ impl App {
             Ok(None) => (PersistedUiState::default(), None),
             Err(error) => (
                 PersistedUiState::default(),
-                Some(StatusMessage::error(format!(
+                Some(StatusMessage::error(compact_status_text(format!(
                     "Unable to load saved TUI state: {error:#}"
-                ))),
+                )))),
             ),
         };
         if let Some(startup_status_message) = startup_status_message {
             status_message = Some(match status_message {
-                Some(existing) => {
-                    StatusMessage::error(format!("{startup_status_message} | {}", existing.text))
-                }
-                None => StatusMessage::error(startup_status_message),
+                Some(existing) => StatusMessage::error(format!(
+                    "{} | {}",
+                    compact_status_text(&startup_status_message),
+                    compact_status_text(&existing.text)
+                )),
+                None => StatusMessage::error(compact_status_text(&startup_status_message)),
             });
         }
+        let mut ui_state = ui_state;
+        ui_state.apply_startup_browse_state(startup_browse_state);
         let focused_pane = PaneFocus::from_pane_mode(ui_state.pane_mode);
 
         let database = Database::open(&config.db_path)?;
@@ -108,6 +118,7 @@ impl App {
             radial_model: RadialModel::default(),
             jump_state: JumpState::default(),
             status_message,
+            status_updates,
             last_refresh_check: Instant::now(),
         };
 
@@ -120,6 +131,7 @@ impl App {
         let mut terminal = TerminalGuard::enter()?;
 
         loop {
+            self.drain_status_updates();
             if self.last_refresh_check.elapsed() >= REFRESH_CHECK_INTERVAL {
                 self.refresh_snapshot_status()?;
                 self.last_refresh_check = Instant::now();
@@ -143,6 +155,66 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn drain_status_updates(&mut self) {
+        loop {
+            let mut disconnected = false;
+            let update = {
+                let Some(receiver) = self.status_updates.as_ref() else {
+                    return;
+                };
+
+                match receiver.try_recv() {
+                    Ok(update) => Some(update),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        None
+                    }
+                }
+            };
+
+            if disconnected {
+                self.status_updates = None;
+            }
+
+            let Some(update) = update else {
+                break;
+            };
+
+            self.apply_status_update(update);
+        }
+    }
+
+    fn apply_status_update(&mut self, update: StartupWorkerEvent) {
+        match update {
+            StartupWorkerEvent::StartupSettled {
+                startup_status_message,
+            } => {
+                if let Some(message) = startup_status_message {
+                    self.push_status_message(message);
+                }
+            }
+            StartupWorkerEvent::DeferredFailures {
+                deferred_status_message,
+            } => {
+                if let Some(message) = deferred_status_message {
+                    self.push_status_message(message);
+                }
+            }
+        }
+    }
+
+    fn push_status_message(&mut self, message: impl Into<String>) {
+        let message = compact_status_text(message.into());
+        self.status_message = Some(match self.status_message.take() {
+            Some(existing) => StatusMessage::error(format!(
+                "{message} | {}",
+                compact_status_text(&existing.text)
+            )),
+            None => StatusMessage::error(message),
+        });
     }
 
     fn render(&mut self, frame: &mut Frame<'_>) {
@@ -1232,6 +1304,18 @@ impl PersistedUiState {
         fs::write(path, serialized).with_context(|| format!("unable to write {}", path.display()))
     }
 
+    fn apply_startup_browse_state(&mut self, startup_browse_state: Option<StartupBrowseState>) {
+        match startup_browse_state {
+            Some(startup_browse_state) => {
+                self.root = startup_browse_state.root;
+                self.path = startup_browse_state.path;
+            }
+            None => {
+                self.path = BrowsePath::Root;
+            }
+        }
+    }
+
     fn clear_filters(&mut self) {
         self.time_window = TimeWindowPreset::All;
         self.model = None;
@@ -1355,8 +1439,7 @@ impl Widget for &RadialPane<'_> {
             let center_y = f64::from(inner.y) + f64::from(inner.height) / 2.0;
             let radius_x = (f64::from(inner.width) / 2.0).max(1.0);
             let radius_y = (f64::from(inner.height) / 2.0).max(1.0);
-            let center_radius = 0.24;
-            let ring_band = (0.96 - center_radius) / layer_count as f64;
+            let ring_band = (0.96 - RADIAL_CENTER_RADIUS) / layer_count as f64;
 
             for y in inner.y..inner.y + inner.height {
                 for x in inner.x..inner.x + inner.width {
@@ -1364,11 +1447,11 @@ impl Widget for &RadialPane<'_> {
                     let normalized_y = (f64::from(y) + 0.5 - center_y) / radius_y;
                     let radius = (normalized_x.powi(2) + normalized_y.powi(2)).sqrt();
 
-                    if !(center_radius..=0.96).contains(&radius) {
+                    if !(RADIAL_CENTER_RADIUS..=0.96).contains(&radius) {
                         continue;
                     }
 
-                    let layer_index = ((radius - center_radius) / ring_band)
+                    let layer_index = ((radius - RADIAL_CENTER_RADIUS) / ring_band)
                         .floor()
                         .clamp(0.0, (layer_count - 1) as f64)
                         as usize;
@@ -1390,27 +1473,69 @@ impl Widget for &RadialPane<'_> {
             }
         }
 
-        let center_width = inner.width.clamp(16, 32);
-        let center_height = inner.height.clamp(5, 7);
-        let center_area = Rect::new(
-            inner.x + inner.width.saturating_sub(center_width) / 2,
-            inner.y + inner.height.saturating_sub(center_height) / 2,
-            center_width,
-            center_height,
-        );
-        let center_lines = vec![
-            Line::from(self.model.center.scope_label.clone()),
-            Line::from(self.model.center.selection_label.clone()),
-            Line::from(format!(
-                "lens: {}  |  texture: uncached->cached",
-                self.model.center.lens_label
-            )),
-        ];
+        let center_area = radial_center_label_area(inner);
+        let center_lines =
+            radial_center_label_lines(&self.model.center, center_area.width, center_area.height);
         Paragraph::new(Text::from(center_lines))
             .alignment(Alignment::Center)
-            .wrap(Wrap { trim: true })
             .render(center_area, buf);
     }
+}
+
+fn radial_center_label_area(inner: Rect) -> Rect {
+    let center_width = radial_center_extent(inner.width);
+    let center_height = radial_center_extent(inner.height).min(3);
+    Rect::new(
+        inner.x + inner.width.saturating_sub(center_width) / 2,
+        inner.y + inner.height.saturating_sub(center_height) / 2,
+        center_width,
+        center_height,
+    )
+}
+
+fn radial_center_extent(dimension: u16) -> u16 {
+    if dimension == 0 {
+        return 0;
+    }
+
+    let extent = (f64::from(dimension) * RADIAL_CENTER_RADIUS).floor() as u16;
+    extent.clamp(1, dimension)
+}
+
+fn radial_center_label_lines(center: &RadialCenter, width: u16, height: u16) -> Vec<Line<'static>> {
+    let max_width = usize::from(width);
+    let line_count = usize::from(height).min(3);
+    let lens_line = format!("lens: {}  |  texture: uncached->cached", center.lens_label);
+    let lines = [
+        center.scope_label.as_str(),
+        center.selection_label.as_str(),
+        lens_line.as_str(),
+    ];
+
+    lines
+        .into_iter()
+        .map(|line| Line::from(truncate_center_label(line, max_width)))
+        .take(line_count)
+        .collect()
+}
+
+fn truncate_center_label(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let char_count = text.chars().count();
+    if char_count <= max_width {
+        return text.to_string();
+    }
+
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let mut truncated = text.chars().take(max_width - 3).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn pane_block(title: &str, focused: bool) -> Block<'static> {
@@ -1628,6 +1753,13 @@ impl StatusMessage {
             tone: StatusTone::Error,
         }
     }
+}
+
+fn compact_status_text(text: impl AsRef<str>) -> String {
+    text.as_ref()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2937,6 +3069,74 @@ mod tests {
         assert_eq!(model.center.scope_label, "project-a");
     }
 
+    #[test]
+    fn radial_center_labels_stay_inside_fit_area_on_narrow_layout() -> Result<()> {
+        let model = RadialModel {
+            center: RadialCenter {
+                scope_label: "QQQQQQ".to_string(),
+                lens_label: "WWWWWW".to_string(),
+                selection_label: "ZZZZZZZZZZ".to_string(),
+            },
+            layers: vec![RadialLayer {
+                segments: vec![
+                    RadialSegment {
+                        value: 8.0,
+                        cached_ratio: 0.0,
+                        bucket: RadialBucket::Project,
+                        is_selected: true,
+                    },
+                    RadialSegment {
+                        value: 4.0,
+                        cached_ratio: 0.0,
+                        bucket: RadialBucket::Category,
+                        is_selected: false,
+                    },
+                ],
+                total_value: 12.0,
+            }],
+        };
+
+        let width = 24;
+        let height = 12;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend)?;
+
+        terminal.draw(|frame| {
+            let pane = RadialPane {
+                model: &model,
+                focused: false,
+            };
+            frame.render_widget(&pane, frame.area());
+        })?;
+
+        let buffer = terminal.backend().buffer();
+        let inner = pane_block("Radial", false).inner(Rect::new(0, 0, width, height));
+        let center_area = radial_center_label_area(inner);
+
+        let mut saw_center_text = false;
+        for (index, cell) in buffer.content.iter().enumerate() {
+            let x = (index as u16) % width;
+            let y = (index as u16) / width;
+            let symbol = cell.symbol();
+            if matches!(symbol, "Q" | "W" | "Z") {
+                saw_center_text = true;
+                assert!(
+                    x >= center_area.x
+                        && x < center_area.x + center_area.width
+                        && y >= center_area.y
+                        && y < center_area.y + center_area.height,
+                    "center label character escaped the fitted area at ({x}, {y}): {symbol:?}"
+                );
+            }
+        }
+
+        assert!(
+            saw_center_text,
+            "expected the fitted center labels to render"
+        );
+        Ok(())
+    }
+
     fn sample_row(label: &str, full_path: Option<String>) -> RollupRow {
         RollupRow {
             kind: RollupRowKind::Directory,
@@ -3000,7 +3200,14 @@ mod tests {
     ) -> Result<String> {
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend)?;
-        let mut app = App::new(config, snapshot.clone(), startup_open_reason, None)?;
+        let mut app = App::new(
+            config,
+            snapshot.clone(),
+            startup_open_reason,
+            None,
+            None,
+            None,
+        )?;
         if let Some(latest_snapshot) = latest_snapshot {
             app.latest_snapshot = latest_snapshot;
             app.has_newer_snapshot = app.latest_snapshot.max_publish_seq > snapshot.max_publish_seq;
@@ -3014,6 +3221,45 @@ mod tests {
             .map(|c| c.symbol().to_string())
             .collect::<String>();
         Ok(content)
+    }
+
+    #[test]
+    fn startup_browse_state_defaults_fresh_sessions_to_root() {
+        let mut state = PersistedUiState {
+            root: RootView::CategoryHierarchy,
+            path: BrowsePath::Category {
+                category: "Editing".to_string(),
+            },
+            ..PersistedUiState::default()
+        };
+
+        state.apply_startup_browse_state(None);
+
+        assert_eq!(state.root, RootView::CategoryHierarchy);
+        assert_eq!(state.path, BrowsePath::Root);
+    }
+
+    #[test]
+    fn startup_browse_state_applies_explicit_drill_down() {
+        let mut state = PersistedUiState::default();
+        let startup_browse_state = StartupBrowseState {
+            root: RootView::ProjectHierarchy,
+            path: BrowsePath::ProjectCategory {
+                project_id: 7,
+                category: "Editing".to_string(),
+            },
+        };
+
+        state.apply_startup_browse_state(Some(startup_browse_state));
+
+        assert_eq!(state.root, RootView::ProjectHierarchy);
+        assert_eq!(
+            state.path,
+            BrowsePath::ProjectCategory {
+                project_id: 7,
+                category: "Editing".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -3058,6 +3304,40 @@ mod tests {
             content.contains("manual only"),
             "refresh policy not rendered in header"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn render_keeps_layout_intact_with_long_import_status_message() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+        )?;
+        app.status_message = Some(StatusMessage::error(
+            "deferred import failed for 2 chunks; first error: unable to normalize source file source/path/to/session.jsonl: unexpected EOF while parsing malformed json",
+        ));
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|frame| app.render(frame))?;
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect::<String>();
+
+        assert!(
+            content.contains("Status"),
+            "status pane header not rendered"
+        );
+        assert!(content.contains("Keys"), "keys pane header not rendered");
         Ok(())
     }
 

@@ -20,6 +20,9 @@ struct Cli {
     #[command(flatten)]
     global: GlobalArgs,
 
+    #[command(flatten)]
+    startup: StartupArgs,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -121,6 +124,45 @@ struct ReportArgs {
     base_command: Option<String>,
 }
 
+#[derive(Debug, Clone, Args, Default, PartialEq, Eq)]
+struct StartupArgs {
+    /// Root hierarchy to open on startup when explicitly requested.
+    #[arg(long = "startup-root", value_enum)]
+    root: Option<RootViewArg>,
+
+    /// Aggregate path to open on startup when explicitly requested.
+    #[arg(long = "startup-path", value_enum)]
+    path: Option<BrowsePathKindArg>,
+
+    /// Project id used by startup path drill-down.
+    #[arg(long = "startup-project-id")]
+    project_id: Option<i64>,
+
+    /// Category used by startup path drill-down.
+    #[arg(long = "startup-category")]
+    category: Option<String>,
+
+    /// Optional parent directory path used for startup path drill-down.
+    #[arg(long = "startup-parent-path")]
+    parent_path: Option<String>,
+
+    /// Classification state for startup action drill-down paths.
+    #[arg(long = "startup-classification-state", value_enum)]
+    classification_state: Option<ClassificationStateArg>,
+
+    /// Normalized action string for startup action drill-down paths.
+    #[arg(long = "startup-normalized-action")]
+    normalized_action: Option<String>,
+
+    /// Command family for startup action drill-down paths.
+    #[arg(long = "startup-command-family")]
+    command_family: Option<String>,
+
+    /// Base command for startup action drill-down paths.
+    #[arg(long = "startup-base-command")]
+    base_command: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum RootViewArg {
     Project,
@@ -161,29 +203,43 @@ fn main() -> Result<()> {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    let Cli {
+        global,
+        startup,
+        command,
+    } = cli;
     let config = RuntimeConfig::load(ConfigOverrides {
-        db_path: cli.global.db,
-        source_root: cli.global.source_root,
+        db_path: global.db,
+        source_root: global.source_root,
     })?;
 
-    match cli.command {
-        None => run_app(&config),
+    match command {
+        None => run_app(&config, startup),
         Some(Command::Db(command)) => run_db_command(&config, command.command),
         Some(Command::Report(args)) => run_report_command(&config, &args),
     }
 }
 
-fn run_app(config: &RuntimeConfig) -> Result<()> {
+fn run_app(config: &RuntimeConfig, startup_args: StartupArgs) -> Result<()> {
     config.ensure_dirs()?;
     let mut database = Database::open(&config.db_path)?;
     let _scan_report = scan_source_manifest(&mut database, &config.source_root)?;
-    let startup_import =
+    let mut startup_import =
         start_startup_import(database.connection(), &config.db_path, &config.source_root)?;
     let snapshot = startup_import.snapshot.clone();
     let open_reason = startup_import.open_reason;
     let startup_status_message = startup_import.startup_status_message.clone();
+    let startup_browse_state = startup_args.build_startup_browse_state()?;
+    let status_updates = startup_import.take_status_updates();
 
-    gnomon_tui::run(config, snapshot, open_reason, startup_status_message)
+    gnomon_tui::run(
+        config,
+        snapshot,
+        open_reason,
+        startup_status_message,
+        startup_browse_state,
+        status_updates,
+    )
 }
 
 fn run_db_command(config: &RuntimeConfig, command: DbSubcommand) -> Result<()> {
@@ -359,6 +415,126 @@ impl ReportArgs {
     }
 }
 
+impl StartupArgs {
+    fn has_explicit_selection(&self) -> bool {
+        self.root.is_some()
+            || self.path.is_some()
+            || self.project_id.is_some()
+            || self.category.is_some()
+            || self.parent_path.is_some()
+            || self.classification_state.is_some()
+            || self.normalized_action.is_some()
+            || self.command_family.is_some()
+            || self.base_command.is_some()
+    }
+
+    fn build_startup_browse_state(&self) -> Result<Option<gnomon_tui::StartupBrowseState>> {
+        if !self.has_explicit_selection() {
+            return Ok(None);
+        }
+
+        let path_kind = self.path.unwrap_or(BrowsePathKindArg::Root);
+        if self.path.is_none() && self.has_path_arguments() {
+            bail!(
+                "startup drill-down requires --startup-path when specifying deeper startup scope"
+            );
+        }
+
+        let path = self.build_path()?;
+        let root = match self.root {
+            Some(root) => {
+                let root = root.into();
+                if path_kind != BrowsePathKindArg::Root
+                    && root != inferred_root_for_startup_path(path_kind)
+                {
+                    bail!("--startup-root does not match the requested --startup-path hierarchy")
+                }
+                root
+            }
+            None => inferred_root_for_startup_path(path_kind),
+        };
+
+        Ok(Some(gnomon_tui::StartupBrowseState { root, path }))
+    }
+
+    fn has_path_arguments(&self) -> bool {
+        self.project_id.is_some()
+            || self.category.is_some()
+            || self.parent_path.is_some()
+            || self.classification_state.is_some()
+            || self.normalized_action.is_some()
+            || self.command_family.is_some()
+            || self.base_command.is_some()
+    }
+
+    fn build_path(&self) -> Result<BrowsePath> {
+        match self.path.unwrap_or(BrowsePathKindArg::Root) {
+            BrowsePathKindArg::Root => Ok(BrowsePath::Root),
+            BrowsePathKindArg::Project => Ok(BrowsePath::Project {
+                project_id: self.required_project_id("startup project path")?,
+            }),
+            BrowsePathKindArg::ProjectCategory => Ok(BrowsePath::ProjectCategory {
+                project_id: self.required_project_id("startup project-category path")?,
+                category: self.required_category("startup project-category path")?,
+            }),
+            BrowsePathKindArg::ProjectAction => Ok(BrowsePath::ProjectAction {
+                project_id: self.required_project_id("startup project-action path")?,
+                category: self.required_category("startup project-action path")?,
+                action: self.required_action("startup project-action path")?,
+                parent_path: self.parent_path.clone(),
+            }),
+            BrowsePathKindArg::Category => Ok(BrowsePath::Category {
+                category: self.required_category("startup category path")?,
+            }),
+            BrowsePathKindArg::CategoryAction => Ok(BrowsePath::CategoryAction {
+                category: self.required_category("startup category-action path")?,
+                action: self.required_action("startup category-action path")?,
+            }),
+            BrowsePathKindArg::CategoryActionProject => Ok(BrowsePath::CategoryActionProject {
+                category: self.required_category("startup category-action-project path")?,
+                action: self.required_action("startup category-action-project path")?,
+                project_id: self.required_project_id("startup category-action-project path")?,
+                parent_path: self.parent_path.clone(),
+            }),
+        }
+    }
+
+    fn required_project_id(&self, context: &str) -> Result<i64> {
+        self.project_id
+            .with_context(|| format!("{context} requires --startup-project-id"))
+    }
+
+    fn required_category(&self, context: &str) -> Result<String> {
+        self.category
+            .clone()
+            .with_context(|| format!("{context} requires --startup-category"))
+    }
+
+    fn required_action(&self, context: &str) -> Result<ActionKey> {
+        Ok(ActionKey {
+            classification_state: self
+                .classification_state
+                .map(Into::into)
+                .with_context(|| format!("{context} requires --startup-classification-state"))?,
+            normalized_action: self.normalized_action.clone(),
+            command_family: self.command_family.clone(),
+            base_command: self.base_command.clone(),
+        })
+    }
+}
+
+fn inferred_root_for_startup_path(path: BrowsePathKindArg) -> RootView {
+    match path {
+        BrowsePathKindArg::Root => RootView::ProjectHierarchy,
+        BrowsePathKindArg::Project
+        | BrowsePathKindArg::ProjectCategory
+        | BrowsePathKindArg::ProjectAction => RootView::ProjectHierarchy,
+        BrowsePathKindArg::Category
+        | BrowsePathKindArg::CategoryAction
+        | BrowsePathKindArg::CategoryActionProject => RootView::CategoryHierarchy,
+    }
+}
+
 impl From<RootViewArg> for RootView {
     fn from(value: RootViewArg) -> Self {
         match value {
@@ -403,7 +579,7 @@ mod tests {
 
     use super::{
         BrowsePathKindArg, ClassificationStateArg, Cli, Command, DbSubcommand, GlobalArgs,
-        MetricLensArg, ReportArgs, ResetArgs, RootViewArg, build_browse_report,
+        MetricLensArg, ReportArgs, ResetArgs, RootViewArg, StartupArgs, build_browse_report,
         count_completed_chunks, run_db_command,
     };
     use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
@@ -533,6 +709,37 @@ mod tests {
             }
             _ => panic!("expected report command"),
         }
+    }
+
+    #[test]
+    fn parse_accepts_startup_drill_down_arguments() {
+        let cli = Cli::parse_from([
+            "gnomon",
+            "--startup-root",
+            "project",
+            "--startup-path",
+            "project-category",
+            "--startup-project-id",
+            "7",
+            "--startup-category",
+            "Editing",
+        ]);
+
+        assert_eq!(
+            cli.startup,
+            StartupArgs {
+                root: Some(RootViewArg::Project),
+                path: Some(BrowsePathKindArg::ProjectCategory),
+                project_id: Some(7),
+                category: Some("Editing".to_string()),
+                parent_path: None,
+                classification_state: None,
+                normalized_action: None,
+                command_family: None,
+                base_command: None,
+            }
+        );
+        assert!(cli.command.is_none());
     }
 
     #[test]

@@ -61,6 +61,10 @@ cargo run -p gnomon
 
 Press `q` or `Esc` to exit the bootstrap TUI.
 
+Fresh launches open at the top level by default. Use `--startup-*` flags to
+open directly into a narrower drill-down view when you want to skip the root
+landing state.
+
 ## Database Maintenance
 
 The SQLite cache is derived data and can be maintained from the CLI:
