@@ -70,7 +70,9 @@ pub fn normalize_jsonl_file(
             }
         }
 
-        state.process_record(&mut tx, record, line_no as i64)?;
+        state
+            .process_record(&mut tx, record, line_no as i64)
+            .with_context(|| state.source_line_context(line_no as i64))?;
     }
 
     if state.conversation.is_none() {
@@ -81,11 +83,17 @@ pub fn normalize_jsonl_file(
     }
 
     if !state.buffered_records.is_empty() {
-        state.flush_buffered_records(&mut tx)?;
+        state
+            .flush_buffered_records(&mut tx)
+            .with_context(|| format!("unable to finish {}", state.source_path_display()))?;
     }
 
-    let turn_count = state.build_turns(&mut tx)?;
-    state.finish_import(&mut tx)?;
+    let turn_count = state
+        .build_turns(&mut tx)
+        .with_context(|| format!("unable to build turns for {}", state.source_path_display()))?;
+    state
+        .finish_import(&mut tx)
+        .with_context(|| format!("unable to finalize {}", state.source_path_display()))?;
     tx.commit().context("unable to commit normalized import")?;
 
     Ok(NormalizeJsonlFileResult {
@@ -328,7 +336,8 @@ impl ImportState {
     fn flush_buffered_records(&mut self, tx: &mut Transaction<'_>) -> Result<()> {
         let buffered_records = std::mem::take(&mut self.buffered_records);
         for record in buffered_records {
-            self.process_record(tx, record.value, record.source_line_no)?;
+            self.process_record(tx, record.value, record.source_line_no)
+                .with_context(|| self.source_line_context(record.source_line_no))?;
         }
         Ok(())
     }
@@ -391,7 +400,8 @@ impl ImportState {
         self.record_count += 1;
 
         if let Some(message) = extract_message(&record, source_line_no) {
-            self.upsert_message(tx, message)?;
+            self.upsert_message(tx, message, source_line_no)
+                .with_context(|| self.source_line_context(source_line_no))?;
         }
 
         Ok(())
@@ -401,7 +411,9 @@ impl ImportState {
         &mut self,
         tx: &mut Transaction<'_>,
         extracted: ExtractedMessage,
+        source_line_no: i64,
     ) -> Result<()> {
+        let source_context = self.source_line_context(source_line_no);
         let conversation_id = self
             .conversation
             .as_ref()
@@ -440,7 +452,12 @@ impl ImportState {
                     extracted.usage.output_tokens,
                 ],
             )
-            .context("unable to update logical message during dedupe merge")?;
+            .with_context(|| {
+                format!(
+                    "unable to update logical message during dedupe merge for {}",
+                    source_context
+                )
+            })?;
 
             state.recorded_at_utc = extracted
                 .recorded_at_utc
@@ -452,7 +469,14 @@ impl ImportState {
 
             for part in extracted.parts {
                 if state.seen_part_keys.insert(part.dedupe_key.clone()) {
-                    insert_message_part(tx, state.id, state.next_part_ordinal, &part)?;
+                    insert_message_part(
+                        tx,
+                        state.id,
+                        state.next_part_ordinal,
+                        &part,
+                        source_line_no,
+                    )
+                    .with_context(|| source_context.clone())?;
                     state.next_part_ordinal += 1;
                 }
             }
@@ -505,7 +529,9 @@ impl ImportState {
                 ],
                 |row| row.get(0),
             )
-            .context("unable to insert normalized message")?;
+            .with_context(|| {
+                format!("unable to insert normalized message for {}", source_context)
+            })?;
 
         let mut state = MessageState {
             id: message_id,
@@ -518,7 +544,8 @@ impl ImportState {
 
         for part in extracted.parts {
             if state.seen_part_keys.insert(part.dedupe_key.clone()) {
-                insert_message_part(tx, state.id, state.next_part_ordinal, &part)?;
+                insert_message_part(tx, state.id, state.next_part_ordinal, &part, source_line_no)
+                    .with_context(|| source_context.clone())?;
                 state.next_part_ordinal += 1;
             }
         }
@@ -647,6 +674,14 @@ impl ImportState {
         .context("unable to update import chunk counters after normalization")?;
 
         Ok(())
+    }
+
+    fn source_line_context(&self, source_line_no: i64) -> String {
+        format!("{} line {}", self.source_path_display(), source_line_no)
+    }
+
+    fn source_path_display(&self) -> String {
+        self.params.path.display().to_string()
     }
 }
 
@@ -780,6 +815,7 @@ fn insert_message_part(
     message_id: i64,
     ordinal: i64,
     part: &ExtractedMessagePart,
+    source_line_no: i64,
 ) -> Result<()> {
     tx.execute(
         "
@@ -808,7 +844,9 @@ fn insert_message_part(
             part.is_error,
         ],
     )
-    .context("unable to insert normalized message part")?;
+    .with_context(|| {
+        format!("unable to insert normalized message part for source line {source_line_no}")
+    })?;
 
     Ok(())
 }
@@ -1279,6 +1317,35 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn normalization_errors_report_source_path_and_line() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let fixture_path = temp.path().join("session.jsonl");
+        std::fs::write(&fixture_path, MAIN_SESSION_FIXTURE)?;
+
+        let mut db = Database::open(&db_path)?;
+        replace_message_table_without_stream_id(db.connection_mut())?;
+        let ids = seed_import_context(db.connection_mut(), "session.jsonl")?;
+        let error = normalize_jsonl_file(
+            db.connection_mut(),
+            &NormalizeJsonlFileParams {
+                project_id: ids.project_id,
+                source_file_id: ids.source_file_id,
+                import_chunk_id: ids.import_chunk_id,
+                path: fixture_path.clone(),
+            },
+        )
+        .expect_err("normalization should fail against a malformed message table");
+
+        let error_text = format!("{error:#}");
+        assert!(error_text.contains(&fixture_path.display().to_string()));
+        assert!(error_text.contains("line 2"));
+        assert!(error_text.contains("unable to insert normalized message"));
+
+        Ok(())
+    }
+
     struct SeededIds {
         project_id: i64,
         source_file_id: i64,
@@ -1321,5 +1388,32 @@ mod tests {
             source_file_id,
             import_chunk_id,
         })
+    }
+
+    fn replace_message_table_without_stream_id(conn: &mut Connection) -> Result<()> {
+        conn.execute_batch(
+            "
+            DROP TABLE message;
+            CREATE TABLE message (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                import_chunk_id INTEGER NOT NULL,
+                external_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                message_kind TEXT NOT NULL,
+                sequence_no INTEGER NOT NULL,
+                created_at_utc TEXT,
+                completed_at_utc TEXT,
+                input_tokens INTEGER,
+                cache_creation_input_tokens INTEGER,
+                cache_read_input_tokens INTEGER,
+                output_tokens INTEGER,
+                model_name TEXT,
+                stop_reason TEXT,
+                usage_source TEXT
+            );
+            ",
+        )?;
+        Ok(())
     }
 }

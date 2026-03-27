@@ -24,11 +24,13 @@ const IMPORTER_THREAD_NAME: &str = "gnomon-importer";
 pub enum StartupOpenReason {
     Last24hReady,
     TimedOut,
+    Failed,
 }
 
 pub struct StartupImport {
     pub snapshot: SnapshotBounds,
     pub open_reason: StartupOpenReason,
+    pub startup_error: Option<String>,
     worker: Option<JoinHandle<Result<()>>>,
 }
 
@@ -209,6 +211,7 @@ fn start_startup_import_with_options(
         return Ok(StartupImport {
             snapshot: SnapshotBounds::load(conn)?,
             open_reason: StartupOpenReason::Last24hReady,
+            startup_error: None,
             worker: None,
         });
     }
@@ -244,9 +247,12 @@ fn start_startup_import_with_options(
     let open_reason = match receiver.recv_timeout(wait_timeout) {
         Ok(StartupWorkerEvent::StartupReady) => StartupOpenReason::Last24hReady,
         Ok(StartupWorkerEvent::Failed(message)) => {
-            let worker_result = join_worker(Some(worker));
-            return Err(worker_result.err().unwrap_or_else(|| anyhow!(message)))
-                .context("background importer failed before the startup gate opened");
+            return Ok(StartupImport {
+                snapshot: SnapshotBounds::load(conn)?,
+                open_reason: StartupOpenReason::Failed,
+                startup_error: Some(message),
+                worker: Some(worker),
+            });
         }
         Err(RecvTimeoutError::Timeout) => StartupOpenReason::TimedOut,
         Err(RecvTimeoutError::Disconnected) => {
@@ -260,6 +266,7 @@ fn start_startup_import_with_options(
     Ok(StartupImport {
         snapshot: SnapshotBounds::load(conn)?,
         open_reason,
+        startup_error: None,
         worker: Some(worker),
     })
 }
@@ -916,6 +923,7 @@ mod tests {
         )?;
 
         assert_eq!(startup.open_reason, StartupOpenReason::Last24hReady);
+        assert_eq!(startup.startup_error, None);
         assert_eq!(startup.snapshot.max_publish_seq, 1);
         startup.wait_for_completion()?;
 
@@ -991,6 +999,7 @@ mod tests {
         )?;
 
         assert_eq!(startup.open_reason, StartupOpenReason::TimedOut);
+        assert_eq!(startup.startup_error, None);
         assert_eq!(startup.snapshot.max_publish_seq, 0);
         startup.wait_for_completion()?;
 
@@ -1000,6 +1009,75 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(complete_count, 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn startup_import_failure_is_non_fatal_and_reports_source_context() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root)?;
+
+        let relative_path = "recent/session.jsonl";
+        let source_path = source_root.join(relative_path);
+        let size_bytes = write_session_fixture(&source_path, "session-failure")?;
+
+        let recent = Timestamp::now()
+            .checked_sub(1_i64.hours())
+            .context("unable to construct recent failure test timestamp")?
+            .to_string();
+
+        let mut db = Database::open(&db_path)?;
+        replace_message_table_without_stream_id(db.connection_mut())?;
+        let project_id = insert_project_with_root(
+            db.connection_mut(),
+            "path:/startup-failure",
+            "startup-failure",
+            &project_root,
+        )?;
+        let _ = insert_seeded_source_file(
+            db.connection_mut(),
+            project_id,
+            relative_path,
+            &recent,
+            size_bytes,
+        )?;
+
+        let startup = start_startup_import_with_options(
+            db.connection(),
+            &db_path,
+            &source_root,
+            Duration::from_secs(2),
+            ImportWorkerOptions::default(),
+        )?;
+
+        assert_eq!(startup.open_reason, StartupOpenReason::Failed);
+        assert_eq!(startup.snapshot.max_publish_seq, 0);
+        let startup_error = startup
+            .startup_error
+            .clone()
+            .context("startup failure should expose an error message")?;
+        assert!(startup_error.contains(&source_path.display().to_string()));
+        assert!(startup_error.contains("line 1"));
+        assert!(startup_error.contains("unable to insert normalized message"));
+
+        let worker_error = startup
+            .wait_for_completion()
+            .expect_err("worker should still report the import failure");
+        let worker_error_text = format!("{worker_error:#}");
+        assert!(worker_error_text.contains(&source_path.display().to_string()));
+        assert!(worker_error_text.contains("line 1"));
+
+        let state: (String, Option<i64>) = db.connection().query_row(
+            "SELECT state, publish_seq FROM import_chunk",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(state.0, "failed");
+        assert_eq!(state.1, None);
 
         Ok(())
     }
@@ -1083,5 +1161,33 @@ mod tests {
 
         fs::write(path, &content).with_context(|| format!("unable to write {}", path.display()))?;
         i64::try_from(content.len()).context("fixture size exceeded i64")
+    }
+
+    fn replace_message_table_without_stream_id(conn: &mut Connection) -> Result<()> {
+        conn.execute_batch(
+            "
+            DROP TABLE message;
+            CREATE TABLE message (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                import_chunk_id INTEGER NOT NULL,
+                external_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                message_kind TEXT NOT NULL,
+                sequence_no INTEGER NOT NULL,
+                created_at_utc TEXT,
+                completed_at_utc TEXT,
+                input_tokens INTEGER,
+                cache_creation_input_tokens INTEGER,
+                cache_read_input_tokens INTEGER,
+                output_tokens INTEGER,
+                model_name TEXT,
+                stop_reason TEXT,
+                usage_source TEXT
+            );
+            ",
+        )
+        .context("unable to replace the message table for the startup failure test")?;
+        Ok(())
     }
 }

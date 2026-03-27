@@ -60,9 +60,10 @@ impl App {
         config: RuntimeConfig,
         snapshot: SnapshotBounds,
         startup_open_reason: StartupOpenReason,
+        startup_error: Option<String>,
     ) -> Result<Self> {
         let ui_state_path = config.state_dir.join(UI_STATE_FILENAME);
-        let (ui_state, status_message) = match PersistedUiState::load(&ui_state_path) {
+        let (ui_state, load_status_message) = match PersistedUiState::load(&ui_state_path) {
             Ok(Some(state)) => (state, None),
             Ok(None) => (PersistedUiState::default(), None),
             Err(error) => (
@@ -72,6 +73,12 @@ impl App {
                 ))),
             ),
         };
+        let status_message = combine_status_messages(
+            startup_error
+                .map(compact_status_text)
+                .map(StatusMessage::error),
+            load_status_message,
+        );
         let focused_pane = PaneFocus::from_pane_mode(ui_state.pane_mode);
 
         let database = Database::open(&config.db_path)?;
@@ -187,6 +194,9 @@ impl App {
                 }
                 StartupOpenReason::TimedOut => {
                     "startup gate: opened on the 10s deadline while import continues in the background"
+                }
+                StartupOpenReason::Failed => {
+                    "startup gate: opened with import failures against the latest completed snapshot"
                 }
             }),
             Line::from(format!(
@@ -1563,6 +1573,44 @@ impl StatusMessage {
     }
 }
 
+fn combine_status_messages(
+    primary: Option<StatusMessage>,
+    secondary: Option<StatusMessage>,
+) -> Option<StatusMessage> {
+    match (primary, secondary) {
+        (Some(primary), Some(secondary)) => Some(StatusMessage {
+            text: format!("{} | {}", primary.text, secondary.text),
+            tone: match (primary.tone, secondary.tone) {
+                (StatusTone::Error, _) | (_, StatusTone::Error) => StatusTone::Error,
+                _ => StatusTone::Info,
+            },
+        }),
+        (Some(message), None) | (None, Some(message)) => Some(message),
+        (None, None) => None,
+    }
+}
+
+fn compact_status_text(text: String) -> String {
+    const MAX_STATUS_CHARS: usize = 240;
+
+    let compact = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    if compact.chars().count() <= MAX_STATUS_CHARS {
+        return compact;
+    }
+
+    let truncated = compact
+        .chars()
+        .take(MAX_STATUS_CHARS - 1)
+        .collect::<String>();
+    format!("{truncated}…")
+}
+
 #[derive(Debug, Clone, Copy)]
 enum StatusTone {
     Info,
@@ -2932,6 +2980,7 @@ mod tests {
             config,
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
         )?;
         terminal.draw(|frame| app.render(frame))?;
         let content = terminal
