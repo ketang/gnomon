@@ -64,13 +64,13 @@ Observed results for the `ten-x` profile:
 - `6` discovered projects
 - `840` discovered source files
 - `84` published `project x day` chunks
-- `1522 ms` to first usable UI
-- `1522 ms` to last-24h ready
-- `7195 ms` to full backfill
-- `12 ms` for filter options
+- `1697 ms` to first usable UI
+- `1697 ms` to last-24h ready
+- `7216 ms` to full backfill
+- `13 ms` for filter options
 - `13 ms` for project-root browse
-- `11 ms` for category-root browse
-- `11 ms` for one project drill browse
+- `14 ms` for category-root browse
+- `13 ms` for one project drill browse
 
 These timings are machine-dependent. Treat them as the current Linux baseline
 for this codebase and rerun the validator after material importer, query, or
@@ -116,7 +116,7 @@ Current packaging assumptions:
 
 On March 27, 2026, `cargo build --release --workspace` produced:
 
-- `target/release/gnomon` at `7.5M`
+- `target/release/gnomon` at `8.2M`
 - `target/release/validate-scale` at `7.2M`
 
 Linux dependency inspection with:
