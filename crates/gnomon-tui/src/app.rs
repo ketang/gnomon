@@ -804,16 +804,15 @@ impl App {
             return;
         }
 
-        if let Some(preferred_key) = preferred_key {
-            if let Some(index) = self
+        if let Some(preferred_key) = preferred_key
+            && let Some(index) = self
                 .visible_rows
                 .iter()
                 .position(|row| row.key == preferred_key)
-            {
-                self.table_state.select(Some(index));
-                self.rebuild_radial_model();
-                return;
-            }
+        {
+            self.table_state.select(Some(index));
+            self.rebuild_radial_model();
+            return;
         }
 
         let selected = self
@@ -1647,7 +1646,7 @@ fn active_columns(
     let mut used_width = 35;
     let optional_specs = enabled_columns
         .iter()
-        .map(|column| optional_column_spec(column))
+        .map(optional_column_spec)
         .collect::<Vec<_>>();
 
     for spec in optional_specs {
@@ -2472,16 +2471,25 @@ fn parent_browse_path(path: &BrowsePath, project_root: Option<&str>) -> BrowsePa
 }
 
 fn matches_path_root(root: &RootView, path: &BrowsePath) -> bool {
-    match (root, path) {
-        (_, BrowsePath::Root) => true,
-        (RootView::ProjectHierarchy, BrowsePath::Project { .. }) => true,
-        (RootView::ProjectHierarchy, BrowsePath::ProjectCategory { .. }) => true,
-        (RootView::ProjectHierarchy, BrowsePath::ProjectAction { .. }) => true,
-        (RootView::CategoryHierarchy, BrowsePath::Category { .. }) => true,
-        (RootView::CategoryHierarchy, BrowsePath::CategoryAction { .. }) => true,
-        (RootView::CategoryHierarchy, BrowsePath::CategoryActionProject { .. }) => true,
-        _ => false,
-    }
+    matches!(
+        (root, path),
+        (_, BrowsePath::Root)
+            | (RootView::ProjectHierarchy, BrowsePath::Project { .. })
+            | (
+                RootView::ProjectHierarchy,
+                BrowsePath::ProjectCategory { .. }
+            )
+            | (RootView::ProjectHierarchy, BrowsePath::ProjectAction { .. })
+            | (RootView::CategoryHierarchy, BrowsePath::Category { .. })
+            | (
+                RootView::CategoryHierarchy,
+                BrowsePath::CategoryAction { .. }
+            )
+            | (
+                RootView::CategoryHierarchy,
+                BrowsePath::CategoryActionProject { .. }
+            )
+    )
 }
 
 fn project_id_from_path(path: &BrowsePath) -> Option<i64> {
