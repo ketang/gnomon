@@ -33,8 +33,10 @@ fn main() -> Result<()> {
     let _scan_report = scan_source_manifest(&mut database, &config.source_root)?;
     let startup_import =
         start_startup_import(database.connection(), &config.db_path, &config.source_root)?;
+    let snapshot = startup_import.snapshot.clone();
+    let open_reason = startup_import.open_reason;
 
-    gnomon_tui::run(&config, startup_import.snapshot, startup_import.open_reason)
+    gnomon_tui::run(&config, snapshot, open_reason)
 }
 
 fn init_tracing() {
