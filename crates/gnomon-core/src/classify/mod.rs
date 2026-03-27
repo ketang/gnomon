@@ -630,18 +630,6 @@ fn classify_tool_search(tool: &ToolInvocation) -> ActionDescriptor {
             Some("tool search"),
             Some("ToolSearch"),
         )
-    } else if query.contains("EnterPlanMode")
-        || query.contains("ExitPlanMode")
-        || query.contains("AskUserQuestion")
-        || query.contains("EnterWorktree")
-        || query.contains("ExitWorktree")
-    {
-        ActionDescriptor::classified(
-            "planning/reasoning",
-            "tool discovery",
-            Some("tool search"),
-            Some("ToolSearch"),
-        )
     } else {
         ActionDescriptor::classified(
             "planning/reasoning",
@@ -1081,14 +1069,13 @@ impl ActionGroupDraft {
             }
         }
 
-        if let Some(candidate) = message.completed_at_utc.clone() {
-            if self
+        if let Some(candidate) = message.completed_at_utc.clone()
+            && self
                 .ended_at_utc
                 .as_ref()
                 .is_none_or(|current| candidate > *current)
-            {
-                self.ended_at_utc = Some(candidate);
-            }
+        {
+            self.ended_at_utc = Some(candidate);
         }
 
         add_usage(&mut self.usage.input_tokens, message.usage.input_tokens);
@@ -1232,8 +1219,7 @@ mod tests {
         assert_eq!(result.path_ref_count, 2);
 
         let conn = db.connection();
-        let actions: Vec<(String, String, Option<String>, Option<String>, i64)> =
-            query_actions(conn)?;
+        let actions: Vec<StoredAction> = query_actions(conn)?;
         assert_eq!(
             actions,
             vec![
@@ -1350,9 +1336,9 @@ mod tests {
         Ok(())
     }
 
-    fn query_actions(
-        conn: &Connection,
-    ) -> Result<Vec<(String, String, Option<String>, Option<String>, i64)>> {
+    type StoredAction = (String, String, Option<String>, Option<String>, i64);
+
+    fn query_actions(conn: &Connection) -> Result<Vec<StoredAction>> {
         let mut stmt = conn.prepare(
             "
             SELECT

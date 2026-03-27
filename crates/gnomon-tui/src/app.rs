@@ -9,7 +9,7 @@ use crossterm::terminal::{
 };
 use gnomon_core::config::RuntimeConfig;
 use gnomon_core::import::{
-    IMPORT_CHUNK_UNIT, STARTUP_IMPORT_WINDOW_HOURS, STARTUP_OPEN_DEADLINE_SECS,
+    IMPORT_CHUNK_UNIT, STARTUP_IMPORT_WINDOW_HOURS, STARTUP_OPEN_DEADLINE_SECS, StartupOpenReason,
 };
 use gnomon_core::query::SnapshotBounds;
 use ratatui::backend::CrosstermBackend;
@@ -22,13 +22,19 @@ use ratatui::{Frame, Terminal};
 pub struct App {
     config: RuntimeConfig,
     snapshot: SnapshotBounds,
+    startup_open_reason: StartupOpenReason,
 }
 
 impl App {
-    pub fn new(config: RuntimeConfig) -> Self {
+    pub fn new(
+        config: RuntimeConfig,
+        snapshot: SnapshotBounds,
+        startup_open_reason: StartupOpenReason,
+    ) -> Self {
         Self {
             config,
-            snapshot: SnapshotBounds::bootstrap(),
+            snapshot,
+            startup_open_reason,
         }
     }
 
@@ -59,6 +65,14 @@ impl App {
     }
 
     fn render(&self, frame: &mut Frame<'_>) {
+        let startup_status = match self.startup_open_reason {
+            StartupOpenReason::Last24hReady => {
+                "Startup gate: last-24h chunk slice finished before the UI opened."
+            }
+            StartupOpenReason::TimedOut => {
+                "Startup gate: opened on the 10s deadline while the importer continues in the background."
+            }
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -85,12 +99,13 @@ impl App {
             Line::from(format!(
                 "Startup policy: prioritize the last {STARTUP_IMPORT_WINDOW_HOURS}h, open after ready or {STARTUP_OPEN_DEADLINE_SECS}s."
             )),
+            Line::from(startup_status),
             Line::from(format!(
                 "Import unit: {IMPORT_CHUNK_UNIT}; active snapshot publish_seq <= {}.",
                 self.snapshot.max_publish_seq
             )),
             Line::from(""),
-            Line::from("Next implementation targets: SQLite schema, chunk scheduler, normalization, and table-first navigation."),
+            Line::from("Current implementation targets after this milestone: aggregate queries, pinned refresh, and table-first navigation."),
         ])
         .block(Block::default().borders(Borders::ALL).title("Bootstrap"))
         .wrap(Wrap { trim: true });

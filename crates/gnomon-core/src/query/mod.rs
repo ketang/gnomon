@@ -24,6 +24,10 @@ impl SnapshotBounds {
     pub fn is_bootstrap(&self) -> bool {
         self.max_publish_seq == 0
     }
+
+    pub fn load(conn: &Connection) -> Result<Self> {
+        QueryEngine::new(conn).latest_snapshot_bounds()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1278,6 +1282,45 @@ mod tests {
         )?;
 
         assert!(engine.has_newer_snapshot(&latest)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_bounds_ignore_incomplete_chunks() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+
+        let project_id = db.connection_mut().query_row(
+            "
+            INSERT INTO project (identity_kind, canonical_key, display_name, root_path)
+            VALUES ('path', 'project-key', 'project', '/tmp/project')
+            RETURNING id
+            ",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+
+        db.connection_mut().execute(
+            "
+            INSERT INTO import_chunk (project_id, chunk_day_local, state, publish_seq)
+            VALUES
+                (?1, '2026-03-26', 'complete', 1),
+                (?1, '2026-03-25', 'running', NULL),
+                (?1, '2026-03-24', 'pending', 99),
+                (?1, '2026-03-23', 'complete', 2)
+            ",
+            [project_id],
+        )?;
+
+        assert_eq!(
+            SnapshotBounds::load(db.connection())?,
+            SnapshotBounds {
+                max_publish_seq: 2,
+                published_chunk_count: 2,
+                upper_bound_utc: None,
+            }
+        );
 
         Ok(())
     }

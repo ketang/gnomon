@@ -165,10 +165,10 @@ fn discover_source_file(
         None => vcs::path_project(source_file_path, vcs::PATH_REASON_MISSING_CWD),
     };
 
-    if project.identity_kind == ProjectIdentityKind::Path {
-        if let Some(reason) = &project.identity_reason {
-            warnings.push(ScanWarning::new(WARNING_PATH_PROJECT, reason.clone()));
-        }
+    if project.identity_kind == ProjectIdentityKind::Path
+        && let Some(reason) = &project.identity_reason
+    {
+        warnings.push(ScanWarning::new(WARNING_PATH_PROJECT, reason.clone()));
     }
 
     let scan_warnings_json = serde_json::to_string(&warnings).with_context(|| {

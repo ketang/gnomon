@@ -634,8 +634,8 @@ impl ImportState {
             "
             UPDATE import_chunk
             SET
-                imported_record_count = ?2,
-                imported_message_count = ?3
+                imported_record_count = imported_record_count + ?2,
+                imported_message_count = imported_message_count + ?3
             WHERE id = ?1
             ",
             params![
@@ -1105,10 +1105,10 @@ fn update_bounds(start: &mut Option<String>, end: &mut Option<String>, candidate
 }
 
 fn update_end(end: &mut Option<String>, candidate: &Option<String>) {
-    if let Some(candidate) = candidate {
-        if end.as_ref().is_none_or(|current| candidate > current) {
-            *end = Some(candidate.clone());
-        }
+    if let Some(candidate) = candidate
+        && end.as_ref().is_none_or(|current| candidate > current)
+    {
+        *end = Some(candidate.clone());
     }
 }
 

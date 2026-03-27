@@ -10,7 +10,12 @@ This repository is bootstrapped as a Rust workspace with three crates:
 - `gnomon-tui`: the interactive terminal interface.
 - `gnomon`: the executable entry point.
 
-The current binary is a thin bootstrap that resolves runtime paths and opens a placeholder TUI. The checked-in design document captures the agreed `v1` architecture and backlog.
+The current binary resolves runtime paths, scans the source manifest, schedules
+`project x day` import chunks, and opens a placeholder TUI against the latest
+published import snapshot. Startup prioritizes the last 24 hours of chunks
+before the UI opens and continues older imports in one background worker after
+launch. The checked-in design document captures the agreed `v1` architecture
+and backlog.
 
 ## Workspace Layout
 
