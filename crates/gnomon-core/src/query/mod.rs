@@ -877,16 +877,12 @@ struct Windows {
 
 impl Windows {
     fn from_snapshot(snapshot: &SnapshotBounds) -> Result<Self> {
-        let Some(upper_bound) = snapshot.upper_bound_utc.as_deref() else {
+        let Some(upper_bound) = parse_timestamp(snapshot.upper_bound_utc.as_deref())? else {
             return Ok(Self {
                 last_5_hours_start: None,
                 last_week_start: None,
             });
         };
-
-        let upper_bound = upper_bound
-            .parse::<Timestamp>()
-            .with_context(|| format!("unable to parse snapshot upper bound {upper_bound}"))?;
 
         Ok(Self {
             last_5_hours_start: upper_bound.checked_sub(5.hours()).ok(),
@@ -1190,11 +1186,18 @@ fn within_window(timestamp: Option<Timestamp>, start_at: Option<Timestamp>) -> b
 }
 
 fn parse_timestamp(raw: Option<&str>) -> Result<Option<Timestamp>> {
-    raw.map(|raw| {
-        raw.parse::<Timestamp>()
-            .with_context(|| format!("unable to parse timestamp {raw}"))
-    })
-    .transpose()
+    raw.map(parse_timestamp_value).transpose()
+}
+
+fn parse_timestamp_value(raw: &str) -> Result<Timestamp> {
+    if let Ok(parsed) = raw.parse::<Timestamp>() {
+        return Ok(parsed);
+    }
+
+    let sqlite_utc = format!("{}Z", raw.replace(' ', "T"));
+    sqlite_utc
+        .parse::<Timestamp>()
+        .with_context(|| format!("unable to parse timestamp {raw}"))
 }
 
 fn parse_classification_state(raw: &str) -> Result<ClassificationState> {
