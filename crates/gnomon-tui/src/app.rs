@@ -51,7 +51,7 @@ pub struct App {
     has_newer_snapshot: bool,
     filter_options: FilterOptions,
     raw_rows: Vec<RollupRow>,
-    visible_rows: Vec<RollupRow>,
+    visible_rows: Vec<TreeRow>,
     table_state: TableState,
     input_mode: InputMode,
     focused_pane: PaneFocus,
@@ -64,6 +64,8 @@ pub struct App {
     status_updates: Option<Receiver<StartupWorkerEvent>>,
     last_refresh_check: Instant,
     perf_logger: Option<PerfLogger>,
+    row_cache: Vec<CachedRows>,
+    expanded_paths: Vec<BrowsePath>,
 }
 
 impl App {
@@ -131,6 +133,8 @@ impl App {
             status_updates,
             last_refresh_check: Instant::now(),
             perf_logger,
+            row_cache: Vec::new(),
+            expanded_paths: Vec::new(),
         };
 
         app.reload_view()?;
@@ -340,13 +344,12 @@ impl App {
                         visible_columns
                             .iter()
                             .map(|column| {
-                                Cell::from(render_column_value(
-                                    column.key,
-                                    row,
-                                    self.ui_state.lens,
-                                    &self.ui_state.root,
-                                    &self.ui_state.path,
-                                ))
+                                let value = if column.key == ColumnKey::Label {
+                                    render_tree_label(row)
+                                } else {
+                                    render_column_value(column.key, &row.row, self.ui_state.lens)
+                                };
+                                Cell::from(value)
                             })
                             .collect::<Vec<_>>(),
                     )
@@ -387,7 +390,7 @@ impl App {
         let lines = match self.input_mode {
             InputMode::Normal => vec![
                 Line::from(
-                    "Enter drill  Backspace up  b breadcrumbs  1/2 hierarchy  l lens  Tab focus/pane  o columns  q quit",
+                    "Enter drill  Right expand  Left collapse/parent  Backspace up  b breadcrumbs  1/2 hierarchy  l lens  Tab focus/pane  o columns  q quit",
                 ),
                 Line::from(
                     "table: up/down rows. radial: left/right siblings. t/m/p/c/a filters  0 clear  / row filter  g jump  r refresh",
@@ -645,8 +648,8 @@ impl App {
             KeyCode::PageDown => self.move_selection(10),
             KeyCode::Home => self.select_first(),
             KeyCode::End => self.select_last(),
-            KeyCode::Right => self.descend_into_selection()?,
-            KeyCode::Left => self.navigate_up()?,
+            KeyCode::Right => self.expand_selected_or_descend()?,
+            KeyCode::Left => self.collapse_selected_or_move_to_parent()?,
             _ => {}
         }
 
@@ -677,12 +680,12 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.ui_state.row_filter.pop();
-                self.apply_row_filter();
+                self.apply_row_filter()?;
                 self.save_state();
             }
             KeyCode::Char(ch) => {
                 self.ui_state.row_filter.push(ch);
-                self.apply_row_filter();
+                self.apply_row_filter()?;
                 self.save_state();
             }
             _ => {}
@@ -801,18 +804,55 @@ impl App {
     }
 
     fn descend_into_selection(&mut self) -> Result<()> {
-        let Some(row) = self.selected_row().cloned() else {
+        let Some(row) = self.selected_tree_row().cloned() else {
             return Ok(());
         };
 
-        if let Some(next_path) = next_browse_path(&self.ui_state.root, &self.ui_state.path, &row) {
+        if let Some(next_path) = row.node_path {
             self.ui_state.path = next_path;
+            self.expanded_paths.clear();
+            self.row_cache.clear();
             self.reload_view()?;
         } else {
             self.status_message = Some(StatusMessage::info("Reached the current leaf row."));
         }
 
         Ok(())
+    }
+
+    fn expand_selected_or_descend(&mut self) -> Result<()> {
+        let Some(row) = self.selected_tree_row() else {
+            return Ok(());
+        };
+
+        if row.is_expandable() && !row.is_expanded {
+            self.expand_selected()?;
+            return Ok(());
+        }
+
+        self.descend_into_selection()
+    }
+
+    fn collapse_selected_or_move_to_parent(&mut self) -> Result<()> {
+        let Some(index) = self.table_state.selected() else {
+            return self.navigate_up();
+        };
+        let Some(row) = self.visible_rows.get(index) else {
+            return self.navigate_up();
+        };
+
+        if row.is_expanded {
+            self.collapse_selected()?;
+            return Ok(());
+        }
+
+        if let Some(parent_index) = self.parent_visible_index(index) {
+            self.table_state.select(Some(parent_index));
+            self.refresh_active_context_for_selection();
+            return Ok(());
+        }
+
+        self.navigate_up()
     }
 
     fn open_breadcrumb_picker(&mut self) {
@@ -898,7 +938,7 @@ impl App {
 
     fn reload_view(&mut self) -> Result<()> {
         let mut perf = self.perf_scope("tui.reload_view");
-        let selected_key = self.selected_row().map(|row| row.key.clone());
+        let selected_key = self.selected_tree_row_key();
         perf.field("selected_key", &selected_key);
 
         let filter_options_started = Instant::now();
@@ -959,44 +999,30 @@ impl App {
         );
         perf.field("browse_attempts", browse_attempts);
         perf.field("raw_row_count", self.raw_rows.len());
-
-        let breadcrumb_started = Instant::now();
-        let project_root = match project_id_from_path(&self.ui_state.path) {
-            Some(project_id) => self.project_root_for(project_id)?,
-            None => None,
-        };
-        self.breadcrumb_targets = build_breadcrumb_targets(
-            &self.ui_state.root,
-            &self.ui_state.path,
-            &self.filter_options,
-            project_root.as_deref(),
-        );
-        self.breadcrumb_picker.selected = self.breadcrumb_targets.len().saturating_sub(1);
-        perf.field(
-            "breadcrumb_build_ms",
-            breadcrumb_started.elapsed().as_secs_f64() * 1000.0,
-        );
-        perf.field("breadcrumb_count", self.breadcrumb_targets.len());
-
-        let radial_started = Instant::now();
-        self.radial_context = self.build_radial_context(&filters)?;
-        perf.field(
-            "radial_context_ms",
-            radial_started.elapsed().as_secs_f64() * 1000.0,
-        );
+        self.row_cache.clear();
+        self.cache_rows(self.ui_state.path.clone(), self.raw_rows.clone());
+        self.expanded_paths
+            .retain(|expanded| path_is_within(expanded, &self.ui_state.path));
 
         let row_filter_started = Instant::now();
-        self.apply_row_filter();
+        self.apply_row_filter()?;
         perf.field(
             "apply_row_filter_ms",
             row_filter_started.elapsed().as_secs_f64() * 1000.0,
         );
 
         let restore_started = Instant::now();
-        self.restore_selection(selected_key);
+        self.restore_selection(selected_key)?;
         perf.field(
             "restore_selection_ms",
             restore_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        let active_context_started = Instant::now();
+        self.refresh_active_context(&filters)?;
+        perf.field(
+            "active_context_ms",
+            active_context_started.elapsed().as_secs_f64() * 1000.0,
         );
 
         let save_started = Instant::now();
@@ -1094,32 +1120,32 @@ impl App {
         normalize_columns(&mut self.ui_state.enabled_columns);
     }
 
-    fn apply_row_filter(&mut self) {
+    fn apply_row_filter(&mut self) -> Result<()> {
         let mut perf = self.perf_scope("tui.apply_row_filter");
         perf.field("raw_row_count", self.raw_rows.len());
-        let selected_key = self.selected_row().map(|row| row.key.clone());
-        self.visible_rows = filter_rows(&self.raw_rows, &self.ui_state.row_filter);
-        self.restore_selection(selected_key);
+        let root_path = self.ui_state.path.clone();
+        self.visible_rows = self.build_visible_rows(&root_path, 0)?;
         perf.field("visible_row_count", self.visible_rows.len());
         perf.finish_ok();
+        Ok(())
     }
 
-    fn restore_selection(&mut self, preferred_key: Option<String>) {
+    fn restore_selection(&mut self, preferred_key: Option<TreeRowKey>) -> Result<()> {
         if self.visible_rows.is_empty() {
             self.table_state.select(None);
             self.rebuild_radial_model();
-            return;
+            return Ok(());
         }
 
         if let Some(preferred_key) = preferred_key
             && let Some(index) = self
                 .visible_rows
                 .iter()
-                .position(|row| row.key == preferred_key)
+                .position(|row| row.key() == preferred_key)
         {
             self.table_state.select(Some(index));
             self.rebuild_radial_model();
-            return;
+            return Ok(());
         }
 
         let selected = self
@@ -1129,9 +1155,14 @@ impl App {
             .min(self.visible_rows.len().saturating_sub(1));
         self.table_state.select(Some(selected));
         self.rebuild_radial_model();
+        Ok(())
     }
 
     fn selected_row(&self) -> Option<&RollupRow> {
+        self.selected_tree_row().map(|row| &row.row)
+    }
+
+    fn selected_tree_row(&self) -> Option<&TreeRow> {
         self.table_state
             .selected()
             .and_then(|index| self.visible_rows.get(index))
@@ -1143,7 +1174,7 @@ impl App {
         } else {
             self.table_state.select(Some(0));
         }
-        self.rebuild_radial_model();
+        self.refresh_active_context_for_selection();
     }
 
     fn select_last(&mut self) {
@@ -1153,7 +1184,7 @@ impl App {
             self.table_state
                 .select(Some(self.visible_rows.len().saturating_sub(1)));
         }
-        self.rebuild_radial_model();
+        self.refresh_active_context_for_selection();
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -1167,7 +1198,59 @@ impl App {
         let max_index = self.visible_rows.len().saturating_sub(1) as isize;
         let next = (current + delta).clamp(0, max_index) as usize;
         self.table_state.select(Some(next));
-        self.rebuild_radial_model();
+        self.refresh_active_context_for_selection();
+    }
+
+    fn selected_tree_row_key(&self) -> Option<TreeRowKey> {
+        self.selected_tree_row().map(TreeRow::key)
+    }
+
+    fn expand_selected(&mut self) -> Result<()> {
+        let Some(path) = self
+            .selected_tree_row()
+            .and_then(|row| row.node_path.clone())
+        else {
+            return Ok(());
+        };
+        if !self.expanded_paths.contains(&path) {
+            self.expanded_paths.push(path);
+        }
+        let preferred_key = self.selected_tree_row_key();
+        self.apply_row_filter()?;
+        self.restore_selection(preferred_key)?;
+        self.refresh_active_context_for_selection();
+        Ok(())
+    }
+
+    fn collapse_selected(&mut self) -> Result<()> {
+        let Some(path) = self
+            .selected_tree_row()
+            .and_then(|row| row.node_path.clone())
+        else {
+            return Ok(());
+        };
+        self.expanded_paths
+            .retain(|expanded| !path_is_within(expanded, &path) || *expanded == path);
+        self.expanded_paths.retain(|expanded| *expanded != path);
+        let preferred_key = self.selected_tree_row_key();
+        self.apply_row_filter()?;
+        self.restore_selection(preferred_key)?;
+        self.refresh_active_context_for_selection();
+        Ok(())
+    }
+
+    fn parent_visible_index(&self, index: usize) -> Option<usize> {
+        let depth = self.visible_rows.get(index)?.depth;
+        if depth == 0 {
+            return None;
+        }
+
+        self.visible_rows[..index]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, row)| row.depth + 1 == depth)
+            .map(|(parent_index, _)| parent_index)
     }
 
     fn update_jump_matches(&mut self) -> Result<()> {
@@ -1392,6 +1475,81 @@ impl App {
             .and_then(|row| row.full_path))
     }
 
+    fn rows_for_path(&self, path: &BrowsePath) -> Option<&Vec<RollupRow>> {
+        self.row_cache
+            .iter()
+            .find(|cached| cached.path == *path)
+            .map(|cached| &cached.rows)
+    }
+
+    fn cache_rows(&mut self, path: BrowsePath, rows: Vec<RollupRow>) {
+        if let Some(cached) = self.row_cache.iter_mut().find(|cached| cached.path == path) {
+            cached.rows = rows;
+        } else {
+            self.row_cache.push(CachedRows { path, rows });
+        }
+    }
+
+    fn expanded_for_path(&self, path: &BrowsePath) -> bool {
+        self.expanded_paths.contains(path)
+    }
+
+    fn build_visible_rows(
+        &mut self,
+        parent_path: &BrowsePath,
+        depth: usize,
+    ) -> Result<Vec<TreeRow>> {
+        let rows = self.rows_for_path(parent_path).cloned().unwrap_or_default();
+        let filter = self.ui_state.row_filter.trim().to_ascii_lowercase();
+        let mut visible = Vec::new();
+
+        for row in rows {
+            let node_path = next_browse_path(&self.ui_state.root, parent_path, &row);
+            let is_expanded = node_path
+                .as_ref()
+                .is_some_and(|path| self.expanded_for_path(path));
+            let include = filter.is_empty() || row_search_text(&row).contains(&filter);
+
+            if include {
+                visible.push(TreeRow {
+                    row: row.clone(),
+                    parent_path: parent_path.clone(),
+                    node_path: node_path.clone(),
+                    depth,
+                    is_expanded,
+                });
+            }
+
+            if let Some(path) = node_path
+                && is_expanded
+            {
+                let children = self.load_rows_for_path(path.clone())?;
+                if !children.is_empty() {
+                    visible.extend(self.build_visible_rows(&path, depth + 1)?);
+                }
+            }
+        }
+
+        Ok(visible)
+    }
+
+    fn load_rows_for_path(&mut self, path: BrowsePath) -> Result<Vec<RollupRow>> {
+        if let Some(rows) = self.rows_for_path(&path) {
+            return Ok(rows.clone());
+        }
+
+        let filters = self.current_query_filters()?;
+        let rows = self.query_engine().browse(&BrowseRequest {
+            snapshot: self.snapshot.clone(),
+            root: self.ui_state.root,
+            lens: self.ui_state.lens,
+            filters,
+            path: path.clone(),
+        })?;
+        self.cache_rows(path, rows.clone());
+        Ok(rows)
+    }
+
     fn filter_summary(&self) -> String {
         let mut parts = vec![format!("time {}", self.ui_state.time_window.label())];
         if let Some(model) = &self.ui_state.model {
@@ -1441,17 +1599,17 @@ impl App {
         format!("selected: {selected}  |  row filter: {filter}")
     }
 
-    fn build_radial_context(&self, filters: &BrowseFilters) -> Result<RadialContext> {
+    fn build_radial_context(
+        &self,
+        filters: &BrowseFilters,
+        path: &BrowsePath,
+    ) -> Result<RadialContext> {
         let mut perf = self.perf_scope_with_filters("tui.build_radial_context", filters);
-        let project_root = match project_id_from_path(&self.ui_state.path) {
+        let project_root = match project_id_from_path(path) {
             Some(project_id) => self.project_root_for(project_id)?,
             None => None,
         };
-        let steps = radial_ancestor_steps(
-            &self.ui_state.root,
-            &self.ui_state.path,
-            project_root.as_deref(),
-        );
+        let steps = radial_ancestor_steps(&self.ui_state.root, path, project_root.as_deref());
         let mut ancestor_layers = Vec::new();
         let mut current_span = RadialSpan::full();
         let browse_started = Instant::now();
@@ -1488,15 +1646,70 @@ impl App {
     }
 
     fn rebuild_radial_model(&mut self) {
+        let (path, rows, selected_row) = self.active_radial_state();
         self.radial_model = build_radial_model(
             &self.radial_context,
-            &self.visible_rows,
-            self.selected_row(),
+            &rows,
+            selected_row.as_ref(),
             &self.ui_state.root,
-            &self.ui_state.path,
+            &path,
             &self.filter_options,
             self.ui_state.lens,
         );
+    }
+
+    fn refresh_active_context(&mut self, filters: &BrowseFilters) -> Result<()> {
+        let active_path = self.active_path();
+        let project_root = match project_id_from_path(&active_path) {
+            Some(project_id) => self.project_root_for(project_id)?,
+            None => None,
+        };
+        self.breadcrumb_targets = build_breadcrumb_targets(
+            &self.ui_state.root,
+            &active_path,
+            &self.filter_options,
+            project_root.as_deref(),
+        );
+        self.breadcrumb_picker.selected = self.breadcrumb_targets.len().saturating_sub(1);
+        self.radial_context = self.build_radial_context(filters, &active_path)?;
+        self.rebuild_radial_model();
+        Ok(())
+    }
+
+    fn refresh_active_context_for_selection(&mut self) {
+        if let Ok(filters) = self.current_query_filters() {
+            if self.refresh_active_context(&filters).is_err() {
+                self.rebuild_radial_model();
+            }
+        } else {
+            self.rebuild_radial_model();
+        }
+    }
+
+    fn active_path(&self) -> BrowsePath {
+        self.selected_tree_row()
+            .and_then(|row| row.node_path.clone())
+            .unwrap_or_else(|| self.ui_state.path.clone())
+    }
+
+    fn active_radial_state(&self) -> (BrowsePath, Vec<RollupRow>, Option<RollupRow>) {
+        let Some(selected) = self.selected_tree_row() else {
+            return (self.ui_state.path.clone(), self.raw_rows.clone(), None);
+        };
+
+        if let Some(parent_rows) = self.rows_for_path(&selected.parent_path).cloned() {
+            return (
+                selected.parent_path.clone(),
+                parent_rows,
+                Some(selected.row.clone()),
+            );
+        }
+
+        (
+            self.ui_state.path.clone(),
+            self.raw_rows.clone(),
+            Some(selected.row.clone()),
+        )
     }
 
     fn save_state(&mut self) {
@@ -1527,6 +1740,40 @@ impl App {
     fn query_engine(&self) -> QueryEngine<'_> {
         QueryEngine::with_perf(self.database.connection(), self.perf_logger.clone())
     }
+}
+
+#[derive(Debug, Clone)]
+struct CachedRows {
+    path: BrowsePath,
+    rows: Vec<RollupRow>,
+}
+
+#[derive(Debug, Clone)]
+struct TreeRow {
+    row: RollupRow,
+    parent_path: BrowsePath,
+    node_path: Option<BrowsePath>,
+    depth: usize,
+    is_expanded: bool,
+}
+
+impl TreeRow {
+    fn key(&self) -> TreeRowKey {
+        TreeRowKey {
+            parent_path: self.parent_path.clone(),
+            row_key: self.row.key.clone(),
+        }
+    }
+
+    fn is_expandable(&self) -> bool {
+        self.node_path.is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TreeRowKey {
+    parent_path: BrowsePath,
+    row_key: String,
 }
 
 struct TerminalGuard {
@@ -2358,21 +2605,9 @@ fn optional_column_spec(column: &OptionalColumn) -> ColumnSpec {
     }
 }
 
-fn render_column_value(
-    column: ColumnKey,
-    row: &RollupRow,
-    lens: MetricLens,
-    root: &RootView,
-    current_path: &BrowsePath,
-) -> String {
+fn render_column_value(column: ColumnKey, row: &RollupRow, lens: MetricLens) -> String {
     match column {
-        ColumnKey::Label => {
-            format!(
-                "{}{}",
-                drillability_glyph(root, current_path, row),
-                row.label
-            )
-        }
+        ColumnKey::Label => row.label.clone(),
         ColumnKey::SelectedLens => format_metric(row.metrics.lens_value(lens)),
         ColumnKey::Optional(OptionalColumn::Kind) => row_kind_label(row.kind).to_string(),
         ColumnKey::Optional(OptionalColumn::GrossInput) => format_metric(row.metrics.gross_input),
@@ -2391,6 +2626,17 @@ fn render_column_value(
     }
 }
 
+fn render_tree_label(row: &TreeRow) -> String {
+    let indent = "  ".repeat(row.depth);
+    let glyph = match (row.is_expandable(), row.is_expanded) {
+        (true, true) => "v ",
+        (true, false) => "> ",
+        (false, _) => "  ",
+    };
+    format!("{indent}{glyph}{}", row.row.label)
+}
+
+#[cfg(test)]
 fn drillability_glyph(root: &RootView, current_path: &BrowsePath, row: &RollupRow) -> &'static str {
     if next_browse_path(root, current_path, row).is_some() {
         "> "
@@ -2869,6 +3115,7 @@ fn classification_state_key(state: ClassificationState) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn filter_rows(rows: &[RollupRow], filter: &str) -> Vec<RollupRow> {
     let needle = filter.trim().to_ascii_lowercase();
     if needle.is_empty() {
@@ -3386,6 +3633,157 @@ fn parent_browse_path(path: &BrowsePath, project_root: Option<&str>) -> BrowsePa
     }
 }
 
+fn path_is_within(candidate: &BrowsePath, ancestor: &BrowsePath) -> bool {
+    match (candidate, ancestor) {
+        (_, BrowsePath::Root) => true,
+        (
+            BrowsePath::Project { project_id },
+            BrowsePath::Project {
+                project_id: ancestor_project,
+            },
+        ) => project_id == ancestor_project,
+        (
+            BrowsePath::ProjectCategory {
+                project_id,
+                category: _,
+            },
+            BrowsePath::Project {
+                project_id: ancestor_project,
+            },
+        ) => project_id == ancestor_project,
+        (
+            BrowsePath::ProjectCategory {
+                project_id,
+                category,
+            },
+            BrowsePath::ProjectCategory {
+                project_id: ancestor_project,
+                category: ancestor_category,
+            },
+        ) => project_id == ancestor_project && category == ancestor_category,
+        (
+            BrowsePath::ProjectAction {
+                project_id,
+                category: _,
+                action: _,
+                parent_path: _,
+            },
+            BrowsePath::Project {
+                project_id: ancestor_project,
+            },
+        ) => project_id == ancestor_project,
+        (
+            BrowsePath::ProjectAction {
+                project_id,
+                category,
+                action: _,
+                parent_path: _,
+            },
+            BrowsePath::ProjectCategory {
+                project_id: ancestor_project,
+                category: ancestor_category,
+            },
+        ) => project_id == ancestor_project && category == ancestor_category,
+        (
+            BrowsePath::ProjectAction {
+                project_id,
+                category,
+                action,
+                parent_path,
+            },
+            BrowsePath::ProjectAction {
+                project_id: ancestor_project,
+                category: ancestor_category,
+                action: ancestor_action,
+                parent_path: ancestor_parent_path,
+            },
+        ) => {
+            project_id == ancestor_project
+                && category == ancestor_category
+                && action == ancestor_action
+                && directory_path_is_within(parent_path.as_deref(), ancestor_parent_path.as_deref())
+        }
+        (
+            BrowsePath::Category { category },
+            BrowsePath::Category {
+                category: ancestor_category,
+            },
+        ) => category == ancestor_category,
+        (
+            BrowsePath::CategoryAction {
+                category,
+                action: _,
+            },
+            BrowsePath::Category {
+                category: ancestor_category,
+            },
+        ) => category == ancestor_category,
+        (
+            BrowsePath::CategoryAction { category, action },
+            BrowsePath::CategoryAction {
+                category: ancestor_category,
+                action: ancestor_action,
+            },
+        ) => category == ancestor_category && action == ancestor_action,
+        (
+            BrowsePath::CategoryActionProject {
+                category,
+                action: _,
+                project_id: _,
+                parent_path: _,
+            },
+            BrowsePath::Category {
+                category: ancestor_category,
+            },
+        ) => category == ancestor_category,
+        (
+            BrowsePath::CategoryActionProject {
+                category,
+                action,
+                project_id: _,
+                parent_path: _,
+            },
+            BrowsePath::CategoryAction {
+                category: ancestor_category,
+                action: ancestor_action,
+            },
+        ) => category == ancestor_category && action == ancestor_action,
+        (
+            BrowsePath::CategoryActionProject {
+                category,
+                action,
+                project_id,
+                parent_path,
+            },
+            BrowsePath::CategoryActionProject {
+                category: ancestor_category,
+                action: ancestor_action,
+                project_id: ancestor_project_id,
+                parent_path: ancestor_parent_path,
+            },
+        ) => {
+            category == ancestor_category
+                && action == ancestor_action
+                && project_id == ancestor_project_id
+                && directory_path_is_within(parent_path.as_deref(), ancestor_parent_path.as_deref())
+        }
+        _ => false,
+    }
+}
+
+fn directory_path_is_within(candidate: Option<&str>, ancestor: Option<&str>) -> bool {
+    match (candidate, ancestor) {
+        (_, None) => true,
+        (Some(candidate), Some(ancestor)) => {
+            candidate == ancestor
+                || candidate
+                    .strip_prefix(ancestor)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        }
+        (None, Some(_)) => false,
+    }
+}
+
 fn matches_path_root(root: &RootView, path: &BrowsePath) -> bool {
     matches!(
         (root, path),
@@ -3622,6 +4020,137 @@ mod tests {
     }
 
     #[test]
+    fn apply_row_filter_flattens_expanded_tree_descendants() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        app.ui_state.root = RootView::ProjectHierarchy;
+        app.ui_state.path = BrowsePath::ProjectAction {
+            project_id: 1,
+            category: "Editing".to_string(),
+            action: sample_action("read file"),
+            parent_path: None,
+        };
+        app.raw_rows = vec![
+            sample_row("src", Some("/tmp/project/src".to_string())),
+            sample_row("tests", Some("/tmp/project/tests".to_string())),
+        ];
+        app.cache_rows(app.ui_state.path.clone(), app.raw_rows.clone());
+        let src_path = BrowsePath::ProjectAction {
+            project_id: 1,
+            category: "Editing".to_string(),
+            action: sample_action("read file"),
+            parent_path: Some("/tmp/project/src".to_string()),
+        };
+        app.expanded_paths.push(src_path.clone());
+        app.cache_rows(
+            src_path,
+            vec![RollupRow {
+                kind: RollupRowKind::File,
+                key: "path:/tmp/project/src/lib.rs".to_string(),
+                label: "lib.rs".to_string(),
+                metrics: gnomon_core::query::MetricTotals {
+                    uncached_input: 3.0,
+                    cached_input: 0.0,
+                    gross_input: 3.0,
+                    output: 0.0,
+                    total: 3.0,
+                },
+                indicators: gnomon_core::query::MetricIndicators {
+                    selected_lens_last_5_hours: 3.0,
+                    selected_lens_last_week: 3.0,
+                    uncached_input_reference: 3.0,
+                },
+                item_count: 1,
+                project_id: Some(1),
+                category: Some("Editing".to_string()),
+                action: Some(sample_action("read file")),
+                full_path: Some("/tmp/project/src/lib.rs".to_string()),
+            }],
+        );
+
+        app.apply_row_filter()?;
+
+        let labels = app
+            .visible_rows
+            .iter()
+            .map(|row| (row.row.label.clone(), row.depth, row.is_expanded))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                ("src".to_string(), 0, true),
+                ("lib.rs".to_string(), 1, false),
+                ("tests".to_string(), 0, false),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn collapse_selected_prunes_descendant_expansions() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        app.ui_state.root = RootView::ProjectHierarchy;
+        app.ui_state.path = BrowsePath::ProjectAction {
+            project_id: 1,
+            category: "Editing".to_string(),
+            action: sample_action("read file"),
+            parent_path: None,
+        };
+        let src_row = sample_row("src", Some("/tmp/project/src".to_string()));
+        app.visible_rows = vec![TreeRow {
+            row: src_row,
+            parent_path: app.ui_state.path.clone(),
+            node_path: Some(BrowsePath::ProjectAction {
+                project_id: 1,
+                category: "Editing".to_string(),
+                action: sample_action("read file"),
+                parent_path: Some("/tmp/project/src".to_string()),
+            }),
+            depth: 0,
+            is_expanded: true,
+        }];
+        app.table_state.select(Some(0));
+        app.expanded_paths = vec![
+            BrowsePath::ProjectAction {
+                project_id: 1,
+                category: "Editing".to_string(),
+                action: sample_action("read file"),
+                parent_path: Some("/tmp/project/src".to_string()),
+            },
+            BrowsePath::ProjectAction {
+                project_id: 1,
+                category: "Editing".to_string(),
+                action: sample_action("read file"),
+                parent_path: Some("/tmp/project/src/lib".to_string()),
+            },
+        ];
+        app.raw_rows = vec![sample_row("src", Some("/tmp/project/src".to_string()))];
+        app.cache_rows(app.ui_state.path.clone(), app.raw_rows.clone());
+
+        app.collapse_selected()?;
+
+        assert!(app.expanded_paths.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn jump_matches_use_fuzzy_sorting() {
         let matches = build_jump_matches(
             "proj edit",
@@ -3701,15 +4230,13 @@ mod tests {
             full_path: None,
         };
 
-        let rendered = render_column_value(
-            ColumnKey::Label,
-            &row,
-            MetricLens::UncachedInput,
-            &RootView::ProjectHierarchy,
-            &BrowsePath::Root,
-        );
+        let rendered = render_column_value(ColumnKey::Label, &row, MetricLens::UncachedInput);
 
-        assert_eq!(rendered, "> project-a");
+        assert_eq!(rendered, "project-a");
+        assert_eq!(
+            drillability_glyph(&RootView::ProjectHierarchy, &BrowsePath::Root, &row),
+            "> "
+        );
     }
 
     #[test]
@@ -3737,20 +4264,22 @@ mod tests {
             full_path: Some("/tmp/project-a/src/lib.rs".to_string()),
         };
 
-        let rendered = render_column_value(
-            ColumnKey::Label,
-            &row,
-            MetricLens::UncachedInput,
-            &RootView::ProjectHierarchy,
-            &BrowsePath::ProjectAction {
-                project_id: 1,
-                category: "Editing".to_string(),
-                action: sample_action("read file"),
-                parent_path: Some("/tmp/project-a/src".to_string()),
-            },
-        );
+        let rendered = render_column_value(ColumnKey::Label, &row, MetricLens::UncachedInput);
 
-        assert_eq!(rendered, "  lib.rs");
+        assert_eq!(rendered, "lib.rs");
+        assert_eq!(
+            drillability_glyph(
+                &RootView::ProjectHierarchy,
+                &BrowsePath::ProjectAction {
+                    project_id: 1,
+                    category: "Editing".to_string(),
+                    action: sample_action("read file"),
+                    parent_path: Some("/tmp/project-a/src".to_string()),
+                },
+                &row,
+            ),
+            "  "
+        );
     }
 
     #[test]
