@@ -51,6 +51,39 @@ The validator reports:
 - query timings for filter options, project-root browse, category-root browse,
   and one project drill
 
+## Query Benchmark Workflow
+
+For focused browse/filter/jump benchmarking and query-plan capture, run the main
+CLI benchmark command against either a real cache or a synthetic cache:
+
+```bash
+cargo run -p gnomon -- benchmark
+cargo run -p gnomon -- --db /path/to/usage.sqlite3 benchmark --iterations 10
+```
+
+The benchmark output is JSON and includes:
+
+- timing samples for `refresh_snapshot_status`
+- timing samples for project-root and category-root browse
+- timing samples for a representative path drill
+- timing samples for refresh, filter-change, and jump-target-build query flows
+- `EXPLAIN QUERY PLAN` output for the latest-snapshot, action-fact, and
+  path-fact statements
+
+The command is read-only against the SQLite cache. Use `--iterations` to gather
+more stable before/after samples when comparing query work.
+
+To pair the benchmark with synthetic fixtures, generate the cache first and then
+point `gnomon benchmark` at the resulting SQLite file:
+
+```bash
+cargo run -p gnomon --bin validate-scale -- --profile quick --root /tmp/gnomon-bench
+cargo run -p gnomon -- --db /tmp/gnomon-bench/validation.sqlite3 benchmark --iterations 10
+```
+
+For before/after comparisons, capture the JSON output from both runs and diff
+the scenario timing samples and `query_plans` sections.
+
 ## Measured Baseline
 
 On March 27, 2026, this repository was validated on Linux with:

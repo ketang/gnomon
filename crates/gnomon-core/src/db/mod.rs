@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 pub const INITIAL_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_DB_FILENAME: &str = "usage.sqlite3";
@@ -28,8 +28,23 @@ impl Database {
         let mut conn = Connection::open(path)
             .with_context(|| format!("unable to open sqlite database at {}", path.display()))?;
 
-        configure_connection(&mut conn)?;
+        configure_read_write_connection(&mut conn)?;
         apply_migrations(&mut conn)?;
+
+        Ok(Self { conn })
+    }
+
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| {
+                format!(
+                    "unable to open sqlite database in read-only mode at {}",
+                    path.display()
+                )
+            })?;
+
+        configure_read_only_connection(&mut conn)?;
 
         Ok(Self { conn })
     }
@@ -95,7 +110,7 @@ fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(sidecar_name)
 }
 
-fn configure_connection(conn: &mut Connection) -> Result<()> {
+fn configure_read_write_connection(conn: &mut Connection) -> Result<()> {
     conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)
         .context("unable to configure sqlite busy timeout")?;
     conn.execute_batch(
@@ -105,6 +120,20 @@ fn configure_connection(conn: &mut Connection) -> Result<()> {
         ",
     )
     .context("unable to configure sqlite connection pragmas")?;
+
+    Ok(())
+}
+
+fn configure_read_only_connection(conn: &mut Connection) -> Result<()> {
+    conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)
+        .context("unable to configure sqlite busy timeout")?;
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys = ON;
+        PRAGMA query_only = ON;
+        ",
+    )
+    .context("unable to configure read-only sqlite connection pragmas")?;
 
     Ok(())
 }

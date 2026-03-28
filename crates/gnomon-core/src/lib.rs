@@ -1,3 +1,4 @@
+pub mod benchmark;
 pub mod classify;
 pub mod config;
 pub mod db;

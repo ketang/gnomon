@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use gnomon_core::benchmark::{QueryBenchmarkOptions, QueryBenchmarkReport, run_query_benchmark};
 use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
 use gnomon_core::db::{Database, ResetReport, reset_sqlite_database};
 use gnomon_core::import::{import_all, scan_source_manifest, start_startup_import};
@@ -41,6 +42,10 @@ struct GlobalArgs {
 enum Command {
     #[command(about = "Database maintenance commands: reset, rebuild.")]
     Db(DbCommand),
+    #[command(
+        about = "Run repeatable read-only query benchmarks against the current SQLite cache."
+    )]
+    Benchmark(Box<BenchmarkArgs>),
     #[command(about = "Return non-interactive aggregate rollups from the current snapshot.")]
     Report(Box<ReportArgs>),
 }
@@ -123,6 +128,13 @@ struct ReportArgs {
     /// Base command for action drill-down paths.
     #[arg(long)]
     base_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+struct BenchmarkArgs {
+    /// Number of timing samples to collect for each benchmark scenario.
+    #[arg(long, default_value_t = QueryBenchmarkOptions::default().iterations)]
+    iterations: usize,
 }
 
 #[derive(Debug, Clone, Args, Default, PartialEq, Eq)]
@@ -217,6 +229,7 @@ fn run(cli: Cli) -> Result<()> {
     match command {
         None => run_app(&config, startup),
         Some(Command::Db(command)) => run_db_command(&config, command.command),
+        Some(Command::Benchmark(args)) => run_benchmark_command(&config, &args),
         Some(Command::Report(args)) => run_report_command(&config, &args),
     }
 }
@@ -289,6 +302,24 @@ fn build_browse_report(
         path: args.build_path()?,
     };
     engine.browse_report(request)
+}
+
+fn run_benchmark_command(config: &RuntimeConfig, args: &BenchmarkArgs) -> Result<()> {
+    let report = build_query_benchmark_report(config, args)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn build_query_benchmark_report(
+    config: &RuntimeConfig,
+    args: &BenchmarkArgs,
+) -> Result<QueryBenchmarkReport> {
+    run_query_benchmark(
+        &config.db_path,
+        QueryBenchmarkOptions {
+            iterations: args.iterations,
+        },
+    )
 }
 
 fn rebuild_database(config: &RuntimeConfig) -> Result<()> {
@@ -586,13 +617,14 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        BrowsePathKindArg, ClassificationStateArg, Cli, Command, DbSubcommand, GlobalArgs,
-        MetricLensArg, ReportArgs, ResetArgs, RootViewArg, StartupArgs, build_browse_report,
-        count_completed_chunks, run_db_command,
+        BenchmarkArgs, BrowsePathKindArg, ClassificationStateArg, Cli, Command, DbSubcommand,
+        GlobalArgs, MetricLensArg, ReportArgs, ResetArgs, RootViewArg, StartupArgs,
+        build_browse_report, build_query_benchmark_report, count_completed_chunks, run_db_command,
     };
     use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
     use gnomon_core::db::Database;
     use gnomon_core::query::BrowsePath;
+    use gnomon_core::validation::{ScaleValidationSpec, run_scale_validation};
 
     #[test]
     fn help_lists_db_subcommands() {
@@ -603,6 +635,7 @@ mod tests {
         let help = String::from_utf8(help).expect("utf8 help");
 
         assert!(help.contains("db"));
+        assert!(help.contains("benchmark"));
         assert!(help.contains("report"));
         assert!(help.contains("reset"));
         assert!(help.contains("rebuild"));
@@ -644,6 +677,7 @@ mod tests {
                 DbSubcommand::Reset(args) => assert!(args.force),
                 DbSubcommand::Rebuild => panic!("expected reset subcommand"),
             },
+            Some(Command::Benchmark(_)) => panic!("expected db command"),
             Some(Command::Report(_)) => panic!("expected db command"),
             None => panic!("expected db command"),
         }
@@ -673,6 +707,7 @@ mod tests {
                 DbSubcommand::Rebuild => {}
                 DbSubcommand::Reset(_) => panic!("expected rebuild subcommand"),
             },
+            Some(Command::Benchmark(_)) => panic!("expected db command"),
             Some(Command::Report(_)) => panic!("expected db command"),
             None => panic!("expected db command"),
         }
@@ -716,6 +751,32 @@ mod tests {
                 assert_eq!(args.normalized_action.as_deref(), Some("read file"));
             }
             _ => panic!("expected report command"),
+        }
+    }
+
+    #[test]
+    fn parse_accepts_benchmark_arguments() {
+        let cli = Cli::parse_from([
+            "gnomon",
+            "--db",
+            "/tmp/custom.sqlite3",
+            "benchmark",
+            "--iterations",
+            "7",
+        ]);
+
+        assert_eq!(
+            cli.global,
+            GlobalArgs {
+                db: Some(PathBuf::from("/tmp/custom.sqlite3")),
+                source_root: None,
+            }
+        );
+        match cli.command {
+            Some(Command::Benchmark(args)) => {
+                assert_eq!(*args, BenchmarkArgs { iterations: 7 });
+            }
+            _ => panic!("expected benchmark command"),
         }
     }
 
@@ -970,6 +1031,36 @@ mod tests {
             .expect_err("action paths should require a classification state");
 
         assert!(err.to_string().contains("--classification-state"));
+    }
+
+    #[test]
+    fn benchmark_returns_query_report_without_launching_tui() -> Result<()> {
+        let temp = tempdir()?;
+        let validation = run_scale_validation(
+            temp.path(),
+            ScaleValidationSpec {
+                project_count: 1,
+                day_count: 2,
+                sessions_per_day: 1,
+            },
+        )?;
+
+        let config = RuntimeConfig::load(ConfigOverrides {
+            db_path: Some(validation.db_path),
+            source_root: Some(validation.source_root),
+        })?;
+
+        let report = build_query_benchmark_report(&config, &BenchmarkArgs { iterations: 2 })?;
+
+        assert_eq!(report.iterations, 2);
+        assert!(
+            report
+                .scenarios
+                .iter()
+                .any(|scenario| scenario.name == "project_root_refresh")
+        );
+
+        Ok(())
     }
 
     fn write_jsonl(path: &Path, cwd: &Path) -> Result<()> {

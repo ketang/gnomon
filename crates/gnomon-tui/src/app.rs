@@ -338,7 +338,13 @@ impl App {
                         visible_columns
                             .iter()
                             .map(|column| {
-                                Cell::from(render_column_value(column.key, row, self.ui_state.lens))
+                                Cell::from(render_column_value(
+                                    column.key,
+                                    row,
+                                    self.ui_state.lens,
+                                    &self.ui_state.root,
+                                    &self.ui_state.path,
+                                ))
                             })
                             .collect::<Vec<_>>(),
                     )
@@ -2268,9 +2274,21 @@ fn optional_column_spec(column: &OptionalColumn) -> ColumnSpec {
     }
 }
 
-fn render_column_value(column: ColumnKey, row: &RollupRow, lens: MetricLens) -> String {
+fn render_column_value(
+    column: ColumnKey,
+    row: &RollupRow,
+    lens: MetricLens,
+    root: &RootView,
+    current_path: &BrowsePath,
+) -> String {
     match column {
-        ColumnKey::Label => row.label.clone(),
+        ColumnKey::Label => {
+            format!(
+                "{}{}",
+                drillability_glyph(root, current_path, row),
+                row.label
+            )
+        }
         ColumnKey::SelectedLens => format_metric(row.metrics.lens_value(lens)),
         ColumnKey::Optional(OptionalColumn::Kind) => row_kind_label(row.kind).to_string(),
         ColumnKey::Optional(OptionalColumn::GrossInput) => format_metric(row.metrics.gross_input),
@@ -2286,6 +2304,14 @@ fn render_column_value(column: ColumnKey, row: &RollupRow, lens: MetricLens) -> 
             format_metric(row.indicators.uncached_input_reference)
         }
         ColumnKey::Optional(OptionalColumn::Items) => row.item_count.to_string(),
+    }
+}
+
+fn drillability_glyph(root: &RootView, current_path: &BrowsePath, row: &RollupRow) -> &'static str {
+    if next_browse_path(root, current_path, row).is_some() {
+        "> "
+    } else {
+        "  "
     }
 }
 
@@ -3560,6 +3586,83 @@ mod tests {
         assert!(columns.len() < default_enabled_columns().len() + 2);
         assert_eq!(columns[0].key, ColumnKey::Label);
         assert_eq!(columns[1].key, ColumnKey::SelectedLens);
+    }
+
+    #[test]
+    fn label_column_marks_drillable_rows() {
+        let row = RollupRow {
+            kind: RollupRowKind::Project,
+            key: "project:1".to_string(),
+            label: "project-a".to_string(),
+            metrics: gnomon_core::query::MetricTotals {
+                uncached_input: 5.0,
+                cached_input: 0.0,
+                gross_input: 5.0,
+                output: 0.0,
+                total: 5.0,
+            },
+            indicators: gnomon_core::query::MetricIndicators {
+                selected_lens_last_5_hours: 5.0,
+                selected_lens_last_week: 5.0,
+                uncached_input_reference: 5.0,
+            },
+            item_count: 1,
+            project_id: Some(1),
+            category: None,
+            action: None,
+            full_path: None,
+        };
+
+        let rendered = render_column_value(
+            ColumnKey::Label,
+            &row,
+            MetricLens::UncachedInput,
+            &RootView::ProjectHierarchy,
+            &BrowsePath::Root,
+        );
+
+        assert_eq!(rendered, "> project-a");
+    }
+
+    #[test]
+    fn label_column_leaves_leaf_rows_unmarked() {
+        let row = RollupRow {
+            kind: RollupRowKind::File,
+            key: "path:/tmp/project-a/src/lib.rs".to_string(),
+            label: "lib.rs".to_string(),
+            metrics: gnomon_core::query::MetricTotals {
+                uncached_input: 5.0,
+                cached_input: 0.0,
+                gross_input: 5.0,
+                output: 0.0,
+                total: 5.0,
+            },
+            indicators: gnomon_core::query::MetricIndicators {
+                selected_lens_last_5_hours: 5.0,
+                selected_lens_last_week: 5.0,
+                uncached_input_reference: 5.0,
+            },
+            item_count: 1,
+            project_id: Some(1),
+            category: Some("Editing".to_string()),
+            action: Some(sample_action("read file")),
+            full_path: Some("/tmp/project-a/src/lib.rs".to_string()),
+        };
+
+        let rendered = render_column_value(
+            ColumnKey::Label,
+            &row,
+            MetricLens::UncachedInput,
+            &RootView::ProjectHierarchy,
+            &BrowsePath::ProjectAction {
+                project_id: 1,
+                category: "Editing".to_string(),
+                action: sample_action("read file"),
+                parent_path: Some("/tmp/project-a/src".to_string()),
+            },
+        );
+
+        assert_eq!(rendered, "  lib.rs");
     }
 
     #[test]
