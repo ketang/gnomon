@@ -259,10 +259,9 @@ impl App {
             ]),
             view_line(&self.breadcrumb_targets),
             Line::from(format!(
-                "{}  |  lens: {}  |  focus: {}",
+                "{}  |  lens: {}",
                 snapshot_summary_text(&self.snapshot, self.has_newer_snapshot),
                 metric_lens_label(self.ui_state.lens),
-                self.focused_pane.label()
             )),
             Line::from(snapshot_refresh_text(
                 &self.snapshot,
@@ -361,14 +360,16 @@ impl App {
             .collect::<Vec<_>>();
 
         let table = Table::new(rows, widths)
-            .header(header)
+            .header(header.style(table_header_style(self.focused_pane == PaneFocus::Table)))
             .block(pane_block("Table", self.focused_pane == PaneFocus::Table))
-            .row_highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol(">> ");
+            .row_highlight_style(table_row_highlight_style(
+                self.focused_pane == PaneFocus::Table,
+            ))
+            .highlight_symbol(if self.focused_pane == PaneFocus::Table {
+                ">> "
+            } else {
+                "   "
+            });
         frame.render_stateful_widget(table, area, &mut self.table_state);
     }
 
@@ -389,7 +390,7 @@ impl App {
                     "Enter drill  Backspace up  b breadcrumbs  1/2 hierarchy  l lens  Tab focus/pane  o columns  q quit",
                 ),
                 Line::from(
-                    "table focus: up/down rows. radial focus: left/right siblings. t/m/p/c/a filters  0 clear  / row filter  g jump  r refresh",
+                    "table: up/down rows. radial: left/right siblings. t/m/p/c/a filters  0 clear  / row filter  g jump  r refresh",
                 ),
                 Line::from(format!(
                     "{}  |  {}",
@@ -1424,8 +1425,6 @@ impl App {
         } else {
             self.ui_state.row_filter.clone()
         };
-        let focus = self.focused_pane.label();
-
         let selected = self
             .selected_row()
             .map(|row| {
@@ -1439,7 +1438,7 @@ impl App {
             })
             .unwrap_or_else(|| "none".to_string());
 
-        format!("focus: {focus}  |  selected: {selected}  |  row filter: {filter}")
+        format!("selected: {selected}  |  row filter: {filter}")
     }
 
     fn build_radial_context(&self, filters: &BrowseFilters) -> Result<RadialContext> {
@@ -1660,13 +1659,6 @@ impl PaneFocus {
         }
     }
 
-    fn label(self) -> &'static str {
-        match self {
-            Self::Table => "table",
-            Self::Radial => "radial",
-        }
-    }
-
     fn from_pane_mode(mode: PaneMode) -> Self {
         match mode {
             PaneMode::Table => Self::Table,
@@ -1824,6 +1816,7 @@ impl Widget for &RadialPane<'_> {
         let center_lines =
             radial_center_label_lines(&self.model.center, center_area.width, center_area.height);
         Paragraph::new(Text::from(center_lines))
+            .style(radial_center_label_style(self.focused))
             .alignment(Alignment::Center)
             .render(center_area, buf);
     }
@@ -1886,18 +1879,73 @@ fn truncate_center_label(text: &str, max_width: usize) -> String {
 }
 
 fn pane_block(title: &str, focused: bool) -> Block<'static> {
-    let mut block = Block::default()
+    Block::default()
         .borders(Borders::ALL)
-        .title(title.to_string());
-    if focused {
-        block = block.border_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
-    }
+        .border_style(pane_border_style(focused))
+        .title(pane_title(title, focused))
+}
 
-    block
+fn pane_border_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray).add_modifier(Modifier::DIM)
+    }
+}
+
+fn pane_title(title: &str, focused: bool) -> Line<'static> {
+    let label = if focused {
+        title.to_uppercase()
+    } else {
+        title.to_string()
+    };
+
+    Line::from(Span::styled(label, pane_title_style(focused)))
+}
+
+fn pane_title_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
+    }
+}
+
+fn table_header_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray).add_modifier(Modifier::DIM)
+    }
+}
+
+fn table_row_highlight_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .bg(Color::DarkGray)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().bg(Color::DarkGray).fg(Color::Gray)
+    }
+}
+
+fn radial_center_label_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray).add_modifier(Modifier::DIM)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2722,6 +2770,10 @@ fn radial_segment_style(segment: &RadialSegment, focused: bool) -> Style {
     let mut style = Style::default()
         .bg(radial_bucket_color(segment.bucket))
         .fg(Color::Black);
+
+    if !focused {
+        style = style.add_modifier(Modifier::DIM);
+    }
 
     if segment.is_selected {
         style = style.fg(Color::White).add_modifier(Modifier::BOLD);
@@ -4348,6 +4400,20 @@ mod tests {
         Ok(content)
     }
 
+    fn render_app_to_string(app: &mut App, width: u16, height: u16) -> Result<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|frame| app.render(frame))?;
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect::<String>();
+        Ok(content)
+    }
+
     #[test]
     fn startup_browse_state_defaults_fresh_sessions_to_root() {
         let mut state = PersistedUiState {
@@ -4430,6 +4496,95 @@ mod tests {
             "refresh policy not rendered in header"
         );
         Ok(())
+    }
+
+    #[test]
+    fn render_omits_status_focus_label() -> Result<()> {
+        let temp = tempdir()?;
+        let content = render_to_string(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+        )?;
+
+        assert!(
+            !content.contains("focus:"),
+            "focus should be communicated by pane styling, not status text"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wide_layout_marks_table_as_the_focused_pane() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+        )?;
+
+        let content = render_app_to_string(&mut app, 140, 40)?;
+
+        assert!(
+            content.contains("TABLE"),
+            "focused table title should stand out"
+        );
+        assert!(
+            content.contains("Radial"),
+            "unfocused radial title should remain visible"
+        );
+        assert!(
+            !content.contains("focus:"),
+            "wide layout should not rely on header focus copy"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn narrow_layout_marks_radial_as_the_focused_pane() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+        )?;
+        app.focused_pane = PaneFocus::Radial;
+        app.ui_state.pane_mode = PaneMode::Radial;
+
+        let content = render_app_to_string(&mut app, 100, 40)?;
+
+        assert!(
+            content.contains("RADIAL"),
+            "focused radial title should stand out"
+        );
+        assert!(
+            !content.contains("Table"),
+            "narrow radial layout should show one pane"
+        );
+        assert!(
+            !content.contains("focus:"),
+            "narrow layout should not reintroduce status focus copy"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pane_styles_make_unfocused_panes_visibly_quieter() {
+        assert_eq!(pane_border_style(true).fg, Some(Color::Cyan));
+        assert_eq!(pane_border_style(false).fg, Some(Color::Gray));
+        assert_eq!(pane_title_style(true).fg, Some(Color::White));
+        assert_eq!(pane_title_style(false).fg, Some(Color::DarkGray));
+        assert_eq!(table_header_style(true).fg, Some(Color::White));
+        assert_eq!(table_header_style(false).fg, Some(Color::Gray));
+        assert_eq!(radial_center_label_style(true).fg, Some(Color::White));
+        assert_eq!(radial_center_label_style(false).fg, Some(Color::Gray));
     }
 
     #[test]
