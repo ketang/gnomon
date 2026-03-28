@@ -38,6 +38,15 @@ impl SnapshotBounds {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SnapshotCoverageSummary {
+    pub project_count: usize,
+    pub project_day_count: usize,
+    pub day_count: usize,
+    pub session_count: usize,
+    pub turn_count: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetricLens {
     UncachedInput,
@@ -301,6 +310,30 @@ const LATEST_SNAPSHOT_BOUNDS_SQL: &str = "
     WHERE state = 'complete' AND publish_seq IS NOT NULL
 ";
 
+const SNAPSHOT_COVERAGE_SUMMARY_SQL: &str = "
+    WITH visible_chunks AS (
+        SELECT id, project_id, chunk_day_local
+        FROM import_chunk
+        WHERE state = 'complete'
+          AND publish_seq IS NOT NULL
+          AND publish_seq <= ?1
+    )
+    SELECT
+        (SELECT COUNT(DISTINCT project_id) FROM visible_chunks),
+        (SELECT COUNT(*) FROM visible_chunks),
+        (SELECT COUNT(DISTINCT chunk_day_local) FROM visible_chunks),
+        (
+            SELECT COUNT(DISTINCT stream.conversation_id)
+            FROM stream
+            JOIN visible_chunks ON visible_chunks.id = stream.import_chunk_id
+        ),
+        (
+            SELECT COUNT(*)
+            FROM turn
+            JOIN visible_chunks ON visible_chunks.id = turn.import_chunk_id
+        )
+";
+
 const LOAD_ACTION_FACTS_SQL: &str = "
     SELECT
         p.id,
@@ -429,6 +462,39 @@ impl<'conn> QueryEngine<'conn> {
 
     pub fn has_newer_snapshot(&self, snapshot: &SnapshotBounds) -> Result<bool> {
         Ok(self.latest_snapshot_bounds()?.max_publish_seq > snapshot.max_publish_seq)
+    }
+
+    pub fn snapshot_coverage_summary(
+        &self,
+        snapshot: &SnapshotBounds,
+    ) -> Result<SnapshotCoverageSummary> {
+        if snapshot.max_publish_seq == 0 {
+            return Ok(SnapshotCoverageSummary::default());
+        }
+
+        let max_publish_seq = i64::try_from(snapshot.max_publish_seq)
+            .context("snapshot publish_seq overflowed i64")?;
+        let row = self
+            .conn
+            .query_row(SNAPSHOT_COVERAGE_SUMMARY_SQL, [max_publish_seq], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .context("unable to compute the visible snapshot coverage summary")?;
+
+        Ok(SnapshotCoverageSummary {
+            project_count: usize::try_from(row.0).context("project count overflowed usize")?,
+            project_day_count: usize::try_from(row.1)
+                .context("project-day count overflowed usize")?,
+            day_count: usize::try_from(row.2).context("day count overflowed usize")?,
+            session_count: usize::try_from(row.3).context("session count overflowed usize")?,
+            turn_count: usize::try_from(row.4).context("turn count overflowed usize")?,
+        })
     }
 
     pub fn filter_options(&self, snapshot: &SnapshotBounds) -> Result<FilterOptions> {
@@ -1397,7 +1463,8 @@ mod tests {
 
     use super::{
         ActionKey, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState, FilterOptions,
-        MetricLens, QueryEngine, RootView, SnapshotBounds, TimeWindowFilter,
+        MetricLens, QueryEngine, RootView, SnapshotBounds, SnapshotCoverageSummary,
+        TimeWindowFilter,
     };
 
     #[test]
@@ -1440,6 +1507,43 @@ mod tests {
         )?;
 
         assert!(engine.has_newer_snapshot(&latest)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_coverage_summary_uses_user_facing_units() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let conn = db.connection_mut();
+        seed_query_fixture(conn, temp.path())?;
+        let engine = QueryEngine::new(conn);
+
+        let coverage = engine.snapshot_coverage_summary(&engine.latest_snapshot_bounds()?)?;
+        assert_eq!(
+            coverage,
+            SnapshotCoverageSummary {
+                project_count: 2,
+                project_day_count: 2,
+                day_count: 1,
+                session_count: 4,
+                turn_count: 4,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_snapshot_has_empty_coverage_summary() -> Result<()> {
+        let temp = tempdir()?;
+        let db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let engine = QueryEngine::new(db.connection());
+
+        assert_eq!(
+            engine.snapshot_coverage_summary(&SnapshotBounds::bootstrap())?,
+            SnapshotCoverageSummary::default()
+        );
 
         Ok(())
     }

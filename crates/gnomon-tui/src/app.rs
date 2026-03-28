@@ -18,7 +18,8 @@ use gnomon_core::import::{StartupOpenReason, StartupWorkerEvent};
 use gnomon_core::perf::{PerfLogger, PerfScope};
 use gnomon_core::query::{
     ActionKey, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState, FilterOptions,
-    MetricLens, QueryEngine, RollupRow, RollupRowKind, RootView, SnapshotBounds, TimeWindowFilter,
+    MetricLens, QueryEngine, RollupRow, RollupRowKind, RootView, SnapshotBounds,
+    SnapshotCoverageSummary, TimeWindowFilter,
 };
 use jiff::ToSpan;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -44,6 +45,7 @@ pub struct App {
     ui_state_path: PathBuf,
     ui_state: PersistedUiState,
     snapshot: SnapshotBounds,
+    snapshot_coverage: SnapshotCoverageSummary,
     latest_snapshot: SnapshotBounds,
     startup_open_reason: StartupOpenReason,
     has_newer_snapshot: bool,
@@ -106,6 +108,7 @@ impl App {
             ui_state,
             latest_snapshot: snapshot.clone(),
             snapshot,
+            snapshot_coverage: SnapshotCoverageSummary::default(),
             startup_open_reason,
             has_newer_snapshot: false,
             filter_options: FilterOptions {
@@ -131,6 +134,7 @@ impl App {
         };
 
         app.reload_view()?;
+        app.refresh_snapshot_coverage()?;
         app.refresh_snapshot_status()?;
         Ok(app)
     }
@@ -253,20 +257,19 @@ impl App {
                 Span::styled("gnomon", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw("  radial + table explorer"),
             ]),
+            view_line(&self.breadcrumb_targets),
             Line::from(format!(
                 "{}  |  lens: {}  |  focus: {}",
                 snapshot_summary_text(&self.snapshot, self.has_newer_snapshot),
                 metric_lens_label(self.ui_state.lens),
                 self.focused_pane.label()
             )),
-            Line::from(snapshot_coverage_text(&self.snapshot)),
             Line::from(snapshot_refresh_text(
                 &self.snapshot,
                 &self.latest_snapshot,
                 self.startup_open_reason,
                 self.has_newer_snapshot,
             )),
-            breadcrumb_line(&self.breadcrumb_targets),
         ];
 
         if let Some(message) = &self.status_message {
@@ -388,7 +391,11 @@ impl App {
                 Line::from(
                     "table focus: up/down rows. radial focus: left/right siblings. t/m/p/c/a filters  0 clear  / row filter  g jump  r refresh",
                 ),
-                Line::from(self.selection_footer_text()),
+                Line::from(format!(
+                    "{}  |  {}",
+                    snapshot_coverage_footer_text(&self.snapshot_coverage),
+                    self.selection_footer_text()
+                )),
             ],
             InputMode::FilterInput => vec![
                 Line::from("Editing current-view filter. Type to filter rows immediately."),
@@ -867,6 +874,13 @@ impl App {
             reload_started.elapsed().as_secs_f64() * 1000.0,
         );
 
+        let coverage_started = Instant::now();
+        self.refresh_snapshot_coverage()?;
+        perf.field(
+            "refresh_snapshot_coverage_ms",
+            coverage_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
         let refresh_status_started = Instant::now();
         self.refresh_snapshot_status()?;
         perf.field(
@@ -874,8 +888,7 @@ impl App {
             refresh_status_started.elapsed().as_secs_f64() * 1000.0,
         );
         self.status_message = Some(StatusMessage::info(format!(
-            "Adopted publish_seq <= {} covering {}.",
-            self.snapshot.max_publish_seq,
+            "Switched to the newest imported snapshot {}.",
             snapshot_coverage_tail(&self.snapshot)
         )));
         perf.finish_ok();
@@ -1004,6 +1017,13 @@ impl App {
         perf.field("latest_snapshot", &self.latest_snapshot);
         perf.field("has_newer_snapshot", self.has_newer_snapshot);
         perf.finish_ok();
+        Ok(())
+    }
+
+    fn refresh_snapshot_coverage(&mut self) -> Result<()> {
+        self.snapshot_coverage = self
+            .query_engine()
+            .snapshot_coverage_summary(&self.snapshot)?;
         Ok(())
     }
 
@@ -1932,42 +1952,32 @@ impl TimeWindowPreset {
 fn snapshot_summary_text(snapshot: &SnapshotBounds, has_newer_snapshot: bool) -> String {
     if snapshot.is_bootstrap() {
         return if has_newer_snapshot {
-            "snapshot: bootstrap (refresh available)".to_string()
+            "snapshot: no imported data is visible yet (newer data is ready)".to_string()
         } else {
-            "snapshot: bootstrap".to_string()
+            "snapshot: no imported data is visible yet".to_string()
         };
     }
 
-    let status = if has_newer_snapshot {
-        "refresh available"
+    if has_newer_snapshot {
+        format!(
+            "snapshot: showing imported data {} (newer data is ready)",
+            snapshot_coverage_tail(snapshot)
+        )
     } else {
-        "pinned"
-    };
-    format!(
-        "snapshot: publish_seq <= {} ({status})",
-        snapshot.max_publish_seq
-    )
-}
-
-fn snapshot_coverage_text(snapshot: &SnapshotBounds) -> String {
-    if snapshot.is_bootstrap() {
-        return "coverage: no published chunks are visible yet".to_string();
+        format!(
+            "snapshot: showing imported data {}",
+            snapshot_coverage_tail(snapshot)
+        )
     }
-
-    format!(
-        "coverage: {} published chunk(s) {}",
-        snapshot.published_chunk_count,
-        snapshot_coverage_tail(snapshot)
-    )
 }
 
-fn breadcrumb_line(targets: &[BreadcrumbTarget]) -> Line<'static> {
+fn view_line(targets: &[BreadcrumbTarget]) -> Line<'static> {
     if targets.is_empty() {
-        return Line::from("breadcrumbs: none");
+        return Line::from("view: none");
     }
 
     let mut spans = vec![Span::styled(
-        "breadcrumbs: ",
+        "view: ",
         Style::default().add_modifier(Modifier::BOLD),
     )];
     for (index, target) in targets.iter().enumerate() {
@@ -1999,26 +2009,52 @@ fn snapshot_coverage_tail(snapshot: &SnapshotBounds) -> String {
 
 fn snapshot_refresh_text(
     snapshot: &SnapshotBounds,
-    latest_snapshot: &SnapshotBounds,
+    _latest_snapshot: &SnapshotBounds,
     startup_open_reason: StartupOpenReason,
     has_newer_snapshot: bool,
 ) -> String {
     if has_newer_snapshot {
-        return format!(
-            "refresh: publish_seq <= {} is ready; current drill-down stays on publish_seq <= {} until you press r",
-            latest_snapshot.max_publish_seq, snapshot.max_publish_seq
-        );
+        return if snapshot.is_bootstrap() {
+            "refresh: imported data is ready. Press r to load it; this empty view stays in place until you refresh."
+                .to_string()
+        } else {
+            "refresh: newer imported data is ready. Press r to switch to it; this view stays pinned until you refresh."
+                .to_string()
+        };
     }
 
     match startup_open_reason {
         StartupOpenReason::Last24hReady => {
-            "refresh: manual only; background import never changes the visible scope automatically"
+            "refresh: manual only. Background import never changes the visible view until you press r."
                 .to_string()
         }
         StartupOpenReason::TimedOut => {
-            "startup gate: opened before the last-24h import slice settled; visible coverage may be partial"
+            "refresh: manual only. Startup opened before the last 24 hours finished importing, so this snapshot may still be partial."
                 .to_string()
         }
+    }
+}
+
+fn snapshot_coverage_footer_text(summary: &SnapshotCoverageSummary) -> String {
+    if summary == &SnapshotCoverageSummary::default() {
+        return "coverage: no imported data is visible yet".to_string();
+    }
+
+    format!(
+        "coverage: {}, {} across {}, {}, {}",
+        count_label(summary.project_count, "project"),
+        count_label(summary.project_day_count, "project-day"),
+        count_label(summary.day_count, "day"),
+        count_label(summary.session_count, "session"),
+        count_label(summary.turn_count, "turn"),
+    )
+}
+
+fn count_label(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
     }
 }
 
@@ -4128,7 +4164,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol().to_string())
             .collect::<String>();
-        assert!(content.contains("breadcrumbs:"));
+        assert!(content.contains("view:"));
         assert!(content.contains("all projects"));
         assert!(content.contains("project-a"));
         assert!(content.contains(" > "));
@@ -4365,8 +4401,8 @@ mod tests {
             "Status pane header not rendered"
         );
         assert!(
-            content.contains("snapshot: bootstrap"),
-            "bootstrap snapshot state not rendered in header"
+            content.contains("snapshot: no imported data is visible yet"),
+            "empty snapshot state not rendered in header"
         );
         assert!(content.contains("Keys"), "Keys pane header not rendered");
         Ok(())
@@ -4386,11 +4422,11 @@ mod tests {
             "app name not rendered in header"
         );
         assert!(
-            content.contains("snapshot: bootstrap"),
-            "bootstrap state not rendered in header"
+            content.contains("snapshot: no imported data is visible yet"),
+            "empty snapshot state not rendered in header"
         );
         assert!(
-            content.contains("manual only"),
+            content.contains("Background import never changes the visible view"),
             "refresh policy not rendered in header"
         );
         Ok(())
@@ -4481,12 +4517,25 @@ mod tests {
         )?;
 
         assert!(
-            content.contains("coverage: 2 published chunk"),
-            "snapshot coverage count not rendered in header"
+            content.contains("refresh:"),
+            "refresh line not rendered in header"
         );
-        assert!(
-            content.contains("visible coverage may be partial"),
-            "partial-data state not rendered in header"
+        assert_eq!(
+            snapshot_refresh_text(
+                &SnapshotBounds {
+                    max_publish_seq: 2,
+                    published_chunk_count: 2,
+                    upper_bound_utc: Some("2026-03-27 18:28:38".to_string()),
+                },
+                &SnapshotBounds {
+                    max_publish_seq: 2,
+                    published_chunk_count: 2,
+                    upper_bound_utc: Some("2026-03-27 18:28:38".to_string()),
+                },
+                StartupOpenReason::TimedOut,
+                false,
+            ),
+            "refresh: manual only. Startup opened before the last 24 hours finished importing, so this snapshot may still be partial."
         );
 
         Ok(())
@@ -4511,18 +4560,42 @@ mod tests {
         )?;
 
         assert!(
-            content.contains("snapshot: publish_seq <= 2 (refresh available)"),
+            content.contains(
+                "snapshot: showing imported data through 2026-03-27T18:28:38Z (newer data is ready)"
+            ),
             "current pinned snapshot summary not rendered"
         );
         assert!(
-            content.contains("publish_seq <= 3 is ready"),
-            "newer snapshot target not rendered"
+            content.contains("newer imported data is ready"),
+            "newer snapshot availability not rendered"
         );
         assert!(
-            content.contains("stays on publish_seq <= 2 until you press r"),
+            content.contains("this view stays pinned until you refresh"),
             "manual refresh guarantee not rendered"
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn snapshot_coverage_footer_uses_meaningful_counts() {
+        assert_eq!(
+            snapshot_coverage_footer_text(&SnapshotCoverageSummary {
+                project_count: 2,
+                project_day_count: 5,
+                day_count: 3,
+                session_count: 7,
+                turn_count: 11,
+            }),
+            "coverage: 2 projects, 5 project-days across 3 days, 7 sessions, 11 turns"
+        );
+    }
+
+    #[test]
+    fn snapshot_coverage_footer_handles_empty_snapshots() {
+        assert_eq!(
+            snapshot_coverage_footer_text(&SnapshotCoverageSummary::default()),
+            "coverage: no imported data is visible yet"
+        );
     }
 }
