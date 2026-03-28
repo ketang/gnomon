@@ -104,6 +104,19 @@ pub fn run_query_benchmark(
         },
         path: BrowsePath::Root,
     };
+    let scoped_action_browse_request = BrowseRequest {
+        snapshot: snapshot.clone(),
+        root: RootView::ProjectHierarchy,
+        lens: MetricLens::UncachedInput,
+        filters: BrowseFilters {
+            model: Some(selection.model_name.clone()),
+            ..BrowseFilters::default()
+        },
+        path: BrowsePath::ProjectCategory {
+            project_id: selection.project_id,
+            category: selection.category.clone(),
+        },
+    };
 
     let scenarios = vec![
         measure_scenario("refresh_snapshot_status", options.iterations, || {
@@ -131,6 +144,15 @@ pub fn run_query_benchmark(
         .with_notes(format!(
             "applies --project-id style filtering with project {} ({})",
             selection.project_id, selection.project_label
+        )),
+        measure_scenario(
+            "project_category_model_filter_browse",
+            options.iterations,
+            || Ok(run_browse(&engine, scoped_action_browse_request.clone())?.len()),
+        )?
+        .with_notes(format!(
+            "applies model filtering with {} inside project {} ({}) category {}",
+            selection.model_name, selection.project_id, selection.project_label, selection.category
         )),
         measure_scenario("jump_target_build", options.iterations, || {
             build_jump_target_count(&engine, &snapshot)
@@ -172,6 +194,11 @@ pub fn run_query_benchmark(
             name: "path_browse_scope".to_string(),
             used_by_scenarios: vec!["path_drill_browse".to_string()],
             detail: engine.path_browse_query_plan(&path_browse_request)?,
+        },
+        QueryPlanReport {
+            name: "action_browse_scope".to_string(),
+            used_by_scenarios: vec!["project_category_model_filter_browse".to_string()],
+            detail: engine.action_browse_query_plan(&scoped_action_browse_request)?,
         },
     ];
 
@@ -371,6 +398,7 @@ struct BenchmarkSelectionInternal {
     category: String,
     action_key: ActionKey,
     action_label: String,
+    model_name: String,
 }
 
 impl BenchmarkSelectionInternal {
@@ -424,6 +452,7 @@ fn select_benchmark_selection(
         .action
         .clone()
         .context("query benchmark action drill target was missing an action key")?;
+    let model_name = select_benchmark_model(engine, snapshot, project.id, &filter_options.models)?;
 
     Ok(BenchmarkSelectionInternal {
         project_id: project.id,
@@ -431,7 +460,41 @@ fn select_benchmark_selection(
         category,
         action_key,
         action_label: action.label.clone(),
+        model_name,
     })
+}
+
+fn select_benchmark_model(
+    engine: &QueryEngine<'_>,
+    snapshot: &SnapshotBounds,
+    project_id: i64,
+    models: &[String],
+) -> Result<String> {
+    let fallback = models
+        .first()
+        .cloned()
+        .context("query benchmark requires at least one visible model")?;
+
+    for model in models {
+        let rows = run_browse(
+            engine,
+            BrowseRequest {
+                snapshot: snapshot.clone(),
+                root: RootView::ProjectHierarchy,
+                lens: MetricLens::UncachedInput,
+                filters: BrowseFilters {
+                    model: Some(model.clone()),
+                    ..BrowseFilters::default()
+                },
+                path: BrowsePath::Project { project_id },
+            },
+        )?;
+        if !rows.is_empty() {
+            return Ok(model.clone());
+        }
+    }
+
+    Ok(fallback)
 }
 
 impl QueryBenchmarkScenario {
@@ -477,12 +540,18 @@ mod tests {
             run_query_benchmark(&validation.db_path, QueryBenchmarkOptions { iterations: 2 })?;
 
         assert_eq!(report.iterations, 2);
-        assert_eq!(report.query_plans.len(), 4);
+        assert_eq!(report.query_plans.len(), 5);
         assert!(
             report
                 .query_plans
                 .iter()
                 .any(|plan| plan.name == "load_action_rollup_facts")
+        );
+        assert!(
+            report
+                .query_plans
+                .iter()
+                .any(|plan| plan.name == "action_browse_scope")
         );
         assert!(
             report
@@ -495,6 +564,12 @@ mod tests {
                 .scenarios
                 .iter()
                 .any(|scenario| scenario.name == "path_drill_browse")
+        );
+        assert!(
+            report
+                .scenarios
+                .iter()
+                .any(|scenario| scenario.name == "project_category_model_filter_browse")
         );
 
         Ok(())

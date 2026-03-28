@@ -66,9 +66,10 @@ The benchmark output is JSON and includes:
 - timing samples for `refresh_snapshot_status`
 - timing samples for project-root and category-root browse
 - timing samples for a representative path drill
+- timing samples for a representative model-filtered project/category browse
 - timing samples for refresh, filter-change, and jump-target-build query flows
-- `EXPLAIN QUERY PLAN` output for the latest-snapshot, action-fact, and
-  path-fact statements
+- `EXPLAIN QUERY PLAN` output for the latest-snapshot, rollup, recent-action,
+  scoped-action, and scoped-path statements
 
 The command is read-only against the SQLite cache. Use `--iterations` to gather
 more stable before/after samples when comparing query work.

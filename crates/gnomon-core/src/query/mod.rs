@@ -742,6 +742,11 @@ impl<'conn> QueryEngine<'conn> {
         )
     }
 
+    pub fn action_browse_query_plan(&self, request: &BrowseRequest) -> Result<Vec<String>> {
+        let (sql, query_params) = build_scoped_action_facts_query(request)?;
+        self.explain_query_plan_with_params(&sql, query_params)
+    }
+
     pub fn path_browse_query_plan(&self, request: &BrowseRequest) -> Result<Vec<String>> {
         let (sql, query_params) = build_scoped_path_facts_query(request)?;
         self.explain_query_plan_with_params(&sql, query_params)
@@ -2107,6 +2112,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use anyhow::{Context, Result};
+    use rusqlite::types::Value;
     use rusqlite::{Connection, OptionalExtension, params};
     use tempfile::tempdir;
 
@@ -2115,7 +2121,8 @@ mod tests {
     use super::{
         ActionKey, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState, FilterOptions,
         MetricLens, QueryEngine, RootView, SnapshotBounds, SnapshotCoverageSummary,
-        TimeWindowFilter, display_category,
+        TimeWindowFilter, build_scoped_action_facts_query, build_scoped_path_facts_query,
+        display_category,
     };
 
     #[test]
@@ -2730,6 +2737,127 @@ mod tests {
                 .expect("unclassified should map to a display label"),
             "[unclassified]"
         );
+    }
+
+    #[test]
+    fn scoped_action_facts_query_applies_path_and_filter_clauses() -> Result<()> {
+        let request = BrowseRequest {
+            snapshot: SnapshotBounds {
+                max_publish_seq: 42,
+                published_chunk_count: 3,
+                upper_bound_utc: Some("2026-03-27T00:00:00Z".to_string()),
+            },
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters {
+                model: Some("claude-opus".to_string()),
+                time_window: Some(TimeWindowFilter {
+                    start_at_utc: Some("2026-03-20T00:00:00Z".to_string()),
+                    end_at_utc: Some("2026-03-27T00:00:00Z".to_string()),
+                }),
+                ..BrowseFilters::default()
+            },
+            path: BrowsePath::ProjectCategory {
+                project_id: 7,
+                category: "editing".to_string(),
+            },
+        };
+
+        let (sql, query_params) = build_scoped_action_facts_query(&request)?;
+
+        assert!(sql.contains("AND ic.publish_seq <= ?"));
+        assert!(sql.contains("AND p.id = ?"));
+        assert!(sql.contains("AND EXISTS ("));
+        assert!(sql.contains("m_filter.model_name = ?"));
+        assert!(
+            sql.contains("datetime(COALESCE(a.ended_at_utc, a.started_at_utc)) >= datetime(?)")
+        );
+        assert!(
+            sql.contains("datetime(COALESCE(a.ended_at_utc, a.started_at_utc)) <= datetime(?)")
+        );
+        assert!(sql.contains("GROUP_CONCAT(DISTINCT m.model_name)"));
+        assert!(sql.contains("GROUP BY"));
+        assert!(sql.contains("WHEN a.category IS NOT NULL THEN a.category"));
+
+        assert_eq!(
+            query_params,
+            vec![
+                Value::Integer(42),
+                Value::Integer(7),
+                Value::Text("editing".to_string()),
+                Value::Text("claude-opus".to_string()),
+                Value::Text("2026-03-20T00:00:00Z".to_string()),
+                Value::Text("2026-03-27T00:00:00Z".to_string()),
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_path_facts_query_applies_scope_parent_and_filters() -> Result<()> {
+        let action = ActionKey {
+            classification_state: ClassificationState::Classified,
+            normalized_action: Some("read file".to_string()),
+            command_family: None,
+            base_command: None,
+        };
+        let request = BrowseRequest {
+            snapshot: SnapshotBounds {
+                max_publish_seq: 12,
+                published_chunk_count: 2,
+                upper_bound_utc: Some("2026-03-27T00:00:00Z".to_string()),
+            },
+            root: RootView::CategoryHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters {
+                model: Some("claude-haiku".to_string()),
+                time_window: Some(TimeWindowFilter {
+                    start_at_utc: Some("2026-03-21T00:00:00Z".to_string()),
+                    end_at_utc: Some("2026-03-27T00:00:00Z".to_string()),
+                }),
+                ..BrowseFilters::default()
+            },
+            path: BrowsePath::CategoryActionProject {
+                category: "editing".to_string(),
+                action,
+                project_id: 9,
+                parent_path: Some("/tmp/project/src".to_string()),
+            },
+        };
+
+        let (sql, query_params) = build_scoped_path_facts_query(&request)?;
+
+        assert!(sql.contains("AND pn.node_kind = 'file'"));
+        assert!(sql.contains("AND p.id = ?"));
+        assert!(sql.contains("AND m.model_name = ?"));
+        assert!(sql.contains("AND substr(pn.full_path, 1, length(?) + 1) = ? || '/'"));
+        assert!(
+            sql.contains("datetime(COALESCE(m.completed_at_utc, m.created_at_utc)) >= datetime(?)")
+        );
+        assert!(
+            sql.contains("datetime(COALESCE(m.completed_at_utc, m.created_at_utc)) <= datetime(?)")
+        );
+        assert!(sql.contains("SELECT COUNT(*)"));
+        assert!(sql.contains("AND a.classification_state = ?"));
+
+        assert_eq!(
+            query_params,
+            vec![
+                Value::Integer(12),
+                Value::Integer(9),
+                Value::Text("editing".to_string()),
+                Value::Text("classified".to_string()),
+                Value::Text("read file".to_string()),
+                Value::Text("claude-haiku".to_string()),
+                Value::Text("2026-03-21T00:00:00Z".to_string()),
+                Value::Text("2026-03-27T00:00:00Z".to_string()),
+                Value::Text("/tmp/project/src".to_string()),
+                Value::Text("/tmp/project/src".to_string()),
+            ]
+        );
+
+        Ok(())
     }
 
     #[derive(Debug)]
