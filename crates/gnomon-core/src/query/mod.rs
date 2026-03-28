@@ -4,7 +4,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use jiff::{Timestamp, ToSpan};
-use rusqlite::{Connection, params};
+use rusqlite::types::Value;
+use rusqlite::{Connection, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
 use crate::perf::{PerfLogger, PerfScope};
@@ -323,47 +324,16 @@ const SNAPSHOT_COVERAGE_SUMMARY_SQL: &str = "
       AND publish_seq <= ?1
 ";
 
-const LOAD_ACTION_FACTS_SQL: &str = "
-    SELECT
-        p.id,
-        p.display_name,
-        p.root_path,
-        a.category,
-        a.normalized_action,
-        a.command_family,
-        a.base_command,
-        a.classification_state,
-        COALESCE(a.ended_at_utc, a.started_at_utc),
-        COALESCE(a.input_tokens, 0),
-        COALESCE(a.cache_creation_input_tokens, 0),
-        COALESCE(a.cache_read_input_tokens, 0),
-        COALESCE(a.output_tokens, 0),
-        GROUP_CONCAT(DISTINCT m.model_name)
-    FROM action a
-    JOIN import_chunk ic ON ic.id = a.import_chunk_id
-    JOIN project p ON p.id = ic.project_id
-    LEFT JOIN action_message am ON am.action_id = a.id
-    LEFT JOIN message m ON m.id = am.message_id
-    WHERE ic.state = 'complete'
-      AND ic.publish_seq IS NOT NULL
-      AND ic.publish_seq <= ?1
-    GROUP BY
-        a.id,
-        p.id,
-        p.display_name,
-        p.root_path,
-        a.category,
-        a.normalized_action,
-        a.command_family,
-        a.base_command,
-        a.classification_state,
-        a.ended_at_utc,
-        a.started_at_utc,
-        a.input_tokens,
-        a.cache_creation_input_tokens,
-        a.cache_read_input_tokens,
-        a.output_tokens
+const DISPLAY_CATEGORY_SQL: &str = "
+    CASE
+        WHEN a.category IS NOT NULL THEN a.category
+        WHEN a.classification_state = 'mixed' THEN 'mixed'
+        WHEN a.classification_state = 'unclassified' THEN 'unclassified'
+        ELSE 'classified'
+    END
 ";
+
+const ACTION_TIMESTAMP_SQL: &str = "COALESCE(a.ended_at_utc, a.started_at_utc)";
 
 const LOAD_ACTION_ROLLUP_FACTS_SQL: &str = "
     SELECT
@@ -410,42 +380,6 @@ const LOAD_RECENT_ACTION_FACTS_SQL: &str = "
       AND ic.publish_seq IS NOT NULL
       AND ic.publish_seq <= ?1
       AND datetime(COALESCE(a.ended_at_utc, a.started_at_utc)) >= datetime(?2)
-";
-
-const LOAD_PATH_FACTS_SQL: &str = "
-    WITH message_ref_counts AS (
-        SELECT message_id, COUNT(*) AS ref_count
-        FROM message_path_ref
-        GROUP BY message_id
-    )
-    SELECT
-        p.id,
-        p.root_path,
-        a.category,
-        a.normalized_action,
-        a.command_family,
-        a.base_command,
-        a.classification_state,
-        COALESCE(m.completed_at_utc, m.created_at_utc),
-        COALESCE(m.input_tokens, 0),
-        COALESCE(m.cache_creation_input_tokens, 0),
-        COALESCE(m.cache_read_input_tokens, 0),
-        COALESCE(m.output_tokens, 0),
-        m.model_name,
-        pn.full_path,
-        rc.ref_count
-    FROM action a
-    JOIN import_chunk ic ON ic.id = a.import_chunk_id
-    JOIN project p ON p.id = ic.project_id
-    JOIN action_message am ON am.action_id = a.id
-    JOIN message m ON m.id = am.message_id
-    JOIN message_path_ref mpr ON mpr.message_id = m.id
-    JOIN path_node pn ON pn.id = mpr.path_node_id
-    JOIN message_ref_counts rc ON rc.message_id = m.id
-    WHERE ic.state = 'complete'
-      AND ic.publish_seq IS NOT NULL
-      AND ic.publish_seq <= ?1
-      AND pn.node_kind = 'file'
 ";
 
 const FILTER_OPTIONS_PROJECT_CATEGORY_ACTION_SQL: &str = "
@@ -683,7 +617,7 @@ impl<'conn> QueryEngine<'conn> {
         let aggregate_started = Instant::now();
         let mut rows = if is_path_browse(&request.path) {
             let path_load_started = Instant::now();
-            let path_facts = self.load_path_facts(&request.snapshot)?;
+            let path_facts = self.load_path_facts(request)?;
             perf.field(
                 "path_load_ms",
                 path_load_started.elapsed().as_secs_f64() * 1000.0,
@@ -723,7 +657,7 @@ impl<'conn> QueryEngine<'conn> {
             rows
         } else {
             let action_load_started = Instant::now();
-            let action_facts = self.load_action_facts(&request.snapshot)?;
+            let action_facts = self.load_action_facts(request)?;
             perf.field(
                 "action_load_ms",
                 action_load_started.elapsed().as_secs_f64() * 1000.0,
@@ -782,22 +716,24 @@ impl<'conn> QueryEngine<'conn> {
         )
     }
 
-    pub fn path_facts_query_plan(&self, snapshot: &SnapshotBounds) -> Result<Vec<String>> {
-        self.explain_query_plan_with_snapshot(LOAD_PATH_FACTS_SQL, snapshot)
+    pub fn path_browse_query_plan(&self, request: &BrowseRequest) -> Result<Vec<String>> {
+        let (sql, query_params) = build_scoped_path_facts_query(request)?;
+        self.explain_query_plan_with_params(&sql, query_params)
     }
 
-    fn load_action_facts(&self, snapshot: &SnapshotBounds) -> Result<Vec<ActionFact>> {
+    fn load_action_facts(&self, request: &BrowseRequest) -> Result<Vec<ActionFact>> {
         let mut perf = self.perf_scope("query.load_action_facts");
-        perf.field("snapshot", snapshot);
-        if snapshot.max_publish_seq == 0 {
+        perf.field("request", request);
+        if request.snapshot.max_publish_seq == 0 {
             perf.field("row_count", 0usize);
             perf.finish_ok();
             return Ok(Vec::new());
         }
 
-        let mut stmt = self.conn.prepare(LOAD_ACTION_FACTS_SQL)?;
+        let (sql, query_params) = build_scoped_action_facts_query(request)?;
+        let mut stmt = self.conn.prepare(&sql)?;
 
-        let rows = stmt.query_map([snapshot.max_publish_seq as i64], |row| {
+        let rows = stmt.query_map(params_from_iter(query_params.iter()), |row| {
             Ok(LoadedActionFact {
                 project_id: row.get(0)?,
                 project_display_name: row.get(1)?,
@@ -981,18 +917,19 @@ impl<'conn> QueryEngine<'conn> {
         Ok(facts)
     }
 
-    fn load_path_facts(&self, snapshot: &SnapshotBounds) -> Result<Vec<PathFact>> {
+    fn load_path_facts(&self, request: &BrowseRequest) -> Result<Vec<PathFact>> {
         let mut perf = self.perf_scope("query.load_path_facts");
-        perf.field("snapshot", snapshot);
-        if snapshot.max_publish_seq == 0 {
+        perf.field("request", request);
+        if request.snapshot.max_publish_seq == 0 {
             perf.field("row_count", 0usize);
             perf.finish_ok();
             return Ok(Vec::new());
         }
 
-        let mut stmt = self.conn.prepare(LOAD_PATH_FACTS_SQL)?;
+        let (sql, query_params) = build_scoped_path_facts_query(request)?;
+        let mut stmt = self.conn.prepare(&sql)?;
 
-        let rows = stmt.query_map([snapshot.max_publish_seq as i64], |row| {
+        let rows = stmt.query_map(params_from_iter(query_params.iter()), |row| {
             Ok(LoadedPathFact {
                 project_id: row.get(0)?,
                 project_root: row.get(1)?,
@@ -1089,6 +1026,23 @@ impl<'conn> QueryEngine<'conn> {
             .prepare(&explain_sql)
             .context("unable to prepare EXPLAIN QUERY PLAN statement")?;
         let rows = stmt.query_map(params![max_publish_seq, timestamp], |row| {
+            row.get::<_, String>(3)
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("unable to read EXPLAIN QUERY PLAN rows")
+    }
+
+    fn explain_query_plan_with_params(
+        &self,
+        sql: &str,
+        query_params: Vec<Value>,
+    ) -> Result<Vec<String>> {
+        let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
+        let mut stmt = self
+            .conn
+            .prepare(&explain_sql)
+            .context("unable to prepare EXPLAIN QUERY PLAN statement")?;
+        let rows = stmt.query_map(params_from_iter(query_params.iter()), |row| {
             row.get::<_, String>(3)
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1766,6 +1720,288 @@ fn apply_indicator_rows(rows: &mut [RollupRow], indicator_rows: Vec<RollupRow>) 
             row.indicators.selected_lens_last_5_hours = indicators.selected_lens_last_5_hours;
             row.indicators.selected_lens_last_week = indicators.selected_lens_last_week;
         }
+    }
+}
+
+fn build_scoped_action_facts_query(request: &BrowseRequest) -> Result<(String, Vec<Value>)> {
+    let max_publish_seq = i64::try_from(request.snapshot.max_publish_seq)
+        .context("snapshot publish_seq overflowed i64")?;
+    let mut sql = format!(
+        "
+        SELECT
+            p.id,
+            p.display_name,
+            p.root_path,
+            a.category,
+            a.normalized_action,
+            a.command_family,
+            a.base_command,
+            a.classification_state,
+            {ACTION_TIMESTAMP_SQL},
+            COALESCE(a.input_tokens, 0),
+            COALESCE(a.cache_creation_input_tokens, 0),
+            COALESCE(a.cache_read_input_tokens, 0),
+            COALESCE(a.output_tokens, 0),
+            GROUP_CONCAT(DISTINCT m.model_name)
+        FROM action a
+        JOIN import_chunk ic ON ic.id = a.import_chunk_id
+        JOIN project p ON p.id = ic.project_id
+        LEFT JOIN action_message am ON am.action_id = a.id
+        LEFT JOIN message m ON m.id = am.message_id
+        WHERE ic.state = 'complete'
+          AND ic.publish_seq IS NOT NULL
+          AND ic.publish_seq <= ?
+        "
+    );
+    let mut query_params = vec![Value::Integer(max_publish_seq)];
+
+    match (&request.root, &request.path) {
+        (RootView::ProjectHierarchy, BrowsePath::Root)
+        | (RootView::CategoryHierarchy, BrowsePath::Root) => {}
+        (RootView::ProjectHierarchy, BrowsePath::Project { project_id }) => {
+            append_project_match(&mut sql, &mut query_params, *project_id);
+        }
+        (
+            RootView::ProjectHierarchy,
+            BrowsePath::ProjectCategory {
+                project_id,
+                category,
+            },
+        ) => {
+            append_project_match(&mut sql, &mut query_params, *project_id);
+            append_category_match(&mut sql, &mut query_params, category);
+        }
+        (RootView::CategoryHierarchy, BrowsePath::Category { category }) => {
+            append_category_match(&mut sql, &mut query_params, category);
+        }
+        (RootView::CategoryHierarchy, BrowsePath::CategoryAction { category, action }) => {
+            append_category_match(&mut sql, &mut query_params, category);
+            append_action_key_match(&mut sql, &mut query_params, action);
+        }
+        _ => {
+            bail!(
+                "browse path {:?} is incompatible with {:?}",
+                request.path,
+                request.root
+            )
+        }
+    }
+
+    if let Some(project_id) = request.filters.project_id {
+        append_project_match(&mut sql, &mut query_params, project_id);
+    }
+    if let Some(category) = request.filters.action_category.as_deref() {
+        append_category_match(&mut sql, &mut query_params, category);
+    }
+    if let Some(action) = request.filters.action.as_ref() {
+        append_action_key_match(&mut sql, &mut query_params, action);
+    }
+    if let Some(model) = request.filters.model.as_deref() {
+        sql.push_str(
+            "
+            AND EXISTS (
+                SELECT 1
+                FROM action_message am_filter
+                JOIN message m_filter ON m_filter.id = am_filter.message_id
+                WHERE am_filter.action_id = a.id
+                  AND m_filter.model_name = ?
+            )
+            ",
+        );
+        query_params.push(Value::Text(model.to_string()));
+    }
+    if let Some(time_window) = request.filters.time_window.as_ref() {
+        if let Some(start_at) = time_window.start_at_utc.as_deref() {
+            sql.push_str(&format!(
+                " AND datetime({ACTION_TIMESTAMP_SQL}) >= datetime(?)"
+            ));
+            query_params.push(Value::Text(start_at.to_string()));
+        }
+        if let Some(end_at) = time_window.end_at_utc.as_deref() {
+            sql.push_str(&format!(
+                " AND datetime({ACTION_TIMESTAMP_SQL}) <= datetime(?)"
+            ));
+            query_params.push(Value::Text(end_at.to_string()));
+        }
+    }
+
+    sql.push_str(
+        "
+        GROUP BY
+            a.id,
+            p.id,
+            p.display_name,
+            p.root_path,
+            a.category,
+            a.normalized_action,
+            a.command_family,
+            a.base_command,
+            a.classification_state,
+            a.ended_at_utc,
+            a.started_at_utc,
+            a.input_tokens,
+            a.cache_creation_input_tokens,
+            a.cache_read_input_tokens,
+            a.output_tokens
+        ",
+    );
+
+    Ok((sql, query_params))
+}
+
+fn build_scoped_path_facts_query(request: &BrowseRequest) -> Result<(String, Vec<Value>)> {
+    let max_publish_seq = i64::try_from(request.snapshot.max_publish_seq)
+        .context("snapshot publish_seq overflowed i64")?;
+    let (scope_project_id, scope_category, scope_action, parent_path) =
+        match (&request.root, &request.path) {
+            (
+                RootView::ProjectHierarchy,
+                BrowsePath::ProjectAction {
+                    project_id,
+                    category,
+                    action,
+                    parent_path,
+                },
+            ) => (
+                *project_id,
+                category.as_str(),
+                action,
+                parent_path.as_deref(),
+            ),
+            (
+                RootView::CategoryHierarchy,
+                BrowsePath::CategoryActionProject {
+                    category,
+                    action,
+                    project_id,
+                    parent_path,
+                },
+            ) => (
+                *project_id,
+                category.as_str(),
+                action,
+                parent_path.as_deref(),
+            ),
+            _ => {
+                bail!(
+                    "browse path {:?} is incompatible with {:?}",
+                    request.path,
+                    request.root
+                )
+            }
+        };
+
+    let mut sql = "
+        SELECT
+            p.id,
+            p.root_path,
+            a.category,
+            a.normalized_action,
+            a.command_family,
+            a.base_command,
+            a.classification_state,
+            COALESCE(m.completed_at_utc, m.created_at_utc),
+            COALESCE(m.input_tokens, 0),
+            COALESCE(m.cache_creation_input_tokens, 0),
+            COALESCE(m.cache_read_input_tokens, 0),
+            COALESCE(m.output_tokens, 0),
+            m.model_name,
+            pn.full_path,
+            (
+                SELECT COUNT(*)
+                FROM message_path_ref ref_count
+                WHERE ref_count.message_id = m.id
+            ) AS ref_count
+        FROM action a
+        JOIN import_chunk ic ON ic.id = a.import_chunk_id
+        JOIN project p ON p.id = ic.project_id
+        JOIN action_message am ON am.action_id = a.id
+        JOIN message m ON m.id = am.message_id
+        JOIN message_path_ref mpr ON mpr.message_id = m.id
+        JOIN path_node pn ON pn.id = mpr.path_node_id
+        WHERE ic.state = 'complete'
+          AND ic.publish_seq IS NOT NULL
+          AND ic.publish_seq <= ?
+          AND pn.node_kind = 'file'
+        "
+    .to_string();
+    let mut query_params = vec![Value::Integer(max_publish_seq)];
+
+    append_project_match(&mut sql, &mut query_params, scope_project_id);
+    append_category_match(&mut sql, &mut query_params, scope_category);
+    append_action_key_match(&mut sql, &mut query_params, scope_action);
+
+    if let Some(project_id) = request.filters.project_id {
+        append_project_match(&mut sql, &mut query_params, project_id);
+    }
+    if let Some(category) = request.filters.action_category.as_deref() {
+        append_category_match(&mut sql, &mut query_params, category);
+    }
+    if let Some(action) = request.filters.action.as_ref() {
+        append_action_key_match(&mut sql, &mut query_params, action);
+    }
+    if let Some(model) = request.filters.model.as_deref() {
+        sql.push_str(" AND m.model_name = ?");
+        query_params.push(Value::Text(model.to_string()));
+    }
+    if let Some(time_window) = request.filters.time_window.as_ref() {
+        if let Some(start_at) = time_window.start_at_utc.as_deref() {
+            sql.push_str(
+                " AND datetime(COALESCE(m.completed_at_utc, m.created_at_utc)) >= datetime(?)",
+            );
+            query_params.push(Value::Text(start_at.to_string()));
+        }
+        if let Some(end_at) = time_window.end_at_utc.as_deref() {
+            sql.push_str(
+                " AND datetime(COALESCE(m.completed_at_utc, m.created_at_utc)) <= datetime(?)",
+            );
+            query_params.push(Value::Text(end_at.to_string()));
+        }
+    }
+    if let Some(parent_path) = parent_path {
+        sql.push_str(" AND substr(pn.full_path, 1, length(?) + 1) = ? || '/'");
+        query_params.push(Value::Text(parent_path.to_string()));
+        query_params.push(Value::Text(parent_path.to_string()));
+    }
+
+    Ok((sql, query_params))
+}
+
+fn append_project_match(sql: &mut String, query_params: &mut Vec<Value>, project_id: i64) {
+    sql.push_str(" AND p.id = ?");
+    query_params.push(Value::Integer(project_id));
+}
+
+fn append_category_match(sql: &mut String, query_params: &mut Vec<Value>, category: &str) {
+    sql.push_str(&format!(" AND {DISPLAY_CATEGORY_SQL} = ?"));
+    query_params.push(Value::Text(category.to_string()));
+}
+
+fn append_action_key_match(sql: &mut String, query_params: &mut Vec<Value>, action: &ActionKey) {
+    sql.push_str(" AND a.classification_state = ?");
+    query_params.push(Value::Text(
+        action.classification_state.as_str().to_string(),
+    ));
+
+    if let Some(normalized_action) = action.normalized_action.as_deref() {
+        sql.push_str(" AND a.normalized_action = ?");
+        query_params.push(Value::Text(normalized_action.to_string()));
+    } else {
+        sql.push_str(" AND a.normalized_action IS NULL");
+    }
+
+    if let Some(command_family) = action.command_family.as_deref() {
+        sql.push_str(" AND a.command_family = ?");
+        query_params.push(Value::Text(command_family.to_string()));
+    } else {
+        sql.push_str(" AND a.command_family IS NULL");
+    }
+
+    if let Some(base_command) = action.base_command.as_deref() {
+        sql.push_str(" AND a.base_command = ?");
+        query_params.push(Value::Text(base_command.to_string()));
+    } else {
+        sql.push_str(" AND a.base_command IS NULL");
     }
 }
 

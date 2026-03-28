@@ -169,9 +169,9 @@ pub fn run_query_benchmark(
             detail: engine.recent_action_facts_query_plan(&snapshot)?,
         },
         QueryPlanReport {
-            name: "load_path_facts".to_string(),
+            name: "path_browse_scope".to_string(),
             used_by_scenarios: vec!["path_drill_browse".to_string()],
-            detail: engine.path_facts_query_plan(&snapshot)?,
+            detail: engine.path_browse_query_plan(&path_browse_request)?,
         },
     ];
 
