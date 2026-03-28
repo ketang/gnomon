@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use jiff::{Timestamp, ToSpan};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
 use crate::perf::{PerfLogger, PerfScope};
@@ -311,27 +311,16 @@ const LATEST_SNAPSHOT_BOUNDS_SQL: &str = "
 ";
 
 const SNAPSHOT_COVERAGE_SUMMARY_SQL: &str = "
-    WITH visible_chunks AS (
-        SELECT id, project_id, chunk_day_local
-        FROM import_chunk
-        WHERE state = 'complete'
-          AND publish_seq IS NOT NULL
-          AND publish_seq <= ?1
-    )
     SELECT
-        (SELECT COUNT(DISTINCT project_id) FROM visible_chunks),
-        (SELECT COUNT(*) FROM visible_chunks),
-        (SELECT COUNT(DISTINCT chunk_day_local) FROM visible_chunks),
-        (
-            SELECT COUNT(DISTINCT stream.conversation_id)
-            FROM stream
-            JOIN visible_chunks ON visible_chunks.id = stream.import_chunk_id
-        ),
-        (
-            SELECT COUNT(*)
-            FROM turn
-            JOIN visible_chunks ON visible_chunks.id = turn.import_chunk_id
-        )
+        COUNT(DISTINCT project_id),
+        COUNT(*),
+        COUNT(DISTINCT chunk_day_local),
+        COALESCE(SUM(imported_conversation_count), 0),
+        COALESCE(SUM(imported_turn_count), 0)
+    FROM import_chunk
+    WHERE state = 'complete'
+      AND publish_seq IS NOT NULL
+      AND publish_seq <= ?1
 ";
 
 const LOAD_ACTION_FACTS_SQL: &str = "
@@ -376,6 +365,53 @@ const LOAD_ACTION_FACTS_SQL: &str = "
         a.output_tokens
 ";
 
+const LOAD_ACTION_ROLLUP_FACTS_SQL: &str = "
+    SELECT
+        p.id,
+        p.display_name,
+        p.root_path,
+        car.display_category,
+        car.normalized_action,
+        car.command_family,
+        car.base_command,
+        car.classification_state,
+        car.input_tokens,
+        car.cache_creation_input_tokens,
+        car.cache_read_input_tokens,
+        car.output_tokens,
+        car.action_count
+    FROM chunk_action_rollup car
+    JOIN import_chunk ic ON ic.id = car.import_chunk_id
+    JOIN project p ON p.id = ic.project_id
+    WHERE ic.state = 'complete'
+      AND ic.publish_seq IS NOT NULL
+      AND ic.publish_seq <= ?1
+";
+
+const LOAD_RECENT_ACTION_FACTS_SQL: &str = "
+    SELECT
+        p.id,
+        p.display_name,
+        p.root_path,
+        a.category,
+        a.normalized_action,
+        a.command_family,
+        a.base_command,
+        a.classification_state,
+        COALESCE(a.ended_at_utc, a.started_at_utc),
+        COALESCE(a.input_tokens, 0),
+        COALESCE(a.cache_creation_input_tokens, 0),
+        COALESCE(a.cache_read_input_tokens, 0),
+        COALESCE(a.output_tokens, 0)
+    FROM action a
+    JOIN import_chunk ic ON ic.id = a.import_chunk_id
+    JOIN project p ON p.id = ic.project_id
+    WHERE ic.state = 'complete'
+      AND ic.publish_seq IS NOT NULL
+      AND ic.publish_seq <= ?1
+      AND datetime(COALESCE(a.ended_at_utc, a.started_at_utc)) >= datetime(?2)
+";
+
 const LOAD_PATH_FACTS_SQL: &str = "
     WITH message_ref_counts AS (
         SELECT message_id, COUNT(*) AS ref_count
@@ -410,6 +446,41 @@ const LOAD_PATH_FACTS_SQL: &str = "
       AND ic.publish_seq IS NOT NULL
       AND ic.publish_seq <= ?1
       AND pn.node_kind = 'file'
+";
+
+const FILTER_OPTIONS_PROJECT_CATEGORY_ACTION_SQL: &str = "
+    SELECT DISTINCT
+        p.id,
+        p.display_name,
+        car.display_category,
+        car.classification_state,
+        car.normalized_action,
+        car.command_family,
+        car.base_command
+    FROM chunk_action_rollup car
+    JOIN import_chunk ic ON ic.id = car.import_chunk_id
+    JOIN project p ON p.id = ic.project_id
+    WHERE ic.state = 'complete'
+      AND ic.publish_seq IS NOT NULL
+      AND ic.publish_seq <= ?1
+    ORDER BY
+        p.id,
+        car.display_category,
+        car.classification_state,
+        car.normalized_action,
+        car.command_family,
+        car.base_command
+";
+
+const FILTER_OPTIONS_MODELS_SQL: &str = "
+    SELECT DISTINCT m.model_name
+    FROM message m
+    JOIN import_chunk ic ON ic.id = m.import_chunk_id
+    WHERE ic.state = 'complete'
+      AND ic.publish_seq IS NOT NULL
+      AND ic.publish_seq <= ?1
+      AND m.model_name IS NOT NULL
+    ORDER BY m.model_name
 ";
 
 impl<'conn> QueryEngine<'conn> {
@@ -501,39 +572,77 @@ impl<'conn> QueryEngine<'conn> {
         let mut perf = self.perf_scope("query.filter_options");
         perf.field("snapshot", snapshot);
 
-        let action_load_started = Instant::now();
-        let action_facts = self.load_action_facts(snapshot)?;
-        perf.field(
-            "action_load_ms",
-            action_load_started.elapsed().as_secs_f64() * 1000.0,
-        );
-
         let build_started = Instant::now();
         let mut projects = BTreeMap::new();
-        let mut models = BTreeSet::new();
         let mut categories = BTreeSet::new();
         let mut actions = BTreeMap::new();
+        let mut models = Vec::new();
 
-        for fact in &action_facts {
-            projects
-                .entry(fact.project_id)
-                .or_insert_with(|| fact.project_display_name.clone());
-            categories.insert(fact.category.clone());
-            actions
-                .entry((fact.category.clone(), fact.action.clone()))
-                .or_insert_with(|| fact.action.label());
+        let rollup_load_started = Instant::now();
+        if snapshot.max_publish_seq > 0 {
+            let max_publish_seq = i64::try_from(snapshot.max_publish_seq)
+                .context("snapshot publish_seq overflowed i64")?;
+            let mut stmt = self
+                .conn
+                .prepare(FILTER_OPTIONS_PROJECT_CATEGORY_ACTION_SQL)
+                .context("unable to prepare filter option rollup query")?;
+            let rows = stmt.query_map([max_publish_seq], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })?;
 
-            for model in &fact.model_names {
-                models.insert(model.clone());
+            for row in rows {
+                let (
+                    project_id,
+                    project_display_name,
+                    category,
+                    classification_state,
+                    normalized_action,
+                    command_family,
+                    base_command,
+                ) = row.context("unable to read filter option rollup row")?;
+                let action = ActionKey {
+                    classification_state: parse_classification_state(&classification_state)?,
+                    normalized_action,
+                    command_family,
+                    base_command,
+                };
+
+                projects.entry(project_id).or_insert(project_display_name);
+                categories.insert(category.clone());
+                actions
+                    .entry((category, action.clone()))
+                    .or_insert_with(|| action.label());
+            }
+
+            let mut model_stmt = self
+                .conn
+                .prepare(FILTER_OPTIONS_MODELS_SQL)
+                .context("unable to prepare filter option model query")?;
+            let model_rows =
+                model_stmt.query_map([max_publish_seq], |row| row.get::<_, String>(0))?;
+            for row in model_rows {
+                models.push(row.context("unable to read filter option model row")?);
             }
         }
+        perf.field(
+            "rollup_load_ms",
+            rollup_load_started.elapsed().as_secs_f64() * 1000.0,
+        );
 
         let options = FilterOptions {
             projects: projects
                 .into_iter()
                 .map(|(id, display_name)| ProjectFilterOption { id, display_name })
                 .collect(),
-            models: models.into_iter().collect(),
+            models,
             categories: categories.into_iter().collect(),
             actions: actions
                 .into_iter()
@@ -557,22 +666,6 @@ impl<'conn> QueryEngine<'conn> {
         let mut perf = self.perf_scope("query.browse");
         perf.field("request", request);
 
-        let action_load_started = Instant::now();
-        let action_facts = self.load_action_facts(&request.snapshot)?;
-        perf.field(
-            "action_load_ms",
-            action_load_started.elapsed().as_secs_f64() * 1000.0,
-        );
-        perf.field("action_fact_count", action_facts.len());
-
-        let path_load_started = Instant::now();
-        let path_facts = self.load_path_facts(&request.snapshot)?;
-        perf.field(
-            "path_load_ms",
-            path_load_started.elapsed().as_secs_f64() * 1000.0,
-        );
-        perf.field("path_fact_count", path_facts.len());
-
         let filter_compile_started = Instant::now();
         let compiled_filters = CompiledFilters::compile(&request.filters)?;
         perf.field(
@@ -588,116 +681,55 @@ impl<'conn> QueryEngine<'conn> {
         );
 
         let aggregate_started = Instant::now();
-        let mut rows = match (&request.root, &request.path) {
-            (RootView::ProjectHierarchy, BrowsePath::Root) => aggregate_projects(
-                &action_facts,
-                &compiled_filters,
-                &windows,
-                request.lens,
-                None,
-                None,
-                None,
-            ),
-            (RootView::ProjectHierarchy, BrowsePath::Project { project_id }) => {
-                aggregate_categories(
-                    &action_facts,
+        let mut rows = if is_path_browse(&request.path) {
+            let path_load_started = Instant::now();
+            let path_facts = self.load_path_facts(&request.snapshot)?;
+            perf.field(
+                "path_load_ms",
+                path_load_started.elapsed().as_secs_f64() * 1000.0,
+            );
+            perf.field("path_fact_count", path_facts.len());
+            aggregate_path_request(request, &compiled_filters, &windows, &path_facts)?
+        } else if can_use_action_rollups(&request.filters) {
+            let action_load_started = Instant::now();
+            let action_rollups = self.load_action_rollup_facts(&request.snapshot)?;
+            perf.field(
+                "action_rollup_load_ms",
+                action_load_started.elapsed().as_secs_f64() * 1000.0,
+            );
+            perf.field("action_rollup_count", action_rollups.len());
+
+            let mut rows =
+                aggregate_action_request(request, &compiled_filters, &windows, &action_rollups)?;
+
+            if let Some(last_week_start) = windows.last_week_start {
+                let recent_load_started = Instant::now();
+                let recent_action_facts =
+                    self.load_recent_action_facts(&request.snapshot, last_week_start)?;
+                perf.field(
+                    "recent_action_load_ms",
+                    recent_load_started.elapsed().as_secs_f64() * 1000.0,
+                );
+                perf.field("recent_action_fact_count", recent_action_facts.len());
+                let indicator_rows = aggregate_action_request(
+                    request,
                     &compiled_filters,
                     &windows,
-                    request.lens,
-                    Some(*project_id),
-                    None,
-                    None,
-                )
+                    &recent_action_facts,
+                )?;
+                apply_indicator_rows(&mut rows, indicator_rows);
             }
-            (
-                RootView::ProjectHierarchy,
-                BrowsePath::ProjectCategory {
-                    project_id,
-                    category,
-                },
-            ) => aggregate_actions(
-                &action_facts,
-                &compiled_filters,
-                &windows,
-                request.lens,
-                Some(*project_id),
-                Some(category),
-                None,
-            ),
-            (
-                RootView::ProjectHierarchy,
-                BrowsePath::ProjectAction {
-                    project_id,
-                    category,
-                    action,
-                    parent_path,
-                },
-            ) => aggregate_paths(
-                &path_facts,
-                &compiled_filters,
-                &windows,
-                request.lens,
-                PathBrowseScope {
-                    project_id: *project_id,
-                    category,
-                    action,
-                    parent_path: parent_path.as_deref(),
-                },
-            ),
-            (RootView::CategoryHierarchy, BrowsePath::Root) => aggregate_categories(
-                &action_facts,
-                &compiled_filters,
-                &windows,
-                request.lens,
-                None,
-                None,
-                None,
-            ),
-            (RootView::CategoryHierarchy, BrowsePath::Category { category }) => aggregate_actions(
-                &action_facts,
-                &compiled_filters,
-                &windows,
-                request.lens,
-                None,
-                Some(category),
-                None,
-            ),
-            (RootView::CategoryHierarchy, BrowsePath::CategoryAction { category, action }) => {
-                aggregate_projects(
-                    &action_facts,
-                    &compiled_filters,
-                    &windows,
-                    request.lens,
-                    None,
-                    Some(category),
-                    Some(action),
-                )
-            }
-            (
-                RootView::CategoryHierarchy,
-                BrowsePath::CategoryActionProject {
-                    category,
-                    action,
-                    project_id,
-                    parent_path,
-                },
-            ) => aggregate_paths(
-                &path_facts,
-                &compiled_filters,
-                &windows,
-                request.lens,
-                PathBrowseScope {
-                    project_id: *project_id,
-                    category,
-                    action,
-                    parent_path: parent_path.as_deref(),
-                },
-            ),
-            _ => bail!(
-                "browse path {:?} is incompatible with {:?}",
-                request.path,
-                request.root
-            ),
+
+            rows
+        } else {
+            let action_load_started = Instant::now();
+            let action_facts = self.load_action_facts(&request.snapshot)?;
+            perf.field(
+                "action_load_ms",
+                action_load_started.elapsed().as_secs_f64() * 1000.0,
+            );
+            perf.field("action_fact_count", action_facts.len());
+            aggregate_action_request(request, &compiled_filters, &windows, &action_facts)?
         };
         perf.field(
             "aggregate_ms",
@@ -732,8 +764,22 @@ impl<'conn> QueryEngine<'conn> {
         self.explain_query_plan(LATEST_SNAPSHOT_BOUNDS_SQL)
     }
 
-    pub fn action_facts_query_plan(&self, snapshot: &SnapshotBounds) -> Result<Vec<String>> {
-        self.explain_query_plan_with_snapshot(LOAD_ACTION_FACTS_SQL, snapshot)
+    pub fn action_rollup_facts_query_plan(&self, snapshot: &SnapshotBounds) -> Result<Vec<String>> {
+        self.explain_query_plan_with_snapshot(LOAD_ACTION_ROLLUP_FACTS_SQL, snapshot)
+    }
+
+    pub fn recent_action_facts_query_plan(&self, snapshot: &SnapshotBounds) -> Result<Vec<String>> {
+        let Some(upper_bound) = snapshot.upper_bound_timestamp()? else {
+            return Ok(Vec::new());
+        };
+        let Ok(last_week_start) = upper_bound.checked_sub(168.hours()) else {
+            return Ok(Vec::new());
+        };
+        self.explain_query_plan_with_snapshot_and_timestamp(
+            LOAD_RECENT_ACTION_FACTS_SQL,
+            snapshot,
+            &last_week_start.to_string(),
+        )
     }
 
     pub fn path_facts_query_plan(&self, snapshot: &SnapshotBounds) -> Result<Vec<String>> {
@@ -794,6 +840,139 @@ impl<'conn> QueryEngine<'conn> {
                         row.output_tokens,
                     ),
                     model_names: split_model_names(row.model_names_csv.as_deref()),
+                    item_count: 1,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        perf.field("row_count", facts.len());
+        perf.finish_ok();
+        Ok(facts)
+    }
+
+    fn load_action_rollup_facts(&self, snapshot: &SnapshotBounds) -> Result<Vec<ActionFact>> {
+        let mut perf = self.perf_scope("query.load_action_rollup_facts");
+        perf.field("snapshot", snapshot);
+        if snapshot.max_publish_seq == 0 {
+            perf.field("row_count", 0usize);
+            perf.finish_ok();
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = self.conn.prepare(LOAD_ACTION_ROLLUP_FACTS_SQL)?;
+        let rows = stmt.query_map([snapshot.max_publish_seq as i64], |row| {
+            Ok(LoadedActionRollupFact {
+                project_id: row.get(0)?,
+                project_display_name: row.get(1)?,
+                project_root: row.get(2)?,
+                display_category: row.get(3)?,
+                normalized_action: row.get(4)?,
+                command_family: row.get(5)?,
+                base_command: row.get(6)?,
+                classification_state: row.get(7)?,
+                input_tokens: row.get(8)?,
+                cache_creation_input_tokens: row.get(9)?,
+                cache_read_input_tokens: row.get(10)?,
+                output_tokens: row.get(11)?,
+                action_count: row.get(12)?,
+            })
+        })?;
+
+        let facts = rows
+            .map(|row| {
+                let row = row.context("unable to read an action rollup row")?;
+                Ok(ActionFact {
+                    project_id: row.project_id,
+                    project_display_name: row.project_display_name,
+                    project_root: row.project_root,
+                    category: row.display_category,
+                    action: ActionKey {
+                        classification_state: parse_classification_state(
+                            &row.classification_state,
+                        )?,
+                        normalized_action: row.normalized_action,
+                        command_family: row.command_family,
+                        base_command: row.base_command,
+                    },
+                    timestamp: None,
+                    metrics: MetricTotals::from_usage(
+                        row.input_tokens,
+                        row.cache_creation_input_tokens,
+                        row.cache_read_input_tokens,
+                        row.output_tokens,
+                    ),
+                    model_names: BTreeSet::new(),
+                    item_count: u64::try_from(row.action_count)
+                        .context("action rollup count overflowed u64")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        perf.field("row_count", facts.len());
+        perf.finish_ok();
+        Ok(facts)
+    }
+
+    fn load_recent_action_facts(
+        &self,
+        snapshot: &SnapshotBounds,
+        start_at: Timestamp,
+    ) -> Result<Vec<ActionFact>> {
+        let mut perf = self.perf_scope("query.load_recent_action_facts");
+        perf.field("snapshot", snapshot);
+        perf.field("start_at", start_at.to_string());
+        if snapshot.max_publish_seq == 0 {
+            perf.field("row_count", 0usize);
+            perf.finish_ok();
+            return Ok(Vec::new());
+        }
+
+        let mut stmt = self.conn.prepare(LOAD_RECENT_ACTION_FACTS_SQL)?;
+        let rows = stmt.query_map(
+            params![snapshot.max_publish_seq as i64, start_at.to_string()],
+            |row| {
+                Ok(LoadedActionFact {
+                    project_id: row.get(0)?,
+                    project_display_name: row.get(1)?,
+                    project_root: row.get(2)?,
+                    category: row.get(3)?,
+                    normalized_action: row.get(4)?,
+                    command_family: row.get(5)?,
+                    base_command: row.get(6)?,
+                    classification_state: row.get(7)?,
+                    timestamp: row.get(8)?,
+                    input_tokens: row.get(9)?,
+                    cache_creation_input_tokens: row.get(10)?,
+                    cache_read_input_tokens: row.get(11)?,
+                    output_tokens: row.get(12)?,
+                    model_names_csv: None,
+                })
+            },
+        )?;
+
+        let facts = rows
+            .map(|row| {
+                let row = row.context("unable to read a recent action fact row")?;
+                Ok(ActionFact {
+                    project_id: row.project_id,
+                    project_display_name: row.project_display_name,
+                    project_root: row.project_root,
+                    category: display_category(row.category.as_deref(), &row.classification_state)?,
+                    action: ActionKey {
+                        classification_state: parse_classification_state(
+                            &row.classification_state,
+                        )?,
+                        normalized_action: row.normalized_action,
+                        command_family: row.command_family,
+                        base_command: row.base_command,
+                    },
+                    timestamp: parse_timestamp(row.timestamp.as_deref())?,
+                    metrics: MetricTotals::from_usage(
+                        row.input_tokens,
+                        row.cache_creation_input_tokens,
+                        row.cache_read_input_tokens,
+                        row.output_tokens,
+                    ),
+                    model_names: BTreeSet::new(),
+                    item_count: 1,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -895,6 +1074,26 @@ impl<'conn> QueryEngine<'conn> {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("unable to read EXPLAIN QUERY PLAN rows")
     }
+
+    fn explain_query_plan_with_snapshot_and_timestamp(
+        &self,
+        sql: &str,
+        snapshot: &SnapshotBounds,
+        timestamp: &str,
+    ) -> Result<Vec<String>> {
+        let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
+        let max_publish_seq = i64::try_from(snapshot.max_publish_seq)
+            .context("snapshot publish_seq overflowed i64 for EXPLAIN QUERY PLAN")?;
+        let mut stmt = self
+            .conn
+            .prepare(&explain_sql)
+            .context("unable to prepare EXPLAIN QUERY PLAN statement")?;
+        let rows = stmt.query_map(params![max_publish_seq, timestamp], |row| {
+            row.get::<_, String>(3)
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("unable to read EXPLAIN QUERY PLAN rows")
+    }
 }
 
 #[derive(Debug)]
@@ -925,6 +1124,24 @@ struct ActionFact {
     timestamp: Option<Timestamp>,
     metrics: MetricTotals,
     model_names: BTreeSet<String>,
+    item_count: u64,
+}
+
+#[derive(Debug)]
+struct LoadedActionRollupFact {
+    project_id: i64,
+    project_display_name: String,
+    project_root: String,
+    display_category: String,
+    normalized_action: Option<String>,
+    command_family: Option<String>,
+    base_command: Option<String>,
+    classification_state: String,
+    input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    cache_read_input_tokens: i64,
+    output_tokens: i64,
+    action_count: i64,
 }
 
 #[derive(Debug)]
@@ -1159,9 +1376,10 @@ impl RollupBuilder {
         lens: MetricLens,
         timestamp: Option<Timestamp>,
         windows: &Windows,
+        item_count: u64,
     ) {
         self.metrics.add_assign(metrics);
-        self.item_count += 1;
+        self.item_count += item_count;
         self.uncached_input_reference += metrics.uncached_input;
 
         if within_window(timestamp, windows.last_5_hours_start) {
@@ -1220,7 +1438,13 @@ fn aggregate_projects(
                     Some(fact.project_root.clone()),
                 )
             })
-            .add_metrics(&fact.metrics, lens, fact.timestamp, windows);
+            .add_metrics(
+                &fact.metrics,
+                lens,
+                fact.timestamp,
+                windows,
+                fact.item_count,
+            );
     }
 
     builders.into_values().map(RollupBuilder::build).collect()
@@ -1254,7 +1478,13 @@ fn aggregate_categories(
                     None,
                 )
             })
-            .add_metrics(&fact.metrics, lens, fact.timestamp, windows);
+            .add_metrics(
+                &fact.metrics,
+                lens,
+                fact.timestamp,
+                windows,
+                fact.item_count,
+            );
     }
 
     builders.into_values().map(RollupBuilder::build).collect()
@@ -1288,7 +1518,13 @@ fn aggregate_actions(
                     None,
                 )
             })
-            .add_metrics(&fact.metrics, lens, fact.timestamp, windows);
+            .add_metrics(
+                &fact.metrics,
+                lens,
+                fact.timestamp,
+                windows,
+                fact.item_count,
+            );
     }
 
     builders.into_values().map(RollupBuilder::build).collect()
@@ -1359,7 +1595,7 @@ fn aggregate_paths(
 
         entry
             .0
-            .add_metrics(&fact.metrics, lens, fact.timestamp, windows);
+            .add_metrics(&fact.metrics, lens, fact.timestamp, windows, 1);
         entry.1.insert(fact.file_path.clone());
     }
 
@@ -1378,6 +1614,159 @@ struct PathBrowseScope<'a> {
     category: &'a str,
     action: &'a ActionKey,
     parent_path: Option<&'a str>,
+}
+
+fn can_use_action_rollups(filters: &BrowseFilters) -> bool {
+    filters.time_window.is_none() && filters.model.is_none()
+}
+
+fn is_path_browse(path: &BrowsePath) -> bool {
+    matches!(
+        path,
+        BrowsePath::ProjectAction { .. } | BrowsePath::CategoryActionProject { .. }
+    )
+}
+
+fn aggregate_action_request(
+    request: &BrowseRequest,
+    filters: &CompiledFilters,
+    windows: &Windows,
+    facts: &[ActionFact],
+) -> Result<Vec<RollupRow>> {
+    let rows = match (&request.root, &request.path) {
+        (RootView::ProjectHierarchy, BrowsePath::Root) => {
+            aggregate_projects(facts, filters, windows, request.lens, None, None, None)
+        }
+        (RootView::ProjectHierarchy, BrowsePath::Project { project_id }) => aggregate_categories(
+            facts,
+            filters,
+            windows,
+            request.lens,
+            Some(*project_id),
+            None,
+            None,
+        ),
+        (
+            RootView::ProjectHierarchy,
+            BrowsePath::ProjectCategory {
+                project_id,
+                category,
+            },
+        ) => aggregate_actions(
+            facts,
+            filters,
+            windows,
+            request.lens,
+            Some(*project_id),
+            Some(category),
+            None,
+        ),
+        (RootView::CategoryHierarchy, BrowsePath::Root) => {
+            aggregate_categories(facts, filters, windows, request.lens, None, None, None)
+        }
+        (RootView::CategoryHierarchy, BrowsePath::Category { category }) => aggregate_actions(
+            facts,
+            filters,
+            windows,
+            request.lens,
+            None,
+            Some(category),
+            None,
+        ),
+        (RootView::CategoryHierarchy, BrowsePath::CategoryAction { category, action }) => {
+            aggregate_projects(
+                facts,
+                filters,
+                windows,
+                request.lens,
+                None,
+                Some(category),
+                Some(action),
+            )
+        }
+        _ => {
+            bail!(
+                "browse path {:?} is incompatible with {:?}",
+                request.path,
+                request.root
+            )
+        }
+    };
+
+    Ok(rows)
+}
+
+fn aggregate_path_request(
+    request: &BrowseRequest,
+    filters: &CompiledFilters,
+    windows: &Windows,
+    facts: &[PathFact],
+) -> Result<Vec<RollupRow>> {
+    let rows = match (&request.root, &request.path) {
+        (
+            RootView::ProjectHierarchy,
+            BrowsePath::ProjectAction {
+                project_id,
+                category,
+                action,
+                parent_path,
+            },
+        ) => aggregate_paths(
+            facts,
+            filters,
+            windows,
+            request.lens,
+            PathBrowseScope {
+                project_id: *project_id,
+                category,
+                action,
+                parent_path: parent_path.as_deref(),
+            },
+        ),
+        (
+            RootView::CategoryHierarchy,
+            BrowsePath::CategoryActionProject {
+                category,
+                action,
+                project_id,
+                parent_path,
+            },
+        ) => aggregate_paths(
+            facts,
+            filters,
+            windows,
+            request.lens,
+            PathBrowseScope {
+                project_id: *project_id,
+                category,
+                action,
+                parent_path: parent_path.as_deref(),
+            },
+        ),
+        _ => {
+            bail!(
+                "browse path {:?} is incompatible with {:?}",
+                request.path,
+                request.root
+            )
+        }
+    };
+
+    Ok(rows)
+}
+
+fn apply_indicator_rows(rows: &mut [RollupRow], indicator_rows: Vec<RollupRow>) {
+    let indicators_by_key = indicator_rows
+        .into_iter()
+        .map(|row| (row.key, row.indicators))
+        .collect::<BTreeMap<_, _>>();
+
+    for row in rows {
+        if let Some(indicators) = indicators_by_key.get(&row.key) {
+            row.indicators.selected_lens_last_5_hours = indicators.selected_lens_last_5_hours;
+            row.indicators.selected_lens_last_week = indicators.selected_lens_last_week;
+        }
+    }
 }
 
 fn matches_timestamp(
@@ -1635,6 +2024,7 @@ mod tests {
                 path_refs: vec![project_a_root.join("src").join("lib.rs")],
             },
         )?;
+        refresh_chunk_fixture_aggregates(conn, refreshed_chunk_id)?;
 
         let still_pinned = engine.browse(&BrowseRequest {
             snapshot: pinned_snapshot.clone(),
@@ -1982,6 +2372,7 @@ mod tests {
                 path_refs: vec![project_a_root.join("src").join("lib.rs")],
             },
         )?;
+        refresh_chunk_fixture_aggregates(conn, chunk_a_id)?;
         seed_action(
             conn,
             SeedAction {
@@ -2002,6 +2393,7 @@ mod tests {
                 path_refs: Vec::new(),
             },
         )?;
+        refresh_chunk_fixture_aggregates(conn, chunk_a_id)?;
         seed_action(
             conn,
             SeedAction {
@@ -2022,6 +2414,7 @@ mod tests {
                 path_refs: vec![project_b_root.join("docs").join("README.md")],
             },
         )?;
+        refresh_chunk_fixture_aggregates(conn, chunk_b_id)?;
         seed_action(
             conn,
             SeedAction {
@@ -2042,6 +2435,7 @@ mod tests {
                 path_refs: Vec::new(),
             },
         )?;
+        refresh_chunk_fixture_aggregates(conn, chunk_b_id)?;
 
         Ok(Fixture { project_a_id })
     }
@@ -2323,6 +2717,44 @@ mod tests {
             )?;
         }
 
+        Ok(())
+    }
+
+    fn refresh_chunk_fixture_aggregates(conn: &Connection, import_chunk_id: i64) -> Result<()> {
+        conn.execute(
+            "
+            UPDATE import_chunk
+            SET
+                imported_record_count = (
+                    SELECT COUNT(*)
+                    FROM record
+                    WHERE import_chunk_id = ?1
+                ),
+                imported_message_count = (
+                    SELECT COUNT(*)
+                    FROM message
+                    WHERE import_chunk_id = ?1
+                ),
+                imported_action_count = (
+                    SELECT COUNT(*)
+                    FROM action
+                    WHERE import_chunk_id = ?1
+                ),
+                imported_conversation_count = (
+                    SELECT COUNT(DISTINCT conversation_id)
+                    FROM stream
+                    WHERE import_chunk_id = ?1
+                ),
+                imported_turn_count = (
+                    SELECT COUNT(*)
+                    FROM turn
+                    WHERE import_chunk_id = ?1
+                )
+            WHERE id = ?1
+            ",
+            [import_chunk_id],
+        )?;
+        crate::rollup::rebuild_chunk_action_rollups(conn, import_chunk_id)?;
         Ok(())
     }
 

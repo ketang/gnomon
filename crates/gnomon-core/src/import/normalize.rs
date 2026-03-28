@@ -85,7 +85,7 @@ pub fn normalize_jsonl_file(
     }
 
     let turn_count = state.build_turns(&mut tx)?;
-    state.finish_import(&mut tx)?;
+    state.finish_import(&mut tx, turn_count)?;
     tx.commit().context("unable to commit normalized import")?;
 
     Ok(NormalizeJsonlFileResult {
@@ -625,7 +625,7 @@ impl ImportState {
         Ok(turn_count)
     }
 
-    fn finish_import(&self, tx: &mut Transaction<'_>) -> Result<()> {
+    fn finish_import(&self, tx: &mut Transaction<'_>, turn_count: usize) -> Result<()> {
         let conversation = self
             .conversation
             .as_ref()
@@ -664,13 +664,16 @@ impl ImportState {
             UPDATE import_chunk
             SET
                 imported_record_count = imported_record_count + ?2,
-                imported_message_count = imported_message_count + ?3
+                imported_message_count = imported_message_count + ?3,
+                imported_conversation_count = imported_conversation_count + 1,
+                imported_turn_count = imported_turn_count + ?4
             WHERE id = ?1
             ",
             params![
                 self.params.import_chunk_id,
                 self.record_count as i64,
-                self.message_states.len() as i64
+                self.message_states.len() as i64,
+                turn_count as i64
             ],
         )
         .context("unable to update import chunk counters after normalization")?;

@@ -6,6 +6,7 @@ pub mod dirs;
 pub mod import;
 pub mod perf;
 pub mod query;
+pub(crate) mod rollup;
 pub mod validation;
 pub mod vcs;
 
