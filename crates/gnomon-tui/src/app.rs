@@ -54,6 +54,60 @@ enum QueryCacheDomain {
     SnapshotCoverage,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct BrowseFanoutRepeatedRequest {
+    signature: String,
+    count: usize,
+}
+
+#[derive(Debug, Default)]
+struct BrowseFanoutStats {
+    total_requests: usize,
+    requests: BTreeMap<String, usize>,
+}
+
+impl BrowseFanoutStats {
+    fn record(&mut self, request: &BrowseRequest) {
+        self.total_requests += 1;
+        let signature = browse_request_signature(request);
+        *self.requests.entry(signature).or_default() += 1;
+    }
+
+    fn total_requests(&self) -> usize {
+        self.total_requests
+    }
+
+    fn distinct_request_count(&self) -> usize {
+        self.requests.len()
+    }
+
+    fn duplicate_request_count(&self) -> usize {
+        self.total_requests.saturating_sub(self.requests.len())
+    }
+
+    fn repeated_requests(&self, limit: usize) -> Vec<BrowseFanoutRepeatedRequest> {
+        let mut repeated = self
+            .requests
+            .iter()
+            .filter(|(_, count)| **count > 1)
+            .map(|(signature, count)| BrowseFanoutRepeatedRequest {
+                signature: signature.clone(),
+                count: *count,
+            })
+            .collect::<Vec<_>>();
+
+        repeated.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.signature.cmp(&right.signature))
+        });
+
+        repeated.truncate(limit);
+        repeated
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct QueryCacheStats {
     hits: usize,
@@ -1699,7 +1753,11 @@ impl App {
             .map(|(parent_index, _)| parent_index)
     }
 
-    fn project_root_for(&mut self, project_id: i64) -> Result<Option<String>> {
+    fn project_root_for(
+        &mut self,
+        project_id: i64,
+        browse_stats: &mut BrowseFanoutStats,
+    ) -> Result<Option<String>> {
         let filters = self.current_query_filters()?;
         let relaxed_filters = BrowseFilters {
             time_window: filters.time_window,
@@ -1708,13 +1766,16 @@ impl App {
             action_category: None,
             action: None,
         };
-        let root_rows = self.cached_browse(BrowseRequest {
-            snapshot: self.snapshot.clone(),
-            root: RootView::ProjectHierarchy,
-            lens: self.ui_state.lens,
-            filters: relaxed_filters,
-            path: BrowsePath::Root,
-        })?;
+        let root_rows = self.cached_browse(
+            BrowseRequest {
+                snapshot: self.snapshot.clone(),
+                root: RootView::ProjectHierarchy,
+                lens: self.ui_state.lens,
+                filters: relaxed_filters,
+                path: BrowsePath::Root,
+            },
+            browse_stats,
+        )?;
 
         Ok(root_rows
             .into_iter()
@@ -1786,13 +1847,17 @@ impl App {
         }
 
         let filters = self.current_query_filters()?;
-        let rows = self.cached_browse(BrowseRequest {
-            snapshot: self.snapshot.clone(),
-            root: self.ui_state.root,
-            lens: self.ui_state.lens,
-            filters,
-            path: path.clone(),
-        })?;
+        let mut browse_stats = BrowseFanoutStats::default();
+        let rows = self.cached_browse(
+            BrowseRequest {
+                snapshot: self.snapshot.clone(),
+                root: self.ui_state.root,
+                lens: self.ui_state.lens,
+                filters,
+                path: path.clone(),
+            },
+            &mut browse_stats,
+        )?;
         self.cache_rows(path, rows.clone());
         Ok(rows)
     }
@@ -1893,46 +1958,52 @@ impl App {
         &mut self,
         filters: &BrowseFilters,
         path: &BrowsePath,
+        browse_stats: &mut BrowseFanoutStats,
     ) -> Result<RadialContext> {
         let mut perf = self.perf_scope_with_filters("tui.build_radial_context", filters);
+        let perf_logger = self.perf_logger.clone();
+        let conn = self.database.connection();
+        let query_engine = QueryEngine::with_perf(conn, perf_logger.clone());
         let project_root = match project_id_from_path(path) {
-            Some(project_id) => self.project_root_for(project_id)?,
+            Some(project_id) => project_root_for_state(
+                &mut self.query_cache,
+                &query_engine,
+                &self.snapshot,
+                self.ui_state.lens,
+                filters,
+                project_id,
+                browse_stats,
+            )?,
             None => None,
         };
-        let steps = radial_ancestor_steps(&self.ui_state.root, path, project_root.as_deref());
-        let mut ancestor_layers = Vec::new();
-        let mut current_span = RadialSpan::full();
-        let browse_started = Instant::now();
-
-        for step in steps {
-            let rows = self.cached_browse(BrowseRequest {
-                snapshot: self.snapshot.clone(),
-                root: self.ui_state.root,
-                lens: self.ui_state.lens,
-                filters: filters.clone(),
-                path: step.query_path,
-            })?;
-            let layer = build_radial_layer(
-                &rows,
-                self.ui_state.lens,
-                Some(&step.selected_child),
-                current_span,
-            );
-            current_span = radial_selected_child_span(&layer);
-            ancestor_layers.push(layer);
-        }
-
+        let radial_context = build_radial_context_for_state(
+            &mut self.query_cache,
+            &query_engine,
+            perf_logger,
+            RadialContextRequest {
+                snapshot: &self.snapshot,
+                ui_state: &self.ui_state,
+                filters,
+                project_root: project_root.as_deref(),
+            },
+            browse_stats,
+        )?;
+        perf.field("browse_request_count", browse_stats.total_requests());
         perf.field(
-            "browse_work_ms",
-            browse_started.elapsed().as_secs_f64() * 1000.0,
+            "distinct_browse_request_count",
+            browse_stats.distinct_request_count(),
         );
-        perf.field("ancestor_layer_count", ancestor_layers.len());
+        perf.field(
+            "duplicate_browse_request_count",
+            browse_stats.duplicate_request_count(),
+        );
+        perf.field(
+            "repeated_browse_requests",
+            browse_stats.repeated_requests(3),
+        );
         perf.finish_ok();
 
-        Ok(RadialContext {
-            ancestor_layers,
-            current_span,
-        })
+        Ok(radial_context)
     }
 
     fn next_request_sequence(&mut self) -> u64 {
@@ -2078,8 +2149,9 @@ impl App {
 
     fn refresh_active_context(&mut self, filters: &BrowseFilters) -> Result<()> {
         let active_path = self.active_path();
+        let mut browse_stats = BrowseFanoutStats::default();
         let project_root = match project_id_from_path(&active_path) {
-            Some(project_id) => self.project_root_for(project_id)?,
+            Some(project_id) => self.project_root_for(project_id, &mut browse_stats)?,
             None => None,
         };
         self.breadcrumb_targets = build_breadcrumb_targets(
@@ -2089,7 +2161,8 @@ impl App {
             project_root.as_deref(),
         );
         self.breadcrumb_picker.selected = self.breadcrumb_targets.len().saturating_sub(1);
-        self.radial_context = self.build_radial_context(filters, &active_path)?;
+        self.radial_context =
+            self.build_radial_context(filters, &active_path, &mut browse_stats)?;
         self.rebuild_radial_model();
         Ok(())
     }
@@ -2159,11 +2232,15 @@ impl App {
         QueryEngine::with_perf(self.database.connection(), self.perf_logger.clone())
     }
 
-    fn cached_browse(&mut self, request: BrowseRequest) -> Result<Vec<RollupRow>> {
+    fn cached_browse(
+        &mut self,
+        request: BrowseRequest,
+        browse_stats: &mut BrowseFanoutStats,
+    ) -> Result<Vec<RollupRow>> {
         let perf_logger = self.perf_logger.clone();
         let conn = self.database.connection();
         let query_engine = QueryEngine::with_perf(conn, perf_logger);
-        cached_browse(&mut self.query_cache, &query_engine, request)
+        cached_browse(&mut self.query_cache, &query_engine, request, browse_stats)
     }
 }
 
@@ -2368,11 +2445,17 @@ fn cached_browse(
     query_cache: &mut QueryResultCache,
     query_engine: &QueryEngine<'_>,
     request: BrowseRequest,
+    browse_stats: &mut BrowseFanoutStats,
 ) -> Result<Vec<RollupRow>> {
+    browse_stats.record(&request);
     let snapshot = request.snapshot.clone();
     query_cache.memoize(QueryCacheDomain::Browse, &snapshot, &request, || {
         query_engine.browse(&request)
     })
+}
+
+fn browse_request_signature(request: &BrowseRequest) -> String {
+    serde_json::to_string(request).unwrap_or_else(|error| format!("serialization error: {error:#}"))
 }
 
 fn cached_filter_options(
@@ -2411,6 +2494,7 @@ fn load_view_for_state(
     perf.field("lens", ui_state.lens);
     perf.field("row_filter", &ui_state.row_filter);
     perf.field("selected_key", &selected_key);
+    let mut browse_stats = BrowseFanoutStats::default();
 
     if let Some(progress) = progress {
         progress.step(1, VIEW_LOAD_PHASE_TOTAL, "loading filter options");
@@ -2453,6 +2537,7 @@ fn load_view_for_state(
         &snapshot,
         &ui_state,
         &filters,
+        &mut browse_stats,
     )?;
     perf.field(
         "browse_loop_ms",
@@ -2473,6 +2558,7 @@ fn load_view_for_state(
             ui_state.lens,
             &filters,
             project_id,
+            &mut browse_stats,
         )?,
         None => None,
     };
@@ -2505,10 +2591,13 @@ fn load_view_for_state(
         query_cache,
         query_engine,
         perf_logger.clone(),
-        &snapshot,
-        &ui_state,
-        &filters,
-        current_project_root.as_deref(),
+        RadialContextRequest {
+            snapshot: &snapshot,
+            ui_state: &ui_state,
+            filters: &filters,
+            project_root: current_project_root.as_deref(),
+        },
+        &mut browse_stats,
     )?;
     perf.field(
         "radial_context_ms",
@@ -2523,6 +2612,19 @@ fn load_view_for_state(
     perf.field(
         "snapshot_coverage_ms",
         coverage_started.elapsed().as_secs_f64() * 1000.0,
+    );
+    perf.field("browse_request_count", browse_stats.total_requests());
+    perf.field(
+        "distinct_browse_request_count",
+        browse_stats.distinct_request_count(),
+    );
+    perf.field(
+        "duplicate_browse_request_count",
+        browse_stats.duplicate_request_count(),
+    );
+    perf.field(
+        "repeated_browse_requests",
+        browse_stats.repeated_requests(5),
     );
     perf.finish_ok();
 
@@ -2557,6 +2659,7 @@ fn build_jump_targets_for_state(
     perf.field("path", &ui_state.path);
     perf.field("lens", ui_state.lens);
     perf.field("filters", &filters);
+    let mut browse_stats = BrowseFanoutStats::default();
     let mut targets = Vec::new();
     let mut project_count = 0usize;
     let mut category_count = 0usize;
@@ -2576,6 +2679,7 @@ fn build_jump_targets_for_state(
             filters: filters.clone(),
             path: BrowsePath::Root,
         },
+        &mut browse_stats,
     )?;
 
     for project in &project_root_rows {
@@ -2600,6 +2704,7 @@ fn build_jump_targets_for_state(
                 filters: filters.clone(),
                 path: BrowsePath::Project { project_id },
             },
+            &mut browse_stats,
         )?;
 
         for category in &categories {
@@ -2630,6 +2735,7 @@ fn build_jump_targets_for_state(
                         category: category_name.clone(),
                     },
                 },
+                &mut browse_stats,
             )?;
 
             for action in actions {
@@ -2665,6 +2771,7 @@ fn build_jump_targets_for_state(
             filters: filters.clone(),
             path: BrowsePath::Root,
         },
+        &mut browse_stats,
     )?;
 
     for category in &category_root_rows {
@@ -2693,6 +2800,7 @@ fn build_jump_targets_for_state(
                     category: category_name.clone(),
                 },
             },
+            &mut browse_stats,
         )?;
 
         for action in &actions {
@@ -2723,6 +2831,7 @@ fn build_jump_targets_for_state(
                         action: action_key,
                     },
                 },
+                &mut browse_stats,
             )?;
 
             for project in projects {
@@ -2759,6 +2868,19 @@ fn build_jump_targets_for_state(
     perf.field("category_count", category_count);
     perf.field("action_count", action_count);
     perf.field("target_count", targets.len());
+    perf.field("browse_request_count", browse_stats.total_requests());
+    perf.field(
+        "distinct_browse_request_count",
+        browse_stats.distinct_request_count(),
+    );
+    perf.field(
+        "duplicate_browse_request_count",
+        browse_stats.duplicate_request_count(),
+    );
+    perf.field(
+        "repeated_browse_requests",
+        browse_stats.repeated_requests(5),
+    );
     perf.finish_ok();
 
     Ok(targets)
@@ -2770,6 +2892,7 @@ fn browse_rows_with_parent_fallback(
     snapshot: &SnapshotBounds,
     ui_state: &PersistedUiState,
     filters: &BrowseFilters,
+    browse_stats: &mut BrowseFanoutStats,
 ) -> Result<(BrowsePath, Vec<RollupRow>)> {
     let mut path = ui_state.path.clone();
 
@@ -2784,6 +2907,7 @@ fn browse_rows_with_parent_fallback(
                 filters: filters.clone(),
                 path: path.clone(),
             },
+            browse_stats,
         )?;
 
         if !rows.is_empty() || matches!(path, BrowsePath::Root) {
@@ -2798,6 +2922,7 @@ fn browse_rows_with_parent_fallback(
                 ui_state.lens,
                 filters,
                 project_id,
+                browse_stats,
             )?,
             None => None,
         };
@@ -2809,22 +2934,31 @@ fn browse_rows_with_parent_fallback(
     }
 }
 
+struct RadialContextRequest<'a> {
+    snapshot: &'a SnapshotBounds,
+    ui_state: &'a PersistedUiState,
+    filters: &'a BrowseFilters,
+    project_root: Option<&'a str>,
+}
+
 fn build_radial_context_for_state(
     query_cache: &mut QueryResultCache,
     query_engine: &QueryEngine<'_>,
     perf_logger: Option<PerfLogger>,
-    snapshot: &SnapshotBounds,
-    ui_state: &PersistedUiState,
-    filters: &BrowseFilters,
-    project_root: Option<&str>,
+    request: RadialContextRequest<'_>,
+    browse_stats: &mut BrowseFanoutStats,
 ) -> Result<RadialContext> {
     let mut perf = PerfScope::new(perf_logger, "tui.build_radial_context");
-    perf.field("snapshot", snapshot);
-    perf.field("root", ui_state.root);
-    perf.field("path", &ui_state.path);
-    perf.field("lens", ui_state.lens);
-    perf.field("filters", filters);
-    let steps = radial_ancestor_steps(&ui_state.root, &ui_state.path, project_root);
+    perf.field("snapshot", request.snapshot);
+    perf.field("root", request.ui_state.root);
+    perf.field("path", &request.ui_state.path);
+    perf.field("lens", request.ui_state.lens);
+    perf.field("filters", request.filters);
+    let steps = radial_ancestor_steps(
+        &request.ui_state.root,
+        &request.ui_state.path,
+        request.project_root,
+    );
     let mut ancestor_layers = Vec::new();
     let mut current_span = RadialSpan::full();
     let browse_started = Instant::now();
@@ -2834,16 +2968,17 @@ fn build_radial_context_for_state(
             query_cache,
             query_engine,
             BrowseRequest {
-                snapshot: snapshot.clone(),
-                root: ui_state.root,
-                lens: ui_state.lens,
-                filters: filters.clone(),
+                snapshot: request.snapshot.clone(),
+                root: request.ui_state.root,
+                lens: request.ui_state.lens,
+                filters: request.filters.clone(),
                 path: step.query_path,
             },
+            browse_stats,
         )?;
         let layer = build_radial_layer(
             &rows,
-            ui_state.lens,
+            request.ui_state.lens,
             Some(&step.selected_child),
             current_span,
         );
@@ -2856,6 +2991,19 @@ fn build_radial_context_for_state(
         browse_started.elapsed().as_secs_f64() * 1000.0,
     );
     perf.field("ancestor_layer_count", ancestor_layers.len());
+    perf.field("browse_request_count", browse_stats.total_requests());
+    perf.field(
+        "distinct_browse_request_count",
+        browse_stats.distinct_request_count(),
+    );
+    perf.field(
+        "duplicate_browse_request_count",
+        browse_stats.duplicate_request_count(),
+    );
+    perf.field(
+        "repeated_browse_requests",
+        browse_stats.repeated_requests(5),
+    );
     perf.finish_ok();
 
     Ok(RadialContext {
@@ -2871,6 +3019,7 @@ fn project_root_for_state(
     lens: MetricLens,
     filters: &BrowseFilters,
     project_id: i64,
+    browse_stats: &mut BrowseFanoutStats,
 ) -> Result<Option<String>> {
     let relaxed_filters = BrowseFilters {
         time_window: filters.time_window.clone(),
@@ -2889,6 +3038,7 @@ fn project_root_for_state(
             filters: relaxed_filters,
             path: BrowsePath::Root,
         },
+        browse_stats,
     )?;
 
     Ok(root_rows
@@ -5121,10 +5271,13 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use anyhow::Result;
+    use anyhow::{Context, Result};
     use gnomon_core::config::RuntimeConfig;
+    use gnomon_core::db::Database;
     use gnomon_core::import::StartupOpenReason;
-    use gnomon_core::query::{ClassificationState, SnapshotBounds};
+    use gnomon_core::perf::PerfLogger;
+    use gnomon_core::query::{ClassificationState, QueryEngine, SnapshotBounds};
+    use gnomon_core::validation::{ScaleValidationSpec, run_scale_validation};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use serde_json::Value;
@@ -5975,6 +6128,120 @@ mod tests {
                 .any(|op| op == "tui.refresh_snapshot_status")
         );
         assert!(operations.iter().any(|op| op == "query.filter_options"));
+        Ok(())
+    }
+
+    #[test]
+    fn browse_fanout_logs_duplicate_reload_requests_on_project_path() -> Result<()> {
+        let temp = tempdir()?;
+        let validation = run_scale_validation(
+            temp.path(),
+            ScaleValidationSpec {
+                project_count: 1,
+                day_count: 2,
+                sessions_per_day: 1,
+            },
+        )?;
+
+        let log_path = temp.path().join("perf.jsonl");
+        let logger = PerfLogger::open(log_path.clone())?;
+
+        let project_id = {
+            let database = Database::open_read_only(&validation.db_path)?;
+            let engine = QueryEngine::new(database.connection());
+            engine
+                .filter_options(&validation.final_snapshot)?
+                .projects
+                .first()
+                .context("expected a visible project in the validation fixture")?
+                .id
+        };
+
+        let _app = App::new(
+            RuntimeConfig {
+                app_name: "gnomon",
+                state_dir: temp.path().to_path_buf(),
+                db_path: validation.db_path.clone(),
+                source_root: validation.source_root.clone(),
+            },
+            validation.final_snapshot.clone(),
+            StartupOpenReason::Last24hReady,
+            None,
+            Some(StartupBrowseState {
+                root: RootView::ProjectHierarchy,
+                path: BrowsePath::Project { project_id },
+            }),
+            None,
+            Some(logger.clone()),
+        )?;
+
+        let mut query_cache = QueryResultCache::default();
+        let database = Database::open_read_only(&validation.db_path)?;
+        let query_engine = QueryEngine::with_perf(database.connection(), Some(logger.clone()));
+        let ui_state = PersistedUiState {
+            root: RootView::ProjectHierarchy,
+            path: BrowsePath::Project { project_id },
+            project_id: None,
+            ..PersistedUiState::default()
+        };
+
+        let _targets = build_jump_targets_for_state(
+            &query_engine,
+            &mut query_cache,
+            Some(logger),
+            validation.final_snapshot.clone(),
+            ui_state,
+            None,
+        )?;
+
+        let payloads = std::fs::read_to_string(log_path)?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let reload = payloads
+            .iter()
+            .find(|payload| payload["operation"] == "tui.reload_view")
+            .context("missing reload perf event")?;
+        let jump = payloads
+            .iter()
+            .find(|payload| payload["operation"] == "tui.build_jump_targets")
+            .context("missing jump-target perf event")?;
+
+        println!(
+            "reload fanout: total={} distinct={} duplicate={} repeated={:?}",
+            reload["browse_request_count"].as_u64().unwrap_or(0),
+            reload["distinct_browse_request_count"]
+                .as_u64()
+                .unwrap_or(0),
+            reload["duplicate_browse_request_count"]
+                .as_u64()
+                .unwrap_or(0),
+            reload["repeated_browse_requests"],
+        );
+        println!(
+            "jump fanout: total={} distinct={} duplicate={} repeated={:?}",
+            jump["browse_request_count"].as_u64().unwrap_or(0),
+            jump["distinct_browse_request_count"].as_u64().unwrap_or(0),
+            jump["duplicate_browse_request_count"].as_u64().unwrap_or(0),
+            jump["repeated_browse_requests"],
+        );
+
+        assert!(
+            reload["duplicate_browse_request_count"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+        );
+        assert!(
+            reload["repeated_browse_requests"]
+                .as_array()
+                .is_some_and(|requests| requests
+                    .iter()
+                    .any(|request| request["count"].as_u64().unwrap_or(0) > 1))
+        );
+        assert!(jump["browse_request_count"].as_u64().unwrap_or(0) > 0);
+
         Ok(())
     }
 
