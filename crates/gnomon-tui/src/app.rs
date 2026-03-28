@@ -4525,6 +4525,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )?;
 
         let content = render_app_to_string(&mut app, 140, 40)?;
@@ -4551,6 +4552,7 @@ mod tests {
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
             None,
             None,
             None,
