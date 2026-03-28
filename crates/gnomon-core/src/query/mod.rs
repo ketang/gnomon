@@ -288,6 +288,93 @@ pub struct QueryEngine<'conn> {
     conn: &'conn Connection,
 }
 
+const LATEST_SNAPSHOT_BOUNDS_SQL: &str = "
+    SELECT
+        MAX(publish_seq),
+        COUNT(*),
+        MAX(completed_at_utc)
+    FROM import_chunk
+    WHERE state = 'complete' AND publish_seq IS NOT NULL
+";
+
+const LOAD_ACTION_FACTS_SQL: &str = "
+    SELECT
+        p.id,
+        p.display_name,
+        p.root_path,
+        a.category,
+        a.normalized_action,
+        a.command_family,
+        a.base_command,
+        a.classification_state,
+        COALESCE(a.ended_at_utc, a.started_at_utc),
+        COALESCE(a.input_tokens, 0),
+        COALESCE(a.cache_creation_input_tokens, 0),
+        COALESCE(a.cache_read_input_tokens, 0),
+        COALESCE(a.output_tokens, 0),
+        GROUP_CONCAT(DISTINCT m.model_name)
+    FROM action a
+    JOIN import_chunk ic ON ic.id = a.import_chunk_id
+    JOIN project p ON p.id = ic.project_id
+    LEFT JOIN action_message am ON am.action_id = a.id
+    LEFT JOIN message m ON m.id = am.message_id
+    WHERE ic.state = 'complete'
+      AND ic.publish_seq IS NOT NULL
+      AND ic.publish_seq <= ?1
+    GROUP BY
+        a.id,
+        p.id,
+        p.display_name,
+        p.root_path,
+        a.category,
+        a.normalized_action,
+        a.command_family,
+        a.base_command,
+        a.classification_state,
+        a.ended_at_utc,
+        a.started_at_utc,
+        a.input_tokens,
+        a.cache_creation_input_tokens,
+        a.cache_read_input_tokens,
+        a.output_tokens
+";
+
+const LOAD_PATH_FACTS_SQL: &str = "
+    WITH message_ref_counts AS (
+        SELECT message_id, COUNT(*) AS ref_count
+        FROM message_path_ref
+        GROUP BY message_id
+    )
+    SELECT
+        p.id,
+        p.root_path,
+        a.category,
+        a.normalized_action,
+        a.command_family,
+        a.base_command,
+        a.classification_state,
+        COALESCE(m.completed_at_utc, m.created_at_utc),
+        COALESCE(m.input_tokens, 0),
+        COALESCE(m.cache_creation_input_tokens, 0),
+        COALESCE(m.cache_read_input_tokens, 0),
+        COALESCE(m.output_tokens, 0),
+        m.model_name,
+        pn.full_path,
+        rc.ref_count
+    FROM action a
+    JOIN import_chunk ic ON ic.id = a.import_chunk_id
+    JOIN project p ON p.id = ic.project_id
+    JOIN action_message am ON am.action_id = a.id
+    JOIN message m ON m.id = am.message_id
+    JOIN message_path_ref mpr ON mpr.message_id = m.id
+    JOIN path_node pn ON pn.id = mpr.path_node_id
+    JOIN message_ref_counts rc ON rc.message_id = m.id
+    WHERE ic.state = 'complete'
+      AND ic.publish_seq IS NOT NULL
+      AND ic.publish_seq <= ?1
+      AND pn.node_kind = 'file'
+";
+
 impl<'conn> QueryEngine<'conn> {
     pub fn new(conn: &'conn Connection) -> Self {
         Self { conn }
@@ -296,24 +383,13 @@ impl<'conn> QueryEngine<'conn> {
     pub fn latest_snapshot_bounds(&self) -> Result<SnapshotBounds> {
         let row = self
             .conn
-            .query_row(
-                "
-                SELECT
-                    MAX(publish_seq),
-                    COUNT(*),
-                    MAX(completed_at_utc)
-                FROM import_chunk
-                WHERE state = 'complete' AND publish_seq IS NOT NULL
-                ",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<i64>>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
-            )
+            .query_row(LATEST_SNAPSHOT_BOUNDS_SQL, [], |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
             .context("unable to compute the latest published snapshot bounds")?;
 
         let Some(max_publish_seq) = row.0 else {
@@ -510,54 +586,24 @@ impl<'conn> QueryEngine<'conn> {
         })
     }
 
+    pub fn latest_snapshot_bounds_query_plan(&self) -> Result<Vec<String>> {
+        self.explain_query_plan(LATEST_SNAPSHOT_BOUNDS_SQL)
+    }
+
+    pub fn action_facts_query_plan(&self, snapshot: &SnapshotBounds) -> Result<Vec<String>> {
+        self.explain_query_plan_with_snapshot(LOAD_ACTION_FACTS_SQL, snapshot)
+    }
+
+    pub fn path_facts_query_plan(&self, snapshot: &SnapshotBounds) -> Result<Vec<String>> {
+        self.explain_query_plan_with_snapshot(LOAD_PATH_FACTS_SQL, snapshot)
+    }
+
     fn load_action_facts(&self, snapshot: &SnapshotBounds) -> Result<Vec<ActionFact>> {
         if snapshot.max_publish_seq == 0 {
             return Ok(Vec::new());
         }
 
-        let mut stmt = self.conn.prepare(
-            "
-            SELECT
-                p.id,
-                p.display_name,
-                p.root_path,
-                a.category,
-                a.normalized_action,
-                a.command_family,
-                a.base_command,
-                a.classification_state,
-                COALESCE(a.ended_at_utc, a.started_at_utc),
-                COALESCE(a.input_tokens, 0),
-                COALESCE(a.cache_creation_input_tokens, 0),
-                COALESCE(a.cache_read_input_tokens, 0),
-                COALESCE(a.output_tokens, 0),
-                GROUP_CONCAT(DISTINCT m.model_name)
-            FROM action a
-            JOIN import_chunk ic ON ic.id = a.import_chunk_id
-            JOIN project p ON p.id = ic.project_id
-            LEFT JOIN action_message am ON am.action_id = a.id
-            LEFT JOIN message m ON m.id = am.message_id
-            WHERE ic.state = 'complete'
-              AND ic.publish_seq IS NOT NULL
-              AND ic.publish_seq <= ?1
-            GROUP BY
-                a.id,
-                p.id,
-                p.display_name,
-                p.root_path,
-                a.category,
-                a.normalized_action,
-                a.command_family,
-                a.base_command,
-                a.classification_state,
-                a.ended_at_utc,
-                a.started_at_utc,
-                a.input_tokens,
-                a.cache_creation_input_tokens,
-                a.cache_read_input_tokens,
-                a.output_tokens
-            ",
-        )?;
+        let mut stmt = self.conn.prepare(LOAD_ACTION_FACTS_SQL)?;
 
         let rows = stmt.query_map([snapshot.max_publish_seq as i64], |row| {
             Ok(LoadedActionFact {
@@ -609,43 +655,7 @@ impl<'conn> QueryEngine<'conn> {
             return Ok(Vec::new());
         }
 
-        let mut stmt = self.conn.prepare(
-            "
-            WITH message_ref_counts AS (
-                SELECT message_id, COUNT(*) AS ref_count
-                FROM message_path_ref
-                GROUP BY message_id
-            )
-            SELECT
-                p.id,
-                p.root_path,
-                a.category,
-                a.normalized_action,
-                a.command_family,
-                a.base_command,
-                a.classification_state,
-                COALESCE(m.completed_at_utc, m.created_at_utc),
-                COALESCE(m.input_tokens, 0),
-                COALESCE(m.cache_creation_input_tokens, 0),
-                COALESCE(m.cache_read_input_tokens, 0),
-                COALESCE(m.output_tokens, 0),
-                m.model_name,
-                pn.full_path,
-                rc.ref_count
-            FROM action a
-            JOIN import_chunk ic ON ic.id = a.import_chunk_id
-            JOIN project p ON p.id = ic.project_id
-            JOIN action_message am ON am.action_id = a.id
-            JOIN message m ON m.id = am.message_id
-            JOIN message_path_ref mpr ON mpr.message_id = m.id
-            JOIN path_node pn ON pn.id = mpr.path_node_id
-            JOIN message_ref_counts rc ON rc.message_id = m.id
-            WHERE ic.state = 'complete'
-              AND ic.publish_seq IS NOT NULL
-              AND ic.publish_seq <= ?1
-              AND pn.node_kind = 'file'
-            ",
-        )?;
+        let mut stmt = self.conn.prepare(LOAD_PATH_FACTS_SQL)?;
 
         let rows = stmt.query_map([snapshot.max_publish_seq as i64], |row| {
             Ok(LoadedPathFact {
@@ -694,6 +704,34 @@ impl<'conn> QueryEngine<'conn> {
             })
         })
         .collect()
+    }
+
+    fn explain_query_plan(&self, sql: &str) -> Result<Vec<String>> {
+        let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
+        let mut stmt = self
+            .conn
+            .prepare(&explain_sql)
+            .context("unable to prepare EXPLAIN QUERY PLAN statement")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(3))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("unable to read EXPLAIN QUERY PLAN rows")
+    }
+
+    fn explain_query_plan_with_snapshot(
+        &self,
+        sql: &str,
+        snapshot: &SnapshotBounds,
+    ) -> Result<Vec<String>> {
+        let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
+        let max_publish_seq = i64::try_from(snapshot.max_publish_seq)
+            .context("snapshot publish_seq overflowed i64 for EXPLAIN QUERY PLAN")?;
+        let mut stmt = self
+            .conn
+            .prepare(&explain_sql)
+            .context("unable to prepare EXPLAIN QUERY PLAN statement")?;
+        let rows = stmt.query_map([max_publish_seq], |row| row.get::<_, String>(3))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("unable to read EXPLAIN QUERY PLAN rows")
     }
 }
 
