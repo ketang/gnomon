@@ -143,7 +143,7 @@ pub struct ActionKey {
 }
 
 impl ActionKey {
-    fn label(&self) -> String {
+    pub fn label(&self) -> String {
         match self.classification_state {
             ClassificationState::Classified => self
                 .normalized_action
@@ -151,8 +151,8 @@ impl ActionKey {
                 .or_else(|| self.base_command.clone())
                 .or_else(|| self.command_family.clone())
                 .unwrap_or_else(|| "classified".to_string()),
-            ClassificationState::Mixed => "mixed".to_string(),
-            ClassificationState::Unclassified => "unclassified".to_string(),
+            ClassificationState::Mixed => "[mixed]".to_string(),
+            ClassificationState::Unclassified => "[unclassified]".to_string(),
         }
     }
 
@@ -246,6 +246,14 @@ impl MetricTotals {
             MetricLens::Total => self.total,
         }
     }
+
+    fn is_zero_value(&self) -> bool {
+        self.uncached_input == 0.0
+            && self.cached_input == 0.0
+            && self.gross_input == 0.0
+            && self.output == 0.0
+            && self.total == 0.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -253,6 +261,14 @@ pub struct MetricIndicators {
     pub selected_lens_last_5_hours: f64,
     pub selected_lens_last_week: f64,
     pub uncached_input_reference: f64,
+}
+
+impl MetricIndicators {
+    fn is_zero_value(&self) -> bool {
+        self.selected_lens_last_5_hours == 0.0
+            && self.selected_lens_last_week == 0.0
+            && self.uncached_input_reference == 0.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -267,6 +283,12 @@ pub struct RollupRow {
     pub category: Option<String>,
     pub action: Option<ActionKey>,
     pub full_path: Option<String>,
+}
+
+impl RollupRow {
+    fn is_zero_value(&self) -> bool {
+        self.metrics.is_zero_value() && self.indicators.is_zero_value()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,8 +349,8 @@ const SNAPSHOT_COVERAGE_SUMMARY_SQL: &str = "
 const DISPLAY_CATEGORY_SQL: &str = "
     CASE
         WHEN a.category IS NOT NULL THEN a.category
-        WHEN a.classification_state = 'mixed' THEN 'mixed'
-        WHEN a.classification_state = 'unclassified' THEN 'unclassified'
+        WHEN a.classification_state = 'mixed' THEN '[mixed]'
+        WHEN a.classification_state = 'unclassified' THEN '[unclassified]'
         ELSE 'classified'
     END
 ";
@@ -669,6 +691,10 @@ impl<'conn> QueryEngine<'conn> {
             "aggregate_ms",
             aggregate_started.elapsed().as_secs_f64() * 1000.0,
         );
+
+        // Hide rows that have no visible usage contribution; item counts alone should not keep
+        // an aggregate row on screen.
+        rows.retain(|row| !row.is_zero_value());
 
         let sort_started = Instant::now();
         rows.sort_by(|left, right| {
@@ -2060,8 +2086,8 @@ fn display_category(raw_category: Option<&str>, classification_state: &str) -> R
     }
 
     match parse_classification_state(classification_state)? {
-        ClassificationState::Mixed => Ok("mixed".to_string()),
-        ClassificationState::Unclassified => Ok("unclassified".to_string()),
+        ClassificationState::Mixed => Ok("[mixed]".to_string()),
+        ClassificationState::Unclassified => Ok("[unclassified]".to_string()),
         ClassificationState::Classified => Ok("classified".to_string()),
     }
 }
@@ -2089,7 +2115,7 @@ mod tests {
     use super::{
         ActionKey, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState, FilterOptions,
         MetricLens, QueryEngine, RootView, SnapshotBounds, SnapshotCoverageSummary,
-        TimeWindowFilter,
+        TimeWindowFilter, display_category,
     };
 
     #[test]
@@ -2246,7 +2272,7 @@ mod tests {
                 project_id: fixture.project_a_id,
                 project_root: &project_a_root,
                 import_chunk_id: refreshed_chunk_id,
-                category: Some("Editing"),
+                category: Some("editing"),
                 normalized_action: Some("read file"),
                 command_family: None,
                 base_command: None,
@@ -2345,7 +2371,7 @@ mod tests {
             path: BrowsePath::Root,
         })?;
         let labels: Vec<_> = time_filtered.iter().map(|row| row.label.as_str()).collect();
-        assert_eq!(labels, vec!["Editing", "test/build/run"]);
+        assert_eq!(labels, vec!["editing", "test/build/run"]);
 
         let category_rows = engine.browse(&BrowseRequest {
             snapshot,
@@ -2357,8 +2383,126 @@ mod tests {
             },
         })?;
         assert_eq!(category_rows.len(), 2);
-        assert_eq!(category_rows[0].label, "Editing");
+        assert_eq!(category_rows[0].label, "editing");
         assert_eq!(category_rows[0].metrics.uncached_input, 5.0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn zero_value_aggregate_rows_are_hidden_across_roots_and_filters() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let conn = db.connection_mut();
+        let fixture = seed_query_fixture(conn, temp.path())?;
+        let project_a_root = temp.path().join("project-a");
+
+        let zero_chunk_id = insert_import_chunk(
+            conn,
+            fixture.project_a_id,
+            "2026-03-28",
+            "complete",
+            Some(3),
+            Some("2026-03-28T09:00:00Z"),
+        )?;
+        seed_action(
+            conn,
+            SeedAction {
+                project_id: fixture.project_a_id,
+                project_root: &project_a_root,
+                import_chunk_id: zero_chunk_id,
+                category: Some("Inactive"),
+                normalized_action: Some("do nothing"),
+                command_family: None,
+                base_command: None,
+                classification_state: "classified",
+                timestamp_utc: "2026-03-28T09:00:00Z",
+                model_name: Some("claude-zero"),
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: 0,
+                path_refs: vec![project_a_root.join("src").join("idle.rs")],
+            },
+        )?;
+        refresh_chunk_fixture_aggregates(conn, zero_chunk_id)?;
+
+        let engine = QueryEngine::new(conn);
+        let snapshot = engine.latest_snapshot_bounds()?;
+
+        let project_rows = engine.browse(&BrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            path: BrowsePath::Project {
+                project_id: fixture.project_a_id,
+            },
+        })?;
+        let project_labels = project_rows
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(project_labels, vec!["editing", "test/build/run"]);
+
+        let category_rows = engine.browse(&BrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::CategoryHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            path: BrowsePath::Root,
+        })?;
+        let category_labels = category_rows
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            category_labels,
+            vec![
+                "editing",
+                "test/build/run",
+                "[mixed]",
+                "documentation writing",
+            ]
+        );
+
+        let zero_category_filtered = engine.browse(&BrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters {
+                action_category: Some("Inactive".to_string()),
+                ..BrowseFilters::default()
+            },
+            path: BrowsePath::Project {
+                project_id: fixture.project_a_id,
+            },
+        })?;
+        assert!(zero_category_filtered.is_empty());
+
+        let zero_category_filtered_root = engine.browse(&BrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::CategoryHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters {
+                action_category: Some("Inactive".to_string()),
+                ..BrowseFilters::default()
+            },
+            path: BrowsePath::Root,
+        })?;
+        assert!(zero_category_filtered_root.is_empty());
+
+        let zero_category_rows = engine.browse(&BrowseRequest {
+            snapshot,
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            path: BrowsePath::ProjectCategory {
+                project_id: fixture.project_a_id,
+                category: "Inactive".to_string(),
+            },
+        })?;
+        assert!(zero_category_rows.is_empty());
 
         Ok(())
     }
@@ -2383,9 +2527,9 @@ mod tests {
         assert_eq!(
             labels,
             vec![
-                "Editing",
+                "editing",
                 "test/build/run",
-                "mixed",
+                "[mixed]",
                 "documentation writing"
             ]
         );
@@ -2402,7 +2546,7 @@ mod tests {
             lens: MetricLens::UncachedInput,
             filters: BrowseFilters::default(),
             path: BrowsePath::Category {
-                category: "Editing".to_string(),
+                category: "editing".to_string(),
             },
         })?;
         assert_eq!(action_rows.len(), 1);
@@ -2414,7 +2558,7 @@ mod tests {
             lens: MetricLens::UncachedInput,
             filters: BrowseFilters::default(),
             path: BrowsePath::CategoryAction {
-                category: "Editing".to_string(),
+                category: "editing".to_string(),
                 action: editing_action.clone(),
             },
         })?;
@@ -2428,7 +2572,7 @@ mod tests {
             filters: BrowseFilters::default(),
             path: BrowsePath::ProjectAction {
                 project_id: fixture.project_a_id,
-                category: "Editing".to_string(),
+                category: "editing".to_string(),
                 action: editing_action.clone(),
                 parent_path: None,
             },
@@ -2445,7 +2589,7 @@ mod tests {
             filters: BrowseFilters::default(),
             path: BrowsePath::ProjectAction {
                 project_id: fixture.project_a_id,
-                category: "Editing".to_string(),
+                category: "editing".to_string(),
                 action: editing_action,
                 parent_path: path_rows[0].full_path.clone(),
             },
@@ -2502,21 +2646,21 @@ mod tests {
                 ],
                 models: vec!["claude-haiku".to_string(), "claude-opus".to_string()],
                 categories: vec![
-                    "Editing".to_string(),
+                    "[mixed]".to_string(),
                     "documentation writing".to_string(),
-                    "mixed".to_string(),
+                    "editing".to_string(),
                     "test/build/run".to_string(),
                 ],
                 actions: vec![
                     super::ActionFilterOption {
-                        category: "Editing".to_string(),
+                        category: "[mixed]".to_string(),
                         action: ActionKey {
-                            classification_state: ClassificationState::Classified,
-                            normalized_action: Some("read file".to_string()),
+                            classification_state: ClassificationState::Mixed,
+                            normalized_action: None,
                             command_family: None,
                             base_command: None,
                         },
-                        label: "read file".to_string(),
+                        label: "[mixed]".to_string(),
                     },
                     super::ActionFilterOption {
                         category: "documentation writing".to_string(),
@@ -2529,14 +2673,14 @@ mod tests {
                         label: "document write".to_string(),
                     },
                     super::ActionFilterOption {
-                        category: "mixed".to_string(),
+                        category: "editing".to_string(),
                         action: ActionKey {
-                            classification_state: ClassificationState::Mixed,
-                            normalized_action: None,
+                            classification_state: ClassificationState::Classified,
+                            normalized_action: Some("read file".to_string()),
                             command_family: None,
                             base_command: None,
                         },
-                        label: "mixed".to_string(),
+                        label: "read file".to_string(),
                     },
                     super::ActionFilterOption {
                         category: "test/build/run".to_string(),
@@ -2553,6 +2697,39 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn special_state_labels_are_bracketed() {
+        assert_eq!(
+            ActionKey {
+                classification_state: ClassificationState::Mixed,
+                normalized_action: None,
+                command_family: None,
+                base_command: None,
+            }
+            .label(),
+            "[mixed]"
+        );
+        assert_eq!(
+            ActionKey {
+                classification_state: ClassificationState::Unclassified,
+                normalized_action: None,
+                command_family: None,
+                base_command: None,
+            }
+            .label(),
+            "[unclassified]"
+        );
+        assert_eq!(
+            display_category(None, "mixed").expect("mixed should map to a display label"),
+            "[mixed]"
+        );
+        assert_eq!(
+            display_category(None, "unclassified")
+                .expect("unclassified should map to a display label"),
+            "[unclassified]"
+        );
     }
 
     #[derive(Debug)]
@@ -2594,7 +2771,7 @@ mod tests {
                 project_id: project_a_id,
                 project_root: &project_a_root,
                 import_chunk_id: chunk_a_id,
-                category: Some("Editing"),
+                category: Some("editing"),
                 normalized_action: Some("read file"),
                 command_family: None,
                 base_command: None,

@@ -77,6 +77,9 @@ cargo run -p gnomon -- db rebuild
 Both commands honor the existing `--db` and `--source-root` overrides.
 `reset` is destructive and requires `--force`. `rebuild` recreates the cache
 from the source manifest and session history without opening the TUI.
+If you pull a version that renames derived taxonomy labels, such as `Editing`
+to `editing` or bracketed special-state labels like `[mixed]`, run `db rebuild`
+to refresh existing cached aggregates and filters.
 
 ## Non-Interactive Reports
 

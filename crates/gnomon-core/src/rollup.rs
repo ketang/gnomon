@@ -24,8 +24,8 @@ const INSERT_CHUNK_ACTION_ROLLUPS_SQL: &str = "
         action.import_chunk_id,
         CASE
             WHEN action.category IS NOT NULL THEN action.category
-            WHEN action.classification_state = 'mixed' THEN 'mixed'
-            WHEN action.classification_state = 'unclassified' THEN 'unclassified'
+            WHEN action.classification_state = 'mixed' THEN '[mixed]'
+            WHEN action.classification_state = 'unclassified' THEN '[unclassified]'
             ELSE 'classified'
         END AS display_category,
         action.classification_state,

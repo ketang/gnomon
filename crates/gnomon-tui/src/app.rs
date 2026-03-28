@@ -456,6 +456,62 @@ fn render_pending_request(request: PendingRequest) -> String {
     }
 }
 
+fn badge(label: impl Into<String>, tone: BadgeTone) -> Span<'static> {
+    Span::styled(format!("[{}]", label.into()), badge_style(tone))
+}
+
+fn separator_span() -> Span<'static> {
+    Span::styled(
+        " │ ",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BadgeTone {
+    Accent,
+    Info,
+    Success,
+    Warning,
+    Muted,
+}
+
+fn badge_style(tone: BadgeTone) -> Style {
+    match tone {
+        BadgeTone::Accent => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        BadgeTone::Info => Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+        BadgeTone::Success => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+        BadgeTone::Warning => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        BadgeTone::Muted => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    }
+}
+
+fn snapshot_state_badge(snapshot: &SnapshotBounds, has_newer_snapshot: bool) -> Span<'static> {
+    if snapshot.is_bootstrap() {
+        if has_newer_snapshot {
+            badge("waiting", BadgeTone::Warning)
+        } else {
+            badge("empty", BadgeTone::Muted)
+        }
+    } else if has_newer_snapshot {
+        badge("new data", BadgeTone::Success)
+    } else {
+        badge("pinned", BadgeTone::Accent)
+    }
+}
+
 fn spinner_frame_for(updated_at: Instant) -> &'static str {
     let frame = (updated_at.elapsed().as_millis() / 250) as usize % ACTIVITY_SPINNER_FRAMES.len();
     ACTIVITY_SPINNER_FRAMES[frame]
@@ -725,21 +781,52 @@ impl App {
     fn render_header(&self, frame: &mut Frame<'_>, area: Rect) {
         let mut lines = vec![
             Line::from(vec![
+                Span::styled("▣ ", Style::default().fg(Color::Cyan)),
                 Span::styled("gnomon", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw("  radial + table explorer"),
             ]),
             view_line(&self.breadcrumb_targets),
-            Line::from(format!(
-                "{}  |  lens: {}",
-                snapshot_summary_text(&self.snapshot, self.has_newer_snapshot),
-                metric_lens_label(self.ui_state.lens),
-            )),
-            Line::from(snapshot_refresh_text(
-                &self.snapshot,
-                &self.latest_snapshot,
-                self.startup_open_reason,
-                self.has_newer_snapshot,
-            )),
+            Line::from(vec![
+                badge("snapshot", BadgeTone::Info),
+                separator_span(),
+                snapshot_state_badge(&self.snapshot, self.has_newer_snapshot),
+                separator_span(),
+                Span::styled(
+                    snapshot_summary_text(&self.snapshot, self.has_newer_snapshot),
+                    Style::default().fg(Color::White),
+                ),
+                separator_span(),
+                badge("lens", BadgeTone::Accent),
+                separator_span(),
+                Span::styled(
+                    metric_lens_label(self.ui_state.lens),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                badge(
+                    "refresh",
+                    if self.has_newer_snapshot {
+                        BadgeTone::Warning
+                    } else {
+                        BadgeTone::Muted
+                    },
+                ),
+                separator_span(),
+                Span::styled(
+                    snapshot_refresh_text(
+                        &self.snapshot,
+                        &self.latest_snapshot,
+                        self.startup_open_reason,
+                        self.has_newer_snapshot,
+                    ),
+                    if self.has_newer_snapshot {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    },
+                ),
+            ]),
         ];
 
         lines.push(self.header_detail_line());
@@ -825,9 +912,9 @@ impl App {
                 self.focused_pane == PaneFocus::Table,
             ))
             .highlight_symbol(if self.focused_pane == PaneFocus::Table {
-                ">> "
+                "▶ "
             } else {
-                "   "
+                "  "
             });
         frame.render_stateful_widget(table, area, &mut self.table_state);
     }
@@ -845,48 +932,138 @@ impl App {
     fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
         let lines = match self.input_mode {
             InputMode::Normal => vec![
-                Line::from(
-                    "Enter drill  Right expand  Left collapse/parent  Backspace up  b breadcrumbs  1/2 hierarchy  l lens  Tab focus/pane  o columns  q quit",
-                ),
-                Line::from(
-                    "table: up/down rows. radial: left/right siblings. t/m/p/c/a filters  0 clear  / row filter  g jump  r refresh",
-                ),
-                Line::from(format!(
-                    "{}  |  {}",
-                    snapshot_coverage_footer_text(&self.snapshot_coverage),
-                    self.selection_footer_text()
-                )),
+                Line::from(vec![
+                    badge("keys", BadgeTone::Info),
+                    separator_span(),
+                    Span::raw("Enter drill"),
+                    separator_span(),
+                    Span::raw("Right expand"),
+                    separator_span(),
+                    Span::raw("Left collapse/parent"),
+                    separator_span(),
+                    Span::raw("Backspace up"),
+                    separator_span(),
+                    Span::raw("b breadcrumbs"),
+                    separator_span(),
+                    Span::raw("1/2 hierarchy"),
+                    separator_span(),
+                    Span::raw("l lens"),
+                    separator_span(),
+                    Span::raw("Tab focus/pane"),
+                    separator_span(),
+                    Span::raw("o columns"),
+                    separator_span(),
+                    Span::raw("q quit"),
+                ]),
+                Line::from(vec![
+                    badge("table", BadgeTone::Accent),
+                    separator_span(),
+                    Span::raw("up/down rows"),
+                    separator_span(),
+                    Span::raw("t/m/p/c/a filters"),
+                    separator_span(),
+                    Span::raw("0 clear"),
+                    separator_span(),
+                    Span::raw("/ row filter"),
+                    separator_span(),
+                    Span::raw("g jump"),
+                    separator_span(),
+                    Span::raw("r refresh"),
+                ]),
+                Line::from(vec![
+                    badge("coverage", BadgeTone::Success),
+                    separator_span(),
+                    Span::styled(
+                        snapshot_coverage_footer_text(&self.snapshot_coverage),
+                        Style::default().fg(Color::White),
+                    ),
+                    separator_span(),
+                    badge("selection", BadgeTone::Accent),
+                    separator_span(),
+                    Span::styled(
+                        self.selection_footer_text(),
+                        Style::default().fg(Color::White),
+                    ),
+                ]),
             ],
             InputMode::FilterInput => vec![
-                Line::from("Editing current-view filter. Type to filter rows immediately."),
-                Line::from("Enter or Esc returns to navigation mode."),
-                Line::from(format!("filter> {}", self.ui_state.row_filter)),
+                Line::from(vec![
+                    badge("filter", BadgeTone::Warning),
+                    separator_span(),
+                    Span::raw("Type to filter rows immediately."),
+                ]),
+                Line::from(vec![
+                    badge("keys", BadgeTone::Muted),
+                    separator_span(),
+                    Span::raw("Enter or Esc returns to navigation mode."),
+                ]),
+                Line::from(vec![
+                    badge("query", BadgeTone::Accent),
+                    separator_span(),
+                    Span::raw(format!("filter> {}", self.ui_state.row_filter)),
+                ]),
             ],
             InputMode::JumpInput => vec![
-                Line::from("Global jump is open. Type to fuzzy-match major navigation nodes."),
-                Line::from("Up/down to change selection. Enter jumps. Esc closes."),
-                Line::from(format!("jump> {}", self.jump_state.query)),
+                Line::from(vec![
+                    badge("jump", BadgeTone::Accent),
+                    separator_span(),
+                    Span::raw("Type to fuzzy-match major navigation nodes."),
+                ]),
+                Line::from(vec![
+                    badge("keys", BadgeTone::Muted),
+                    separator_span(),
+                    Span::raw("Up/down to change selection. Enter jumps. Esc closes."),
+                ]),
+                Line::from(vec![
+                    badge("query", BadgeTone::Info),
+                    separator_span(),
+                    Span::raw(format!("jump> {}", self.jump_state.query)),
+                ]),
             ],
             InputMode::BreadcrumbPicker => vec![
-                Line::from("Breadcrumb navigation is open. Choose an ancestor scope to jump to."),
-                Line::from("Up/down or j/k to change selection. Enter jumps. Esc closes."),
-                Line::from(format!(
-                    "breadcrumb> {}",
-                    self.breadcrumb_targets
-                        .get(self.breadcrumb_picker.selected)
-                        .map(|target| target.display.as_str())
-                        .unwrap_or("none")
-                )),
+                Line::from(vec![
+                    badge("breadcrumbs", BadgeTone::Accent),
+                    separator_span(),
+                    Span::raw("Choose an ancestor scope to jump to."),
+                ]),
+                Line::from(vec![
+                    badge("keys", BadgeTone::Muted),
+                    separator_span(),
+                    Span::raw("Up/down or j/k to change selection. Enter jumps. Esc closes."),
+                ]),
+                Line::from(vec![
+                    badge("target", BadgeTone::Info),
+                    separator_span(),
+                    Span::raw(format!(
+                        "breadcrumb> {}",
+                        self.breadcrumb_targets
+                            .get(self.breadcrumb_picker.selected)
+                            .map(|target| target.display.as_str())
+                            .unwrap_or("none")
+                    )),
+                ]),
             ],
             InputMode::ColumnChooser => vec![
-                Line::from(
-                    "Column chooser: toggle with k kind, g gross, o output, t total, f 5h, w 1w, u ref, i items.",
-                ),
-                Line::from("Esc closes the chooser."),
-                Line::from(format!(
-                    "enabled columns: {}",
-                    enabled_column_summary(&self.ui_state.enabled_columns)
-                )),
+                Line::from(vec![
+                    badge("columns", BadgeTone::Accent),
+                    separator_span(),
+                    Span::raw(
+                        "Toggle with k kind, g gross, o output, t total, f 5h, w 1w, u ref, i items.",
+                    ),
+                ]),
+                Line::from(vec![
+                    badge("keys", BadgeTone::Muted),
+                    separator_span(),
+                    Span::raw("Esc closes the chooser."),
+                ]),
+                Line::from(vec![
+                    badge("enabled", BadgeTone::Info),
+                    separator_span(),
+                    Span::raw(format!(
+                        "enabled columns: {}",
+                        enabled_column_summary(&self.ui_state.enabled_columns)
+                    )),
+                ]),
             ],
         };
 
@@ -909,9 +1086,9 @@ impl App {
                 .enumerate()
                 .map(|(index, target)| {
                     let prefix = if index == self.jump_state.selected {
-                        ">> "
+                        "▶ "
                     } else {
-                        "   "
+                        "  "
                     };
                     ListItem::new(format!("{prefix}{}  |  {}", target.label, target.detail))
                 })
@@ -937,9 +1114,9 @@ impl App {
                 .enumerate()
                 .map(|(index, target)| {
                     let prefix = if index == self.breadcrumb_picker.selected {
-                        ">> "
+                        "▶ "
                     } else {
-                        "   "
+                        "  "
                     };
                     ListItem::new(format!("{prefix}{}", target.display))
                 })
@@ -1674,21 +1851,41 @@ impl App {
             self.status_message.as_ref(),
         ) {
             (Some(activity), Some(message)) => Line::from(vec![
-                Span::styled("activity: ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(activity, Style::default().fg(Color::Cyan)),
-                Span::raw("  |  "),
-                Span::styled("status: ", Style::default().add_modifier(Modifier::BOLD)),
+                badge("activity", BadgeTone::Accent),
+                separator_span(),
+                Span::styled(activity, Style::default().fg(Color::White)),
+                separator_span(),
+                badge(
+                    "status",
+                    match message.tone {
+                        StatusTone::Info => BadgeTone::Info,
+                        StatusTone::Error => BadgeTone::Warning,
+                    },
+                ),
+                separator_span(),
                 Span::styled(message.text.clone(), status_tone_style(message.tone)),
             ]),
             (Some(activity), None) => Line::from(vec![
-                Span::styled("activity: ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(activity, Style::default().fg(Color::Cyan)),
+                badge("activity", BadgeTone::Accent),
+                separator_span(),
+                Span::styled(activity, Style::default().fg(Color::White)),
             ]),
             (None, Some(message)) => Line::from(vec![
-                Span::styled("status: ", Style::default().add_modifier(Modifier::BOLD)),
+                badge(
+                    "status",
+                    match message.tone {
+                        StatusTone::Info => BadgeTone::Info,
+                        StatusTone::Error => BadgeTone::Warning,
+                    },
+                ),
+                separator_span(),
                 Span::styled(message.text.clone(), status_tone_style(message.tone)),
             ]),
-            (None, None) => Line::from(format!("filters: {}", self.filter_summary())),
+            (None, None) => Line::from(vec![
+                badge("filters", BadgeTone::Muted),
+                separator_span(),
+                Span::styled(self.filter_summary(), Style::default().fg(Color::Gray)),
+            ]),
         }
     }
 
@@ -3133,13 +3330,17 @@ fn pane_title(title: &str, focused: bool) -> Line<'static> {
         title.to_string()
     };
 
-    Line::from(Span::styled(label, pane_title_style(focused)))
+    let prefix = if focused { "◆" } else { "◦" };
+    Line::from(vec![
+        Span::styled(format!("{prefix} "), pane_title_style(focused)),
+        Span::styled(label, pane_title_style(focused)),
+    ])
 }
 
 fn pane_title_style(focused: bool) -> Style {
     if focused {
         Style::default()
-            .fg(Color::White)
+            .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
@@ -3151,7 +3352,7 @@ fn pane_title_style(focused: bool) -> Style {
 fn table_header_style(focused: bool) -> Style {
     if focused {
         Style::default()
-            .fg(Color::White)
+            .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Gray).add_modifier(Modifier::DIM)
@@ -3497,7 +3698,11 @@ fn toggle_column(columns: &mut Vec<OptionalColumn>, column: OptionalColumn) {
 }
 
 fn toggle_mark(columns: &[OptionalColumn], column: OptionalColumn) -> &'static str {
-    if columns.contains(&column) { "x" } else { " " }
+    if columns.contains(&column) {
+        "☑"
+    } else {
+        "☐"
+    }
 }
 
 fn enabled_column_summary(columns: &[OptionalColumn]) -> String {
@@ -3620,8 +3825,8 @@ fn render_column_value(column: ColumnKey, row: &RollupRow, lens: MetricLens) -> 
 fn render_tree_label(row: &TreeRow) -> String {
     let indent = "  ".repeat(row.depth);
     let glyph = match (row.is_expandable(), row.is_expanded) {
-        (true, true) => "v ",
-        (true, false) => "> ",
+        (true, true) => "▾ ",
+        (true, false) => "▸ ",
         (false, _) => "  ",
     };
     format!("{indent}{glyph}{}", row.row.label)
@@ -3630,7 +3835,7 @@ fn render_tree_label(row: &TreeRow) -> String {
 #[cfg(test)]
 fn drillability_glyph(root: &RootView, current_path: &BrowsePath, row: &RollupRow) -> &'static str {
     if next_browse_path(root, current_path, row).is_some() {
-        "> "
+        "▸ "
     } else {
         "  "
     }
@@ -4241,16 +4446,7 @@ fn cycle_action(
 }
 
 fn action_label(action: &ActionKey) -> String {
-    match action.classification_state {
-        gnomon_core::query::ClassificationState::Classified => action
-            .normalized_action
-            .clone()
-            .or_else(|| action.base_command.clone())
-            .or_else(|| action.command_family.clone())
-            .unwrap_or_else(|| "classified".to_string()),
-        gnomon_core::query::ClassificationState::Mixed => "mixed".to_string(),
-        gnomon_core::query::ClassificationState::Unclassified => "unclassified".to_string(),
-    }
+    action.label()
 }
 
 fn action_key_from_row(row: &RollupRow) -> ActionKey {
@@ -4943,14 +5139,14 @@ mod tests {
         let state = PersistedUiState {
             root: RootView::CategoryHierarchy,
             path: BrowsePath::Category {
-                category: "Editing".to_string(),
+                category: "editing".to_string(),
             },
             lens: MetricLens::Total,
             pane_mode: PaneMode::Radial,
             time_window: TimeWindowPreset::LastWeek,
             model: Some("claude-opus".to_string()),
             project_id: Some(7),
-            action_category: Some("Editing".to_string()),
+            action_category: Some("editing".to_string()),
             action: Some(sample_action("read file")),
             row_filter: "src".to_string(),
             enabled_columns: vec![OptionalColumn::Kind, OptionalColumn::Items],
@@ -5025,7 +5221,7 @@ mod tests {
         app.ui_state.root = RootView::ProjectHierarchy;
         app.ui_state.path = BrowsePath::ProjectAction {
             project_id: 1,
-            category: "Editing".to_string(),
+            category: "editing".to_string(),
             action: sample_action("read file"),
             parent_path: None,
         };
@@ -5036,7 +5232,7 @@ mod tests {
         app.cache_rows(app.ui_state.path.clone(), app.raw_rows.clone());
         let src_path = BrowsePath::ProjectAction {
             project_id: 1,
-            category: "Editing".to_string(),
+            category: "editing".to_string(),
             action: sample_action("read file"),
             parent_path: Some("/tmp/project/src".to_string()),
         };
@@ -5061,7 +5257,7 @@ mod tests {
                 },
                 item_count: 1,
                 project_id: Some(1),
-                category: Some("Editing".to_string()),
+                category: Some("editing".to_string()),
                 action: Some(sample_action("read file")),
                 full_path: Some("/tmp/project/src/lib.rs".to_string()),
             }],
@@ -5100,7 +5296,7 @@ mod tests {
         app.ui_state.root = RootView::ProjectHierarchy;
         app.ui_state.path = BrowsePath::ProjectAction {
             project_id: 1,
-            category: "Editing".to_string(),
+            category: "editing".to_string(),
             action: sample_action("read file"),
             parent_path: None,
         };
@@ -5110,7 +5306,7 @@ mod tests {
             parent_path: app.ui_state.path.clone(),
             node_path: Some(BrowsePath::ProjectAction {
                 project_id: 1,
-                category: "Editing".to_string(),
+                category: "editing".to_string(),
                 action: sample_action("read file"),
                 parent_path: Some("/tmp/project/src".to_string()),
             }),
@@ -5121,13 +5317,13 @@ mod tests {
         app.expanded_paths = vec![
             BrowsePath::ProjectAction {
                 project_id: 1,
-                category: "Editing".to_string(),
+                category: "editing".to_string(),
                 action: sample_action("read file"),
                 parent_path: Some("/tmp/project/src".to_string()),
             },
             BrowsePath::ProjectAction {
                 project_id: 1,
-                category: "Editing".to_string(),
+                category: "editing".to_string(),
                 action: sample_action("read file"),
                 parent_path: Some("/tmp/project/src/lib".to_string()),
             },
@@ -5147,7 +5343,7 @@ mod tests {
             "proj edit",
             vec![
                 JumpTarget {
-                    label: "project-a / Editing".to_string(),
+                    label: "project-a / editing".to_string(),
                     detail: "project category".to_string(),
                     root: RootView::ProjectHierarchy,
                     path: BrowsePath::Root,
@@ -5162,7 +5358,7 @@ mod tests {
         );
 
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].label, "project-a / Editing");
+        assert_eq!(matches[0].label, "project-a / editing");
     }
 
     #[test]
@@ -5170,7 +5366,7 @@ mod tests {
         let parent = parent_browse_path(
             &BrowsePath::ProjectAction {
                 project_id: 1,
-                category: "Editing".to_string(),
+                category: "editing".to_string(),
                 action: sample_action("read file"),
                 parent_path: Some("/tmp/project-a/src".to_string()),
             },
@@ -5181,7 +5377,7 @@ mod tests {
             parent,
             BrowsePath::ProjectAction {
                 project_id: 1,
-                category: "Editing".to_string(),
+                category: "editing".to_string(),
                 action: sample_action("read file"),
                 parent_path: None,
             }
@@ -5226,7 +5422,7 @@ mod tests {
         assert_eq!(rendered, "project-a");
         assert_eq!(
             drillability_glyph(&RootView::ProjectHierarchy, &BrowsePath::Root, &row),
-            "> "
+            "▸ "
         );
     }
 
@@ -5250,7 +5446,7 @@ mod tests {
             },
             item_count: 1,
             project_id: Some(1),
-            category: Some("Editing".to_string()),
+            category: Some("editing".to_string()),
             action: Some(sample_action("read file")),
             full_path: Some("/tmp/project-a/src/lib.rs".to_string()),
         };
@@ -5263,7 +5459,7 @@ mod tests {
                 &RootView::ProjectHierarchy,
                 &BrowsePath::ProjectAction {
                     project_id: 1,
-                    category: "Editing".to_string(),
+                    category: "editing".to_string(),
                     action: sample_action("read file"),
                     parent_path: Some("/tmp/project-a/src".to_string()),
                 },
@@ -5292,7 +5488,7 @@ mod tests {
             &RootView::ProjectHierarchy,
             &BrowsePath::ProjectAction {
                 project_id: 1,
-                category: "Editing".to_string(),
+                category: "editing".to_string(),
                 action: action.clone(),
                 parent_path: Some("/tmp/project-a/src/lib".to_string()),
             },
@@ -5311,7 +5507,7 @@ mod tests {
             steps[1],
             RadialAncestorStep {
                 query_path: BrowsePath::Project { project_id: 1 },
-                selected_child: "category:Editing".to_string(),
+                selected_child: "category:editing".to_string(),
             }
         );
         assert_eq!(
@@ -5319,7 +5515,7 @@ mod tests {
             RadialAncestorStep {
                 query_path: BrowsePath::ProjectCategory {
                     project_id: 1,
-                    category: "Editing".to_string(),
+                    category: "editing".to_string(),
                 },
                 selected_child: action_row_key(&action),
             }
@@ -5329,7 +5525,7 @@ mod tests {
             RadialAncestorStep {
                 query_path: BrowsePath::ProjectAction {
                     project_id: 1,
-                    category: "Editing".to_string(),
+                    category: "editing".to_string(),
                     action: action.clone(),
                     parent_path: None,
                 },
@@ -5341,7 +5537,7 @@ mod tests {
             RadialAncestorStep {
                 query_path: BrowsePath::ProjectAction {
                     project_id: 1,
-                    category: "Editing".to_string(),
+                    category: "editing".to_string(),
                     action,
                     parent_path: Some("/tmp/project-a/src".to_string()),
                 },
@@ -5390,7 +5586,7 @@ mod tests {
             &RootView::ProjectHierarchy,
             &BrowsePath::ProjectAction {
                 project_id: 1,
-                category: "Editing".to_string(),
+                category: "editing".to_string(),
                 action: sample_action("read file"),
                 parent_path: Some("/tmp/project-a/src/lib".to_string()),
             },
@@ -5407,7 +5603,7 @@ mod tests {
             vec![
                 "all projects",
                 "project-a",
-                "Editing",
+                "editing",
                 "read file",
                 "src",
                 "lib",
@@ -5419,7 +5615,7 @@ mod tests {
             targets[3].path,
             BrowsePath::ProjectAction {
                 project_id: 1,
-                category: "Editing".to_string(),
+                category: "editing".to_string(),
                 action: sample_action("read file"),
                 parent_path: None,
             }
@@ -5428,7 +5624,7 @@ mod tests {
             targets[5].path,
             BrowsePath::ProjectAction {
                 project_id: 1,
-                category: "Editing".to_string(),
+                category: "editing".to_string(),
                 action: sample_action("read file"),
                 parent_path: Some("/tmp/project-a/src/lib".to_string()),
             }
@@ -5526,12 +5722,12 @@ mod tests {
         let category_layer = build_radial_layer(
             &[
                 radial_row(RadialRowSpec {
-                    key: "category:Editing",
-                    label: "Editing",
+                    key: "category:editing",
+                    label: "editing",
                     kind: RollupRowKind::ActionCategory,
                     value: 8.0,
                     project_id: Some(1),
-                    category: Some("Editing"),
+                    category: Some("editing"),
                     action: None,
                     full_path: None,
                 }),
@@ -5717,7 +5913,7 @@ mod tests {
             &RootView::ProjectHierarchy,
             &BrowsePath::ProjectAction {
                 project_id: 1,
-                category: "Editing".to_string(),
+                category: "editing".to_string(),
                 action: sample_action("read file"),
                 parent_path: Some("/tmp/project-a/src".to_string()),
             },
@@ -5911,7 +6107,7 @@ mod tests {
             },
             item_count: 1,
             project_id: Some(1),
-            category: Some("Editing".to_string()),
+            category: Some("editing".to_string()),
             action: Some(sample_action("read file")),
             full_path,
         }
@@ -6049,7 +6245,7 @@ mod tests {
         let mut state = PersistedUiState {
             root: RootView::CategoryHierarchy,
             path: BrowsePath::Category {
-                category: "Editing".to_string(),
+                category: "editing".to_string(),
             },
             ..PersistedUiState::default()
         };
@@ -6067,7 +6263,7 @@ mod tests {
             root: RootView::ProjectHierarchy,
             path: BrowsePath::ProjectCategory {
                 project_id: 7,
-                category: "Editing".to_string(),
+                category: "editing".to_string(),
             },
         };
 
@@ -6078,7 +6274,7 @@ mod tests {
             state.path,
             BrowsePath::ProjectCategory {
                 project_id: 7,
-                category: "Editing".to_string(),
+                category: "editing".to_string(),
             }
         );
     }
@@ -6097,7 +6293,11 @@ mod tests {
             "Status pane header not rendered"
         );
         assert!(
-            content.contains("snapshot: no imported data is visible yet"),
+            content.contains("[snapshot]"),
+            "snapshot badge not rendered"
+        );
+        assert!(
+            content.contains("no imported data is visible yet"),
             "empty snapshot state not rendered in header"
         );
         assert!(content.contains("Keys"), "Keys pane header not rendered");
@@ -6114,12 +6314,16 @@ mod tests {
             None,
         )?;
         assert!(
-            content.contains("gnomon"),
+            content.contains("▣ gnomon"),
             "app name not rendered in header"
         );
         assert!(
-            content.contains("snapshot: no imported data is visible yet"),
-            "empty snapshot state not rendered in header"
+            content.contains("[refresh]"),
+            "refresh badge not rendered in header"
+        );
+        assert!(
+            content.contains("[snapshot]"),
+            "snapshot badge not rendered in header"
         );
         assert!(
             content.contains("Background import never changes the visible view"),
@@ -6161,11 +6365,11 @@ mod tests {
         let content = render_app_to_string(&mut app, 140, 40)?;
 
         assert!(
-            content.contains("TABLE"),
+            content.contains("◆ TABLE"),
             "focused table title should stand out"
         );
         assert!(
-            content.contains("Radial"),
+            content.contains("◦ Radial"),
             "unfocused radial title should remain visible"
         );
         assert!(
@@ -6193,7 +6397,7 @@ mod tests {
         let content = render_app_to_string(&mut app, 100, 40)?;
 
         assert!(
-            content.contains("RADIAL"),
+            content.contains("◆ RADIAL"),
             "focused radial title should stand out"
         );
         assert!(
@@ -6211,12 +6415,39 @@ mod tests {
     fn pane_styles_make_unfocused_panes_visibly_quieter() {
         assert_eq!(pane_border_style(true).fg, Some(Color::Cyan));
         assert_eq!(pane_border_style(false).fg, Some(Color::Gray));
-        assert_eq!(pane_title_style(true).fg, Some(Color::White));
+        assert_eq!(pane_title_style(true).fg, Some(Color::Cyan));
         assert_eq!(pane_title_style(false).fg, Some(Color::DarkGray));
-        assert_eq!(table_header_style(true).fg, Some(Color::White));
+        assert_eq!(table_header_style(true).fg, Some(Color::Cyan));
         assert_eq!(table_header_style(false).fg, Some(Color::Gray));
         assert_eq!(radial_center_label_style(true).fg, Some(Color::White));
         assert_eq!(radial_center_label_style(false).fg, Some(Color::Gray));
+        assert_eq!(badge_style(BadgeTone::Accent).fg, Some(Color::Cyan));
+        assert_eq!(badge_style(BadgeTone::Info).fg, Some(Color::White));
+        assert_eq!(badge_style(BadgeTone::Success).fg, Some(Color::Green));
+        assert_eq!(badge_style(BadgeTone::Warning).fg, Some(Color::Yellow));
+        assert_eq!(badge_style(BadgeTone::Muted).fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn toggle_mark_uses_checkbox_glyphs() {
+        assert_eq!(
+            toggle_mark(&[OptionalColumn::Kind], OptionalColumn::Kind),
+            "☑"
+        );
+        assert_eq!(toggle_mark(&[], OptionalColumn::Kind), "☐");
+    }
+
+    #[test]
+    fn render_tree_label_uses_box_drawing_glyphs() {
+        let row = TreeRow {
+            row: sample_row("src", Some("/tmp/project/src".to_string())),
+            parent_path: BrowsePath::Root,
+            node_path: Some(BrowsePath::Project { project_id: 1 }),
+            depth: 1,
+            is_expanded: false,
+        };
+
+        assert_eq!(render_tree_label(&row), "  ▸ src");
     }
 
     #[test]
@@ -6432,7 +6663,7 @@ mod tests {
 
         let content = render_app_to_string(&mut app, 120, 40)?;
 
-        assert!(content.contains("activity:"));
+        assert!(content.contains("[activity]"));
         assert!(content.contains("queued loading view"));
         Ok(())
     }
@@ -6463,6 +6694,7 @@ mod tests {
 
         let content = render_app_to_string(&mut app, 120, 40)?;
 
+        assert!(content.contains("[activity]"));
         assert!(content.contains("loading view"));
         assert!(content.contains("[4/8]"));
         assert!(content.contains("browsing current path"));
@@ -6554,11 +6786,17 @@ mod tests {
             }),
         }))?;
 
-        let content = render_app_to_string(&mut app, 100, 40)?;
+        let detail = app
+            .header_detail_line()
+            .spans
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
 
-        assert!(content.contains("refreshing snapshot"));
-        assert!(content.contains("[7/8]"));
-        assert!(content.contains("recomputing radial context"));
+        assert!(detail.contains("[activity]"));
+        assert!(detail.contains("refreshing snapshot"));
+        assert!(detail.contains("[7/8]"));
+        assert!(detail.contains("recomputing radial context"));
         Ok(())
     }
 

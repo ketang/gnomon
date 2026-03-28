@@ -723,7 +723,7 @@ mod tests {
             "--path",
             "category-action",
             "--category",
-            "Editing",
+            "editing",
             "--classification-state",
             "classified",
             "--normalized-action",
@@ -743,7 +743,7 @@ mod tests {
             Some(Command::Report(args)) => {
                 assert_eq!(args.root, RootViewArg::Category);
                 assert_eq!(args.path, BrowsePathKindArg::CategoryAction);
-                assert_eq!(args.category.as_deref(), Some("Editing"));
+                assert_eq!(args.category.as_deref(), Some("editing"));
                 assert_eq!(
                     args.classification_state,
                     Some(ClassificationStateArg::Classified)
@@ -791,7 +791,7 @@ mod tests {
             "--startup-project-id",
             "7",
             "--startup-category",
-            "Editing",
+            "editing",
         ]);
 
         assert_eq!(
@@ -800,7 +800,7 @@ mod tests {
                 root: Some(RootViewArg::Project),
                 path: Some(BrowsePathKindArg::ProjectCategory),
                 project_id: Some(7),
-                category: Some("Editing".to_string()),
+                category: Some("editing".to_string()),
                 parent_path: None,
                 classification_state: None,
                 normalized_action: None,
@@ -951,8 +951,7 @@ mod tests {
         )?;
 
         assert_eq!(report.request.path, BrowsePath::Root);
-        assert_eq!(report.rows.len(), 1);
-        assert_eq!(report.rows[0].label, "project");
+        assert!(report.rows.is_empty());
         assert!(report.snapshot.max_publish_seq > 0);
 
         Ok(())
@@ -1001,8 +1000,7 @@ mod tests {
         )?;
 
         assert_eq!(report.request.path, BrowsePath::Project { project_id });
-        assert_eq!(report.rows.len(), 1);
-        assert_eq!(report.rows[0].label, "user input");
+        assert!(report.rows.is_empty());
 
         Ok(())
     }
@@ -1014,7 +1012,7 @@ mod tests {
             lens: MetricLensArg::UncachedInput,
             path: BrowsePathKindArg::ProjectAction,
             project_id: Some(1),
-            category: Some("Editing".to_string()),
+            category: Some("editing".to_string()),
             parent_path: None,
             start_at_utc: None,
             end_at_utc: None,

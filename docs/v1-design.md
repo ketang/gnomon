@@ -31,6 +31,7 @@ Definitions:
 - Conservative behavior:
   - explicit `mixed`
   - explicit `unclassified`
+  - UI renders those special states as bracketed labels: `[mixed]` and `[unclassified]`
   - no user correction loop in `v1`
 - Grouped-run actions:
   - consecutive messages in the same turn with the same classification collapse into one action
@@ -41,7 +42,7 @@ Working top-level action taxonomy:
 - `project discovery`
 - `local search/navigation`
 - `external/web research`
-- `Editing`
+- `editing`
 - `test/build/run`
 - `debugging/investigation`
 - `data traffic`

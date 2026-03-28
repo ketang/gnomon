@@ -498,7 +498,7 @@ fn classify_tool_invocation(tool: &ToolInvocation) -> ActionDescriptor {
                 )
             } else {
                 ActionDescriptor::classified(
-                    "Editing",
+                    "editing",
                     "file write",
                     Some("explicit file tool"),
                     Some("Write"),
@@ -518,7 +518,7 @@ fn classify_tool_invocation(tool: &ToolInvocation) -> ActionDescriptor {
                 )
             } else {
                 ActionDescriptor::classified(
-                    "Editing",
+                    "editing",
                     "file edit",
                     Some("explicit file tool"),
                     Some("Edit"),
@@ -538,7 +538,7 @@ fn classify_tool_invocation(tool: &ToolInvocation) -> ActionDescriptor {
                 )
             } else {
                 ActionDescriptor::classified(
-                    "Editing",
+                    "editing",
                     "file edit",
                     Some("explicit file tool"),
                     Some("MultiEdit"),
@@ -1238,7 +1238,7 @@ mod tests {
                     2
                 ),
                 (
-                    "Editing".to_string(),
+                    "editing".to_string(),
                     "file edit".to_string(),
                     Some("explicit file tool".to_string()),
                     Some("Edit".to_string()),
