@@ -218,26 +218,34 @@ enum PendingTaskState {
 
 #[derive(Debug, Default)]
 struct PendingAsyncWork {
-    view: Option<PendingRequest>,
-    jump: Option<PendingRequest>,
+    view: PendingTaskTracker,
+    jump: PendingTaskTracker,
 }
 
-impl PendingAsyncWork {
-    fn begin_view(&mut self, sequence: u64, label: &'static str) {
-        self.view = Some(PendingRequest::queued(sequence, label, self.view.is_some()));
+#[derive(Debug, Default)]
+struct PendingTaskTracker {
+    current: Option<PendingRequest>,
+    next: Option<PendingRequest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingFinish {
+    Apply,
+    IgnoredBySupersedingRequest,
+    NotFound,
+}
+
+impl PendingTaskTracker {
+    fn begin(&mut self, sequence: u64, label: &'static str) {
+        if self.current.is_some() {
+            self.next = Some(PendingRequest::queued(sequence, label, true));
+        } else {
+            self.current = Some(PendingRequest::queued(sequence, label, false));
+        }
     }
 
-    fn begin_jump(&mut self, sequence: u64, label: &'static str) {
-        self.jump = Some(PendingRequest::queued(sequence, label, self.jump.is_some()));
-    }
-
-    fn apply_progress(&mut self, progress: QueryProgressUpdate) -> bool {
-        let pending = match progress.task {
-            PendingTaskKind::View => &mut self.view,
-            PendingTaskKind::Jump => &mut self.jump,
-        };
-
-        let Some(request) = pending.as_mut() else {
+    fn apply_progress(&mut self, progress: &QueryProgressUpdate) -> bool {
+        let Some(request) = self.current.as_mut() else {
             return false;
         };
         if request.sequence != progress.sequence {
@@ -252,31 +260,60 @@ impl PendingAsyncWork {
         true
     }
 
-    fn finish(&mut self, task: PendingTaskKind, sequence: u64) -> bool {
-        let pending = match task {
-            PendingTaskKind::View => &mut self.view,
-            PendingTaskKind::Jump => &mut self.jump,
-        };
+    fn finish(&mut self, sequence: u64) -> PendingFinish {
+        match self.current {
+            Some(request) if request.sequence == sequence => {
+                if let Some(next) = self.next.take() {
+                    self.current = Some(next);
+                    PendingFinish::IgnoredBySupersedingRequest
+                } else {
+                    self.current = None;
+                    PendingFinish::Apply
+                }
+            }
+            _ => PendingFinish::NotFound,
+        }
+    }
 
-        if pending
-            .as_ref()
-            .is_some_and(|request| request.sequence == sequence)
-        {
-            *pending = None;
-            true
-        } else {
-            false
+    fn summary_parts(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if let Some(request) = self.current {
+            parts.push(render_pending_request(request));
+        }
+        if let Some(request) = self.next {
+            parts.push(render_pending_request(request));
+        }
+        parts
+    }
+}
+
+impl PendingAsyncWork {
+    fn begin_view(&mut self, sequence: u64, label: &'static str) {
+        self.view.begin(sequence, label);
+    }
+
+    fn begin_jump(&mut self, sequence: u64, label: &'static str) {
+        self.jump.begin(sequence, label);
+    }
+
+    fn apply_progress(&mut self, progress: QueryProgressUpdate) -> bool {
+        match progress.task {
+            PendingTaskKind::View => self.view.apply_progress(&progress),
+            PendingTaskKind::Jump => self.jump.apply_progress(&progress),
+        }
+    }
+
+    fn finish(&mut self, task: PendingTaskKind, sequence: u64) -> PendingFinish {
+        match task {
+            PendingTaskKind::View => self.view.finish(sequence),
+            PendingTaskKind::Jump => self.jump.finish(sequence),
         }
     }
 
     fn summary(&self) -> Option<String> {
         let mut parts = Vec::new();
-        if let Some(request) = self.view {
-            parts.push(render_pending_request(request));
-        }
-        if let Some(request) = self.jump {
-            parts.push(render_pending_request(request));
-        }
+        parts.extend(self.view.summary_parts());
+        parts.extend(self.jump.summary_parts());
 
         if parts.is_empty() {
             None
@@ -1639,6 +1676,7 @@ impl App {
                 if self
                     .pending_async_work
                     .finish(PendingTaskKind::View, result.sequence)
+                    == PendingFinish::Apply
                 {
                     self.apply_loaded_view(result.loaded_view)?;
                 }
@@ -1647,6 +1685,7 @@ impl App {
                 if self
                     .pending_async_work
                     .finish(PendingTaskKind::View, result.sequence)
+                    == PendingFinish::Apply
                 {
                     self.latest_snapshot = result.latest_snapshot.clone();
                     if let Some(loaded_view) = result.loaded_view {
@@ -1669,6 +1708,7 @@ impl App {
                 if self
                     .pending_async_work
                     .finish(PendingTaskKind::Jump, result.sequence)
+                    == PendingFinish::Apply
                 {
                     self.jump_state.matches =
                         build_jump_matches(&self.jump_state.query, result.targets);
@@ -1679,6 +1719,7 @@ impl App {
                 if self
                     .pending_async_work
                     .finish(failure.task, failure.sequence)
+                    == PendingFinish::Apply
                 {
                     self.status_message = Some(StatusMessage::error(failure.message));
                 }
@@ -5920,7 +5961,10 @@ mod tests {
 
         assert_eq!(app.ui_state.root, original_root);
         assert_eq!(
-            app.pending_async_work.view.map(|request| request.sequence),
+            app.pending_async_work
+                .view
+                .current
+                .map(|request| request.sequence),
             Some(2)
         );
         Ok(())
@@ -5950,7 +5994,11 @@ mod tests {
             }),
         }))?;
 
-        let request = app.pending_async_work.view.expect("pending view request");
+        let request = app
+            .pending_async_work
+            .view
+            .current
+            .expect("pending view request");
         assert_eq!(request.sequence, 2);
         assert_eq!(request.state, PendingTaskState::Queued);
         assert!(request.phase.is_none());
@@ -5988,7 +6036,10 @@ mod tests {
 
         assert!(app.jump_state.matches.is_empty());
         assert_eq!(
-            app.pending_async_work.jump.map(|request| request.sequence),
+            app.pending_async_work
+                .jump
+                .current
+                .map(|request| request.sequence),
             Some(4)
         );
         Ok(())
@@ -6019,7 +6070,11 @@ mod tests {
             }),
         }))?;
 
-        let request = app.pending_async_work.jump.expect("pending jump request");
+        let request = app
+            .pending_async_work
+            .jump
+            .current
+            .expect("pending jump request");
         assert_eq!(request.state, PendingTaskState::Running);
         assert_eq!(request.phase, Some("walking category hierarchy"));
         assert_eq!(
@@ -6049,6 +6104,93 @@ mod tests {
 
         assert!(content.contains("activity:"));
         assert!(content.contains("queued loading view"));
+        Ok(())
+    }
+
+    #[test]
+    fn render_shows_running_and_superseding_view_requests_together() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        app.pending_async_work.begin_view(1, "loading view");
+        app.apply_query_result(QueryWorkerResult::Progress(QueryProgressUpdate {
+            sequence: 1,
+            task: PendingTaskKind::View,
+            phase: "browsing current path".to_string(),
+            progress: Some(PhaseProgress {
+                current: 4,
+                total: VIEW_LOAD_PHASE_TOTAL,
+            }),
+        }))?;
+        app.pending_async_work.begin_view(2, "refreshing snapshot");
+
+        let content = render_app_to_string(&mut app, 120, 40)?;
+
+        assert!(content.contains("loading view"));
+        assert!(content.contains("[4/8]"));
+        assert!(content.contains("browsing current path"));
+        assert!(content.contains("queued refreshing snapshot"));
+        assert!(content.contains("superseding older request"));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_view_completion_promotes_superseding_request_without_applying_result() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        let original_root = app.ui_state.root;
+
+        app.pending_async_work.begin_view(1, "loading view");
+        app.apply_query_result(QueryWorkerResult::Progress(QueryProgressUpdate {
+            sequence: 1,
+            task: PendingTaskKind::View,
+            phase: "browsing current path".to_string(),
+            progress: Some(PhaseProgress {
+                current: 4,
+                total: VIEW_LOAD_PHASE_TOTAL,
+            }),
+        }))?;
+        app.pending_async_work.begin_view(2, "refreshing snapshot");
+
+        let mut loaded_view = load_view_for_state(
+            &app.query_engine(),
+            None,
+            app.snapshot.clone(),
+            app.ui_state.clone(),
+            None,
+            None,
+        )?;
+        loaded_view.ui_state.root = RootView::CategoryHierarchy;
+
+        app.apply_query_result(QueryWorkerResult::ViewLoaded(ViewLoadResult {
+            sequence: 1,
+            loaded_view,
+        }))?;
+
+        assert_eq!(app.ui_state.root, original_root);
+        let current = app
+            .pending_async_work
+            .view
+            .current
+            .expect("superseding view request should remain pending");
+        assert_eq!(current.sequence, 2);
+        assert_eq!(current.state, PendingTaskState::Queued);
+        assert!(app.pending_async_work.view.next.is_none());
         Ok(())
     }
 
