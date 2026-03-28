@@ -2,7 +2,8 @@ use std::f64::consts::{FRAC_PI_2, TAU};
 use std::fs;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::StartupBrowseState;
@@ -40,8 +41,187 @@ const REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const WIDE_LAYOUT_WIDTH: u16 = 120;
 const JUMP_MATCH_LIMIT: usize = 8;
 const RADIAL_CENTER_RADIUS: f64 = 0.24;
+
+struct QueryWorker {
+    requests: Sender<QueryWorkerRequest>,
+    results: Receiver<QueryWorkerResult>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl QueryWorker {
+    fn spawn(db_path: PathBuf, perf_logger: Option<PerfLogger>) -> Self {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            run_query_worker(db_path, perf_logger, request_rx, result_tx);
+        });
+
+        Self {
+            requests: request_tx,
+            results: result_rx,
+            handle: Some(handle),
+        }
+    }
+
+    fn send(&self, request: QueryWorkerRequest) -> Result<()> {
+        self.requests
+            .send(request)
+            .context("interactive query worker is unavailable")
+    }
+}
+
+impl Drop for QueryWorker {
+    fn drop(&mut self) {
+        let (placeholder_tx, _) = mpsc::channel();
+        let sender = std::mem::replace(&mut self.requests, placeholder_tx);
+        drop(sender);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[derive(Debug)]
+enum QueryWorkerRequest {
+    LoadView(ViewLoadRequest),
+    RefreshLatest(RefreshViewRequest),
+    BuildJumpTargets(JumpTargetRequest),
+}
+
+#[derive(Debug)]
+struct ViewLoadRequest {
+    sequence: u64,
+    snapshot: SnapshotBounds,
+    ui_state: PersistedUiState,
+    selected_key: Option<TreeRowKey>,
+}
+
+#[derive(Debug)]
+struct RefreshViewRequest {
+    sequence: u64,
+    current_snapshot: SnapshotBounds,
+    ui_state: PersistedUiState,
+    selected_key: Option<TreeRowKey>,
+}
+
+#[derive(Debug)]
+struct JumpTargetRequest {
+    sequence: u64,
+    snapshot: SnapshotBounds,
+    ui_state: PersistedUiState,
+}
+
+#[derive(Debug)]
+enum QueryWorkerResult {
+    ViewLoaded(ViewLoadResult),
+    RefreshCompleted(RefreshViewResult),
+    JumpTargetsBuilt(JumpTargetsResult),
+    Failed(QueryWorkerFailure),
+}
+
+#[derive(Debug)]
+struct ViewLoadResult {
+    sequence: u64,
+    loaded_view: LoadedView,
+}
+
+#[derive(Debug)]
+struct RefreshViewResult {
+    sequence: u64,
+    latest_snapshot: SnapshotBounds,
+    loaded_view: Option<LoadedView>,
+}
+
+#[derive(Debug)]
+struct JumpTargetsResult {
+    sequence: u64,
+    targets: Vec<JumpTarget>,
+}
+
+#[derive(Debug)]
+struct QueryWorkerFailure {
+    sequence: u64,
+    task: PendingTaskKind,
+    message: String,
+}
+
+#[derive(Debug)]
+struct LoadedView {
+    snapshot: SnapshotBounds,
+    snapshot_coverage: SnapshotCoverageSummary,
+    ui_state: PersistedUiState,
+    filter_options: FilterOptions,
+    raw_rows: Vec<RollupRow>,
+    breadcrumb_targets: Vec<BreadcrumbTarget>,
+    radial_context: RadialContext,
+    current_project_root: Option<String>,
+    selected_key: Option<TreeRowKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingTaskKind {
+    View,
+    Jump,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingRequest {
+    sequence: u64,
+    label: &'static str,
+}
+
+#[derive(Debug, Default)]
+struct PendingAsyncWork {
+    view: Option<PendingRequest>,
+    jump: Option<PendingRequest>,
+}
+
+impl PendingAsyncWork {
+    fn begin_view(&mut self, sequence: u64, label: &'static str) {
+        self.view = Some(PendingRequest { sequence, label });
+    }
+
+    fn begin_jump(&mut self, sequence: u64, label: &'static str) {
+        self.jump = Some(PendingRequest { sequence, label });
+    }
+
+    fn finish(&mut self, task: PendingTaskKind, sequence: u64) -> bool {
+        let pending = match task {
+            PendingTaskKind::View => &mut self.view,
+            PendingTaskKind::Jump => &mut self.jump,
+        };
+
+        if pending
+            .as_ref()
+            .is_some_and(|request| request.sequence == sequence)
+        {
+            *pending = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn summary(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(request) = self.view {
+            parts.push(request.label);
+        }
+        if let Some(request) = self.jump {
+            parts.push(request.label);
+        }
+
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("  |  "))
+        }
+    }
+}
+
 pub struct App {
     database: Database,
+    worker: QueryWorker,
     ui_state_path: PathBuf,
     ui_state: PersistedUiState,
     snapshot: SnapshotBounds,
@@ -57,12 +237,15 @@ pub struct App {
     focused_pane: PaneFocus,
     breadcrumb_targets: Vec<BreadcrumbTarget>,
     breadcrumb_picker: BreadcrumbPickerState,
+    current_project_root: Option<String>,
     radial_context: RadialContext,
     radial_model: RadialModel,
     jump_state: JumpState,
     status_message: Option<StatusMessage>,
     status_updates: Option<Receiver<StartupWorkerEvent>>,
     last_refresh_check: Instant,
+    next_request_sequence: u64,
+    pending_async_work: PendingAsyncWork,
     perf_logger: Option<PerfLogger>,
     row_cache: Vec<CachedRows>,
     expanded_paths: Vec<BrowsePath>,
@@ -104,12 +287,14 @@ impl App {
         let focused_pane = PaneFocus::from_pane_mode(ui_state.pane_mode);
 
         let database = Database::open(&config.db_path)?;
+        let worker = QueryWorker::spawn(config.db_path.clone(), perf_logger.clone());
         let mut app = Self {
             database,
+            worker,
             ui_state_path,
             ui_state,
             latest_snapshot: snapshot.clone(),
-            snapshot,
+            snapshot: snapshot.clone(),
             snapshot_coverage: SnapshotCoverageSummary::default(),
             startup_open_reason,
             has_newer_snapshot: false,
@@ -126,19 +311,28 @@ impl App {
             focused_pane,
             breadcrumb_targets: Vec::new(),
             breadcrumb_picker: BreadcrumbPickerState::default(),
+            current_project_root: None,
             radial_context: RadialContext::default(),
             radial_model: RadialModel::default(),
             jump_state: JumpState::default(),
             status_message,
             status_updates,
             last_refresh_check: Instant::now(),
+            next_request_sequence: 1,
+            pending_async_work: PendingAsyncWork::default(),
             perf_logger,
             row_cache: Vec::new(),
             expanded_paths: Vec::new(),
         };
 
-        app.reload_view()?;
-        app.refresh_snapshot_coverage()?;
+        let initial_view = load_view_for_state(
+            &app.query_engine(),
+            app.perf_logger.clone(),
+            snapshot,
+            app.ui_state.clone(),
+            None,
+        )?;
+        app.apply_loaded_view(initial_view)?;
         app.refresh_snapshot_status()?;
         Ok(app)
     }
@@ -148,6 +342,7 @@ impl App {
 
         loop {
             self.drain_status_updates();
+            self.drain_query_results();
             if self.last_refresh_check.elapsed() >= REFRESH_CHECK_INTERVAL {
                 self.refresh_snapshot_status()?;
                 self.last_refresh_check = Instant::now();
@@ -275,18 +470,7 @@ impl App {
             )),
         ];
 
-        if let Some(message) = &self.status_message {
-            let style = match message.tone {
-                StatusTone::Info => Style::default().fg(Color::Cyan),
-                StatusTone::Error => Style::default().fg(Color::Red),
-            };
-            lines.push(Line::from(vec![
-                Span::styled("status: ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(&message.text, style),
-            ]));
-        } else {
-            lines.push(Line::from(format!("filters: {}", self.filter_summary())));
-        }
+        lines.push(self.header_detail_line());
 
         let header = Paragraph::new(Text::from(lines))
             .block(Block::default().borders(Borders::ALL).title("Status"))
@@ -565,7 +749,7 @@ impl App {
             }
             KeyCode::Char('l') => {
                 self.ui_state.lens = next_metric_lens(self.ui_state.lens);
-                self.reload_view()?;
+                self.enqueue_view_reload("loading view")?;
                 Ok(false)
             }
             KeyCode::Tab => {
@@ -576,19 +760,19 @@ impl App {
             }
             KeyCode::Char('t') => {
                 self.ui_state.time_window = self.ui_state.time_window.next();
-                self.reload_view()?;
+                self.enqueue_view_reload("loading view")?;
                 Ok(false)
             }
             KeyCode::Char('m') => {
                 self.ui_state.model =
                     cycle_option(self.ui_state.model.clone(), &self.filter_options.models);
-                self.reload_view()?;
+                self.enqueue_view_reload("loading view")?;
                 Ok(false)
             }
             KeyCode::Char('p') => {
                 self.ui_state.project_id =
                     cycle_project(self.ui_state.project_id, &self.filter_options.projects);
-                self.reload_view()?;
+                self.enqueue_view_reload("loading view")?;
                 Ok(false)
             }
             KeyCode::Char('c') => {
@@ -596,7 +780,7 @@ impl App {
                     self.ui_state.action_category.clone(),
                     &self.filter_options.categories,
                 );
-                self.reload_view()?;
+                self.enqueue_view_reload("loading view")?;
                 Ok(false)
             }
             KeyCode::Char('a') => {
@@ -605,12 +789,12 @@ impl App {
                     &self.filter_options.actions,
                     self.ui_state.action_category.as_deref(),
                 );
-                self.reload_view()?;
+                self.enqueue_view_reload("loading view")?;
                 Ok(false)
             }
             KeyCode::Char('0') => {
                 self.ui_state.clear_filters();
-                self.reload_view()?;
+                self.enqueue_view_reload("loading view")?;
                 Ok(false)
             }
             KeyCode::Char('/') => {
@@ -620,7 +804,7 @@ impl App {
             KeyCode::Char('g') => {
                 self.input_mode = InputMode::JumpInput;
                 self.jump_state.query.clear();
-                self.update_jump_matches()?;
+                self.enqueue_jump_target_rebuild()?;
                 Ok(false)
             }
             KeyCode::Char('b') => {
@@ -701,7 +885,7 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.jump_state.query.pop();
-                self.update_jump_matches()?;
+                self.enqueue_jump_target_rebuild()?;
             }
             KeyCode::Up => {
                 if self.jump_state.selected > 0 {
@@ -723,12 +907,12 @@ impl App {
                     self.ui_state.root = target.root;
                     self.ui_state.path = target.path;
                     self.input_mode = InputMode::Normal;
-                    self.reload_view()?;
+                    self.enqueue_view_reload("loading view")?;
                 }
             }
             KeyCode::Char(ch) => {
                 self.jump_state.query.push(ch);
-                self.update_jump_matches()?;
+                self.enqueue_jump_target_rebuild()?;
             }
             _ => {}
         }
@@ -769,7 +953,7 @@ impl App {
                     self.ui_state.root = target.root;
                     self.ui_state.path = target.path.clone();
                     self.input_mode = InputMode::Normal;
-                    self.reload_view()?;
+                    self.enqueue_view_reload("loading view")?;
                 }
             }
             _ => {}
@@ -812,7 +996,7 @@ impl App {
             self.ui_state.path = next_path;
             self.expanded_paths.clear();
             self.row_cache.clear();
-            self.reload_view()?;
+            self.enqueue_view_reload("loading view")?;
         } else {
             self.status_message = Some(StatusMessage::info("Reached the current leaf row."));
         }
@@ -872,20 +1056,16 @@ impl App {
     }
 
     fn navigate_up(&mut self) -> Result<()> {
-        let project_root = match project_id_from_path(&self.ui_state.path) {
-            Some(project_id) => self.project_root_for(project_id)?,
-            None => None,
-        };
-
-        self.ui_state.path = parent_browse_path(&self.ui_state.path, project_root.as_deref());
-        self.reload_view()?;
+        self.ui_state.path =
+            parent_browse_path(&self.ui_state.path, self.current_project_root.as_deref());
+        self.enqueue_view_reload("loading view")?;
         Ok(())
     }
 
     fn switch_root(&mut self, root: RootView) -> Result<()> {
         self.ui_state.root = root;
         self.ui_state.path = BrowsePath::Root;
-        self.reload_view()?;
+        self.enqueue_view_reload("loading view")?;
         Ok(())
     }
 
@@ -900,138 +1080,17 @@ impl App {
             return Ok(());
         }
 
-        let snapshot_load_started = Instant::now();
-        self.snapshot = self.query_engine().latest_snapshot_bounds()?;
-        perf.field(
-            "snapshot_load_ms",
-            snapshot_load_started.elapsed().as_secs_f64() * 1000.0,
-        );
-        perf.field("has_newer_snapshot", true);
-
-        let reload_started = Instant::now();
-        self.reload_view()?;
-        perf.field(
-            "reload_view_ms",
-            reload_started.elapsed().as_secs_f64() * 1000.0,
-        );
-
-        let coverage_started = Instant::now();
-        self.refresh_snapshot_coverage()?;
-        perf.field(
-            "refresh_snapshot_coverage_ms",
-            coverage_started.elapsed().as_secs_f64() * 1000.0,
-        );
-
-        let refresh_status_started = Instant::now();
-        self.refresh_snapshot_status()?;
-        perf.field(
-            "refresh_snapshot_status_ms",
-            refresh_status_started.elapsed().as_secs_f64() * 1000.0,
-        );
-        self.status_message = Some(StatusMessage::info(format!(
-            "Switched to the newest imported snapshot {}.",
-            snapshot_coverage_tail(&self.snapshot)
-        )));
-        perf.finish_ok();
-        Ok(())
-    }
-
-    fn reload_view(&mut self) -> Result<()> {
-        let mut perf = self.perf_scope("tui.reload_view");
-        let selected_key = self.selected_tree_row_key();
-        perf.field("selected_key", &selected_key);
-
-        let filter_options_started = Instant::now();
-        self.filter_options = self.query_engine().filter_options(&self.snapshot)?;
-        perf.field(
-            "filter_options_ms",
-            filter_options_started.elapsed().as_secs_f64() * 1000.0,
-        );
-
-        let sanitize_started = Instant::now();
-        self.sanitize_ui_state();
-        perf.field(
-            "sanitize_ui_state_ms",
-            sanitize_started.elapsed().as_secs_f64() * 1000.0,
-        );
-
-        let filters_started = Instant::now();
-        let filters = self.current_query_filters()?;
-        perf.field(
-            "current_query_filters_ms",
-            filters_started.elapsed().as_secs_f64() * 1000.0,
-        );
-        perf.field("filters", &filters);
-        let mut path = self.ui_state.path.clone();
-        let mut browse_attempts = 0usize;
-        let browse_loop_started = Instant::now();
-
-        loop {
-            browse_attempts += 1;
-            let rows = self.query_engine().browse(&BrowseRequest {
-                snapshot: self.snapshot.clone(),
-                root: self.ui_state.root,
-                lens: self.ui_state.lens,
-                filters: filters.clone(),
-                path: path.clone(),
-            })?;
-
-            if !rows.is_empty() || matches!(path, BrowsePath::Root) {
-                self.ui_state.path = path;
-                self.raw_rows = rows;
-                break;
-            }
-
-            let project_root = match project_id_from_path(&path) {
-                Some(project_id) => self.project_root_for(project_id)?,
-                None => None,
-            };
-            let parent = parent_browse_path(&path, project_root.as_deref());
-            if parent == path {
-                self.raw_rows = rows;
-                break;
-            }
-            path = parent;
-        }
-        perf.field(
-            "browse_loop_ms",
-            browse_loop_started.elapsed().as_secs_f64() * 1000.0,
-        );
-        perf.field("browse_attempts", browse_attempts);
-        perf.field("raw_row_count", self.raw_rows.len());
-        self.row_cache.clear();
-        self.cache_rows(self.ui_state.path.clone(), self.raw_rows.clone());
-        self.expanded_paths
-            .retain(|expanded| path_is_within(expanded, &self.ui_state.path));
-
-        let row_filter_started = Instant::now();
-        self.apply_row_filter()?;
-        perf.field(
-            "apply_row_filter_ms",
-            row_filter_started.elapsed().as_secs_f64() * 1000.0,
-        );
-
-        let restore_started = Instant::now();
-        self.restore_selection(selected_key)?;
-        perf.field(
-            "restore_selection_ms",
-            restore_started.elapsed().as_secs_f64() * 1000.0,
-        );
-
-        let active_context_started = Instant::now();
-        self.refresh_active_context(&filters)?;
-        perf.field(
-            "active_context_ms",
-            active_context_started.elapsed().as_secs_f64() * 1000.0,
-        );
-
-        let save_started = Instant::now();
-        self.save_state();
-        perf.field(
-            "save_state_ms",
-            save_started.elapsed().as_secs_f64() * 1000.0,
-        );
-        perf.field("visible_row_count", self.visible_rows.len());
+        let sequence = self.next_request_sequence();
+        self.pending_async_work
+            .begin_view(sequence, "refreshing snapshot");
+        self.worker
+            .send(QueryWorkerRequest::RefreshLatest(RefreshViewRequest {
+                sequence,
+                current_snapshot: self.snapshot.clone(),
+                ui_state: self.ui_state.clone(),
+                selected_key: self.selected_tree_row_key(),
+            }))?;
+        perf.field("queued_sequence", sequence);
         perf.finish_ok();
         Ok(())
     }
@@ -1047,13 +1106,6 @@ impl App {
         Ok(())
     }
 
-    fn refresh_snapshot_coverage(&mut self) -> Result<()> {
-        self.snapshot_coverage = self
-            .query_engine()
-            .snapshot_coverage_summary(&self.snapshot)?;
-        Ok(())
-    }
-
     fn current_query_filters(&self) -> Result<BrowseFilters> {
         Ok(BrowseFilters {
             time_window: self.ui_state.time_window.to_filter(&self.snapshot)?,
@@ -1062,62 +1114,6 @@ impl App {
             action_category: self.ui_state.action_category.clone(),
             action: self.ui_state.action.clone(),
         })
-    }
-
-    fn sanitize_ui_state(&mut self) {
-        if !matches_path_root(&self.ui_state.root, &self.ui_state.path) {
-            self.ui_state.path = BrowsePath::Root;
-        }
-
-        if self.ui_state.model.as_ref().is_some_and(|model| {
-            !self
-                .filter_options
-                .models
-                .iter()
-                .any(|candidate| candidate == model)
-        }) {
-            self.ui_state.model = None;
-        }
-
-        if self.ui_state.project_id.is_some_and(|project_id| {
-            !self
-                .filter_options
-                .projects
-                .iter()
-                .any(|project| project.id == project_id)
-        }) {
-            self.ui_state.project_id = None;
-        }
-
-        if self
-            .ui_state
-            .action_category
-            .as_ref()
-            .is_some_and(|category| {
-                !self
-                    .filter_options
-                    .categories
-                    .iter()
-                    .any(|candidate| candidate == category)
-            })
-        {
-            self.ui_state.action_category = None;
-        }
-
-        if self.ui_state.action.as_ref().is_some_and(|action| {
-            !self.filter_options.actions.iter().any(|option| {
-                option.action == *action
-                    && self
-                        .ui_state
-                        .action_category
-                        .as_ref()
-                        .is_none_or(|category| option.category == *category)
-            })
-        }) {
-            self.ui_state.action = None;
-        }
-
-        normalize_columns(&mut self.ui_state.enabled_columns);
     }
 
     fn apply_row_filter(&mut self) -> Result<()> {
@@ -1253,205 +1249,6 @@ impl App {
             .map(|(parent_index, _)| parent_index)
     }
 
-    fn update_jump_matches(&mut self) -> Result<()> {
-        let mut perf = self.perf_scope("tui.update_jump_matches");
-        perf.field("jump_query", &self.jump_state.query);
-        let build_targets_started = Instant::now();
-        let targets = self.build_jump_targets()?;
-        perf.field(
-            "build_jump_targets_ms",
-            build_targets_started.elapsed().as_secs_f64() * 1000.0,
-        );
-        perf.field("target_count", targets.len());
-
-        let match_started = Instant::now();
-        self.jump_state.matches = build_jump_matches(&self.jump_state.query, targets);
-        perf.field(
-            "match_list_ms",
-            match_started.elapsed().as_secs_f64() * 1000.0,
-        );
-        self.jump_state.selected = 0;
-        perf.field("match_count", self.jump_state.matches.len());
-        perf.finish_ok();
-        Ok(())
-    }
-
-    fn build_jump_targets(&self) -> Result<Vec<JumpTarget>> {
-        let filters = self.current_query_filters()?;
-        let mut perf = self.perf_scope_with_filters("tui.build_jump_targets", &filters);
-        let mut targets = Vec::new();
-        let mut project_count = 0usize;
-        let mut category_count = 0usize;
-        let mut action_count = 0usize;
-        let browse_started = Instant::now();
-
-        let project_root_rows = self.query_engine().browse(&BrowseRequest {
-            snapshot: self.snapshot.clone(),
-            root: RootView::ProjectHierarchy,
-            lens: self.ui_state.lens,
-            filters: filters.clone(),
-            path: BrowsePath::Root,
-        })?;
-
-        for project in &project_root_rows {
-            let Some(project_id) = project.project_id else {
-                continue;
-            };
-            project_count += 1;
-            targets.push(JumpTarget {
-                label: project.label.clone(),
-                detail: "project".to_string(),
-                root: RootView::ProjectHierarchy,
-                path: BrowsePath::Project { project_id },
-            });
-
-            let categories = self.query_engine().browse(&BrowseRequest {
-                snapshot: self.snapshot.clone(),
-                root: RootView::ProjectHierarchy,
-                lens: self.ui_state.lens,
-                filters: filters.clone(),
-                path: BrowsePath::Project { project_id },
-            })?;
-
-            for category in &categories {
-                let Some(category_name) = category.category.clone() else {
-                    continue;
-                };
-                category_count += 1;
-                targets.push(JumpTarget {
-                    label: format!("{} / {}", project.label, category_name),
-                    detail: "project category".to_string(),
-                    root: RootView::ProjectHierarchy,
-                    path: BrowsePath::ProjectCategory {
-                        project_id,
-                        category: category_name.clone(),
-                    },
-                });
-
-                let actions = self.query_engine().browse(&BrowseRequest {
-                    snapshot: self.snapshot.clone(),
-                    root: RootView::ProjectHierarchy,
-                    lens: self.ui_state.lens,
-                    filters: filters.clone(),
-                    path: BrowsePath::ProjectCategory {
-                        project_id,
-                        category: category_name.clone(),
-                    },
-                })?;
-
-                for action in actions {
-                    let Some(action_key) = action.action.clone() else {
-                        continue;
-                    };
-                    action_count += 1;
-                    targets.push(JumpTarget {
-                        label: format!("{} / {} / {}", project.label, category_name, action.label),
-                        detail: "project action".to_string(),
-                        root: RootView::ProjectHierarchy,
-                        path: BrowsePath::ProjectAction {
-                            project_id,
-                            category: category_name.clone(),
-                            action: action_key,
-                            parent_path: None,
-                        },
-                    });
-                }
-            }
-        }
-
-        let category_root_rows = self.query_engine().browse(&BrowseRequest {
-            snapshot: self.snapshot.clone(),
-            root: RootView::CategoryHierarchy,
-            lens: self.ui_state.lens,
-            filters: filters.clone(),
-            path: BrowsePath::Root,
-        })?;
-
-        for category in &category_root_rows {
-            let Some(category_name) = category.category.clone() else {
-                continue;
-            };
-            category_count += 1;
-            targets.push(JumpTarget {
-                label: category_name.clone(),
-                detail: "category".to_string(),
-                root: RootView::CategoryHierarchy,
-                path: BrowsePath::Category {
-                    category: category_name.clone(),
-                },
-            });
-
-            let actions = self.query_engine().browse(&BrowseRequest {
-                snapshot: self.snapshot.clone(),
-                root: RootView::CategoryHierarchy,
-                lens: self.ui_state.lens,
-                filters: filters.clone(),
-                path: BrowsePath::Category {
-                    category: category_name.clone(),
-                },
-            })?;
-
-            for action in &actions {
-                let Some(action_key) = action.action.clone() else {
-                    continue;
-                };
-                action_count += 1;
-                targets.push(JumpTarget {
-                    label: format!("{} / {}", category_name, action.label),
-                    detail: "category action".to_string(),
-                    root: RootView::CategoryHierarchy,
-                    path: BrowsePath::CategoryAction {
-                        category: category_name.clone(),
-                        action: action_key.clone(),
-                    },
-                });
-
-                let projects = self.query_engine().browse(&BrowseRequest {
-                    snapshot: self.snapshot.clone(),
-                    root: RootView::CategoryHierarchy,
-                    lens: self.ui_state.lens,
-                    filters: filters.clone(),
-                    path: BrowsePath::CategoryAction {
-                        category: category_name.clone(),
-                        action: action_key,
-                    },
-                })?;
-
-                for project in projects {
-                    let Some(project_id) = project.project_id else {
-                        continue;
-                    };
-                    project_count += 1;
-                    targets.push(JumpTarget {
-                        label: format!("{} / {} / {}", category_name, action.label, project.label),
-                        detail: "category project".to_string(),
-                        root: RootView::CategoryHierarchy,
-                        path: BrowsePath::CategoryActionProject {
-                            category: category_name.clone(),
-                            action: project
-                                .action
-                                .clone()
-                                .unwrap_or_else(|| action_key_from_row(&project)),
-                            project_id,
-                            parent_path: None,
-                        },
-                    });
-                }
-            }
-        }
-
-        perf.field(
-            "browse_work_ms",
-            browse_started.elapsed().as_secs_f64() * 1000.0,
-        );
-        perf.field("project_count", project_count);
-        perf.field("category_count", category_count);
-        perf.field("action_count", action_count);
-        perf.field("target_count", targets.len());
-        perf.finish_ok();
-        Ok(targets)
-    }
-
     fn project_root_for(&self, project_id: i64) -> Result<Option<String>> {
         let filters = self.current_query_filters()?;
         let relaxed_filters = BrowseFilters {
@@ -1549,7 +1346,6 @@ impl App {
         self.cache_rows(path, rows.clone());
         Ok(rows)
     }
-
     fn filter_summary(&self) -> String {
         let mut parts = vec![format!("time {}", self.ui_state.time_window.label())];
         if let Some(model) = &self.ui_state.model {
@@ -1599,6 +1395,30 @@ impl App {
         format!("selected: {selected}  |  row filter: {filter}")
     }
 
+    fn header_detail_line(&self) -> Line<'static> {
+        match (
+            self.pending_async_work.summary(),
+            self.status_message.as_ref(),
+        ) {
+            (Some(activity), Some(message)) => Line::from(vec![
+                Span::styled("activity: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(activity, Style::default().fg(Color::Cyan)),
+                Span::raw("  |  "),
+                Span::styled("status: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(message.text.clone(), status_tone_style(message.tone)),
+            ]),
+            (Some(activity), None) => Line::from(vec![
+                Span::styled("activity: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(activity, Style::default().fg(Color::Cyan)),
+            ]),
+            (None, Some(message)) => Line::from(vec![
+                Span::styled("status: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(message.text.clone(), status_tone_style(message.tone)),
+            ]),
+            (None, None) => Line::from(format!("filters: {}", self.filter_summary())),
+        }
+    }
+
     fn build_radial_context(
         &self,
         filters: &BrowseFilters,
@@ -1643,6 +1463,124 @@ impl App {
             ancestor_layers,
             current_span,
         })
+    }
+
+    fn next_request_sequence(&mut self) -> u64 {
+        let sequence = self.next_request_sequence;
+        self.next_request_sequence += 1;
+        sequence
+    }
+
+    fn enqueue_view_reload(&mut self, label: &'static str) -> Result<()> {
+        let sequence = self.next_request_sequence();
+        self.pending_async_work.begin_view(sequence, label);
+        self.worker
+            .send(QueryWorkerRequest::LoadView(ViewLoadRequest {
+                sequence,
+                snapshot: self.snapshot.clone(),
+                ui_state: self.ui_state.clone(),
+                selected_key: self.selected_tree_row_key(),
+            }))
+    }
+
+    fn enqueue_jump_target_rebuild(&mut self) -> Result<()> {
+        let sequence = self.next_request_sequence();
+        self.pending_async_work
+            .begin_jump(sequence, "building jump targets");
+        self.jump_state.matches.clear();
+        self.jump_state.selected = 0;
+        self.worker
+            .send(QueryWorkerRequest::BuildJumpTargets(JumpTargetRequest {
+                sequence,
+                snapshot: self.snapshot.clone(),
+                ui_state: self.ui_state.clone(),
+            }))
+    }
+
+    fn drain_query_results(&mut self) {
+        while let Ok(result) = self.worker.results.try_recv() {
+            if let Err(error) = self.apply_query_result(result) {
+                self.status_message = Some(StatusMessage::error(format!(
+                    "Unable to apply interactive query result: {error:#}"
+                )));
+            }
+        }
+    }
+
+    fn apply_query_result(&mut self, result: QueryWorkerResult) -> Result<()> {
+        match result {
+            QueryWorkerResult::ViewLoaded(result) => {
+                if self
+                    .pending_async_work
+                    .finish(PendingTaskKind::View, result.sequence)
+                {
+                    self.apply_loaded_view(result.loaded_view)?;
+                }
+            }
+            QueryWorkerResult::RefreshCompleted(result) => {
+                if self
+                    .pending_async_work
+                    .finish(PendingTaskKind::View, result.sequence)
+                {
+                    self.latest_snapshot = result.latest_snapshot.clone();
+                    if let Some(loaded_view) = result.loaded_view {
+                        self.apply_loaded_view(loaded_view)?;
+                        self.has_newer_snapshot = false;
+                        self.status_message = Some(StatusMessage::info(format!(
+                            "Switched to the newest imported snapshot {}.",
+                            snapshot_coverage_tail(&self.snapshot)
+                        )));
+                    } else {
+                        self.has_newer_snapshot =
+                            self.latest_snapshot.max_publish_seq > self.snapshot.max_publish_seq;
+                        self.status_message = Some(StatusMessage::info(
+                            "No newer published snapshot is available.",
+                        ));
+                    }
+                }
+            }
+            QueryWorkerResult::JumpTargetsBuilt(result) => {
+                if self
+                    .pending_async_work
+                    .finish(PendingTaskKind::Jump, result.sequence)
+                {
+                    self.jump_state.matches =
+                        build_jump_matches(&self.jump_state.query, result.targets);
+                    self.jump_state.selected = 0;
+                }
+            }
+            QueryWorkerResult::Failed(failure) => {
+                if self
+                    .pending_async_work
+                    .finish(failure.task, failure.sequence)
+                {
+                    self.status_message = Some(StatusMessage::error(failure.message));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_loaded_view(&mut self, loaded_view: LoadedView) -> Result<()> {
+        self.snapshot = loaded_view.snapshot;
+        self.snapshot_coverage = loaded_view.snapshot_coverage;
+        self.ui_state = loaded_view.ui_state;
+        self.filter_options = loaded_view.filter_options;
+        self.raw_rows = loaded_view.raw_rows;
+        self.breadcrumb_targets = loaded_view.breadcrumb_targets;
+        self.breadcrumb_picker.selected = self.breadcrumb_targets.len().saturating_sub(1);
+        self.current_project_root = loaded_view.current_project_root;
+        self.radial_context = loaded_view.radial_context;
+        self.row_cache.clear();
+        self.cache_rows(self.ui_state.path.clone(), self.raw_rows.clone());
+        self.expanded_paths
+            .retain(|expanded| path_is_within(expanded, &self.ui_state.path));
+        self.apply_row_filter()?;
+        self.restore_selection(loaded_view.selected_key)?;
+        self.refresh_active_context_for_selection();
+        self.save_state();
+        Ok(())
     }
 
     fn rebuild_radial_model(&mut self) {
@@ -1774,6 +1712,582 @@ impl TreeRow {
 struct TreeRowKey {
     parent_path: BrowsePath,
     row_key: String,
+}
+
+fn run_query_worker(
+    db_path: PathBuf,
+    perf_logger: Option<PerfLogger>,
+    requests: Receiver<QueryWorkerRequest>,
+    results: Sender<QueryWorkerResult>,
+) {
+    let database = match Database::open_read_only(&db_path) {
+        Ok(database) => database,
+        Err(error) => {
+            let _ = results.send(QueryWorkerResult::Failed(QueryWorkerFailure {
+                sequence: 0,
+                task: PendingTaskKind::View,
+                message: format!("Unable to start interactive query worker: {error:#}"),
+            }));
+            return;
+        }
+    };
+    let query_engine = QueryEngine::with_perf(database.connection(), perf_logger.clone());
+
+    while let Ok(request) = requests.recv() {
+        let result = match request {
+            QueryWorkerRequest::LoadView(request) => load_view_for_state(
+                &query_engine,
+                perf_logger.clone(),
+                request.snapshot,
+                request.ui_state,
+                request.selected_key,
+            )
+            .map(|loaded_view| {
+                QueryWorkerResult::ViewLoaded(ViewLoadResult {
+                    sequence: request.sequence,
+                    loaded_view,
+                })
+            })
+            .unwrap_or_else(|error| {
+                QueryWorkerResult::Failed(QueryWorkerFailure {
+                    sequence: request.sequence,
+                    task: PendingTaskKind::View,
+                    message: format!("Unable to load view: {error:#}"),
+                })
+            }),
+            QueryWorkerRequest::RefreshLatest(request) => {
+                let latest_snapshot = query_engine.latest_snapshot_bounds();
+                match latest_snapshot {
+                    Ok(latest_snapshot)
+                        if latest_snapshot.max_publish_seq
+                            > request.current_snapshot.max_publish_seq =>
+                    {
+                        load_view_for_state(
+                            &query_engine,
+                            perf_logger.clone(),
+                            latest_snapshot.clone(),
+                            request.ui_state,
+                            request.selected_key,
+                        )
+                        .map(|loaded_view| {
+                            QueryWorkerResult::RefreshCompleted(RefreshViewResult {
+                                sequence: request.sequence,
+                                latest_snapshot,
+                                loaded_view: Some(loaded_view),
+                            })
+                        })
+                        .unwrap_or_else(|error| {
+                            QueryWorkerResult::Failed(QueryWorkerFailure {
+                                sequence: request.sequence,
+                                task: PendingTaskKind::View,
+                                message: format!("Unable to refresh snapshot: {error:#}"),
+                            })
+                        })
+                    }
+                    Ok(latest_snapshot) => QueryWorkerResult::RefreshCompleted(RefreshViewResult {
+                        sequence: request.sequence,
+                        latest_snapshot,
+                        loaded_view: None,
+                    }),
+                    Err(error) => QueryWorkerResult::Failed(QueryWorkerFailure {
+                        sequence: request.sequence,
+                        task: PendingTaskKind::View,
+                        message: format!("Unable to refresh snapshot: {error:#}"),
+                    }),
+                }
+            }
+            QueryWorkerRequest::BuildJumpTargets(request) => build_jump_targets_for_state(
+                &query_engine,
+                perf_logger.clone(),
+                request.snapshot,
+                request.ui_state,
+            )
+            .map(|targets| {
+                QueryWorkerResult::JumpTargetsBuilt(JumpTargetsResult {
+                    sequence: request.sequence,
+                    targets,
+                })
+            })
+            .unwrap_or_else(|error| {
+                QueryWorkerResult::Failed(QueryWorkerFailure {
+                    sequence: request.sequence,
+                    task: PendingTaskKind::Jump,
+                    message: format!("Unable to build jump targets: {error:#}"),
+                })
+            }),
+        };
+
+        if results.send(result).is_err() {
+            break;
+        }
+    }
+}
+
+fn load_view_for_state(
+    query_engine: &QueryEngine<'_>,
+    perf_logger: Option<PerfLogger>,
+    snapshot: SnapshotBounds,
+    mut ui_state: PersistedUiState,
+    selected_key: Option<TreeRowKey>,
+) -> Result<LoadedView> {
+    let mut perf = PerfScope::new(perf_logger.clone(), "tui.reload_view");
+    perf.field("snapshot", &snapshot);
+    perf.field("root", ui_state.root);
+    perf.field("path", &ui_state.path);
+    perf.field("lens", ui_state.lens);
+    perf.field("row_filter", &ui_state.row_filter);
+    perf.field("selected_key", &selected_key);
+
+    let filter_options_started = Instant::now();
+    let filter_options = query_engine.filter_options(&snapshot)?;
+    perf.field(
+        "filter_options_ms",
+        filter_options_started.elapsed().as_secs_f64() * 1000.0,
+    );
+
+    let sanitize_started = Instant::now();
+    sanitize_ui_state(&mut ui_state, &filter_options);
+    perf.field(
+        "sanitize_ui_state_ms",
+        sanitize_started.elapsed().as_secs_f64() * 1000.0,
+    );
+
+    let filters_started = Instant::now();
+    let filters = current_query_filters_for(&ui_state, &snapshot)?;
+    perf.field(
+        "current_query_filters_ms",
+        filters_started.elapsed().as_secs_f64() * 1000.0,
+    );
+    perf.field("filters", &filters);
+
+    let browse_started = Instant::now();
+    let (path, raw_rows) =
+        browse_rows_with_parent_fallback(query_engine, &snapshot, &ui_state, &filters)?;
+    perf.field(
+        "browse_loop_ms",
+        browse_started.elapsed().as_secs_f64() * 1000.0,
+    );
+    perf.field("raw_row_count", raw_rows.len());
+    ui_state.path = path;
+
+    let project_root_started = Instant::now();
+    let current_project_root = match project_id_from_path(&ui_state.path) {
+        Some(project_id) => {
+            project_root_for_state(query_engine, &snapshot, ui_state.lens, &filters, project_id)?
+        }
+        None => None,
+    };
+    perf.field(
+        "project_root_ms",
+        project_root_started.elapsed().as_secs_f64() * 1000.0,
+    );
+
+    let breadcrumb_started = Instant::now();
+    let breadcrumb_targets = build_breadcrumb_targets(
+        &ui_state.root,
+        &ui_state.path,
+        &filter_options,
+        current_project_root.as_deref(),
+    );
+    perf.field(
+        "breadcrumb_build_ms",
+        breadcrumb_started.elapsed().as_secs_f64() * 1000.0,
+    );
+    perf.field("breadcrumb_count", breadcrumb_targets.len());
+
+    let radial_started = Instant::now();
+    let radial_context = build_radial_context_for_state(
+        query_engine,
+        perf_logger.clone(),
+        &snapshot,
+        &ui_state,
+        &filters,
+        current_project_root.as_deref(),
+    )?;
+    perf.field(
+        "radial_context_ms",
+        radial_started.elapsed().as_secs_f64() * 1000.0,
+    );
+
+    let coverage_started = Instant::now();
+    let snapshot_coverage = query_engine.snapshot_coverage_summary(&snapshot)?;
+    perf.field(
+        "snapshot_coverage_ms",
+        coverage_started.elapsed().as_secs_f64() * 1000.0,
+    );
+    perf.finish_ok();
+
+    Ok(LoadedView {
+        snapshot,
+        snapshot_coverage,
+        ui_state,
+        filter_options,
+        raw_rows,
+        breadcrumb_targets,
+        radial_context,
+        current_project_root,
+        selected_key,
+    })
+}
+
+fn build_jump_targets_for_state(
+    query_engine: &QueryEngine<'_>,
+    perf_logger: Option<PerfLogger>,
+    snapshot: SnapshotBounds,
+    ui_state: PersistedUiState,
+) -> Result<Vec<JumpTarget>> {
+    let filters = current_query_filters_for(&ui_state, &snapshot)?;
+    let mut perf = PerfScope::new(perf_logger, "tui.build_jump_targets");
+    perf.field("snapshot", &snapshot);
+    perf.field("root", ui_state.root);
+    perf.field("path", &ui_state.path);
+    perf.field("lens", ui_state.lens);
+    perf.field("filters", &filters);
+    let mut targets = Vec::new();
+    let mut project_count = 0usize;
+    let mut category_count = 0usize;
+    let mut action_count = 0usize;
+    let browse_started = Instant::now();
+
+    let project_root_rows = query_engine.browse(&BrowseRequest {
+        snapshot: snapshot.clone(),
+        root: RootView::ProjectHierarchy,
+        lens: ui_state.lens,
+        filters: filters.clone(),
+        path: BrowsePath::Root,
+    })?;
+
+    for project in &project_root_rows {
+        let Some(project_id) = project.project_id else {
+            continue;
+        };
+        project_count += 1;
+        targets.push(JumpTarget {
+            label: project.label.clone(),
+            detail: "project".to_string(),
+            root: RootView::ProjectHierarchy,
+            path: BrowsePath::Project { project_id },
+        });
+
+        let categories = query_engine.browse(&BrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::ProjectHierarchy,
+            lens: ui_state.lens,
+            filters: filters.clone(),
+            path: BrowsePath::Project { project_id },
+        })?;
+
+        for category in &categories {
+            let Some(category_name) = category.category.clone() else {
+                continue;
+            };
+            category_count += 1;
+            targets.push(JumpTarget {
+                label: format!("{} / {}", project.label, category_name),
+                detail: "project category".to_string(),
+                root: RootView::ProjectHierarchy,
+                path: BrowsePath::ProjectCategory {
+                    project_id,
+                    category: category_name.clone(),
+                },
+            });
+
+            let actions = query_engine.browse(&BrowseRequest {
+                snapshot: snapshot.clone(),
+                root: RootView::ProjectHierarchy,
+                lens: ui_state.lens,
+                filters: filters.clone(),
+                path: BrowsePath::ProjectCategory {
+                    project_id,
+                    category: category_name.clone(),
+                },
+            })?;
+
+            for action in actions {
+                let Some(action_key) = action.action.clone() else {
+                    continue;
+                };
+                action_count += 1;
+                targets.push(JumpTarget {
+                    label: format!("{} / {} / {}", project.label, category_name, action.label),
+                    detail: "project action".to_string(),
+                    root: RootView::ProjectHierarchy,
+                    path: BrowsePath::ProjectAction {
+                        project_id,
+                        category: category_name.clone(),
+                        action: action_key,
+                        parent_path: None,
+                    },
+                });
+            }
+        }
+    }
+
+    let category_root_rows = query_engine.browse(&BrowseRequest {
+        snapshot: snapshot.clone(),
+        root: RootView::CategoryHierarchy,
+        lens: ui_state.lens,
+        filters: filters.clone(),
+        path: BrowsePath::Root,
+    })?;
+
+    for category in &category_root_rows {
+        let Some(category_name) = category.category.clone() else {
+            continue;
+        };
+        category_count += 1;
+        targets.push(JumpTarget {
+            label: category_name.clone(),
+            detail: "category".to_string(),
+            root: RootView::CategoryHierarchy,
+            path: BrowsePath::Category {
+                category: category_name.clone(),
+            },
+        });
+
+        let actions = query_engine.browse(&BrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::CategoryHierarchy,
+            lens: ui_state.lens,
+            filters: filters.clone(),
+            path: BrowsePath::Category {
+                category: category_name.clone(),
+            },
+        })?;
+
+        for action in &actions {
+            let Some(action_key) = action.action.clone() else {
+                continue;
+            };
+            action_count += 1;
+            targets.push(JumpTarget {
+                label: format!("{} / {}", category_name, action.label),
+                detail: "category action".to_string(),
+                root: RootView::CategoryHierarchy,
+                path: BrowsePath::CategoryAction {
+                    category: category_name.clone(),
+                    action: action_key.clone(),
+                },
+            });
+
+            let projects = query_engine.browse(&BrowseRequest {
+                snapshot: snapshot.clone(),
+                root: RootView::CategoryHierarchy,
+                lens: ui_state.lens,
+                filters: filters.clone(),
+                path: BrowsePath::CategoryAction {
+                    category: category_name.clone(),
+                    action: action_key,
+                },
+            })?;
+
+            for project in projects {
+                let Some(project_id) = project.project_id else {
+                    continue;
+                };
+                project_count += 1;
+                targets.push(JumpTarget {
+                    label: format!("{} / {} / {}", category_name, action.label, project.label),
+                    detail: "category project".to_string(),
+                    root: RootView::CategoryHierarchy,
+                    path: BrowsePath::CategoryActionProject {
+                        category: category_name.clone(),
+                        action: project
+                            .action
+                            .clone()
+                            .unwrap_or_else(|| action_key_from_row(&project)),
+                        project_id,
+                        parent_path: None,
+                    },
+                });
+            }
+        }
+    }
+
+    perf.field(
+        "browse_work_ms",
+        browse_started.elapsed().as_secs_f64() * 1000.0,
+    );
+    perf.field("project_count", project_count);
+    perf.field("category_count", category_count);
+    perf.field("action_count", action_count);
+    perf.field("target_count", targets.len());
+    perf.finish_ok();
+
+    Ok(targets)
+}
+
+fn browse_rows_with_parent_fallback(
+    query_engine: &QueryEngine<'_>,
+    snapshot: &SnapshotBounds,
+    ui_state: &PersistedUiState,
+    filters: &BrowseFilters,
+) -> Result<(BrowsePath, Vec<RollupRow>)> {
+    let mut path = ui_state.path.clone();
+
+    loop {
+        let rows = query_engine.browse(&BrowseRequest {
+            snapshot: snapshot.clone(),
+            root: ui_state.root,
+            lens: ui_state.lens,
+            filters: filters.clone(),
+            path: path.clone(),
+        })?;
+
+        if !rows.is_empty() || matches!(path, BrowsePath::Root) {
+            return Ok((path, rows));
+        }
+
+        let project_root = match project_id_from_path(&path) {
+            Some(project_id) => {
+                project_root_for_state(query_engine, snapshot, ui_state.lens, filters, project_id)?
+            }
+            None => None,
+        };
+        let parent = parent_browse_path(&path, project_root.as_deref());
+        if parent == path {
+            return Ok((path, rows));
+        }
+        path = parent;
+    }
+}
+
+fn build_radial_context_for_state(
+    query_engine: &QueryEngine<'_>,
+    perf_logger: Option<PerfLogger>,
+    snapshot: &SnapshotBounds,
+    ui_state: &PersistedUiState,
+    filters: &BrowseFilters,
+    project_root: Option<&str>,
+) -> Result<RadialContext> {
+    let mut perf = PerfScope::new(perf_logger, "tui.build_radial_context");
+    perf.field("snapshot", snapshot);
+    perf.field("root", ui_state.root);
+    perf.field("path", &ui_state.path);
+    perf.field("lens", ui_state.lens);
+    perf.field("filters", filters);
+    let steps = radial_ancestor_steps(&ui_state.root, &ui_state.path, project_root);
+    let mut ancestor_layers = Vec::new();
+    let mut current_span = RadialSpan::full();
+    let browse_started = Instant::now();
+
+    for step in steps {
+        let rows = query_engine.browse(&BrowseRequest {
+            snapshot: snapshot.clone(),
+            root: ui_state.root,
+            lens: ui_state.lens,
+            filters: filters.clone(),
+            path: step.query_path,
+        })?;
+        let layer = build_radial_layer(
+            &rows,
+            ui_state.lens,
+            Some(&step.selected_child),
+            current_span,
+        );
+        current_span = radial_selected_child_span(&layer);
+        ancestor_layers.push(layer);
+    }
+
+    perf.field(
+        "browse_work_ms",
+        browse_started.elapsed().as_secs_f64() * 1000.0,
+    );
+    perf.field("ancestor_layer_count", ancestor_layers.len());
+    perf.finish_ok();
+
+    Ok(RadialContext {
+        ancestor_layers,
+        current_span,
+    })
+}
+
+fn project_root_for_state(
+    query_engine: &QueryEngine<'_>,
+    snapshot: &SnapshotBounds,
+    lens: MetricLens,
+    filters: &BrowseFilters,
+    project_id: i64,
+) -> Result<Option<String>> {
+    let relaxed_filters = BrowseFilters {
+        time_window: filters.time_window.clone(),
+        model: filters.model.clone(),
+        project_id: None,
+        action_category: None,
+        action: None,
+    };
+    let root_rows = query_engine.browse(&BrowseRequest {
+        snapshot: snapshot.clone(),
+        root: RootView::ProjectHierarchy,
+        lens,
+        filters: relaxed_filters,
+        path: BrowsePath::Root,
+    })?;
+
+    Ok(root_rows
+        .into_iter()
+        .find(|row| row.project_id == Some(project_id))
+        .and_then(|row| row.full_path))
+}
+
+fn current_query_filters_for(
+    ui_state: &PersistedUiState,
+    snapshot: &SnapshotBounds,
+) -> Result<BrowseFilters> {
+    Ok(BrowseFilters {
+        time_window: ui_state.time_window.to_filter(snapshot)?,
+        model: ui_state.model.clone(),
+        project_id: ui_state.project_id,
+        action_category: ui_state.action_category.clone(),
+        action: ui_state.action.clone(),
+    })
+}
+
+fn sanitize_ui_state(ui_state: &mut PersistedUiState, filter_options: &FilterOptions) {
+    if !matches_path_root(&ui_state.root, &ui_state.path) {
+        ui_state.path = BrowsePath::Root;
+    }
+
+    if ui_state.model.as_ref().is_some_and(|model| {
+        !filter_options
+            .models
+            .iter()
+            .any(|candidate| candidate == model)
+    }) {
+        ui_state.model = None;
+    }
+
+    if ui_state.project_id.is_some_and(|project_id| {
+        !filter_options
+            .projects
+            .iter()
+            .any(|project| project.id == project_id)
+    }) {
+        ui_state.project_id = None;
+    }
+
+    if ui_state.action_category.as_ref().is_some_and(|category| {
+        !filter_options
+            .categories
+            .iter()
+            .any(|candidate| candidate == category)
+    }) {
+        ui_state.action_category = None;
+    }
+
+    if ui_state.action.as_ref().is_some_and(|action| {
+        !filter_options.actions.iter().any(|option| {
+            option.action == *action
+                && ui_state
+                    .action_category
+                    .as_ref()
+                    .is_none_or(|category| option.category == *category)
+        })
+    }) {
+        ui_state.action = None;
+    }
+
+    normalize_columns(&mut ui_state.enabled_columns);
 }
 
 struct TerminalGuard {
@@ -2463,6 +2977,13 @@ fn compact_status_text(text: impl AsRef<str>) -> String {
 enum StatusTone {
     Info,
     Error,
+}
+
+fn status_tone_style(tone: StatusTone) -> Style {
+    match tone {
+        StatusTone::Info => Style::default().fg(Color::Cyan),
+        StatusTone::Error => Style::default().fg(Color::Red),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -5150,6 +5671,100 @@ mod tests {
             "status pane header not rendered"
         );
         assert!(content.contains("Keys"), "keys pane header not rendered");
+        Ok(())
+    }
+
+    #[test]
+    fn stale_view_result_does_not_overwrite_newer_pending_view() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        let original_root = app.ui_state.root;
+
+        let mut loaded_view = load_view_for_state(
+            &app.query_engine(),
+            None,
+            app.snapshot.clone(),
+            app.ui_state.clone(),
+            None,
+        )?;
+        loaded_view.ui_state.root = RootView::CategoryHierarchy;
+        app.pending_async_work.begin_view(2, "loading view");
+
+        app.apply_query_result(QueryWorkerResult::ViewLoaded(ViewLoadResult {
+            sequence: 1,
+            loaded_view,
+        }))?;
+
+        assert_eq!(app.ui_state.root, original_root);
+        assert_eq!(
+            app.pending_async_work.view.map(|request| request.sequence),
+            Some(2)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_jump_result_does_not_overwrite_newer_pending_query() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        app.jump_state.query = "doc".to_string();
+        app.pending_async_work
+            .begin_jump(4, "building jump targets");
+
+        app.apply_query_result(QueryWorkerResult::JumpTargetsBuilt(JumpTargetsResult {
+            sequence: 3,
+            targets: vec![JumpTarget {
+                label: "documentation".to_string(),
+                detail: "category".to_string(),
+                root: RootView::CategoryHierarchy,
+                path: BrowsePath::Category {
+                    category: "Documentation".to_string(),
+                },
+            }],
+        }))?;
+
+        assert!(app.jump_state.matches.is_empty());
+        assert_eq!(
+            app.pending_async_work.jump.map(|request| request.sequence),
+            Some(4)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn render_shows_pending_activity_immediately() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        app.pending_async_work.begin_view(1, "loading view");
+
+        let content = render_app_to_string(&mut app, 120, 40)?;
+
+        assert!(content.contains("activity:"));
+        assert!(content.contains("loading view"));
         Ok(())
     }
 
