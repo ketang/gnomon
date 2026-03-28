@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 
-pub const INITIAL_SCHEMA_VERSION: u32 = 3;
+pub const INITIAL_SCHEMA_VERSION: u32 = 4;
 pub const DEFAULT_DB_FILENAME: &str = "usage.sqlite3";
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -158,7 +158,7 @@ mod tests {
         reset_sqlite_database,
     };
 
-    const REQUIRED_TABLES: [&str; 15] = [
+    const REQUIRED_TABLES: [&str; 16] = [
         "project",
         "source_file",
         "import_chunk",
@@ -172,6 +172,7 @@ mod tests {
         "turn_message",
         "action",
         "action_message",
+        "chunk_action_rollup",
         "path_node",
         "message_path_ref",
     ];

@@ -147,7 +147,7 @@ pub fn run_query_benchmark(
             detail: engine.latest_snapshot_bounds_query_plan()?,
         },
         QueryPlanReport {
-            name: "load_action_facts".to_string(),
+            name: "load_action_rollup_facts".to_string(),
             used_by_scenarios: vec![
                 "project_root_browse".to_string(),
                 "category_root_browse".to_string(),
@@ -155,7 +155,18 @@ pub fn run_query_benchmark(
                 "project_root_filter_change".to_string(),
                 "jump_target_build".to_string(),
             ],
-            detail: engine.action_facts_query_plan(&snapshot)?,
+            detail: engine.action_rollup_facts_query_plan(&snapshot)?,
+        },
+        QueryPlanReport {
+            name: "load_recent_action_facts".to_string(),
+            used_by_scenarios: vec![
+                "project_root_browse".to_string(),
+                "category_root_browse".to_string(),
+                "project_root_refresh".to_string(),
+                "project_root_filter_change".to_string(),
+                "jump_target_build".to_string(),
+            ],
+            detail: engine.recent_action_facts_query_plan(&snapshot)?,
         },
         QueryPlanReport {
             name: "load_path_facts".to_string(),
@@ -466,7 +477,13 @@ mod tests {
             run_query_benchmark(&validation.db_path, QueryBenchmarkOptions { iterations: 2 })?;
 
         assert_eq!(report.iterations, 2);
-        assert_eq!(report.query_plans.len(), 3);
+        assert_eq!(report.query_plans.len(), 4);
+        assert!(
+            report
+                .query_plans
+                .iter()
+                .any(|plan| plan.name == "load_action_rollup_facts")
+        );
         assert!(
             report
                 .scenarios

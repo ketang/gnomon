@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::classify::{BuildActionsParams, build_actions};
 use crate::db::Database;
 use crate::query::SnapshotBounds;
+use crate::rollup::{clear_chunk_action_rollups, rebuild_chunk_action_rollups};
 use anyhow::{Context, Result, anyhow};
 use jiff::{Timestamp, ToSpan, tz::TimeZone};
 use rusqlite::{Connection, Transaction, params};
@@ -484,16 +485,20 @@ fn prepare_chunk(conn: &Connection, chunk: &ChunkCandidate) -> Result<PreparedCh
                 completed_at_utc,
                 imported_record_count,
                 imported_message_count,
-                imported_action_count
+                imported_action_count,
+                imported_conversation_count,
+                imported_turn_count
             )
-            VALUES (?1, ?2, 'pending', NULL, NULL, 0, 0, 0)
+            VALUES (?1, ?2, 'pending', NULL, NULL, 0, 0, 0, 0, 0)
             ON CONFLICT(project_id, chunk_day_local) DO UPDATE SET
                 state = 'pending',
                 publish_seq = NULL,
                 completed_at_utc = NULL,
                 imported_record_count = 0,
                 imported_message_count = 0,
-                imported_action_count = 0
+                imported_action_count = 0,
+                imported_conversation_count = 0,
+                imported_turn_count = 0
             RETURNING id
             ",
             params![chunk.project_id, chunk.chunk_day_local],
@@ -676,7 +681,9 @@ fn begin_chunk_import(conn: &mut Connection, chunk: &PreparedChunk) -> Result<()
             completed_at_utc = NULL,
             imported_record_count = 0,
             imported_message_count = 0,
-            imported_action_count = 0
+            imported_action_count = 0,
+            imported_conversation_count = 0,
+            imported_turn_count = 0
         WHERE id = ?1
         ",
         [chunk.import_chunk_id],
@@ -698,6 +705,7 @@ fn purge_chunk_data(tx: &Transaction<'_>, import_chunk_id: i64) -> Result<()> {
         [import_chunk_id],
     )
     .context("unable to clear prior chunk warnings")?;
+    clear_chunk_action_rollups(tx, import_chunk_id)?;
 
     tx.execute(
         "
@@ -750,6 +758,8 @@ fn finalize_chunk_import(conn: &mut Connection, chunk: &PreparedChunk) -> Result
             )
         })?;
     }
+
+    rebuild_chunk_action_rollups(&tx, chunk.import_chunk_id)?;
 
     let next_publish_seq: i64 = tx
         .query_row(
