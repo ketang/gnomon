@@ -15,6 +15,7 @@ use crossterm::terminal::{
 use gnomon_core::config::RuntimeConfig;
 use gnomon_core::db::Database;
 use gnomon_core::import::{StartupOpenReason, StartupWorkerEvent};
+use gnomon_core::perf::{PerfLogger, PerfScope};
 use gnomon_core::query::{
     ActionKey, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState, FilterOptions,
     MetricLens, QueryEngine, RollupRow, RollupRowKind, RootView, SnapshotBounds, TimeWindowFilter,
@@ -60,6 +61,7 @@ pub struct App {
     status_message: Option<StatusMessage>,
     status_updates: Option<Receiver<StartupWorkerEvent>>,
     last_refresh_check: Instant,
+    perf_logger: Option<PerfLogger>,
 }
 
 impl App {
@@ -70,6 +72,7 @@ impl App {
         startup_status_message: Option<String>,
         startup_browse_state: Option<StartupBrowseState>,
         status_updates: Option<Receiver<StartupWorkerEvent>>,
+        perf_logger: Option<PerfLogger>,
     ) -> Result<Self> {
         let ui_state_path = config.state_dir.join(UI_STATE_FILENAME);
         let (ui_state, mut status_message) = match PersistedUiState::load(&ui_state_path) {
@@ -124,6 +127,7 @@ impl App {
             status_message,
             status_updates,
             last_refresh_check: Instant::now(),
+            perf_logger,
         };
 
         app.reload_view()?;
@@ -832,33 +836,78 @@ impl App {
     }
 
     fn refresh_snapshot(&mut self) -> Result<()> {
+        let mut perf = self.perf_scope("tui.refresh_snapshot");
         if !self.has_newer_snapshot {
             self.status_message = Some(StatusMessage::info(
                 "No newer published snapshot is available.",
             ));
+            perf.field("has_newer_snapshot", false);
+            perf.finish_ok();
             return Ok(());
         }
 
+        let snapshot_load_started = Instant::now();
         self.snapshot = self.query_engine().latest_snapshot_bounds()?;
+        perf.field(
+            "snapshot_load_ms",
+            snapshot_load_started.elapsed().as_secs_f64() * 1000.0,
+        );
+        perf.field("has_newer_snapshot", true);
+
+        let reload_started = Instant::now();
         self.reload_view()?;
+        perf.field(
+            "reload_view_ms",
+            reload_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        let refresh_status_started = Instant::now();
         self.refresh_snapshot_status()?;
+        perf.field(
+            "refresh_snapshot_status_ms",
+            refresh_status_started.elapsed().as_secs_f64() * 1000.0,
+        );
         self.status_message = Some(StatusMessage::info(format!(
             "Adopted publish_seq <= {} covering {}.",
             self.snapshot.max_publish_seq,
             snapshot_coverage_tail(&self.snapshot)
         )));
+        perf.finish_ok();
         Ok(())
     }
 
     fn reload_view(&mut self) -> Result<()> {
+        let mut perf = self.perf_scope("tui.reload_view");
         let selected_key = self.selected_row().map(|row| row.key.clone());
-        self.filter_options = self.query_engine().filter_options(&self.snapshot)?;
-        self.sanitize_ui_state();
+        perf.field("selected_key", &selected_key);
 
+        let filter_options_started = Instant::now();
+        self.filter_options = self.query_engine().filter_options(&self.snapshot)?;
+        perf.field(
+            "filter_options_ms",
+            filter_options_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        let sanitize_started = Instant::now();
+        self.sanitize_ui_state();
+        perf.field(
+            "sanitize_ui_state_ms",
+            sanitize_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        let filters_started = Instant::now();
         let filters = self.current_query_filters()?;
+        perf.field(
+            "current_query_filters_ms",
+            filters_started.elapsed().as_secs_f64() * 1000.0,
+        );
+        perf.field("filters", &filters);
         let mut path = self.ui_state.path.clone();
+        let mut browse_attempts = 0usize;
+        let browse_loop_started = Instant::now();
 
         loop {
+            browse_attempts += 1;
             let rows = self.query_engine().browse(&BrowseRequest {
                 snapshot: self.snapshot.clone(),
                 root: self.ui_state.root,
@@ -884,7 +933,14 @@ impl App {
             }
             path = parent;
         }
+        perf.field(
+            "browse_loop_ms",
+            browse_loop_started.elapsed().as_secs_f64() * 1000.0,
+        );
+        perf.field("browse_attempts", browse_attempts);
+        perf.field("raw_row_count", self.raw_rows.len());
 
+        let breadcrumb_started = Instant::now();
         let project_root = match project_id_from_path(&self.ui_state.path) {
             Some(project_id) => self.project_root_for(project_id)?,
             None => None,
@@ -896,17 +952,52 @@ impl App {
             project_root.as_deref(),
         );
         self.breadcrumb_picker.selected = self.breadcrumb_targets.len().saturating_sub(1);
+        perf.field(
+            "breadcrumb_build_ms",
+            breadcrumb_started.elapsed().as_secs_f64() * 1000.0,
+        );
+        perf.field("breadcrumb_count", self.breadcrumb_targets.len());
+
+        let radial_started = Instant::now();
         self.radial_context = self.build_radial_context(&filters)?;
+        perf.field(
+            "radial_context_ms",
+            radial_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        let row_filter_started = Instant::now();
         self.apply_row_filter();
+        perf.field(
+            "apply_row_filter_ms",
+            row_filter_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        let restore_started = Instant::now();
         self.restore_selection(selected_key);
+        perf.field(
+            "restore_selection_ms",
+            restore_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        let save_started = Instant::now();
         self.save_state();
+        perf.field(
+            "save_state_ms",
+            save_started.elapsed().as_secs_f64() * 1000.0,
+        );
+        perf.field("visible_row_count", self.visible_rows.len());
+        perf.finish_ok();
         Ok(())
     }
 
     fn refresh_snapshot_status(&mut self) -> Result<()> {
+        let mut perf = self.perf_scope("tui.refresh_snapshot_status");
         self.latest_snapshot = self.query_engine().latest_snapshot_bounds()?;
         self.has_newer_snapshot =
             self.latest_snapshot.max_publish_seq > self.snapshot.max_publish_seq;
+        perf.field("latest_snapshot", &self.latest_snapshot);
+        perf.field("has_newer_snapshot", self.has_newer_snapshot);
+        perf.finish_ok();
         Ok(())
     }
 
@@ -977,9 +1068,13 @@ impl App {
     }
 
     fn apply_row_filter(&mut self) {
+        let mut perf = self.perf_scope("tui.apply_row_filter");
+        perf.field("raw_row_count", self.raw_rows.len());
         let selected_key = self.selected_row().map(|row| row.key.clone());
         self.visible_rows = filter_rows(&self.raw_rows, &self.ui_state.row_filter);
         self.restore_selection(selected_key);
+        perf.field("visible_row_count", self.visible_rows.len());
+        perf.finish_ok();
     }
 
     fn restore_selection(&mut self, preferred_key: Option<String>) {
@@ -1049,15 +1144,36 @@ impl App {
     }
 
     fn update_jump_matches(&mut self) -> Result<()> {
+        let mut perf = self.perf_scope("tui.update_jump_matches");
+        perf.field("jump_query", &self.jump_state.query);
+        let build_targets_started = Instant::now();
         let targets = self.build_jump_targets()?;
+        perf.field(
+            "build_jump_targets_ms",
+            build_targets_started.elapsed().as_secs_f64() * 1000.0,
+        );
+        perf.field("target_count", targets.len());
+
+        let match_started = Instant::now();
         self.jump_state.matches = build_jump_matches(&self.jump_state.query, targets);
+        perf.field(
+            "match_list_ms",
+            match_started.elapsed().as_secs_f64() * 1000.0,
+        );
         self.jump_state.selected = 0;
+        perf.field("match_count", self.jump_state.matches.len());
+        perf.finish_ok();
         Ok(())
     }
 
     fn build_jump_targets(&self) -> Result<Vec<JumpTarget>> {
         let filters = self.current_query_filters()?;
+        let mut perf = self.perf_scope_with_filters("tui.build_jump_targets", &filters);
         let mut targets = Vec::new();
+        let mut project_count = 0usize;
+        let mut category_count = 0usize;
+        let mut action_count = 0usize;
+        let browse_started = Instant::now();
 
         let project_root_rows = self.query_engine().browse(&BrowseRequest {
             snapshot: self.snapshot.clone(),
@@ -1071,6 +1187,7 @@ impl App {
             let Some(project_id) = project.project_id else {
                 continue;
             };
+            project_count += 1;
             targets.push(JumpTarget {
                 label: project.label.clone(),
                 detail: "project".to_string(),
@@ -1090,6 +1207,7 @@ impl App {
                 let Some(category_name) = category.category.clone() else {
                     continue;
                 };
+                category_count += 1;
                 targets.push(JumpTarget {
                     label: format!("{} / {}", project.label, category_name),
                     detail: "project category".to_string(),
@@ -1115,6 +1233,7 @@ impl App {
                     let Some(action_key) = action.action.clone() else {
                         continue;
                     };
+                    action_count += 1;
                     targets.push(JumpTarget {
                         label: format!("{} / {} / {}", project.label, category_name, action.label),
                         detail: "project action".to_string(),
@@ -1134,7 +1253,7 @@ impl App {
             snapshot: self.snapshot.clone(),
             root: RootView::CategoryHierarchy,
             lens: self.ui_state.lens,
-            filters,
+            filters: filters.clone(),
             path: BrowsePath::Root,
         })?;
 
@@ -1142,6 +1261,7 @@ impl App {
             let Some(category_name) = category.category.clone() else {
                 continue;
             };
+            category_count += 1;
             targets.push(JumpTarget {
                 label: category_name.clone(),
                 detail: "category".to_string(),
@@ -1155,7 +1275,7 @@ impl App {
                 snapshot: self.snapshot.clone(),
                 root: RootView::CategoryHierarchy,
                 lens: self.ui_state.lens,
-                filters: self.current_query_filters()?,
+                filters: filters.clone(),
                 path: BrowsePath::Category {
                     category: category_name.clone(),
                 },
@@ -1165,6 +1285,7 @@ impl App {
                 let Some(action_key) = action.action.clone() else {
                     continue;
                 };
+                action_count += 1;
                 targets.push(JumpTarget {
                     label: format!("{} / {}", category_name, action.label),
                     detail: "category action".to_string(),
@@ -1179,7 +1300,7 @@ impl App {
                     snapshot: self.snapshot.clone(),
                     root: RootView::CategoryHierarchy,
                     lens: self.ui_state.lens,
-                    filters: self.current_query_filters()?,
+                    filters: filters.clone(),
                     path: BrowsePath::CategoryAction {
                         category: category_name.clone(),
                         action: action_key,
@@ -1190,6 +1311,7 @@ impl App {
                     let Some(project_id) = project.project_id else {
                         continue;
                     };
+                    project_count += 1;
                     targets.push(JumpTarget {
                         label: format!("{} / {} / {}", category_name, action.label, project.label),
                         detail: "category project".to_string(),
@@ -1208,6 +1330,15 @@ impl App {
             }
         }
 
+        perf.field(
+            "browse_work_ms",
+            browse_started.elapsed().as_secs_f64() * 1000.0,
+        );
+        perf.field("project_count", project_count);
+        perf.field("category_count", category_count);
+        perf.field("action_count", action_count);
+        perf.field("target_count", targets.len());
+        perf.finish_ok();
         Ok(targets)
     }
 
@@ -1286,6 +1417,7 @@ impl App {
     }
 
     fn build_radial_context(&self, filters: &BrowseFilters) -> Result<RadialContext> {
+        let mut perf = self.perf_scope_with_filters("tui.build_radial_context", filters);
         let project_root = match project_id_from_path(&self.ui_state.path) {
             Some(project_id) => self.project_root_for(project_id)?,
             None => None,
@@ -1297,6 +1429,7 @@ impl App {
         );
         let mut ancestor_layers = Vec::new();
         let mut current_span = RadialSpan::full();
+        let browse_started = Instant::now();
 
         for step in steps {
             let rows = self.query_engine().browse(&BrowseRequest {
@@ -1315,6 +1448,13 @@ impl App {
             current_span = radial_selected_child_span(&layer);
             ancestor_layers.push(layer);
         }
+
+        perf.field(
+            "browse_work_ms",
+            browse_started.elapsed().as_secs_f64() * 1000.0,
+        );
+        perf.field("ancestor_layer_count", ancestor_layers.len());
+        perf.finish_ok();
 
         Ok(RadialContext {
             ancestor_layers,
@@ -1342,8 +1482,25 @@ impl App {
         }
     }
 
+    fn perf_scope(&self, operation: &str) -> PerfScope {
+        let mut scope = PerfScope::new(self.perf_logger.clone(), operation);
+        scope.field("snapshot", &self.snapshot);
+        scope.field("root", self.ui_state.root);
+        scope.field("path", &self.ui_state.path);
+        scope.field("lens", self.ui_state.lens);
+        scope.field("row_filter", &self.ui_state.row_filter);
+        scope.field("selected_row_count", self.visible_rows.len());
+        scope
+    }
+
+    fn perf_scope_with_filters(&self, operation: &str, filters: &BrowseFilters) -> PerfScope {
+        let mut scope = self.perf_scope(operation);
+        scope.field("filters", filters);
+        scope
+    }
+
     fn query_engine(&self) -> QueryEngine<'_> {
-        QueryEngine::new(self.database.connection())
+        QueryEngine::with_perf(self.database.connection(), self.perf_logger.clone())
     }
 }
 
@@ -3271,6 +3428,7 @@ mod tests {
     use gnomon_core::query::{ClassificationState, SnapshotBounds};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use serde_json::Value;
     use tempfile::tempdir;
 
     use super::*;
@@ -3842,6 +4000,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )?;
         app.breadcrumb_targets = build_breadcrumb_targets(
             &RootView::ProjectHierarchy,
@@ -3871,6 +4030,44 @@ mod tests {
         assert!(content.contains("project-a"));
         assert!(content.contains(" > "));
 
+        Ok(())
+    }
+
+    #[test]
+    fn app_new_with_perf_logger_emits_tui_and_query_events() -> Result<()> {
+        let temp = tempdir()?;
+        let log_path = temp.path().join("perf.jsonl");
+        let logger = PerfLogger::open(log_path.clone())?;
+
+        let _app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            Some(logger),
+        )?;
+
+        let operations = fs::read_to_string(log_path)?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|payload| {
+                payload["operation"]
+                    .as_str()
+                    .map(std::string::ToString::to_string)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(operations.iter().any(|op| op == "tui.reload_view"));
+        assert!(
+            operations
+                .iter()
+                .any(|op| op == "tui.refresh_snapshot_status")
+        );
+        assert!(operations.iter().any(|op| op == "query.filter_options"));
         Ok(())
     }
 
@@ -3995,6 +4192,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )?;
         if let Some(latest_snapshot) = latest_snapshot {
             app.latest_snapshot = latest_snapshot;
@@ -4102,6 +4300,7 @@ mod tests {
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
             None,
             None,
             None,

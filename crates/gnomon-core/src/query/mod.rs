@@ -1,10 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use jiff::{Timestamp, ToSpan};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+
+use crate::perf::{PerfLogger, PerfScope};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotBounds {
@@ -286,14 +289,27 @@ pub struct BrowseReport {
 
 pub struct QueryEngine<'conn> {
     conn: &'conn Connection,
+    perf_logger: Option<PerfLogger>,
 }
 
 impl<'conn> QueryEngine<'conn> {
     pub fn new(conn: &'conn Connection) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            perf_logger: None,
+        }
+    }
+
+    pub fn with_perf(conn: &'conn Connection, perf_logger: Option<PerfLogger>) -> Self {
+        Self { conn, perf_logger }
+    }
+
+    fn perf_scope(&self, operation: &str) -> PerfScope {
+        PerfScope::new(self.perf_logger.clone(), operation)
     }
 
     pub fn latest_snapshot_bounds(&self) -> Result<SnapshotBounds> {
+        let mut perf = self.perf_scope("query.latest_snapshot_bounds");
         let row = self
             .conn
             .query_row(
@@ -317,16 +333,22 @@ impl<'conn> QueryEngine<'conn> {
             .context("unable to compute the latest published snapshot bounds")?;
 
         let Some(max_publish_seq) = row.0 else {
-            return Ok(SnapshotBounds::bootstrap());
+            let snapshot = SnapshotBounds::bootstrap();
+            perf.field("snapshot", &snapshot);
+            perf.finish_ok();
+            return Ok(snapshot);
         };
 
-        Ok(SnapshotBounds {
+        let snapshot = SnapshotBounds {
             max_publish_seq: u64::try_from(max_publish_seq)
                 .context("latest publish_seq was negative")?,
             published_chunk_count: usize::try_from(row.1)
                 .context("published chunk count overflowed usize")?,
             upper_bound_utc: row.2,
-        })
+        };
+        perf.field("snapshot", &snapshot);
+        perf.finish_ok();
+        Ok(snapshot)
     }
 
     pub fn has_newer_snapshot(&self, snapshot: &SnapshotBounds) -> Result<bool> {
@@ -334,7 +356,17 @@ impl<'conn> QueryEngine<'conn> {
     }
 
     pub fn filter_options(&self, snapshot: &SnapshotBounds) -> Result<FilterOptions> {
+        let mut perf = self.perf_scope("query.filter_options");
+        perf.field("snapshot", snapshot);
+
+        let action_load_started = Instant::now();
         let action_facts = self.load_action_facts(snapshot)?;
+        perf.field(
+            "action_load_ms",
+            action_load_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        let build_started = Instant::now();
         let mut projects = BTreeMap::new();
         let mut models = BTreeSet::new();
         let mut categories = BTreeSet::new();
@@ -354,7 +386,7 @@ impl<'conn> QueryEngine<'conn> {
             }
         }
 
-        Ok(FilterOptions {
+        let options = FilterOptions {
             projects: projects
                 .into_iter()
                 .map(|(id, display_name)| ProjectFilterOption { id, display_name })
@@ -369,15 +401,51 @@ impl<'conn> QueryEngine<'conn> {
                     label,
                 })
                 .collect(),
-        })
+        };
+        perf.field("build_ms", build_started.elapsed().as_secs_f64() * 1000.0);
+        perf.field("project_count", options.projects.len());
+        perf.field("model_count", options.models.len());
+        perf.field("category_count", options.categories.len());
+        perf.field("action_count", options.actions.len());
+        perf.finish_ok();
+        Ok(options)
     }
 
     pub fn browse(&self, request: &BrowseRequest) -> Result<Vec<RollupRow>> {
-        let action_facts = self.load_action_facts(&request.snapshot)?;
-        let path_facts = self.load_path_facts(&request.snapshot)?;
-        let compiled_filters = CompiledFilters::compile(&request.filters)?;
-        let windows = Windows::from_snapshot(&request.snapshot)?;
+        let mut perf = self.perf_scope("query.browse");
+        perf.field("request", request);
 
+        let action_load_started = Instant::now();
+        let action_facts = self.load_action_facts(&request.snapshot)?;
+        perf.field(
+            "action_load_ms",
+            action_load_started.elapsed().as_secs_f64() * 1000.0,
+        );
+        perf.field("action_fact_count", action_facts.len());
+
+        let path_load_started = Instant::now();
+        let path_facts = self.load_path_facts(&request.snapshot)?;
+        perf.field(
+            "path_load_ms",
+            path_load_started.elapsed().as_secs_f64() * 1000.0,
+        );
+        perf.field("path_fact_count", path_facts.len());
+
+        let filter_compile_started = Instant::now();
+        let compiled_filters = CompiledFilters::compile(&request.filters)?;
+        perf.field(
+            "filter_compile_ms",
+            filter_compile_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        let windows_started = Instant::now();
+        let windows = Windows::from_snapshot(&request.snapshot)?;
+        perf.field(
+            "window_build_ms",
+            windows_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        let aggregate_started = Instant::now();
         let mut rows = match (&request.root, &request.path) {
             (RootView::ProjectHierarchy, BrowsePath::Root) => aggregate_projects(
                 &action_facts,
@@ -489,7 +557,12 @@ impl<'conn> QueryEngine<'conn> {
                 request.root
             ),
         };
+        perf.field(
+            "aggregate_ms",
+            aggregate_started.elapsed().as_secs_f64() * 1000.0,
+        );
 
+        let sort_started = Instant::now();
         rows.sort_by(|left, right| {
             right
                 .metrics
@@ -497,6 +570,9 @@ impl<'conn> QueryEngine<'conn> {
                 .total_cmp(&left.metrics.lens_value(request.lens))
                 .then_with(|| left.label.cmp(&right.label))
         });
+        perf.field("sort_ms", sort_started.elapsed().as_secs_f64() * 1000.0);
+        perf.field("row_count", rows.len());
+        perf.finish_ok();
 
         Ok(rows)
     }
@@ -511,7 +587,11 @@ impl<'conn> QueryEngine<'conn> {
     }
 
     fn load_action_facts(&self, snapshot: &SnapshotBounds) -> Result<Vec<ActionFact>> {
+        let mut perf = self.perf_scope("query.load_action_facts");
+        perf.field("snapshot", snapshot);
         if snapshot.max_publish_seq == 0 {
+            perf.field("row_count", 0usize);
+            perf.finish_ok();
             return Ok(Vec::new());
         }
 
@@ -578,34 +658,44 @@ impl<'conn> QueryEngine<'conn> {
             })
         })?;
 
-        rows.map(|row| {
-            let row = row.context("unable to read an action fact row")?;
-            Ok(ActionFact {
-                project_id: row.project_id,
-                project_display_name: row.project_display_name,
-                project_root: row.project_root,
-                category: display_category(row.category.as_deref(), &row.classification_state)?,
-                action: ActionKey {
-                    classification_state: parse_classification_state(&row.classification_state)?,
-                    normalized_action: row.normalized_action,
-                    command_family: row.command_family,
-                    base_command: row.base_command,
-                },
-                timestamp: parse_timestamp(row.timestamp.as_deref())?,
-                metrics: MetricTotals::from_usage(
-                    row.input_tokens,
-                    row.cache_creation_input_tokens,
-                    row.cache_read_input_tokens,
-                    row.output_tokens,
-                ),
-                model_names: split_model_names(row.model_names_csv.as_deref()),
+        let facts = rows
+            .map(|row| {
+                let row = row.context("unable to read an action fact row")?;
+                Ok(ActionFact {
+                    project_id: row.project_id,
+                    project_display_name: row.project_display_name,
+                    project_root: row.project_root,
+                    category: display_category(row.category.as_deref(), &row.classification_state)?,
+                    action: ActionKey {
+                        classification_state: parse_classification_state(
+                            &row.classification_state,
+                        )?,
+                        normalized_action: row.normalized_action,
+                        command_family: row.command_family,
+                        base_command: row.base_command,
+                    },
+                    timestamp: parse_timestamp(row.timestamp.as_deref())?,
+                    metrics: MetricTotals::from_usage(
+                        row.input_tokens,
+                        row.cache_creation_input_tokens,
+                        row.cache_read_input_tokens,
+                        row.output_tokens,
+                    ),
+                    model_names: split_model_names(row.model_names_csv.as_deref()),
+                })
             })
-        })
-        .collect()
+            .collect::<Result<Vec<_>>>()?;
+        perf.field("row_count", facts.len());
+        perf.finish_ok();
+        Ok(facts)
     }
 
     fn load_path_facts(&self, snapshot: &SnapshotBounds) -> Result<Vec<PathFact>> {
+        let mut perf = self.perf_scope("query.load_path_facts");
+        perf.field("snapshot", snapshot);
         if snapshot.max_publish_seq == 0 {
+            perf.field("row_count", 0usize);
+            perf.finish_ok();
             return Ok(Vec::new());
         }
 
@@ -667,33 +757,39 @@ impl<'conn> QueryEngine<'conn> {
             })
         })?;
 
-        rows.map(|row| {
-            let row = row.context("unable to read a path attribution fact row")?;
-            let metrics = MetricTotals::from_usage(
-                row.input_tokens,
-                row.cache_creation_input_tokens,
-                row.cache_read_input_tokens,
-                row.output_tokens,
-            )
-            .divided_by(row.ref_count as f64);
+        let facts = rows
+            .map(|row| {
+                let row = row.context("unable to read a path attribution fact row")?;
+                let metrics = MetricTotals::from_usage(
+                    row.input_tokens,
+                    row.cache_creation_input_tokens,
+                    row.cache_read_input_tokens,
+                    row.output_tokens,
+                )
+                .divided_by(row.ref_count as f64);
 
-            Ok(PathFact {
-                project_id: row.project_id,
-                project_root: row.project_root,
-                category: display_category(row.category.as_deref(), &row.classification_state)?,
-                action: ActionKey {
-                    classification_state: parse_classification_state(&row.classification_state)?,
-                    normalized_action: row.normalized_action,
-                    command_family: row.command_family,
-                    base_command: row.base_command,
-                },
-                timestamp: parse_timestamp(row.timestamp.as_deref())?,
-                model_name: row.model_name,
-                file_path: row.file_path,
-                metrics,
+                Ok(PathFact {
+                    project_id: row.project_id,
+                    project_root: row.project_root,
+                    category: display_category(row.category.as_deref(), &row.classification_state)?,
+                    action: ActionKey {
+                        classification_state: parse_classification_state(
+                            &row.classification_state,
+                        )?,
+                        normalized_action: row.normalized_action,
+                        command_family: row.command_family,
+                        base_command: row.base_command,
+                    },
+                    timestamp: parse_timestamp(row.timestamp.as_deref())?,
+                    model_name: row.model_name,
+                    file_path: row.file_path,
+                    metrics,
+                })
             })
-        })
-        .collect()
+            .collect::<Result<Vec<_>>>()?;
+        perf.field("row_count", facts.len());
+        perf.finish_ok();
+        Ok(facts)
     }
 }
 

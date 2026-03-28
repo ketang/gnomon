@@ -5,9 +5,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
 use gnomon_core::db::{Database, ResetReport, reset_sqlite_database};
 use gnomon_core::import::{import_all, scan_source_manifest, start_startup_import};
+use gnomon_core::perf::PerfLogger;
 use gnomon_core::query::{
     ActionKey, BrowseFilters, BrowsePath, BrowseReport, BrowseRequest, ClassificationState,
-    MetricLens, QueryEngine, RootView, SnapshotBounds, TimeWindowFilter,
+    MetricLens, QueryEngine, RootView, TimeWindowFilter,
 };
 
 #[derive(Debug, Parser)]
@@ -222,6 +223,7 @@ fn run(cli: Cli) -> Result<()> {
 
 fn run_app(config: &RuntimeConfig, startup_args: StartupArgs) -> Result<()> {
     config.ensure_dirs()?;
+    let perf_logger = PerfLogger::from_env(&config.state_dir)?;
     let mut database = Database::open(&config.db_path)?;
     let _scan_report = scan_source_manifest(&mut database, &config.source_root)?;
     let mut startup_import =
@@ -239,6 +241,7 @@ fn run_app(config: &RuntimeConfig, startup_args: StartupArgs) -> Result<()> {
         startup_status_message,
         startup_browse_state,
         status_updates,
+        perf_logger,
     )
 }
 
@@ -264,15 +267,20 @@ fn run_db_command(config: &RuntimeConfig, command: DbSubcommand) -> Result<()> {
 
 fn run_report_command(config: &RuntimeConfig, args: &ReportArgs) -> Result<()> {
     config.ensure_dirs()?;
-    let report = build_browse_report(config, args)?;
+    let perf_logger = PerfLogger::from_env(&config.state_dir)?;
+    let report = build_browse_report(config, args, perf_logger)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
-fn build_browse_report(config: &RuntimeConfig, args: &ReportArgs) -> Result<BrowseReport> {
+fn build_browse_report(
+    config: &RuntimeConfig,
+    args: &ReportArgs,
+    perf_logger: Option<PerfLogger>,
+) -> Result<BrowseReport> {
     let database = Database::open(&config.db_path)?;
-    let engine = QueryEngine::new(database.connection());
-    let snapshot = SnapshotBounds::load(database.connection())?;
+    let engine = QueryEngine::with_perf(database.connection(), perf_logger);
+    let snapshot = engine.latest_snapshot_bounds()?;
     let request = BrowseRequest {
         snapshot,
         root: args.root.into(),
@@ -878,6 +886,7 @@ mod tests {
                 command_family: None,
                 base_command: None,
             },
+            None,
         )?;
 
         assert_eq!(report.request.path, BrowsePath::Root);
@@ -927,6 +936,7 @@ mod tests {
                 command_family: None,
                 base_command: None,
             },
+            None,
         )?;
 
         assert_eq!(report.request.path, BrowsePath::Project { project_id });
