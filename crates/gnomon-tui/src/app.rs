@@ -1,3 +1,5 @@
+use std::any::Any;
+use std::collections::BTreeMap;
 use std::f64::consts::{FRAC_PI_2, TAU};
 use std::fs;
 use std::io::{self, Stdout};
@@ -44,6 +46,113 @@ const RADIAL_CENTER_RADIUS: f64 = 0.24;
 const ACTIVITY_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 const VIEW_LOAD_PHASE_TOTAL: usize = 8;
 const JUMP_TARGET_PHASE_TOTAL: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum QueryCacheDomain {
+    Browse,
+    FilterOptions,
+    SnapshotCoverage,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct QueryCacheStats {
+    hits: usize,
+    misses: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct QueryCacheKey {
+    domain: QueryCacheDomain,
+    input: String,
+}
+
+struct SnapshotQueryCache {
+    snapshot: SnapshotBounds,
+    entries: BTreeMap<QueryCacheKey, Box<dyn Any>>,
+}
+
+#[derive(Default)]
+struct QueryResultCache {
+    snapshots: Vec<SnapshotQueryCache>,
+    stats: BTreeMap<QueryCacheDomain, QueryCacheStats>,
+}
+
+impl QueryResultCache {
+    fn memoize<K, V, F>(
+        &mut self,
+        domain: QueryCacheDomain,
+        snapshot: &SnapshotBounds,
+        input: &K,
+        build: F,
+    ) -> Result<V>
+    where
+        K: Serialize,
+        V: Clone + Any + 'static,
+        F: FnOnce() -> Result<V>,
+    {
+        let key = QueryCacheKey {
+            domain,
+            input: serde_json::to_string(input).context("unable to serialize query cache key")?,
+        };
+
+        if let Some(cached) = self.cached::<V>(snapshot, &key) {
+            self.stats.entry(domain).or_default().hits += 1;
+            return Ok(cached);
+        }
+
+        self.stats.entry(domain).or_default().misses += 1;
+        let value = build()?;
+        self.snapshot_bucket_mut(snapshot)
+            .entries
+            .insert(key, Box::new(value.clone()));
+        Ok(value)
+    }
+
+    fn retain_snapshot(&mut self, snapshot: &SnapshotBounds) {
+        self.snapshots.retain(|bucket| &bucket.snapshot == snapshot);
+    }
+
+    fn cached<V>(&self, snapshot: &SnapshotBounds, key: &QueryCacheKey) -> Option<V>
+    where
+        V: Clone + Any + 'static,
+    {
+        let bucket = self
+            .snapshots
+            .iter()
+            .find(|bucket| bucket.snapshot == *snapshot)?;
+        let value = bucket.entries.get(key)?;
+        let typed = value.downcast_ref::<V>()?;
+        Some(typed.clone())
+    }
+
+    fn snapshot_bucket_mut(&mut self, snapshot: &SnapshotBounds) -> &mut SnapshotQueryCache {
+        if let Some(index) = self
+            .snapshots
+            .iter()
+            .position(|bucket| bucket.snapshot == *snapshot)
+        {
+            return &mut self.snapshots[index];
+        }
+
+        self.snapshots.push(SnapshotQueryCache {
+            snapshot: snapshot.clone(),
+            entries: BTreeMap::new(),
+        });
+        self.snapshots
+            .last_mut()
+            .expect("snapshot cache bucket inserted")
+    }
+
+    #[cfg(test)]
+    fn stats_for(&self, domain: QueryCacheDomain) -> QueryCacheStats {
+        self.stats.get(&domain).copied().unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn snapshot_count(&self) -> usize {
+        self.snapshots.len()
+    }
+}
 
 struct QueryWorker {
     requests: Sender<QueryWorkerRequest>,
@@ -403,6 +512,7 @@ pub struct App {
     next_request_sequence: u64,
     pending_async_work: PendingAsyncWork,
     perf_logger: Option<PerfLogger>,
+    query_cache: QueryResultCache,
     row_cache: Vec<CachedRows>,
     expanded_paths: Vec<BrowsePath>,
 }
@@ -477,13 +587,18 @@ impl App {
             next_request_sequence: 1,
             pending_async_work: PendingAsyncWork::default(),
             perf_logger,
+            query_cache: QueryResultCache::default(),
             row_cache: Vec::new(),
             expanded_paths: Vec::new(),
         };
 
+        let perf_logger = app.perf_logger.clone();
+        let conn = app.database.connection();
+        let query_engine = QueryEngine::with_perf(conn, perf_logger.clone());
         let initial_view = load_view_for_state(
-            &app.query_engine(),
-            app.perf_logger.clone(),
+            &query_engine,
+            &mut app.query_cache,
+            perf_logger,
             snapshot,
             app.ui_state.clone(),
             None,
@@ -1407,7 +1522,7 @@ impl App {
             .map(|(parent_index, _)| parent_index)
     }
 
-    fn project_root_for(&self, project_id: i64) -> Result<Option<String>> {
+    fn project_root_for(&mut self, project_id: i64) -> Result<Option<String>> {
         let filters = self.current_query_filters()?;
         let relaxed_filters = BrowseFilters {
             time_window: filters.time_window,
@@ -1416,7 +1531,7 @@ impl App {
             action_category: None,
             action: None,
         };
-        let root_rows = self.query_engine().browse(&BrowseRequest {
+        let root_rows = self.cached_browse(BrowseRequest {
             snapshot: self.snapshot.clone(),
             root: RootView::ProjectHierarchy,
             lens: self.ui_state.lens,
@@ -1494,7 +1609,7 @@ impl App {
         }
 
         let filters = self.current_query_filters()?;
-        let rows = self.query_engine().browse(&BrowseRequest {
+        let rows = self.cached_browse(BrowseRequest {
             snapshot: self.snapshot.clone(),
             root: self.ui_state.root,
             lens: self.ui_state.lens,
@@ -1578,7 +1693,7 @@ impl App {
     }
 
     fn build_radial_context(
-        &self,
+        &mut self,
         filters: &BrowseFilters,
         path: &BrowsePath,
     ) -> Result<RadialContext> {
@@ -1593,7 +1708,7 @@ impl App {
         let browse_started = Instant::now();
 
         for step in steps {
-            let rows = self.query_engine().browse(&BrowseRequest {
+            let rows = self.cached_browse(BrowseRequest {
                 snapshot: self.snapshot.clone(),
                 root: self.ui_state.root,
                 lens: self.ui_state.lens,
@@ -1731,6 +1846,7 @@ impl App {
 
     fn apply_loaded_view(&mut self, loaded_view: LoadedView) -> Result<()> {
         self.snapshot = loaded_view.snapshot;
+        self.query_cache.retain_snapshot(&self.snapshot);
         self.snapshot_coverage = loaded_view.snapshot_coverage;
         self.ui_state = loaded_view.ui_state;
         self.filter_options = loaded_view.filter_options;
@@ -1845,6 +1961,13 @@ impl App {
     fn query_engine(&self) -> QueryEngine<'_> {
         QueryEngine::with_perf(self.database.connection(), self.perf_logger.clone())
     }
+
+    fn cached_browse(&mut self, request: BrowseRequest) -> Result<Vec<RollupRow>> {
+        let perf_logger = self.perf_logger.clone();
+        let conn = self.database.connection();
+        let query_engine = QueryEngine::with_perf(conn, perf_logger);
+        cached_browse(&mut self.query_cache, &query_engine, request)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1934,6 +2057,7 @@ fn run_query_worker(
         }
     };
     let query_engine = QueryEngine::with_perf(database.connection(), perf_logger.clone());
+    let mut query_cache = QueryResultCache::default();
 
     while let Ok(request) = requests.recv() {
         let result = match request {
@@ -1942,6 +2066,7 @@ fn run_query_worker(
                     QueryProgressReporter::new(&results, request.sequence, PendingTaskKind::View);
                 load_view_for_state(
                     &query_engine,
+                    &mut query_cache,
                     perf_logger.clone(),
                     request.snapshot,
                     request.ui_state,
@@ -1975,6 +2100,7 @@ fn run_query_worker(
                         progress.phase("loading filter options");
                         load_view_for_state(
                             &query_engine,
+                            &mut query_cache,
                             perf_logger.clone(),
                             latest_snapshot.clone(),
                             request.ui_state,
@@ -2013,6 +2139,7 @@ fn run_query_worker(
                     QueryProgressReporter::new(&results, request.sequence, PendingTaskKind::Jump);
                 build_jump_targets_for_state(
                     &query_engine,
+                    &mut query_cache,
                     perf_logger.clone(),
                     request.snapshot,
                     request.ui_state,
@@ -2040,8 +2167,40 @@ fn run_query_worker(
     }
 }
 
+fn cached_browse(
+    query_cache: &mut QueryResultCache,
+    query_engine: &QueryEngine<'_>,
+    request: BrowseRequest,
+) -> Result<Vec<RollupRow>> {
+    let snapshot = request.snapshot.clone();
+    query_cache.memoize(QueryCacheDomain::Browse, &snapshot, &request, || {
+        query_engine.browse(&request)
+    })
+}
+
+fn cached_filter_options(
+    query_cache: &mut QueryResultCache,
+    query_engine: &QueryEngine<'_>,
+    snapshot: &SnapshotBounds,
+) -> Result<FilterOptions> {
+    query_cache.memoize(QueryCacheDomain::FilterOptions, snapshot, &(), || {
+        query_engine.filter_options(snapshot)
+    })
+}
+
+fn cached_snapshot_coverage_summary(
+    query_cache: &mut QueryResultCache,
+    query_engine: &QueryEngine<'_>,
+    snapshot: &SnapshotBounds,
+) -> Result<SnapshotCoverageSummary> {
+    query_cache.memoize(QueryCacheDomain::SnapshotCoverage, snapshot, &(), || {
+        query_engine.snapshot_coverage_summary(snapshot)
+    })
+}
+
 fn load_view_for_state(
     query_engine: &QueryEngine<'_>,
+    query_cache: &mut QueryResultCache,
     perf_logger: Option<PerfLogger>,
     snapshot: SnapshotBounds,
     mut ui_state: PersistedUiState,
@@ -2060,7 +2219,7 @@ fn load_view_for_state(
         progress.step(1, VIEW_LOAD_PHASE_TOTAL, "loading filter options");
     }
     let filter_options_started = Instant::now();
-    let filter_options = query_engine.filter_options(&snapshot)?;
+    let filter_options = cached_filter_options(query_cache, query_engine, &snapshot)?;
     perf.field(
         "filter_options_ms",
         filter_options_started.elapsed().as_secs_f64() * 1000.0,
@@ -2091,8 +2250,13 @@ fn load_view_for_state(
         progress.step(4, VIEW_LOAD_PHASE_TOTAL, "browsing current path");
     }
     let browse_started = Instant::now();
-    let (path, raw_rows) =
-        browse_rows_with_parent_fallback(query_engine, &snapshot, &ui_state, &filters)?;
+    let (path, raw_rows) = browse_rows_with_parent_fallback(
+        query_cache,
+        query_engine,
+        &snapshot,
+        &ui_state,
+        &filters,
+    )?;
     perf.field(
         "browse_loop_ms",
         browse_started.elapsed().as_secs_f64() * 1000.0,
@@ -2105,9 +2269,14 @@ fn load_view_for_state(
     }
     let project_root_started = Instant::now();
     let current_project_root = match project_id_from_path(&ui_state.path) {
-        Some(project_id) => {
-            project_root_for_state(query_engine, &snapshot, ui_state.lens, &filters, project_id)?
-        }
+        Some(project_id) => project_root_for_state(
+            query_cache,
+            query_engine,
+            &snapshot,
+            ui_state.lens,
+            &filters,
+            project_id,
+        )?,
         None => None,
     };
     perf.field(
@@ -2136,6 +2305,7 @@ fn load_view_for_state(
     }
     let radial_started = Instant::now();
     let radial_context = build_radial_context_for_state(
+        query_cache,
         query_engine,
         perf_logger.clone(),
         &snapshot,
@@ -2152,7 +2322,7 @@ fn load_view_for_state(
         progress.step(8, VIEW_LOAD_PHASE_TOTAL, "refreshing snapshot coverage");
     }
     let coverage_started = Instant::now();
-    let snapshot_coverage = query_engine.snapshot_coverage_summary(&snapshot)?;
+    let snapshot_coverage = cached_snapshot_coverage_summary(query_cache, query_engine, &snapshot)?;
     perf.field(
         "snapshot_coverage_ms",
         coverage_started.elapsed().as_secs_f64() * 1000.0,
@@ -2174,6 +2344,7 @@ fn load_view_for_state(
 
 fn build_jump_targets_for_state(
     query_engine: &QueryEngine<'_>,
+    query_cache: &mut QueryResultCache,
     perf_logger: Option<PerfLogger>,
     snapshot: SnapshotBounds,
     ui_state: PersistedUiState,
@@ -2198,13 +2369,17 @@ fn build_jump_targets_for_state(
     if let Some(progress) = progress {
         progress.step(2, JUMP_TARGET_PHASE_TOTAL, "walking project hierarchy");
     }
-    let project_root_rows = query_engine.browse(&BrowseRequest {
-        snapshot: snapshot.clone(),
-        root: RootView::ProjectHierarchy,
-        lens: ui_state.lens,
-        filters: filters.clone(),
-        path: BrowsePath::Root,
-    })?;
+    let project_root_rows = cached_browse(
+        query_cache,
+        query_engine,
+        BrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::ProjectHierarchy,
+            lens: ui_state.lens,
+            filters: filters.clone(),
+            path: BrowsePath::Root,
+        },
+    )?;
 
     for project in &project_root_rows {
         let Some(project_id) = project.project_id else {
@@ -2218,13 +2393,17 @@ fn build_jump_targets_for_state(
             path: BrowsePath::Project { project_id },
         });
 
-        let categories = query_engine.browse(&BrowseRequest {
-            snapshot: snapshot.clone(),
-            root: RootView::ProjectHierarchy,
-            lens: ui_state.lens,
-            filters: filters.clone(),
-            path: BrowsePath::Project { project_id },
-        })?;
+        let categories = cached_browse(
+            query_cache,
+            query_engine,
+            BrowseRequest {
+                snapshot: snapshot.clone(),
+                root: RootView::ProjectHierarchy,
+                lens: ui_state.lens,
+                filters: filters.clone(),
+                path: BrowsePath::Project { project_id },
+            },
+        )?;
 
         for category in &categories {
             let Some(category_name) = category.category.clone() else {
@@ -2241,16 +2420,20 @@ fn build_jump_targets_for_state(
                 },
             });
 
-            let actions = query_engine.browse(&BrowseRequest {
-                snapshot: snapshot.clone(),
-                root: RootView::ProjectHierarchy,
-                lens: ui_state.lens,
-                filters: filters.clone(),
-                path: BrowsePath::ProjectCategory {
-                    project_id,
-                    category: category_name.clone(),
+            let actions = cached_browse(
+                query_cache,
+                query_engine,
+                BrowseRequest {
+                    snapshot: snapshot.clone(),
+                    root: RootView::ProjectHierarchy,
+                    lens: ui_state.lens,
+                    filters: filters.clone(),
+                    path: BrowsePath::ProjectCategory {
+                        project_id,
+                        category: category_name.clone(),
+                    },
                 },
-            })?;
+            )?;
 
             for action in actions {
                 let Some(action_key) = action.action.clone() else {
@@ -2275,13 +2458,17 @@ fn build_jump_targets_for_state(
     if let Some(progress) = progress {
         progress.step(3, JUMP_TARGET_PHASE_TOTAL, "walking category hierarchy");
     }
-    let category_root_rows = query_engine.browse(&BrowseRequest {
-        snapshot: snapshot.clone(),
-        root: RootView::CategoryHierarchy,
-        lens: ui_state.lens,
-        filters: filters.clone(),
-        path: BrowsePath::Root,
-    })?;
+    let category_root_rows = cached_browse(
+        query_cache,
+        query_engine,
+        BrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::CategoryHierarchy,
+            lens: ui_state.lens,
+            filters: filters.clone(),
+            path: BrowsePath::Root,
+        },
+    )?;
 
     for category in &category_root_rows {
         let Some(category_name) = category.category.clone() else {
@@ -2297,15 +2484,19 @@ fn build_jump_targets_for_state(
             },
         });
 
-        let actions = query_engine.browse(&BrowseRequest {
-            snapshot: snapshot.clone(),
-            root: RootView::CategoryHierarchy,
-            lens: ui_state.lens,
-            filters: filters.clone(),
-            path: BrowsePath::Category {
-                category: category_name.clone(),
+        let actions = cached_browse(
+            query_cache,
+            query_engine,
+            BrowseRequest {
+                snapshot: snapshot.clone(),
+                root: RootView::CategoryHierarchy,
+                lens: ui_state.lens,
+                filters: filters.clone(),
+                path: BrowsePath::Category {
+                    category: category_name.clone(),
+                },
             },
-        })?;
+        )?;
 
         for action in &actions {
             let Some(action_key) = action.action.clone() else {
@@ -2322,16 +2513,20 @@ fn build_jump_targets_for_state(
                 },
             });
 
-            let projects = query_engine.browse(&BrowseRequest {
-                snapshot: snapshot.clone(),
-                root: RootView::CategoryHierarchy,
-                lens: ui_state.lens,
-                filters: filters.clone(),
-                path: BrowsePath::CategoryAction {
-                    category: category_name.clone(),
-                    action: action_key,
+            let projects = cached_browse(
+                query_cache,
+                query_engine,
+                BrowseRequest {
+                    snapshot: snapshot.clone(),
+                    root: RootView::CategoryHierarchy,
+                    lens: ui_state.lens,
+                    filters: filters.clone(),
+                    path: BrowsePath::CategoryAction {
+                        category: category_name.clone(),
+                        action: action_key,
+                    },
                 },
-            })?;
+            )?;
 
             for project in projects {
                 let Some(project_id) = project.project_id else {
@@ -2373,6 +2568,7 @@ fn build_jump_targets_for_state(
 }
 
 fn browse_rows_with_parent_fallback(
+    query_cache: &mut QueryResultCache,
     query_engine: &QueryEngine<'_>,
     snapshot: &SnapshotBounds,
     ui_state: &PersistedUiState,
@@ -2381,22 +2577,31 @@ fn browse_rows_with_parent_fallback(
     let mut path = ui_state.path.clone();
 
     loop {
-        let rows = query_engine.browse(&BrowseRequest {
-            snapshot: snapshot.clone(),
-            root: ui_state.root,
-            lens: ui_state.lens,
-            filters: filters.clone(),
-            path: path.clone(),
-        })?;
+        let rows = cached_browse(
+            query_cache,
+            query_engine,
+            BrowseRequest {
+                snapshot: snapshot.clone(),
+                root: ui_state.root,
+                lens: ui_state.lens,
+                filters: filters.clone(),
+                path: path.clone(),
+            },
+        )?;
 
         if !rows.is_empty() || matches!(path, BrowsePath::Root) {
             return Ok((path, rows));
         }
 
         let project_root = match project_id_from_path(&path) {
-            Some(project_id) => {
-                project_root_for_state(query_engine, snapshot, ui_state.lens, filters, project_id)?
-            }
+            Some(project_id) => project_root_for_state(
+                query_cache,
+                query_engine,
+                snapshot,
+                ui_state.lens,
+                filters,
+                project_id,
+            )?,
             None => None,
         };
         let parent = parent_browse_path(&path, project_root.as_deref());
@@ -2408,6 +2613,7 @@ fn browse_rows_with_parent_fallback(
 }
 
 fn build_radial_context_for_state(
+    query_cache: &mut QueryResultCache,
     query_engine: &QueryEngine<'_>,
     perf_logger: Option<PerfLogger>,
     snapshot: &SnapshotBounds,
@@ -2427,13 +2633,17 @@ fn build_radial_context_for_state(
     let browse_started = Instant::now();
 
     for step in steps {
-        let rows = query_engine.browse(&BrowseRequest {
-            snapshot: snapshot.clone(),
-            root: ui_state.root,
-            lens: ui_state.lens,
-            filters: filters.clone(),
-            path: step.query_path,
-        })?;
+        let rows = cached_browse(
+            query_cache,
+            query_engine,
+            BrowseRequest {
+                snapshot: snapshot.clone(),
+                root: ui_state.root,
+                lens: ui_state.lens,
+                filters: filters.clone(),
+                path: step.query_path,
+            },
+        )?;
         let layer = build_radial_layer(
             &rows,
             ui_state.lens,
@@ -2458,6 +2668,7 @@ fn build_radial_context_for_state(
 }
 
 fn project_root_for_state(
+    query_cache: &mut QueryResultCache,
     query_engine: &QueryEngine<'_>,
     snapshot: &SnapshotBounds,
     lens: MetricLens,
@@ -2471,13 +2682,17 @@ fn project_root_for_state(
         action_category: None,
         action: None,
     };
-    let root_rows = query_engine.browse(&BrowseRequest {
-        snapshot: snapshot.clone(),
-        root: RootView::ProjectHierarchy,
-        lens,
-        filters: relaxed_filters,
-        path: BrowsePath::Root,
-    })?;
+    let root_rows = cached_browse(
+        query_cache,
+        query_engine,
+        BrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::ProjectHierarchy,
+            lens,
+            filters: relaxed_filters,
+            path: BrowsePath::Root,
+        },
+    )?;
 
     Ok(root_rows
         .into_iter()
@@ -5567,6 +5782,116 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn repeated_view_load_reuses_cached_query_results_for_same_snapshot() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        app.query_cache = QueryResultCache::default();
+        let perf_logger = app.perf_logger.clone();
+        let conn = app.database.connection();
+        let query_engine = QueryEngine::with_perf(conn, perf_logger.clone());
+
+        let _first = load_view_for_state(
+            &query_engine,
+            &mut app.query_cache,
+            perf_logger.clone(),
+            app.snapshot.clone(),
+            app.ui_state.clone(),
+            None,
+            None,
+        )?;
+        assert_eq!(
+            app.query_cache.stats_for(QueryCacheDomain::FilterOptions),
+            QueryCacheStats { hits: 0, misses: 1 }
+        );
+        assert_eq!(
+            app.query_cache.stats_for(QueryCacheDomain::Browse),
+            QueryCacheStats { hits: 0, misses: 1 }
+        );
+        assert_eq!(
+            app.query_cache
+                .stats_for(QueryCacheDomain::SnapshotCoverage),
+            QueryCacheStats { hits: 0, misses: 1 }
+        );
+
+        let _second = load_view_for_state(
+            &query_engine,
+            &mut app.query_cache,
+            perf_logger,
+            app.snapshot.clone(),
+            app.ui_state.clone(),
+            None,
+            None,
+        )?;
+        assert_eq!(
+            app.query_cache.stats_for(QueryCacheDomain::FilterOptions),
+            QueryCacheStats { hits: 1, misses: 1 }
+        );
+        assert_eq!(
+            app.query_cache.stats_for(QueryCacheDomain::Browse),
+            QueryCacheStats { hits: 1, misses: 1 }
+        );
+        assert_eq!(
+            app.query_cache
+                .stats_for(QueryCacheDomain::SnapshotCoverage),
+            QueryCacheStats { hits: 1, misses: 1 }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn query_result_cache_swaps_snapshot_buckets_cleanly() -> Result<()> {
+        let snapshot_a = SnapshotBounds {
+            max_publish_seq: 1,
+            published_chunk_count: 1,
+            upper_bound_utc: Some("2026-03-28T10:00:00Z".to_string()),
+        };
+        let snapshot_b = SnapshotBounds {
+            max_publish_seq: 2,
+            published_chunk_count: 2,
+            upper_bound_utc: Some("2026-03-28T11:00:00Z".to_string()),
+        };
+        let mut cache = QueryResultCache::default();
+        let mut build_count = 0usize;
+
+        let first = cache.memoize(QueryCacheDomain::Browse, &snapshot_a, &"root", || {
+            build_count += 1;
+            Ok::<_, anyhow::Error>(vec!["snapshot-a".to_string()])
+        })?;
+        let second = cache.memoize(QueryCacheDomain::Browse, &snapshot_a, &"root", || {
+            build_count += 1;
+            Ok::<_, anyhow::Error>(vec!["should-not-run".to_string()])
+        })?;
+        let refreshed = cache.memoize(QueryCacheDomain::Browse, &snapshot_b, &"root", || {
+            build_count += 1;
+            Ok::<_, anyhow::Error>(vec!["snapshot-b".to_string()])
+        })?;
+
+        assert_eq!(first, vec!["snapshot-a".to_string()]);
+        assert_eq!(second, vec!["snapshot-a".to_string()]);
+        assert_eq!(refreshed, vec!["snapshot-b".to_string()]);
+        assert_eq!(build_count, 2);
+        assert_eq!(
+            cache.stats_for(QueryCacheDomain::Browse),
+            QueryCacheStats { hits: 1, misses: 2 }
+        );
+        assert_eq!(cache.snapshot_count(), 2);
+
+        cache.retain_snapshot(&snapshot_b);
+
+        assert_eq!(cache.snapshot_count(), 1);
+        Ok(())
+    }
+
     fn sample_row(label: &str, full_path: Option<String>) -> RollupRow {
         RollupRow {
             kind: RollupRowKind::Directory,
@@ -5942,10 +6267,15 @@ mod tests {
             None,
         )?;
         let original_root = app.ui_state.root;
+        let mut query_cache = QueryResultCache::default();
+        let perf_logger = app.perf_logger.clone();
+        let conn = app.database.connection();
+        let query_engine = QueryEngine::with_perf(conn, perf_logger.clone());
 
         let mut loaded_view = load_view_for_state(
-            &app.query_engine(),
-            None,
+            &query_engine,
+            &mut query_cache,
+            perf_logger,
             app.snapshot.clone(),
             app.ui_state.clone(),
             None,
@@ -6166,10 +6496,15 @@ mod tests {
             }),
         }))?;
         app.pending_async_work.begin_view(2, "refreshing snapshot");
+        let mut query_cache = QueryResultCache::default();
+        let perf_logger = app.perf_logger.clone();
+        let conn = app.database.connection();
+        let query_engine = QueryEngine::with_perf(conn, perf_logger.clone());
 
         let mut loaded_view = load_view_for_state(
-            &app.query_engine(),
-            None,
+            &query_engine,
+            &mut query_cache,
+            perf_logger,
             app.snapshot.clone(),
             app.ui_state.clone(),
             None,
