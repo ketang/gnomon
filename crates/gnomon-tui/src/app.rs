@@ -8027,7 +8027,7 @@ mod tests {
         let filters = current_query_filters_for(&app.ui_state, &app.snapshot)?;
         let mut browse_stats = BrowseFanoutStats::default();
 
-        let ctx = app.build_radial_context(&filters, &active_path, &mut browse_stats)?;
+        let ctx = app.build_radial_context(&filters, &active_path, None, &mut browse_stats)?;
 
         // With an empty database, ancestor layers should exist (1 for Root→Project)
         // but descendant layers will be empty since there's no data to query.
@@ -8063,7 +8063,7 @@ mod tests {
         let filters = current_query_filters_for(&app.ui_state, &app.snapshot)?;
         let mut browse_stats = BrowseFanoutStats::default();
 
-        let ctx = app.build_radial_context(&filters, &active_path, &mut browse_stats)?;
+        let ctx = app.build_radial_context(&filters, &active_path, None, &mut browse_stats)?;
 
         assert!(
             ctx.descendant_layers.is_empty(),
