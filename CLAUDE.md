@@ -31,13 +31,14 @@ use that model. `gnomon` does not. The local branch policy above overrides it.
 
 ### Issue tracking
 
-- This repo does not currently document a canonical issue tracker workflow.
+- GitHub Issues is the canonical issue tracker workflow for this repo.
 - Do not assume `beads`.
-- If the user references a GitHub issue, branch naming convention, or another
-  tracker explicitly, follow that context. Otherwise do not mutate tracker
-  state on your own.
+- If the user references a GitHub issue or branch naming convention, follow
+  that context.
+- Do not create, edit, or close GitHub issues unless the user explicitly asks.
 
-This is why this repo does not currently import `.agents/rules/beads.md`.
+GitHub Issues is the tracker for `gnomon`, so this repo does not import
+`.agents/rules/beads.md`.
 
 ## Read First
 
