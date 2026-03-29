@@ -640,18 +640,20 @@ fn import_chunk(
                 )
             })?;
 
-            let _ = build_actions(
-                database.connection_mut(),
-                &BuildActionsParams {
-                    conversation_id: conversation.conversation_id,
-                },
-            )
-            .with_context(|| {
-                format!(
-                    "unable to build actions for source file {}",
-                    source_root.join(&source_file.relative_path).display()
+            if let Some(conversation) = conversation {
+                let _ = build_actions(
+                    database.connection_mut(),
+                    &BuildActionsParams {
+                        conversation_id: conversation.conversation_id,
+                    },
                 )
-            })?;
+                .with_context(|| {
+                    format!(
+                        "unable to build actions for source file {}",
+                        source_root.join(&source_file.relative_path).display()
+                    )
+                })?;
+            }
         }
 
         finalize_chunk_import(database.connection_mut(), chunk)?;

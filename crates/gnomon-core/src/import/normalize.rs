@@ -29,7 +29,7 @@ pub struct NormalizeJsonlFileResult {
 pub fn normalize_jsonl_file(
     conn: &mut Connection,
     params: &NormalizeJsonlFileParams,
-) -> Result<NormalizeJsonlFileResult> {
+) -> Result<Option<NormalizeJsonlFileResult>> {
     let mut tx = conn
         .transaction()
         .context("unable to start normalization transaction")?;
@@ -74,6 +74,11 @@ pub fn normalize_jsonl_file(
     }
 
     if state.conversation.is_none() {
+        if file_contains_only_sessionless_metadata(&state.buffered_records) {
+            tx.commit()
+                .context("unable to commit skipped metadata-only import")?;
+            return Ok(None);
+        }
         bail!(
             "no sessionId found in {}; unable to normalize file",
             params.path.display()
@@ -88,7 +93,7 @@ pub fn normalize_jsonl_file(
     state.finish_import(&mut tx, turn_count)?;
     tx.commit().context("unable to commit normalized import")?;
 
-    Ok(NormalizeJsonlFileResult {
+    Ok(Some(NormalizeJsonlFileResult {
         conversation_id: state
             .conversation
             .as_ref()
@@ -102,7 +107,7 @@ pub fn normalize_jsonl_file(
         record_count: state.record_count,
         message_count: state.message_states.len(),
         turn_count,
-    })
+    }))
 }
 
 fn purge_existing_import(
@@ -1120,6 +1125,20 @@ fn extract_session_id(record: &Value) -> Option<&str> {
     record.get("sessionId").and_then(Value::as_str)
 }
 
+fn file_contains_only_sessionless_metadata(records: &[BufferedRecord]) -> bool {
+    !records.is_empty()
+        && records
+            .iter()
+            .all(|record| is_sessionless_metadata_record(&record.value))
+}
+
+fn is_sessionless_metadata_record(record: &Value) -> bool {
+    matches!(
+        record.get("type").and_then(Value::as_str),
+        Some("file-history-snapshot")
+    )
+}
+
 fn conversation_external_id(session_id: &str, source_file_id: i64) -> String {
     format!("source-file:{source_file_id}:session:{session_id}")
 }
@@ -1191,6 +1210,8 @@ mod tests {
         "{\"type\":\"assistant\",\"uuid\":\"side-assistant-1\",\"timestamp\":\"2026-03-26T11:00:01Z\",\"sessionId\":\"session-2\",\"isSidechain\":true,\"agentId\":\"agent-side\",\"message\":{\"id\":\"msg-side\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Inspecting parser.rs\"}],\"usage\":{\"input_tokens\":4,\"cache_creation_input_tokens\":6,\"cache_read_input_tokens\":7,\"output_tokens\":1},\"model\":\"claude-haiku\",\"stop_reason\":null}}\n"
     );
 
+    const SNAPSHOT_ONLY_FIXTURE: &str = "{\"type\":\"file-history-snapshot\",\"messageId\":\"snap-only-1\",\"snapshot\":{\"messageId\":\"snap-only-1\",\"trackedFileBackups\":{},\"timestamp\":\"2026-03-26T09:00:00Z\"},\"isSnapshotUpdate\":false}\n";
+
     #[test]
     fn normalizes_main_session_and_deduplicates_assistant_usage() -> Result<()> {
         let temp = tempdir()?;
@@ -1208,7 +1229,8 @@ mod tests {
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
             },
-        )?;
+        )?
+        .expect("main session fixture should import");
 
         assert_eq!(result.record_count, 8);
         assert_eq!(result.message_count, 6);
@@ -1297,7 +1319,8 @@ mod tests {
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
             },
-        )?;
+        )?
+        .expect("sidechain fixture should import");
 
         assert_eq!(result.record_count, 2);
         assert_eq!(result.message_count, 2);
@@ -1422,6 +1445,47 @@ mod tests {
     }
 
     #[test]
+    fn skips_snapshot_only_files_without_session_id() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let fixture_path = temp.path().join("snapshot-only.jsonl");
+        std::fs::write(&fixture_path, SNAPSHOT_ONLY_FIXTURE)?;
+
+        let mut db = Database::open(&db_path)?;
+        let ids = seed_import_context(db.connection_mut(), "snapshot-only.jsonl")?;
+        let result = normalize_jsonl_file(
+            db.connection_mut(),
+            &NormalizeJsonlFileParams {
+                project_id: ids.project_id,
+                source_file_id: ids.source_file_id,
+                import_chunk_id: ids.import_chunk_id,
+                path: fixture_path,
+            },
+        )?;
+
+        assert!(result.is_none());
+
+        let conn = db.connection();
+        let conversation_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM conversation", [], |row| row.get(0))?;
+        let stream_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM stream", [], |row| row.get(0))?;
+        let record_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM record", [], |row| row.get(0))?;
+        let message_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM message", [], |row| row.get(0))?;
+        let turn_count: i64 = conn.query_row("SELECT COUNT(*) FROM turn", [], |row| row.get(0))?;
+
+        assert_eq!(conversation_count, 0);
+        assert_eq!(stream_count, 0);
+        assert_eq!(record_count, 0);
+        assert_eq!(message_count, 0);
+        assert_eq!(turn_count, 0);
+
+        Ok(())
+    }
+
+    #[test]
     fn normalization_allows_duplicate_session_ids_across_source_files() -> Result<()> {
         let temp = tempdir()?;
         let db_path = temp.path().join("usage.sqlite3");
@@ -1447,7 +1511,8 @@ mod tests {
                 import_chunk_id: first_ids.import_chunk_id,
                 path: first_fixture_path,
             },
-        )?;
+        )?
+        .expect("first fixture should import");
         let second_result = normalize_jsonl_file(
             db.connection_mut(),
             &NormalizeJsonlFileParams {
@@ -1456,7 +1521,8 @@ mod tests {
                 import_chunk_id: second_ids.import_chunk_id,
                 path: second_fixture_path,
             },
-        )?;
+        )?
+        .expect("second fixture should import");
 
         let conversations: Vec<(i64, i64, String)> = {
             let mut stmt = db.connection().prepare(

@@ -1207,7 +1207,8 @@ mod tests {
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
             },
-        )?;
+        )?
+        .expect("classification fixture should import");
         let result = build_actions(
             db.connection_mut(),
             &BuildActionsParams {
@@ -1284,7 +1285,8 @@ mod tests {
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
             },
-        )?;
+        )?
+        .expect("mixed fixture should import");
         let result = build_actions(
             db.connection_mut(),
             &BuildActionsParams {
