@@ -81,6 +81,24 @@ from the source manifest and session history without opening the TUI.
 If you pull a version that renames derived taxonomy labels, such as `Editing`
 to `editing` or bracketed special-state labels like `[mixed]`, run `db rebuild`
 to refresh existing cached aggregates and filters.
+Run `db rebuild` after pulling a version that changes project identity
+resolution as well. Identity fixes only affect newly imported manifest rows, so
+an existing cache can keep stale project records until it is rebuilt.
+
+Common stale-identity symptoms include:
+
+- duplicate top-level project rows for what should be one repo
+- ephemeral labels derived from worktree or agent directory names
+- project metadata that still points at an old root path or fallback identity
+
+Recovery path:
+
+```bash
+cargo run -p gnomon -- db rebuild
+```
+
+Use `db reset --force` only when you want to remove the cache artifacts first;
+`db rebuild` is the normal recovery command after identity-related fixes.
 
 ## Non-Interactive Reports
 
