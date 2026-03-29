@@ -1163,6 +1163,8 @@ impl App {
                     separator_span(),
                     Span::raw("p/c/a scope"),
                     separator_span(),
+                    Span::raw("x opp-filter"),
+                    separator_span(),
                     Span::raw("0 clear"),
                     separator_span(),
                     Span::raw("/ row filter"),
@@ -1171,21 +1173,33 @@ impl App {
                     separator_span(),
                     Span::raw("r refresh"),
                 ]),
-                Line::from(vec![
-                    badge("coverage", BadgeTone::Success),
-                    separator_span(),
-                    Span::styled(
-                        snapshot_coverage_footer_text(&self.snapshot_coverage),
-                        Style::default().fg(Color::White),
-                    ),
-                    separator_span(),
-                    badge("selection", BadgeTone::Accent),
-                    separator_span(),
-                    Span::styled(
-                        self.selection_footer_text(),
-                        Style::default().fg(Color::White),
-                    ),
-                ]),
+                Line::from({
+                    let mut spans = vec![
+                        badge("coverage", BadgeTone::Success),
+                        separator_span(),
+                        Span::styled(
+                            snapshot_coverage_footer_text(&self.snapshot_coverage),
+                            Style::default().fg(Color::White),
+                        ),
+                        separator_span(),
+                        badge("selection", BadgeTone::Accent),
+                        separator_span(),
+                        Span::styled(
+                            self.selection_footer_text(),
+                            Style::default().fg(Color::White),
+                        ),
+                    ];
+                    if let Some(cat) = self.ui_state.opportunity_filter {
+                        spans.push(separator_span());
+                        spans.push(badge("opp-filter", BadgeTone::Warning));
+                        spans.push(separator_span());
+                        spans.push(Span::styled(
+                            opportunity_category_label(cat).to_string(),
+                            Style::default().fg(Color::Yellow),
+                        ));
+                    }
+                    spans
+                }),
             ],
             InputMode::FilterInput => vec![
                 Line::from(vec![
@@ -1249,7 +1263,7 @@ impl App {
                     badge("columns", BadgeTone::Accent),
                     separator_span(),
                     Span::raw(
-                        "Toggle with k kind, g gross, o output, t total, f 5h, w 1w, u ref, i items.",
+                        "Toggle with k/g/o/t/f/w/u/i metrics, T/S/C opp summary, 1-8 opp categories.",
                     ),
                 ]),
                 Line::from(vec![
@@ -1335,28 +1349,49 @@ impl App {
     }
 
     fn render_columns_overlay(&self, frame: &mut Frame<'_>) {
-        let area = centered_rect(frame.area(), 60, 12);
+        let area = centered_rect(frame.area(), 76, 18);
         frame.render_widget(Clear, area);
 
+        let cols = &self.ui_state.enabled_columns;
         let lines = vec![
             Line::from("Toggle optional columns:"),
             Line::from(format!(
                 "k kind [{}]   g gross [{}]   o output [{}]   t total [{}]",
-                toggle_mark(&self.ui_state.enabled_columns, OptionalColumn::Kind),
-                toggle_mark(&self.ui_state.enabled_columns, OptionalColumn::GrossInput),
-                toggle_mark(&self.ui_state.enabled_columns, OptionalColumn::Output),
-                toggle_mark(&self.ui_state.enabled_columns, OptionalColumn::Total),
+                toggle_mark(cols, OptionalColumn::Kind),
+                toggle_mark(cols, OptionalColumn::GrossInput),
+                toggle_mark(cols, OptionalColumn::Output),
+                toggle_mark(cols, OptionalColumn::Total),
             )),
             Line::from(format!(
                 "f 5h [{}]     w 1w [{}]      u ref [{}]      i items [{}]",
-                toggle_mark(&self.ui_state.enabled_columns, OptionalColumn::Last5Hours),
-                toggle_mark(&self.ui_state.enabled_columns, OptionalColumn::LastWeek),
-                toggle_mark(
-                    &self.ui_state.enabled_columns,
-                    OptionalColumn::UncachedReference
-                ),
-                toggle_mark(&self.ui_state.enabled_columns, OptionalColumn::Items),
+                toggle_mark(cols, OptionalColumn::Last5Hours),
+                toggle_mark(cols, OptionalColumn::LastWeek),
+                toggle_mark(cols, OptionalColumn::UncachedReference),
+                toggle_mark(cols, OptionalColumn::Items),
             )),
+            Line::from(""),
+            Line::from("Opportunity columns:"),
+            Line::from(format!(
+                "T top [{}]    S score [{}]   C conf [{}]",
+                toggle_mark(cols, OptionalColumn::TopOpportunity),
+                toggle_mark(cols, OptionalColumn::OppScore),
+                toggle_mark(cols, OptionalColumn::Confidence),
+            )),
+            Line::from(format!(
+                "1 sess [{}]   2 task [{}]    3 hist [{}]   4 deleg [{}]",
+                toggle_mark(cols, OptionalColumn::OppSessionSetup),
+                toggle_mark(cols, OptionalColumn::OppTaskSetup),
+                toggle_mark(cols, OptionalColumn::OppHistoryDrag),
+                toggle_mark(cols, OptionalColumn::OppDelegation),
+            )),
+            Line::from(format!(
+                "5 model [{}]  6 yield [{}]   7 srch [{}]   8 bloat [{}]",
+                toggle_mark(cols, OptionalColumn::OppModelMismatch),
+                toggle_mark(cols, OptionalColumn::OppPromptYield),
+                toggle_mark(cols, OptionalColumn::OppSearchChurn),
+                toggle_mark(cols, OptionalColumn::OppToolResultBloat),
+            )),
+            Line::from(""),
             Line::from("The label and selected-lens columns are always visible."),
             Line::from("Narrow terminals automatically hide lower-priority enabled columns."),
             Line::from("Esc closes the chooser."),
@@ -1440,6 +1475,13 @@ impl App {
                     self.ui_state.action_category.as_deref(),
                 );
                 self.enqueue_view_reload("loading view")?;
+                Ok(false)
+            }
+            KeyCode::Char('x') => {
+                self.ui_state.opportunity_filter =
+                    cycle_opportunity_filter(self.ui_state.opportunity_filter);
+                self.apply_row_filter()?;
+                self.save_state();
                 Ok(false)
             }
             KeyCode::Char('0') => {
@@ -1630,6 +1672,17 @@ impl App {
             KeyCode::Char('w') => Some(OptionalColumn::LastWeek),
             KeyCode::Char('u') => Some(OptionalColumn::UncachedReference),
             KeyCode::Char('i') => Some(OptionalColumn::Items),
+            KeyCode::Char('T') => Some(OptionalColumn::TopOpportunity),
+            KeyCode::Char('S') => Some(OptionalColumn::OppScore),
+            KeyCode::Char('C') => Some(OptionalColumn::Confidence),
+            KeyCode::Char('1') => Some(OptionalColumn::OppSessionSetup),
+            KeyCode::Char('2') => Some(OptionalColumn::OppTaskSetup),
+            KeyCode::Char('3') => Some(OptionalColumn::OppHistoryDrag),
+            KeyCode::Char('4') => Some(OptionalColumn::OppDelegation),
+            KeyCode::Char('5') => Some(OptionalColumn::OppModelMismatch),
+            KeyCode::Char('6') => Some(OptionalColumn::OppPromptYield),
+            KeyCode::Char('7') => Some(OptionalColumn::OppSearchChurn),
+            KeyCode::Char('8') => Some(OptionalColumn::OppToolResultBloat),
             _ => None,
         };
 
@@ -2016,7 +2069,11 @@ impl App {
             let is_expanded = node_path
                 .as_ref()
                 .is_some_and(|path| self.expanded_for_path(path));
-            let include = filter.is_empty() || row_search_text(&row).contains(&filter);
+            let include = (filter.is_empty() || row_search_text(&row).contains(&filter))
+                && self
+                    .ui_state
+                    .opportunity_filter
+                    .is_none_or(|cat| row.opportunities.top_category == Some(cat));
 
             if include {
                 visible.push(TreeRow {
@@ -3487,6 +3544,8 @@ struct PersistedUiState {
     action: Option<ActionKey>,
     row_filter: String,
     enabled_columns: Vec<OptionalColumn>,
+    #[serde(default)]
+    opportunity_filter: Option<OpportunityCategory>,
 }
 
 impl Default for PersistedUiState {
@@ -3503,6 +3562,7 @@ impl Default for PersistedUiState {
             action: None,
             row_filter: String::new(),
             enabled_columns: default_enabled_columns(),
+            opportunity_filter: None,
         }
     }
 }
@@ -3546,6 +3606,7 @@ impl PersistedUiState {
         self.model = None;
         self.clear_scoped_filters();
         self.row_filter.clear();
+        self.opportunity_filter = None;
     }
 
     fn clear_scoped_filters(&mut self) {
@@ -4056,6 +4117,17 @@ enum OptionalColumn {
     LastWeek,
     UncachedReference,
     Items,
+    TopOpportunity,
+    OppScore,
+    Confidence,
+    OppSessionSetup,
+    OppTaskSetup,
+    OppHistoryDrag,
+    OppDelegation,
+    OppModelMismatch,
+    OppPromptYield,
+    OppSearchChurn,
+    OppToolResultBloat,
 }
 
 impl OptionalColumn {
@@ -4069,6 +4141,17 @@ impl OptionalColumn {
             Self::Output => 5,
             Self::Total => 6,
             Self::Items => 7,
+            Self::TopOpportunity => 8,
+            Self::OppScore => 9,
+            Self::Confidence => 10,
+            Self::OppSessionSetup => 11,
+            Self::OppTaskSetup => 12,
+            Self::OppHistoryDrag => 13,
+            Self::OppDelegation => 14,
+            Self::OppModelMismatch => 15,
+            Self::OppPromptYield => 16,
+            Self::OppSearchChurn => 17,
+            Self::OppToolResultBloat => 18,
         }
     }
 
@@ -4082,6 +4165,17 @@ impl OptionalColumn {
             Self::LastWeek => "1w",
             Self::UncachedReference => "ref",
             Self::Items => "items",
+            Self::TopOpportunity => "top",
+            Self::OppScore => "score",
+            Self::Confidence => "conf",
+            Self::OppSessionSetup => "sess",
+            Self::OppTaskSetup => "task",
+            Self::OppHistoryDrag => "hist",
+            Self::OppDelegation => "deleg",
+            Self::OppModelMismatch => "model",
+            Self::OppPromptYield => "yield",
+            Self::OppSearchChurn => "srch",
+            Self::OppToolResultBloat => "bloat",
         }
     }
 }
@@ -4297,6 +4391,61 @@ fn optional_column_spec(column: &OptionalColumn) -> ColumnSpec {
             title: "items".to_string(),
             constraint: Constraint::Length(7),
         },
+        OptionalColumn::TopOpportunity => ColumnSpec {
+            key: ColumnKey::Optional(OptionalColumn::TopOpportunity),
+            title: "top opp".to_string(),
+            constraint: Constraint::Length(18),
+        },
+        OptionalColumn::OppScore => ColumnSpec {
+            key: ColumnKey::Optional(OptionalColumn::OppScore),
+            title: "opp score".to_string(),
+            constraint: Constraint::Length(10),
+        },
+        OptionalColumn::Confidence => ColumnSpec {
+            key: ColumnKey::Optional(OptionalColumn::Confidence),
+            title: "conf".to_string(),
+            constraint: Constraint::Length(8),
+        },
+        OptionalColumn::OppSessionSetup => ColumnSpec {
+            key: ColumnKey::Optional(OptionalColumn::OppSessionSetup),
+            title: "sess".to_string(),
+            constraint: Constraint::Length(8),
+        },
+        OptionalColumn::OppTaskSetup => ColumnSpec {
+            key: ColumnKey::Optional(OptionalColumn::OppTaskSetup),
+            title: "task".to_string(),
+            constraint: Constraint::Length(8),
+        },
+        OptionalColumn::OppHistoryDrag => ColumnSpec {
+            key: ColumnKey::Optional(OptionalColumn::OppHistoryDrag),
+            title: "hist".to_string(),
+            constraint: Constraint::Length(8),
+        },
+        OptionalColumn::OppDelegation => ColumnSpec {
+            key: ColumnKey::Optional(OptionalColumn::OppDelegation),
+            title: "deleg".to_string(),
+            constraint: Constraint::Length(8),
+        },
+        OptionalColumn::OppModelMismatch => ColumnSpec {
+            key: ColumnKey::Optional(OptionalColumn::OppModelMismatch),
+            title: "model".to_string(),
+            constraint: Constraint::Length(8),
+        },
+        OptionalColumn::OppPromptYield => ColumnSpec {
+            key: ColumnKey::Optional(OptionalColumn::OppPromptYield),
+            title: "yield".to_string(),
+            constraint: Constraint::Length(8),
+        },
+        OptionalColumn::OppSearchChurn => ColumnSpec {
+            key: ColumnKey::Optional(OptionalColumn::OppSearchChurn),
+            title: "srch".to_string(),
+            constraint: Constraint::Length(8),
+        },
+        OptionalColumn::OppToolResultBloat => ColumnSpec {
+            key: ColumnKey::Optional(OptionalColumn::OppToolResultBloat),
+            title: "bloat".to_string(),
+            constraint: Constraint::Length(8),
+        },
     }
 }
 
@@ -4318,7 +4467,68 @@ fn render_column_value(column: ColumnKey, row: &RollupRow, lens: MetricLens) -> 
             format_metric(row.indicators.uncached_input_reference)
         }
         ColumnKey::Optional(OptionalColumn::Items) => row.item_count.to_string(),
+        ColumnKey::Optional(OptionalColumn::TopOpportunity) => row
+            .opportunities
+            .top_category
+            .map(opportunity_category_label)
+            .unwrap_or("")
+            .to_string(),
+        ColumnKey::Optional(OptionalColumn::OppScore) => {
+            if row.opportunities.total_score > 0.0 {
+                format!("{:.1}", row.opportunities.total_score)
+            } else {
+                String::new()
+            }
+        }
+        ColumnKey::Optional(OptionalColumn::Confidence) => row
+            .opportunities
+            .top_confidence
+            .map(opportunity_confidence_label)
+            .unwrap_or("")
+            .to_string(),
+        ColumnKey::Optional(OptionalColumn::OppSessionSetup) => {
+            format_category_score(&row.opportunities, OpportunityCategory::SessionSetup)
+        }
+        ColumnKey::Optional(OptionalColumn::OppTaskSetup) => {
+            format_category_score(&row.opportunities, OpportunityCategory::TaskSetup)
+        }
+        ColumnKey::Optional(OptionalColumn::OppHistoryDrag) => {
+            format_category_score(&row.opportunities, OpportunityCategory::HistoryDrag)
+        }
+        ColumnKey::Optional(OptionalColumn::OppDelegation) => {
+            format_category_score(&row.opportunities, OpportunityCategory::Delegation)
+        }
+        ColumnKey::Optional(OptionalColumn::OppModelMismatch) => {
+            format_category_score(&row.opportunities, OpportunityCategory::ModelMismatch)
+        }
+        ColumnKey::Optional(OptionalColumn::OppPromptYield) => {
+            format_category_score(&row.opportunities, OpportunityCategory::PromptYield)
+        }
+        ColumnKey::Optional(OptionalColumn::OppSearchChurn) => {
+            format_category_score(&row.opportunities, OpportunityCategory::SearchChurn)
+        }
+        ColumnKey::Optional(OptionalColumn::OppToolResultBloat) => {
+            format_category_score(&row.opportunities, OpportunityCategory::ToolResultBloat)
+        }
     }
+}
+
+fn format_category_score(
+    summary: &gnomon_core::opportunity::OpportunitySummary,
+    category: OpportunityCategory,
+) -> String {
+    summary
+        .annotations
+        .iter()
+        .find(|ann| ann.category == category)
+        .map(|ann| {
+            if ann.score > 0.0 {
+                format!("{:.1}", ann.score)
+            } else {
+                String::new()
+            }
+        })
+        .unwrap_or_default()
 }
 
 fn render_tree_label(row: &TreeRow) -> String {
@@ -4972,6 +5182,34 @@ fn cycle_action(
                 None
             } else {
                 filtered.get(index + 1).map(|option| option.action.clone())
+            }
+        }
+    }
+}
+
+const OPPORTUNITY_CATEGORIES: [OpportunityCategory; 8] = [
+    OpportunityCategory::SessionSetup,
+    OpportunityCategory::TaskSetup,
+    OpportunityCategory::HistoryDrag,
+    OpportunityCategory::Delegation,
+    OpportunityCategory::ModelMismatch,
+    OpportunityCategory::PromptYield,
+    OpportunityCategory::SearchChurn,
+    OpportunityCategory::ToolResultBloat,
+];
+
+fn cycle_opportunity_filter(current: Option<OpportunityCategory>) -> Option<OpportunityCategory> {
+    match current {
+        None => Some(OPPORTUNITY_CATEGORIES[0]),
+        Some(current) => {
+            let index = OPPORTUNITY_CATEGORIES
+                .iter()
+                .position(|cat| *cat == current)
+                .unwrap_or(0);
+            if index + 1 >= OPPORTUNITY_CATEGORIES.len() {
+                None
+            } else {
+                Some(OPPORTUNITY_CATEGORIES[index + 1])
             }
         }
     }
@@ -5689,11 +5927,16 @@ mod tests {
             action: Some(sample_action("read file")),
             row_filter: "src".to_string(),
             enabled_columns: vec![OptionalColumn::Kind, OptionalColumn::Items],
+            opportunity_filter: Some(OpportunityCategory::HistoryDrag),
         };
 
         state.save(&path)?;
         let loaded = PersistedUiState::load(&path)?.context("missing persisted state")?;
         assert_eq!(loaded.row_filter, "src");
+        assert_eq!(
+            loaded.opportunity_filter,
+            Some(OpportunityCategory::HistoryDrag)
+        );
         assert_eq!(loaded.lens, MetricLens::Total);
         assert_eq!(loaded.pane_mode, PaneMode::Radial);
         assert_eq!(
@@ -8172,6 +8415,214 @@ mod tests {
             content.contains("reset or split the session sooner"),
             "recommendation text should appear"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn render_column_value_top_opportunity_shows_category_label() {
+        let mut row = sample_row("src", None);
+        row.opportunities = OpportunitySummary::from_annotations(vec![OpportunityAnnotation {
+            category: OpportunityCategory::HistoryDrag,
+            score: 0.7,
+            confidence: OpportunityConfidence::High,
+            evidence: vec![],
+            recommendation: None,
+        }]);
+
+        let value = render_column_value(
+            ColumnKey::Optional(OptionalColumn::TopOpportunity),
+            &row,
+            MetricLens::UncachedInput,
+        );
+        assert_eq!(value, "history drag");
+    }
+
+    #[test]
+    fn render_column_value_top_opportunity_empty_when_no_opportunities() {
+        let row = sample_row("src", None);
+        let value = render_column_value(
+            ColumnKey::Optional(OptionalColumn::TopOpportunity),
+            &row,
+            MetricLens::UncachedInput,
+        );
+        assert_eq!(value, "");
+    }
+
+    #[test]
+    fn render_column_value_opp_score_formats_to_one_decimal() {
+        let mut row = sample_row("src", None);
+        row.opportunities = OpportunitySummary::from_annotations(vec![
+            OpportunityAnnotation {
+                category: OpportunityCategory::HistoryDrag,
+                score: 0.7,
+                confidence: OpportunityConfidence::High,
+                evidence: vec![],
+                recommendation: None,
+            },
+            OpportunityAnnotation {
+                category: OpportunityCategory::SearchChurn,
+                score: 0.3,
+                confidence: OpportunityConfidence::Medium,
+                evidence: vec![],
+                recommendation: None,
+            },
+        ]);
+
+        let value = render_column_value(
+            ColumnKey::Optional(OptionalColumn::OppScore),
+            &row,
+            MetricLens::UncachedInput,
+        );
+        assert_eq!(value, "1.0");
+    }
+
+    #[test]
+    fn render_column_value_opp_score_empty_when_zero() {
+        let row = sample_row("src", None);
+        let value = render_column_value(
+            ColumnKey::Optional(OptionalColumn::OppScore),
+            &row,
+            MetricLens::UncachedInput,
+        );
+        assert_eq!(value, "");
+    }
+
+    #[test]
+    fn render_column_value_confidence_shows_label() {
+        let mut row = sample_row("src", None);
+        row.opportunities = OpportunitySummary::from_annotations(vec![OpportunityAnnotation {
+            category: OpportunityCategory::SessionSetup,
+            score: 0.5,
+            confidence: OpportunityConfidence::Medium,
+            evidence: vec![],
+            recommendation: None,
+        }]);
+
+        let value = render_column_value(
+            ColumnKey::Optional(OptionalColumn::Confidence),
+            &row,
+            MetricLens::UncachedInput,
+        );
+        assert_eq!(value, "medium");
+    }
+
+    #[test]
+    fn render_column_value_per_category_shows_matching_score() {
+        let mut row = sample_row("src", None);
+        row.opportunities = OpportunitySummary::from_annotations(vec![
+            OpportunityAnnotation {
+                category: OpportunityCategory::HistoryDrag,
+                score: 0.7,
+                confidence: OpportunityConfidence::High,
+                evidence: vec![],
+                recommendation: None,
+            },
+            OpportunityAnnotation {
+                category: OpportunityCategory::SearchChurn,
+                score: 0.3,
+                confidence: OpportunityConfidence::Medium,
+                evidence: vec![],
+                recommendation: None,
+            },
+        ]);
+
+        let history = render_column_value(
+            ColumnKey::Optional(OptionalColumn::OppHistoryDrag),
+            &row,
+            MetricLens::UncachedInput,
+        );
+        assert_eq!(history, "0.7");
+
+        let churn = render_column_value(
+            ColumnKey::Optional(OptionalColumn::OppSearchChurn),
+            &row,
+            MetricLens::UncachedInput,
+        );
+        assert_eq!(churn, "0.3");
+
+        let delegation = render_column_value(
+            ColumnKey::Optional(OptionalColumn::OppDelegation),
+            &row,
+            MetricLens::UncachedInput,
+        );
+        assert_eq!(delegation, "");
+    }
+
+    #[test]
+    fn toggle_column_works_with_opportunity_columns() {
+        let mut columns = default_enabled_columns();
+        assert!(!columns.contains(&OptionalColumn::TopOpportunity));
+
+        toggle_column(&mut columns, OptionalColumn::TopOpportunity);
+        assert!(columns.contains(&OptionalColumn::TopOpportunity));
+
+        toggle_column(&mut columns, OptionalColumn::TopOpportunity);
+        assert!(!columns.contains(&OptionalColumn::TopOpportunity));
+    }
+
+    #[test]
+    fn active_columns_includes_opportunity_columns_when_enabled() {
+        let enabled = vec![OptionalColumn::TopOpportunity, OptionalColumn::OppScore];
+        let columns = active_columns(200, MetricLens::UncachedInput, &enabled);
+        let keys: Vec<_> = columns.iter().map(|c| c.key).collect();
+        assert!(keys.contains(&ColumnKey::Optional(OptionalColumn::TopOpportunity)));
+        assert!(keys.contains(&ColumnKey::Optional(OptionalColumn::OppScore)));
+    }
+
+    #[test]
+    fn cycle_opportunity_filter_cycles_through_all_categories_and_back_to_none() {
+        let mut current = None;
+        current = cycle_opportunity_filter(current);
+        assert_eq!(current, Some(OpportunityCategory::SessionSetup));
+
+        current = cycle_opportunity_filter(current);
+        assert_eq!(current, Some(OpportunityCategory::TaskSetup));
+
+        // Cycle through remaining 6 categories to reach ToolResultBloat
+        for _ in 0..6 {
+            current = cycle_opportunity_filter(current);
+        }
+        assert_eq!(current, Some(OpportunityCategory::ToolResultBloat));
+
+        // One more cycle wraps back to None
+        current = cycle_opportunity_filter(current);
+        assert_eq!(
+            current, None,
+            "should wrap back to None after last category"
+        );
+    }
+
+    #[test]
+    fn clear_filters_resets_opportunity_filter() {
+        let mut state = PersistedUiState {
+            opportunity_filter: Some(OpportunityCategory::Delegation),
+            ..PersistedUiState::default()
+        };
+        state.clear_filters();
+        assert_eq!(state.opportunity_filter, None);
+    }
+
+    #[test]
+    fn persisted_state_deserializes_without_opportunity_filter() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("tui-state.json");
+        // Write state JSON without opportunity_filter field to test serde(default)
+        let json = serde_json::json!({
+            "root": "ProjectHierarchy",
+            "path": "Root",
+            "lens": "UncachedInput",
+            "pane_mode": "Table",
+            "time_window": "All",
+            "model": null,
+            "project_id": null,
+            "action_category": null,
+            "action": null,
+            "row_filter": "",
+            "enabled_columns": ["Kind"]
+        });
+        fs::write(&path, serde_json::to_string_pretty(&json)?)?;
+        let loaded = PersistedUiState::load(&path)?.context("missing")?;
+        assert_eq!(loaded.opportunity_filter, None);
         Ok(())
     }
 }
