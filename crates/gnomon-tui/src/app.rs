@@ -1156,6 +1156,8 @@ impl App {
                     separator_span(),
                     Span::raw("Backspace up"),
                     separator_span(),
+                    Span::raw("Space clear scope/root"),
+                    separator_span(),
                     Span::raw("b breadcrumbs"),
                     separator_span(),
                     Span::raw("1/2 hierarchy"),
@@ -1177,7 +1179,7 @@ impl App {
                     separator_span(),
                     Span::raw("t/m filters"),
                     separator_span(),
-                    Span::raw("p/c/a structural scope"),
+                    Span::raw("p/c/a cycle scope"),
                     separator_span(),
                     Span::raw("x opp-filter"),
                     separator_span(),
@@ -1438,6 +1440,10 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.navigate_up()?;
+                Ok(false)
+            }
+            KeyCode::Char(' ') => {
+                self.clear_structural_scope_or_reset_to_root()?;
                 Ok(false)
             }
             KeyCode::Char('1') => {
@@ -1781,6 +1787,27 @@ impl App {
     fn navigate_up(&mut self) -> Result<()> {
         self.ui_state.path =
             parent_browse_path(&self.ui_state.path, self.current_project_root.as_deref());
+        self.enqueue_view_reload("loading view")?;
+        Ok(())
+    }
+
+    fn clear_structural_scope_or_reset_to_root(&mut self) -> Result<()> {
+        if self.ui_state.action.is_some() {
+            self.ui_state.action = None;
+        } else if self.ui_state.action_category.is_some() {
+            self.ui_state.action_category = None;
+            self.ui_state.action = None;
+        } else if self.ui_state.project_id.is_some() {
+            self.ui_state.project_id = None;
+        } else if !matches!(self.ui_state.path, BrowsePath::Root) {
+            self.ui_state.path = BrowsePath::Root;
+            self.expanded_paths.clear();
+            self.row_cache.clear();
+        } else {
+            self.status_message = Some(StatusMessage::info("Already at the unscoped root view."));
+            return Ok(());
+        }
+
         self.enqueue_view_reload("loading view")?;
         Ok(())
     }
@@ -7760,7 +7787,8 @@ mod tests {
         )?;
         let content = render_app_to_string(&mut app, 200, 40)?;
 
-        assert!(content.contains("p/c/a structural scope"));
+        assert!(content.contains("p/c/a cycle scope"));
+        assert!(content.contains("Space clear scope/root"));
         assert!(content.contains("t/m filters"));
         assert!(content.contains("quit"));
         Ok(())
@@ -8515,6 +8543,98 @@ mod tests {
         };
         state.clear_filters();
         assert_eq!(state.opportunity_filter, None);
+    }
+
+    #[test]
+    fn space_clears_most_specific_structural_filter_first() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        app.ui_state.project_id = Some(1);
+        app.ui_state.action_category = Some("editing".to_string());
+        app.ui_state.action = Some(sample_action("read file"));
+
+        app.handle_normal_key(KeyEvent::from(KeyCode::Char(' ')))?;
+        assert_eq!(app.ui_state.action, None);
+        assert_eq!(app.ui_state.action_category.as_deref(), Some("editing"));
+        assert_eq!(app.ui_state.project_id, Some(1));
+
+        app.handle_normal_key(KeyEvent::from(KeyCode::Char(' ')))?;
+        assert_eq!(app.ui_state.action_category, None);
+        assert_eq!(app.ui_state.project_id, Some(1));
+
+        app.handle_normal_key(KeyEvent::from(KeyCode::Char(' ')))?;
+        assert_eq!(app.ui_state.project_id, None);
+        Ok(())
+    }
+
+    #[test]
+    fn space_resets_drilled_path_to_root_when_no_structural_filter_is_active() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        app.ui_state.root = RootView::CategoryHierarchy;
+        app.ui_state.path = BrowsePath::Category {
+            category: "editing".to_string(),
+        };
+        app.expanded_paths = vec![BrowsePath::Category {
+            category: "editing".to_string(),
+        }];
+        app.row_cache = vec![CachedRows {
+            path: BrowsePath::Category {
+                category: "editing".to_string(),
+            },
+            rows: Vec::new(),
+        }];
+
+        app.handle_normal_key(KeyEvent::from(KeyCode::Char(' ')))?;
+
+        assert_eq!(app.ui_state.path, BrowsePath::Root);
+        assert!(app.expanded_paths.is_empty());
+        assert!(app.row_cache.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn space_at_root_without_structural_filters_sets_status_message() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        app.handle_normal_key(KeyEvent::from(KeyCode::Char(' ')))?;
+
+        assert_eq!(app.ui_state.path, BrowsePath::Root);
+        assert_eq!(app.ui_state.project_id, None);
+        assert_eq!(app.ui_state.action_category, None);
+        assert_eq!(app.ui_state.action, None);
+        assert_eq!(
+            app.status_message
+                .as_ref()
+                .map(|message| message.text.as_str()),
+            Some("Already at the unscoped root view.")
+        );
+        Ok(())
     }
 
     #[test]
