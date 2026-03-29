@@ -13,7 +13,7 @@ This repository is bootstrapped as a Rust workspace with three crates:
 The current binary resolves runtime paths, scans the source manifest, schedules
 `project x day` import chunks, normalizes and classifies actions into the
 SQLite cache, and opens a pinned TUI against the latest published import
-snapshot. The TUI now includes synchronized radial and table panes, persistent
+snapshot. The TUI now includes synchronized map and statistics panes, persistent
 UI state, current-view filtering, global jump, and manual snapshot refresh.
 Startup prioritizes the last 24 hours of chunks before the UI opens and
 continues older imports in one background worker after launch. Startup import

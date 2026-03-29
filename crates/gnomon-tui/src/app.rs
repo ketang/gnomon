@@ -581,7 +581,7 @@ fn phase_label_for(task: PendingTaskKind, phase: &str) -> Option<&'static str> {
         (PendingTaskKind::View, "browsing current path") => Some("browsing current path"),
         (PendingTaskKind::View, "resolving project root") => Some("resolving project root"),
         (PendingTaskKind::View, "building breadcrumbs") => Some("building breadcrumbs"),
-        (PendingTaskKind::View, "recomputing radial context") => Some("recomputing radial context"),
+        (PendingTaskKind::View, "recomputing map context") => Some("recomputing map context"),
         (PendingTaskKind::View, "refreshing snapshot coverage") => {
             Some("refreshing snapshot coverage")
         }
@@ -841,7 +841,6 @@ impl App {
             Line::from(vec![
                 Span::styled("▣ ", Style::default().fg(Color::Cyan)),
                 Span::styled("gnomon", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw("  radial + table explorer"),
             ]),
             view_line(&self.breadcrumb_targets),
             Line::from(vec![
@@ -965,7 +964,10 @@ impl App {
 
         let table = Table::new(rows, widths)
             .header(header.style(table_header_style(self.focused_pane == PaneFocus::Table)))
-            .block(pane_block("Table", self.focused_pane == PaneFocus::Table))
+            .block(pane_block(
+                "Statistics",
+                self.focused_pane == PaneFocus::Table,
+            ))
             .row_highlight_style(table_row_highlight_style(
                 self.focused_pane == PaneFocus::Table,
             ))
@@ -1014,7 +1016,7 @@ impl App {
                     Span::raw("q quit"),
                 ]),
                 Line::from(vec![
-                    badge("table", BadgeTone::Accent),
+                    badge("statistics", BadgeTone::Accent),
                     separator_span(),
                     Span::raw("up/down rows"),
                     separator_span(),
@@ -2656,7 +2658,7 @@ fn load_view_for_state(
     perf.field("breadcrumb_count", breadcrumb_targets.len());
 
     if let Some(progress) = progress {
-        progress.step(7, VIEW_LOAD_PHASE_TOTAL, "recomputing radial context");
+        progress.step(7, VIEW_LOAD_PHASE_TOTAL, "recomputing map context");
     }
     let radial_started = Instant::now();
     let radial_context = build_radial_context_for_state(
@@ -3420,7 +3422,7 @@ struct RadialPane<'a> {
 
 impl Widget for &RadialPane<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = pane_block("Radial", self.focused);
+        let block = pane_block("Map", self.focused);
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -6137,7 +6139,7 @@ mod tests {
         })?;
 
         let buffer = terminal.backend().buffer();
-        let inner = pane_block("Radial", false).inner(Rect::new(0, 0, width, height));
+        let inner = pane_block("Map", false).inner(Rect::new(0, 0, width, height));
         let center_area = radial_center_label_area(inner);
 
         let mut saw_center_text = false;
@@ -6792,12 +6794,12 @@ mod tests {
         let content = render_app_to_string(&mut app, 140, 40)?;
 
         assert!(
-            content.contains("◆ TABLE"),
-            "focused table title should stand out"
+            content.contains("◆ STATISTICS"),
+            "focused statistics title should stand out"
         );
         assert!(
-            content.contains("◦ Radial"),
-            "unfocused radial title should remain visible"
+            content.contains("◦ Map"),
+            "unfocused map title should remain visible"
         );
         assert!(
             !content.contains("focus:"),
@@ -6824,12 +6826,12 @@ mod tests {
         let content = render_app_to_string(&mut app, 100, 40)?;
 
         assert!(
-            content.contains("◆ RADIAL"),
-            "focused radial title should stand out"
+            content.contains("◆ MAP"),
+            "focused map title should stand out"
         );
         assert!(
-            !content.contains("Table"),
-            "narrow radial layout should show one pane"
+            !content.contains("Statistics"),
+            "narrow map layout should show one pane"
         );
         assert!(
             !content.contains("focus:"),
@@ -7206,7 +7208,7 @@ mod tests {
         app.apply_query_result(QueryWorkerResult::Progress(QueryProgressUpdate {
             sequence: 1,
             task: PendingTaskKind::View,
-            phase: "recomputing radial context".to_string(),
+            phase: "recomputing map context".to_string(),
             progress: Some(PhaseProgress {
                 current: 7,
                 total: VIEW_LOAD_PHASE_TOTAL,
@@ -7223,7 +7225,7 @@ mod tests {
         assert!(detail.contains("[activity]"));
         assert!(detail.contains("refreshing snapshot"));
         assert!(detail.contains("[7/8]"));
-        assert!(detail.contains("recomputing radial context"));
+        assert!(detail.contains("recomputing map context"));
         Ok(())
     }
 

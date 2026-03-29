@@ -34,7 +34,7 @@ hierarchy, not a new hierarchy root or a replacement navigation model.
   - `project -> action category -> action -> directory/file`
   - `action category -> action -> project -> directory/file`
 - Attach opportunity metadata to existing rollup rows.
-- Keep the radial + table explorer as the primary interaction surface.
+- Keep the map + statistics explorer as the primary interaction surface.
 - Treat opportunity as sparse row-level data:
   - a row may have zero, one, or several opportunity annotations
   - absence of annotations means "no confident signal", not "confirmed healthy"
@@ -166,7 +166,7 @@ Shell commands do not create path attribution.
 ## TUI
 
 - Keyboard-first
-- Wide layout: radial view + table view
+- Wide layout: map view + statistics view
 - Narrow layout: one pane at a time with toggle
 - Visual encoding:
   - area/width = selected input lens
@@ -222,6 +222,6 @@ crates/
 4. JSONL normalization into messages, turns, and actions
 5. Deterministic classification and grouped-run construction
 6. Stable aggregate queries with pinned chunk visibility
-7. Table-first TUI with filtering and global jump
-8. Radial view synchronized with table selection
+7. Statistics-first TUI with filtering and global jump
+8. Map view synchronized with statistics selection
 9. Performance and scale validation against roughly `10x` the current corpus
