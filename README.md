@@ -44,6 +44,13 @@ docs/
 - Repo-local worktrees live under `.worktrees/`. Treat that directory as local
   orchestration state, not product source.
 
+## Issue Tracking
+
+- GitHub Issues is the canonical issue tracker for this repository.
+- If a task is already tracked, use the corresponding GitHub issue as the
+  source of truth for task context.
+- This repository does not use `beads`.
+
 ## Planned Core Stack
 
 - TUI: `ratatui` + `crossterm`

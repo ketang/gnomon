@@ -44,10 +44,10 @@ asks.
 - Use a feature branch or the existing task branch for every implementation task
 - Use a dedicated worktree for implementation work whenever practical, and for
   all parallel work
-- This repo does not currently document a canonical issue tracker
+- GitHub Issues is the canonical issue tracker for this repo
 - Do not assume `beads`
-- If the user references an issue or tracker explicitly, follow that context;
-  otherwise do not make tracker mutations on your own
+- If the user references a GitHub issue, follow that context
+- Do not create, edit, or close GitHub issues unless the user explicitly asks
 
 ## Rust Commands
 
