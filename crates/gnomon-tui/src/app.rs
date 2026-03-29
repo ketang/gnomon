@@ -5509,7 +5509,9 @@ mod tests {
     use gnomon_core::config::RuntimeConfig;
     use gnomon_core::db::Database;
     use gnomon_core::import::StartupOpenReason;
-    use gnomon_core::opportunity::OpportunitySummary;
+    use gnomon_core::opportunity::{
+        OpportunityAnnotation, OpportunityCategory, OpportunityConfidence, OpportunitySummary,
+    };
     use gnomon_core::perf::PerfLogger;
     use gnomon_core::query::{ClassificationState, QueryEngine, SnapshotBounds};
     use gnomon_core::validation::{ScaleValidationSpec, run_scale_validation};
@@ -7587,5 +7589,108 @@ mod tests {
             snapshot_coverage_footer_text(&SnapshotCoverageSummary::default()),
             "coverage: no imported data is visible yet"
         );
+    }
+
+    #[test]
+    fn inspect_pane_shows_no_opportunities_message_for_empty_row() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        app.show_inspect_pane = true;
+        app.visible_rows = vec![TreeRow {
+            row: sample_row("src", None),
+            parent_path: BrowsePath::Root,
+            node_path: None,
+            depth: 0,
+            is_expanded: false,
+        }];
+        app.table_state.select(Some(0));
+
+        let content = render_app_to_string(&mut app, 120, 40)?;
+
+        assert!(
+            content.contains("Opportunity Details"),
+            "inspect pane title should be rendered"
+        );
+        assert!(
+            content.contains("No opportunities detected"),
+            "empty opportunity message should appear"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_pane_renders_opportunity_annotations() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        app.show_inspect_pane = true;
+        let mut row = sample_row("src", None);
+        row.opportunities = OpportunitySummary::from_annotations(vec![
+            OpportunityAnnotation {
+                category: OpportunityCategory::HistoryDrag,
+                score: 0.7,
+                confidence: OpportunityConfidence::High,
+                evidence: vec!["later turns carry more context".to_string()],
+                recommendation: Some("reset or split the session sooner".to_string()),
+            },
+            OpportunityAnnotation {
+                category: OpportunityCategory::SearchChurn,
+                score: 0.35,
+                confidence: OpportunityConfidence::Medium,
+                evidence: vec!["repeated search loops".to_string()],
+                recommendation: None,
+            },
+        ]);
+        app.visible_rows = vec![TreeRow {
+            row,
+            parent_path: BrowsePath::Root,
+            node_path: None,
+            depth: 0,
+            is_expanded: false,
+        }];
+        app.table_state.select(Some(0));
+
+        let content = render_app_to_string(&mut app, 120, 40)?;
+
+        assert!(
+            content.contains("Opportunity Details"),
+            "inspect pane title should be rendered"
+        );
+        assert!(
+            content.contains("history drag"),
+            "history drag category should appear"
+        );
+        assert!(
+            content.contains("search churn"),
+            "search churn category should appear"
+        );
+        assert!(
+            content.contains("0.70"),
+            "history drag score should be formatted"
+        );
+        assert!(
+            content.contains("later turns carry more context"),
+            "evidence text should appear"
+        );
+        assert!(
+            content.contains("reset or split the session sooner"),
+            "recommendation text should appear"
+        );
+        Ok(())
     }
 }
