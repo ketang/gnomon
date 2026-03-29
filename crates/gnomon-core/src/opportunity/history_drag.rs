@@ -84,12 +84,7 @@ pub fn detect(turns: &[HistoryDragTurn]) -> Option<HistoryDragDetection> {
     let late_uncached_share = uncached_share(late_turns);
     let mix = classify_mix(late_uncached_share);
     let confidence = classify_confidence(overall_input, growth_ratio);
-    let score = score_detection(
-        overall_input,
-        growth_ratio,
-        late_uncached_share,
-        mix,
-    );
+    let score = score_detection(overall_input, growth_ratio, late_uncached_share, mix);
     let annotation = OpportunityAnnotation {
         category: OpportunityCategory::HistoryDrag,
         score,
@@ -178,11 +173,11 @@ fn evidence_lines(
     ];
 
     lines.push(match mix {
-        HistoryDragMix::MostlyUncached => {
-            "history drag is mostly uncached input".to_string()
-        }
+        HistoryDragMix::MostlyUncached => "history drag is mostly uncached input".to_string(),
         HistoryDragMix::MostlyCached => "history drag is mostly cached input".to_string(),
-        HistoryDragMix::Mixed => "history drag is mixed across cached and uncached input".to_string(),
+        HistoryDragMix::Mixed => {
+            "history drag is mixed across cached and uncached input".to_string()
+        }
     });
 
     lines
@@ -216,9 +211,7 @@ fn clean_value(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        HistoryDragMix, HistoryDragTurn, detect, detect_summary, MEDIUM_GROWTH_RATIO,
-    };
+    use super::{HistoryDragMix, HistoryDragTurn, MEDIUM_GROWTH_RATIO, detect, detect_summary};
     use crate::opportunity::{OpportunityCategory, OpportunityConfidence};
 
     fn turn(uncached_input: f64, cached_input: f64) -> HistoryDragTurn {
@@ -260,11 +253,13 @@ mod tests {
         assert_eq!(detection.mix, HistoryDragMix::MostlyUncached);
         assert!(detection.late_uncached_share > 0.8);
         assert!(detection.annotation.score > 0.5);
-        assert!(detection
-            .annotation
-            .evidence
-            .iter()
-            .any(|line| line.contains("mostly uncached input")));
+        assert!(
+            detection
+                .annotation
+                .evidence
+                .iter()
+                .any(|line| line.contains("mostly uncached input"))
+        );
 
         let summary = detect_summary(&turns);
         assert_eq!(summary.top_category, Some(OpportunityCategory::HistoryDrag));
@@ -285,11 +280,13 @@ mod tests {
         assert_eq!(detection.mix, HistoryDragMix::MostlyCached);
         assert!(detection.late_uncached_share < 0.2);
         assert!(detection.annotation.score > 0.4);
-        assert!(detection
-            .annotation
-            .evidence
-            .iter()
-            .any(|line| line.contains("mostly cached input")));
+        assert!(
+            detection
+                .annotation
+                .evidence
+                .iter()
+                .any(|line| line.contains("mostly cached input"))
+        );
     }
 
     #[test]
