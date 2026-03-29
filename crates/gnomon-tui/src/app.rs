@@ -646,6 +646,7 @@ pub struct App {
     breadcrumb_picker: BreadcrumbPickerState,
     current_project_root: Option<String>,
     radial_context: RadialContext,
+    radial_context_path: BrowsePath,
     radial_model: RadialModel,
     jump_state: JumpState,
     status_message: Option<StatusMessage>,
@@ -723,6 +724,7 @@ impl App {
             breadcrumb_picker: BreadcrumbPickerState::default(),
             current_project_root: None,
             radial_context: RadialContext::default(),
+            radial_context_path: BrowsePath::Root,
             radial_model: RadialModel::default(),
             jump_state: JumpState::default(),
             status_message,
@@ -2164,23 +2166,27 @@ impl App {
         &mut self,
         filters: &BrowseFilters,
         path: &BrowsePath,
+        pre_resolved_project_root: Option<Option<String>>,
         browse_stats: &mut BrowseFanoutStats,
     ) -> Result<RadialContext> {
         let mut perf = self.perf_scope_with_filters("tui.build_radial_context", filters);
         let perf_logger = self.perf_logger.clone();
         let conn = self.database.connection();
         let query_engine = QueryEngine::with_perf(conn, perf_logger.clone());
-        let project_root = match project_id_from_path(path) {
-            Some(project_id) => project_root_for_state(
-                &mut self.query_cache,
-                &query_engine,
-                &self.snapshot,
-                self.ui_state.lens,
-                filters,
-                project_id,
-                browse_stats,
-            )?,
-            None => None,
+        let project_root = match pre_resolved_project_root {
+            Some(resolved) => resolved,
+            None => match project_id_from_path(path) {
+                Some(project_id) => project_root_for_state(
+                    &mut self.query_cache,
+                    &query_engine,
+                    &self.snapshot,
+                    self.ui_state.lens,
+                    filters,
+                    project_id,
+                    browse_stats,
+                )?,
+                None => None,
+            },
         };
         let radial_context = build_radial_context_for_state(
             &mut self.query_cache,
@@ -2330,6 +2336,7 @@ impl App {
         self.breadcrumb_picker.selected = self.breadcrumb_targets.len().saturating_sub(1);
         self.current_project_root = loaded_view.current_project_root;
         self.radial_context = loaded_view.radial_context;
+        self.radial_context_path = self.ui_state.path.clone();
         self.row_cache.clear();
         self.cache_rows(self.ui_state.path.clone(), self.raw_rows.clone());
         self.expanded_paths
@@ -2368,14 +2375,24 @@ impl App {
             project_root.as_deref(),
         );
         self.breadcrumb_picker.selected = self.breadcrumb_targets.len().saturating_sub(1);
-        self.radial_context =
-            self.build_radial_context(filters, &active_path, &mut browse_stats)?;
+        self.radial_context = self.build_radial_context(
+            filters,
+            &active_path,
+            Some(project_root),
+            &mut browse_stats,
+        )?;
+        self.radial_context_path = active_path;
         self.rebuild_radial_model();
         Ok(())
     }
 
     fn refresh_active_context_for_selection(&mut self) {
         self.update_selected_node_metadata();
+        let new_active_path = self.active_path();
+        if new_active_path == self.radial_context_path {
+            self.rebuild_radial_model();
+            return;
+        }
         if let Ok(filters) = self.current_query_filters() {
             if self.refresh_active_context(&filters).is_err() {
                 self.rebuild_radial_model();
@@ -5997,7 +6014,7 @@ mod tests {
         let filters = current_query_filters_for(&app.ui_state, &app.snapshot)?;
         let mut browse_stats = BrowseFanoutStats::default();
 
-        let ctx = app.build_radial_context(&filters, &active_path, &mut browse_stats)?;
+        let ctx = app.build_radial_context(&filters, &active_path, None, &mut browse_stats)?;
 
         // With the fix, ancestor_layers length == number of ancestor steps for
         // `active_path` (2 for ProjectCategory).  Before the fix, ui_state.path
@@ -6035,7 +6052,7 @@ mod tests {
         let filters = current_query_filters_for(&app.ui_state, &app.snapshot)?;
         let mut browse_stats = BrowseFanoutStats::default();
 
-        let ctx = app.build_radial_context(&filters, &active_path, &mut browse_stats)?;
+        let ctx = app.build_radial_context(&filters, &active_path, None, &mut browse_stats)?;
 
         assert_eq!(
             ctx.ancestor_layers.len(),
