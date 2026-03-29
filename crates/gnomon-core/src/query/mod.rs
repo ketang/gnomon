@@ -357,29 +357,6 @@ const DISPLAY_CATEGORY_SQL: &str = "
 
 const ACTION_TIMESTAMP_SQL: &str = "COALESCE(a.ended_at_utc, a.started_at_utc)";
 
-const LOAD_ACTION_ROLLUP_FACTS_SQL: &str = "
-    SELECT
-        p.id,
-        p.display_name,
-        p.root_path,
-        car.display_category,
-        car.normalized_action,
-        car.command_family,
-        car.base_command,
-        car.classification_state,
-        car.input_tokens,
-        car.cache_creation_input_tokens,
-        car.cache_read_input_tokens,
-        car.output_tokens,
-        car.action_count
-    FROM chunk_action_rollup car
-    JOIN import_chunk ic ON ic.id = car.import_chunk_id
-    JOIN project p ON p.id = ic.project_id
-    WHERE ic.state = 'complete'
-      AND ic.publish_seq IS NOT NULL
-      AND ic.publish_seq <= ?1
-";
-
 const LOAD_RECENT_ACTION_FACTS_SQL: &str = "
     SELECT
         p.id,
@@ -648,15 +625,14 @@ impl<'conn> QueryEngine<'conn> {
             aggregate_path_request(request, &compiled_filters, &windows, &path_facts)?
         } else if can_use_action_rollups(&request.filters) {
             let action_load_started = Instant::now();
-            let action_rollups = self.load_action_rollup_facts(&request.snapshot)?;
+            let action_rollups = self.load_grouped_action_rollup_rows(request)?;
             perf.field(
-                "action_rollup_load_ms",
+                "grouped_action_rollup_load_ms",
                 action_load_started.elapsed().as_secs_f64() * 1000.0,
             );
-            perf.field("action_rollup_count", action_rollups.len());
+            perf.field("grouped_action_rollup_count", action_rollups.len());
 
-            let mut rows =
-                aggregate_action_request(request, &compiled_filters, &windows, &action_rollups)?;
+            let mut rows = action_rollups;
 
             if let Some(last_week_start) = windows.last_week_start {
                 let recent_load_started = Instant::now();
@@ -724,8 +700,12 @@ impl<'conn> QueryEngine<'conn> {
         self.explain_query_plan(LATEST_SNAPSHOT_BOUNDS_SQL)
     }
 
-    pub fn action_rollup_facts_query_plan(&self, snapshot: &SnapshotBounds) -> Result<Vec<String>> {
-        self.explain_query_plan_with_snapshot(LOAD_ACTION_ROLLUP_FACTS_SQL, snapshot)
+    pub fn grouped_action_rollup_browse_query_plan(
+        &self,
+        request: &BrowseRequest,
+    ) -> Result<Vec<String>> {
+        let (sql, query_params) = build_grouped_action_rollup_rows_query(request)?;
+        self.explain_query_plan_with_params(&sql, query_params)
     }
 
     pub fn recent_action_facts_query_plan(&self, snapshot: &SnapshotBounds) -> Result<Vec<String>> {
@@ -816,26 +796,27 @@ impl<'conn> QueryEngine<'conn> {
         Ok(facts)
     }
 
-    fn load_action_rollup_facts(&self, snapshot: &SnapshotBounds) -> Result<Vec<ActionFact>> {
-        let mut perf = self.perf_scope("query.load_action_rollup_facts");
-        perf.field("snapshot", snapshot);
-        if snapshot.max_publish_seq == 0 {
+    fn load_grouped_action_rollup_rows(&self, request: &BrowseRequest) -> Result<Vec<RollupRow>> {
+        let mut perf = self.perf_scope("query.load_grouped_action_rollup_rows");
+        perf.field("request", request);
+        if request.snapshot.max_publish_seq == 0 {
             perf.field("row_count", 0usize);
             perf.finish_ok();
             return Ok(Vec::new());
         }
 
-        let mut stmt = self.conn.prepare(LOAD_ACTION_ROLLUP_FACTS_SQL)?;
-        let rows = stmt.query_map([snapshot.max_publish_seq as i64], |row| {
-            Ok(LoadedActionRollupFact {
+        let (sql, query_params) = build_grouped_action_rollup_rows_query(request)?;
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(query_params.iter()), |row| {
+            Ok(LoadedGroupedActionRollupRow {
                 project_id: row.get(0)?,
                 project_display_name: row.get(1)?,
                 project_root: row.get(2)?,
                 display_category: row.get(3)?,
-                normalized_action: row.get(4)?,
-                command_family: row.get(5)?,
-                base_command: row.get(6)?,
-                classification_state: row.get(7)?,
+                classification_state: row.get(4)?,
+                normalized_action: row.get(5)?,
+                command_family: row.get(6)?,
+                base_command: row.get(7)?,
                 input_tokens: row.get(8)?,
                 cache_creation_input_tokens: row.get(9)?,
                 cache_read_input_tokens: row.get(10)?,
@@ -846,31 +827,8 @@ impl<'conn> QueryEngine<'conn> {
 
         let facts = rows
             .map(|row| {
-                let row = row.context("unable to read an action rollup row")?;
-                Ok(ActionFact {
-                    project_id: row.project_id,
-                    project_display_name: row.project_display_name,
-                    project_root: row.project_root,
-                    category: row.display_category,
-                    action: ActionKey {
-                        classification_state: parse_classification_state(
-                            &row.classification_state,
-                        )?,
-                        normalized_action: row.normalized_action,
-                        command_family: row.command_family,
-                        base_command: row.base_command,
-                    },
-                    timestamp: None,
-                    metrics: MetricTotals::from_usage(
-                        row.input_tokens,
-                        row.cache_creation_input_tokens,
-                        row.cache_read_input_tokens,
-                        row.output_tokens,
-                    ),
-                    model_names: BTreeSet::new(),
-                    item_count: u64::try_from(row.action_count)
-                        .context("action rollup count overflowed u64")?,
-                })
+                let row = row.context("unable to read a grouped action rollup row")?;
+                grouped_action_rollup_row_to_rollup_row(request, row)
             })
             .collect::<Result<Vec<_>>>()?;
         perf.field("row_count", facts.len());
@@ -1026,23 +984,6 @@ impl<'conn> QueryEngine<'conn> {
             .context("unable to read EXPLAIN QUERY PLAN rows")
     }
 
-    fn explain_query_plan_with_snapshot(
-        &self,
-        sql: &str,
-        snapshot: &SnapshotBounds,
-    ) -> Result<Vec<String>> {
-        let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
-        let max_publish_seq = i64::try_from(snapshot.max_publish_seq)
-            .context("snapshot publish_seq overflowed i64 for EXPLAIN QUERY PLAN")?;
-        let mut stmt = self
-            .conn
-            .prepare(&explain_sql)
-            .context("unable to prepare EXPLAIN QUERY PLAN statement")?;
-        let rows = stmt.query_map([max_publish_seq], |row| row.get::<_, String>(3))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("unable to read EXPLAIN QUERY PLAN rows")
-    }
-
     fn explain_query_plan_with_snapshot_and_timestamp(
         &self,
         sql: &str,
@@ -1113,15 +1054,15 @@ struct ActionFact {
 }
 
 #[derive(Debug)]
-struct LoadedActionRollupFact {
-    project_id: i64,
-    project_display_name: String,
-    project_root: String,
-    display_category: String,
+struct LoadedGroupedActionRollupRow {
+    project_id: Option<i64>,
+    project_display_name: Option<String>,
+    project_root: Option<String>,
+    display_category: Option<String>,
+    classification_state: Option<String>,
     normalized_action: Option<String>,
     command_family: Option<String>,
     base_command: Option<String>,
-    classification_state: String,
     input_tokens: i64,
     cache_creation_input_tokens: i64,
     cache_read_input_tokens: i64,
@@ -1612,6 +1553,308 @@ fn is_path_browse(path: &BrowsePath) -> bool {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupedActionRollupShape {
+    Project,
+    Category,
+    Action,
+}
+
+fn grouped_action_rollup_shape(request: &BrowseRequest) -> Result<GroupedActionRollupShape> {
+    match (&request.root, &request.path) {
+        (RootView::ProjectHierarchy, BrowsePath::Root)
+        | (RootView::CategoryHierarchy, BrowsePath::CategoryAction { .. }) => {
+            Ok(GroupedActionRollupShape::Project)
+        }
+        (RootView::ProjectHierarchy, BrowsePath::Project { .. })
+        | (RootView::CategoryHierarchy, BrowsePath::Root) => Ok(GroupedActionRollupShape::Category),
+        (RootView::ProjectHierarchy, BrowsePath::ProjectCategory { .. })
+        | (RootView::CategoryHierarchy, BrowsePath::Category { .. }) => {
+            Ok(GroupedActionRollupShape::Action)
+        }
+        _ => {
+            bail!(
+                "browse path {:?} is incompatible with {:?}",
+                request.path,
+                request.root
+            )
+        }
+    }
+}
+
+fn build_grouped_action_rollup_rows_query(request: &BrowseRequest) -> Result<(String, Vec<Value>)> {
+    let shape = grouped_action_rollup_shape(request)?;
+    let max_publish_seq = i64::try_from(request.snapshot.max_publish_seq)
+        .context("snapshot publish_seq overflowed i64")?;
+    let mut sql = match shape {
+        GroupedActionRollupShape::Project => String::from(
+            "
+        SELECT
+            p.id,
+            p.display_name,
+            p.root_path,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            COALESCE(SUM(car.input_tokens), 0),
+            COALESCE(SUM(car.cache_creation_input_tokens), 0),
+            COALESCE(SUM(car.cache_read_input_tokens), 0),
+            COALESCE(SUM(car.output_tokens), 0),
+            COALESCE(SUM(car.action_count), 0)
+        FROM chunk_action_rollup car
+        JOIN import_chunk ic ON ic.id = car.import_chunk_id
+        JOIN project p ON p.id = ic.project_id
+        WHERE ic.state = 'complete'
+          AND ic.publish_seq IS NOT NULL
+          AND ic.publish_seq <= ?
+        ",
+        ),
+        GroupedActionRollupShape::Category => String::from(
+            "
+        SELECT
+            NULL,
+            NULL,
+            NULL,
+            car.display_category,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            COALESCE(SUM(car.input_tokens), 0),
+            COALESCE(SUM(car.cache_creation_input_tokens), 0),
+            COALESCE(SUM(car.cache_read_input_tokens), 0),
+            COALESCE(SUM(car.output_tokens), 0),
+            COALESCE(SUM(car.action_count), 0)
+        FROM chunk_action_rollup car
+        JOIN import_chunk ic ON ic.id = car.import_chunk_id
+        JOIN project p ON p.id = ic.project_id
+        WHERE ic.state = 'complete'
+          AND ic.publish_seq IS NOT NULL
+          AND ic.publish_seq <= ?
+        ",
+        ),
+        GroupedActionRollupShape::Action => String::from(
+            "
+        SELECT
+            NULL,
+            NULL,
+            NULL,
+            car.display_category,
+            car.classification_state,
+            car.normalized_action,
+            car.command_family,
+            car.base_command,
+            COALESCE(SUM(car.input_tokens), 0),
+            COALESCE(SUM(car.cache_creation_input_tokens), 0),
+            COALESCE(SUM(car.cache_read_input_tokens), 0),
+            COALESCE(SUM(car.output_tokens), 0),
+            COALESCE(SUM(car.action_count), 0)
+        FROM chunk_action_rollup car
+        JOIN import_chunk ic ON ic.id = car.import_chunk_id
+        JOIN project p ON p.id = ic.project_id
+        WHERE ic.state = 'complete'
+          AND ic.publish_seq IS NOT NULL
+          AND ic.publish_seq <= ?
+        ",
+        ),
+    };
+    let mut query_params = vec![Value::Integer(max_publish_seq)];
+
+    match (&request.root, &request.path) {
+        (RootView::ProjectHierarchy, BrowsePath::Root)
+        | (RootView::CategoryHierarchy, BrowsePath::Root) => {}
+        (RootView::ProjectHierarchy, BrowsePath::Project { project_id }) => {
+            append_project_match(&mut sql, &mut query_params, *project_id);
+        }
+        (
+            RootView::ProjectHierarchy,
+            BrowsePath::ProjectCategory {
+                project_id,
+                category,
+            },
+        ) => {
+            append_project_match(&mut sql, &mut query_params, *project_id);
+            append_grouped_category_match(&mut sql, &mut query_params, category);
+        }
+        (RootView::CategoryHierarchy, BrowsePath::Category { category }) => {
+            append_grouped_category_match(&mut sql, &mut query_params, category);
+        }
+        (RootView::CategoryHierarchy, BrowsePath::CategoryAction { category, action }) => {
+            append_grouped_category_match(&mut sql, &mut query_params, category);
+            append_grouped_action_key_match(&mut sql, &mut query_params, action);
+        }
+        _ => {
+            bail!(
+                "browse path {:?} is incompatible with {:?}",
+                request.path,
+                request.root
+            )
+        }
+    }
+
+    if let Some(project_id) = request.filters.project_id {
+        append_project_match(&mut sql, &mut query_params, project_id);
+    }
+    if let Some(category) = request.filters.action_category.as_deref() {
+        append_grouped_category_match(&mut sql, &mut query_params, category);
+    }
+    if let Some(action) = request.filters.action.as_ref() {
+        append_grouped_action_key_match(&mut sql, &mut query_params, action);
+    }
+
+    sql.push_str(match shape {
+        GroupedActionRollupShape::Project => {
+            "
+        GROUP BY
+            p.id,
+            p.display_name,
+            p.root_path
+        "
+        }
+        GroupedActionRollupShape::Category => {
+            "
+        GROUP BY
+            car.display_category
+        "
+        }
+        GroupedActionRollupShape::Action => {
+            "
+        GROUP BY
+            car.display_category,
+            car.classification_state,
+            car.normalized_action,
+            car.command_family,
+            car.base_command
+        "
+        }
+    });
+
+    Ok((sql, query_params))
+}
+
+fn grouped_action_rollup_row_to_rollup_row(
+    request: &BrowseRequest,
+    row: LoadedGroupedActionRollupRow,
+) -> Result<RollupRow> {
+    let metrics = MetricTotals::from_usage(
+        row.input_tokens,
+        row.cache_creation_input_tokens,
+        row.cache_read_input_tokens,
+        row.output_tokens,
+    );
+    let uncached_input_reference = metrics.uncached_input;
+    let item_count = u64::try_from(row.action_count)
+        .context("grouped action rollup action_count overflowed u64")?;
+
+    match (&request.root, &request.path) {
+        (RootView::ProjectHierarchy, BrowsePath::Root)
+        | (RootView::CategoryHierarchy, BrowsePath::CategoryAction { .. }) => {
+            let project_id = row
+                .project_id
+                .context("grouped project rollup row is missing project_id")?;
+            let project_display_name = row
+                .project_display_name
+                .context("grouped project rollup row is missing project_display_name")?;
+            let project_root = row
+                .project_root
+                .context("grouped project rollup row is missing project_root")?;
+
+            Ok(RollupRow {
+                kind: RollupRowKind::Project,
+                key: format!("project:{project_id}"),
+                label: project_display_name,
+                metrics,
+                indicators: MetricIndicators {
+                    selected_lens_last_5_hours: 0.0,
+                    selected_lens_last_week: 0.0,
+                    uncached_input_reference,
+                },
+                item_count,
+                project_id: Some(project_id),
+                category: None,
+                action: None,
+                full_path: Some(project_root),
+            })
+        }
+        (RootView::ProjectHierarchy, BrowsePath::Project { .. })
+        | (RootView::CategoryHierarchy, BrowsePath::Root) => {
+            let display_category = row
+                .display_category
+                .context("grouped category rollup row is missing display_category")?;
+
+            Ok(RollupRow {
+                kind: RollupRowKind::ActionCategory,
+                key: format!("category:{display_category}"),
+                label: display_category.clone(),
+                metrics,
+                indicators: MetricIndicators {
+                    selected_lens_last_5_hours: 0.0,
+                    selected_lens_last_week: 0.0,
+                    uncached_input_reference,
+                },
+                item_count,
+                project_id: None,
+                category: Some(display_category),
+                action: None,
+                full_path: None,
+            })
+        }
+        (RootView::ProjectHierarchy, BrowsePath::ProjectCategory { project_id, .. }) => {
+            build_grouped_action_row(row, metrics, item_count, Some(*project_id))
+        }
+        (RootView::CategoryHierarchy, BrowsePath::Category { .. }) => {
+            build_grouped_action_row(row, metrics, item_count, None)
+        }
+        _ => {
+            bail!(
+                "browse path {:?} is incompatible with {:?}",
+                request.path,
+                request.root
+            )
+        }
+    }
+}
+
+fn build_grouped_action_row(
+    row: LoadedGroupedActionRollupRow,
+    metrics: MetricTotals,
+    item_count: u64,
+    project_id: Option<i64>,
+) -> Result<RollupRow> {
+    let uncached_input_reference = metrics.uncached_input;
+    let display_category = row
+        .display_category
+        .context("grouped action rollup row is missing display_category")?;
+    let classification_state = row
+        .classification_state
+        .context("grouped action rollup row is missing classification_state")?;
+    let action = ActionKey {
+        classification_state: parse_classification_state(&classification_state)?,
+        normalized_action: row.normalized_action,
+        command_family: row.command_family,
+        base_command: row.base_command,
+    };
+
+    Ok(RollupRow {
+        kind: RollupRowKind::Action,
+        key: format!("action:{}", action.stable_key()),
+        label: action.label(),
+        metrics,
+        indicators: MetricIndicators {
+            selected_lens_last_5_hours: 0.0,
+            selected_lens_last_week: 0.0,
+            uncached_input_reference,
+        },
+        item_count,
+        project_id,
+        category: Some(display_category),
+        action: Some(action),
+        full_path: None,
+    })
+}
+
 fn aggregate_action_request(
     request: &BrowseRequest,
     filters: &CompiledFilters,
@@ -2036,6 +2279,43 @@ fn append_action_key_match(sql: &mut String, query_params: &mut Vec<Value>, acti
     }
 }
 
+fn append_grouped_category_match(sql: &mut String, query_params: &mut Vec<Value>, category: &str) {
+    sql.push_str(" AND car.display_category = ?");
+    query_params.push(Value::Text(category.to_string()));
+}
+
+fn append_grouped_action_key_match(
+    sql: &mut String,
+    query_params: &mut Vec<Value>,
+    action: &ActionKey,
+) {
+    sql.push_str(" AND car.classification_state = ?");
+    query_params.push(Value::Text(
+        action.classification_state.as_str().to_string(),
+    ));
+
+    if let Some(normalized_action) = action.normalized_action.as_deref() {
+        sql.push_str(" AND car.normalized_action = ?");
+        query_params.push(Value::Text(normalized_action.to_string()));
+    } else {
+        sql.push_str(" AND car.normalized_action IS NULL");
+    }
+
+    if let Some(command_family) = action.command_family.as_deref() {
+        sql.push_str(" AND car.command_family = ?");
+        query_params.push(Value::Text(command_family.to_string()));
+    } else {
+        sql.push_str(" AND car.command_family IS NULL");
+    }
+
+    if let Some(base_command) = action.base_command.as_deref() {
+        sql.push_str(" AND car.base_command = ?");
+        query_params.push(Value::Text(base_command.to_string()));
+    } else {
+        sql.push_str(" AND car.base_command IS NULL");
+    }
+}
+
 fn matches_timestamp(
     timestamp: Option<Timestamp>,
     start_at: Option<Timestamp>,
@@ -2121,8 +2401,8 @@ mod tests {
     use super::{
         ActionKey, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState, FilterOptions,
         MetricLens, QueryEngine, RootView, SnapshotBounds, SnapshotCoverageSummary,
-        TimeWindowFilter, build_scoped_action_facts_query, build_scoped_path_facts_query,
-        display_category,
+        TimeWindowFilter, build_grouped_action_rollup_rows_query, build_scoped_action_facts_query,
+        build_scoped_path_facts_query, display_category,
     };
 
     #[test]
@@ -2788,6 +3068,83 @@ mod tests {
                 Value::Text("claude-opus".to_string()),
                 Value::Text("2026-03-20T00:00:00Z".to_string()),
                 Value::Text("2026-03-27T00:00:00Z".to_string()),
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn grouped_action_rollup_rows_query_groups_project_root_rows() -> Result<()> {
+        let request = BrowseRequest {
+            snapshot: SnapshotBounds {
+                max_publish_seq: 42,
+                published_chunk_count: 3,
+                upper_bound_utc: Some("2026-03-27T00:00:00Z".to_string()),
+            },
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            path: BrowsePath::Root,
+        };
+
+        let (sql, query_params) = build_grouped_action_rollup_rows_query(&request)?;
+
+        assert!(sql.contains("FROM chunk_action_rollup car"));
+        assert!(sql.contains("JOIN import_chunk ic ON ic.id = car.import_chunk_id"));
+        assert!(sql.contains("JOIN project p ON p.id = ic.project_id"));
+        assert!(sql.contains("COALESCE(SUM(car.action_count), 0)"));
+        assert!(sql.contains("GROUP BY"));
+        assert!(sql.contains("p.display_name"));
+        assert_eq!(query_params, vec![Value::Integer(42)]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn grouped_action_rollup_rows_query_groups_action_rows_and_applies_filters() -> Result<()> {
+        let request = BrowseRequest {
+            snapshot: SnapshotBounds {
+                max_publish_seq: 42,
+                published_chunk_count: 3,
+                upper_bound_utc: Some("2026-03-27T00:00:00Z".to_string()),
+            },
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters {
+                action: Some(ActionKey {
+                    classification_state: ClassificationState::Classified,
+                    normalized_action: Some("read file".to_string()),
+                    command_family: None,
+                    base_command: None,
+                }),
+                ..BrowseFilters::default()
+            },
+            path: BrowsePath::ProjectCategory {
+                project_id: 7,
+                category: "editing".to_string(),
+            },
+        };
+
+        let (sql, query_params) = build_grouped_action_rollup_rows_query(&request)?;
+
+        assert!(sql.contains("car.display_category"));
+        assert!(sql.contains("car.classification_state"));
+        assert!(sql.contains("car.normalized_action"));
+        assert!(sql.contains("car.command_family"));
+        assert!(sql.contains("car.base_command"));
+        assert!(sql.contains("GROUP BY"));
+        assert!(sql.contains("AND p.id = ?"));
+        assert!(sql.contains("AND car.display_category = ?"));
+        assert!(sql.contains("AND car.classification_state = ?"));
+        assert_eq!(
+            query_params,
+            vec![
+                Value::Integer(42),
+                Value::Integer(7),
+                Value::Text("editing".to_string()),
+                Value::Text("classified".to_string()),
+                Value::Text("read file".to_string()),
             ]
         );
 
