@@ -1,6 +1,5 @@
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::f64::consts::{FRAC_PI_2, TAU};
 use std::fs;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -10,6 +9,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::StartupBrowseState;
+use crate::gnomon_sunburst::{
+    build_sunburst_layer, build_sunburst_model, build_sunburst_scope_label,
+};
+use crate::sunburst::{
+    SunburstDistortionPolicy, SunburstLayer, SunburstModel, SunburstPane, SunburstRenderConfig,
+    SunburstSpan, sunburst_selected_child_span,
+};
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::execute;
@@ -31,16 +37,24 @@ use jiff::ToSpan;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as MatcherConfig, Matcher};
 use ratatui::backend::{CrosstermBackend, TestBackend};
-use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState, Widget, Wrap,
+    Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState, Wrap,
 };
 use ratatui::{Frame, Terminal};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+
+#[cfg(test)]
+use std::f64::consts::TAU;
+
+#[cfg(test)]
+use crate::sunburst::{
+    SunburstBucket, SunburstCenter, SunburstRenderMode, SunburstSegment,
+    sunburst_center_label_area, sunburst_center_label_style, sunburst_segment_at_angle,
+};
 
 const UI_STATE_FILENAME: &str = "tui-state.json";
 const REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -50,7 +64,6 @@ const MAP_PANE_INNER_ASPECT_DENOMINATOR: u16 = 4;
 const MAP_PANE_MIN_WIDTH: u16 = 48;
 const STATISTICS_PANE_MIN_WIDTH: u16 = 56;
 const JUMP_MATCH_LIMIT: usize = 8;
-const RADIAL_CENTER_RADIUS: f64 = 0.24;
 const RADIAL_DESCENDANT_DEPTH_LIMIT: usize = 3;
 const ACTIVITY_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 const VIEW_LOAD_PHASE_TOTAL: usize = 8;
@@ -1049,9 +1062,10 @@ impl App {
 
     fn render_radial(&self, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(
-            &RadialPane {
+            &SunburstPane {
                 model: &self.radial_model,
                 focused: self.focused_pane == PaneFocus::Radial,
+                config: SunburstRenderConfig::default(),
             },
             area,
         );
@@ -3270,7 +3284,7 @@ fn build_radial_context_for_state(
             },
             browse_stats,
         )?;
-        let layer = build_radial_layer(
+        let layer = build_sunburst_layer(
             &rows,
             request.ui_state.lens,
             Some(&step.selected_child),
@@ -3663,83 +3677,18 @@ struct RadialContext {
     descendant_layers: Vec<RadialLayer>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct RadialModel {
-    center: RadialCenter,
-    layers: Vec<RadialLayer>,
-}
+type RadialModel = SunburstModel;
+type RadialLayer = SunburstLayer;
+type RadialSpan = SunburstSpan;
 
-#[derive(Debug, Clone, Default)]
-struct RadialCenter {
-    scope_label: String,
-    lens_label: String,
-    selection_label: String,
-}
+#[cfg(test)]
+type RadialCenter = SunburstCenter;
 
-#[derive(Debug, Clone, Default)]
-struct RadialLayer {
-    span: RadialSpan,
-    segments: Vec<RadialSegment>,
-    total_value: f64,
-}
+#[cfg(test)]
+type RadialSegment = SunburstSegment;
 
-#[derive(Debug, Clone, Copy)]
-struct RadialSpan {
-    start: f64,
-    sweep: f64,
-}
-
-impl Default for RadialSpan {
-    fn default() -> Self {
-        Self::full()
-    }
-}
-
-impl RadialSpan {
-    fn full() -> Self {
-        Self {
-            start: 0.0,
-            sweep: TAU,
-        }
-    }
-
-    fn child_span(self, start_offset: f64, sweep: f64) -> Self {
-        Self {
-            start: (self.start + start_offset).rem_euclid(TAU),
-            sweep,
-        }
-    }
-
-    fn local_angle(self, angle: f64) -> Option<f64> {
-        if self.sweep <= 0.0 {
-            return None;
-        }
-
-        let offset = (angle - self.start).rem_euclid(TAU);
-        if offset > self.sweep {
-            None
-        } else {
-            Some(offset)
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct RadialSegment {
-    value: f64,
-    cached_ratio: f64,
-    bucket: RadialBucket,
-    is_selected: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RadialBucket {
-    Project,
-    Category,
-    Classified,
-    Mixed,
-    Unclassified,
-}
+#[cfg(test)]
+type RadialBucket = SunburstBucket;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RadialAncestorStep {
@@ -3747,128 +3696,7 @@ struct RadialAncestorStep {
     selected_child: String,
 }
 
-struct RadialPane<'a> {
-    model: &'a RadialModel,
-    focused: bool,
-}
-
-impl Widget for &RadialPane<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = pane_block("Map", self.focused);
-        let inner = block.inner(area);
-        block.render(area, buf);
-
-        if inner.width < 12 || inner.height < 8 {
-            return;
-        }
-
-        let layer_count = self.model.layers.len();
-        if layer_count > 0 {
-            let center_x = f64::from(inner.x) + f64::from(inner.width) / 2.0;
-            let center_y = f64::from(inner.y) + f64::from(inner.height) / 2.0;
-            let radius_x = (f64::from(inner.width) / 2.0).max(1.0);
-            let radius_y = (f64::from(inner.height) / 2.0).max(1.0);
-            let ring_band = (0.96 - RADIAL_CENTER_RADIUS) / layer_count as f64;
-
-            for y in inner.y..inner.y + inner.height {
-                for x in inner.x..inner.x + inner.width {
-                    let normalized_x = (f64::from(x) + 0.5 - center_x) / radius_x;
-                    let normalized_y = (f64::from(y) + 0.5 - center_y) / radius_y;
-                    let radius = (normalized_x.powi(2) + normalized_y.powi(2)).sqrt();
-
-                    if !(RADIAL_CENTER_RADIUS..=0.96).contains(&radius) {
-                        continue;
-                    }
-
-                    let layer_index = ((radius - RADIAL_CENTER_RADIUS) / ring_band)
-                        .floor()
-                        .clamp(0.0, (layer_count - 1) as f64)
-                        as usize;
-                    let Some(layer) = self.model.layers.get(layer_index) else {
-                        continue;
-                    };
-                    let Some(segment) = radial_segment_at_angle(
-                        layer,
-                        (normalized_y.atan2(normalized_x) + FRAC_PI_2).rem_euclid(TAU),
-                    ) else {
-                        continue;
-                    };
-
-                    if let Some(cell) = buf.cell_mut((x, y)) {
-                        cell.set_style(radial_segment_style(segment, self.focused));
-                        cell.set_char(radial_texture(segment));
-                    }
-                }
-            }
-        }
-
-        let center_area = radial_center_label_area(inner);
-        let center_lines =
-            radial_center_label_lines(&self.model.center, center_area.width, center_area.height);
-        Paragraph::new(Text::from(center_lines))
-            .style(radial_center_label_style(self.focused))
-            .alignment(Alignment::Center)
-            .render(center_area, buf);
-    }
-}
-
-fn radial_center_label_area(inner: Rect) -> Rect {
-    let center_width = radial_center_extent(inner.width);
-    let center_height = radial_center_extent(inner.height).min(3);
-    Rect::new(
-        inner.x + inner.width.saturating_sub(center_width) / 2,
-        inner.y + inner.height.saturating_sub(center_height) / 2,
-        center_width,
-        center_height,
-    )
-}
-
-fn radial_center_extent(dimension: u16) -> u16 {
-    if dimension == 0 {
-        return 0;
-    }
-
-    let extent = (f64::from(dimension) * RADIAL_CENTER_RADIUS).floor() as u16;
-    extent.clamp(1, dimension)
-}
-
-fn radial_center_label_lines(center: &RadialCenter, width: u16, height: u16) -> Vec<Line<'static>> {
-    let max_width = usize::from(width);
-    let line_count = usize::from(height).min(3);
-    let lens_line = format!("lens: {}  |  texture: uncached->cached", center.lens_label);
-    let lines = [
-        center.scope_label.as_str(),
-        center.selection_label.as_str(),
-        lens_line.as_str(),
-    ];
-
-    lines
-        .into_iter()
-        .map(|line| Line::from(truncate_center_label(line, max_width)))
-        .take(line_count)
-        .collect()
-}
-
-fn truncate_center_label(text: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-
-    let char_count = text.chars().count();
-    if char_count <= max_width {
-        return text.to_string();
-    }
-
-    if max_width <= 3 {
-        return ".".repeat(max_width);
-    }
-
-    let mut truncated = text.chars().take(max_width - 3).collect::<String>();
-    truncated.push_str("...");
-    truncated
-}
-
-fn pane_block(title: &str, focused: bool) -> Block<'static> {
+pub(crate) fn pane_block(title: &str, focused: bool) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_style(pane_border_style(focused))
@@ -3929,16 +3757,6 @@ fn table_row_highlight_style(focused: bool) -> Style {
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().bg(Color::DarkGray).fg(Color::Gray)
-    }
-}
-
-fn radial_center_label_style(focused: bool) -> Style {
-    if focused {
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray).add_modifier(Modifier::DIM)
     }
 }
 
@@ -4552,7 +4370,7 @@ fn drillability_glyph(root: &RootView, current_path: &BrowsePath, row: &RollupRo
     }
 }
 
-fn metric_lens_label(lens: MetricLens) -> &'static str {
+pub(crate) fn metric_lens_label(lens: MetricLens) -> &'static str {
     match lens {
         MetricLens::UncachedInput => "uncached",
         MetricLens::GrossInput => "gross",
@@ -4570,7 +4388,7 @@ fn next_metric_lens(lens: MetricLens) -> MetricLens {
     }
 }
 
-fn row_kind_label(kind: RollupRowKind) -> &'static str {
+pub(crate) fn row_kind_label(kind: RollupRowKind) -> &'static str {
     match kind {
         RollupRowKind::Project => "project",
         RollupRowKind::ActionCategory => "category",
@@ -4589,37 +4407,15 @@ fn build_radial_model(
     filter_options: &FilterOptions,
     lens: MetricLens,
 ) -> RadialModel {
-    let mut layers = context.ancestor_layers.clone();
-    if !visible_rows.is_empty() {
-        layers.push(build_radial_layer(
-            visible_rows,
-            lens,
-            selected_row.map(|row| row.key.as_str()),
-            context.current_span,
-        ));
-    }
-    layers.extend(context.descendant_layers.iter().cloned());
-
-    let selection_label = selected_row
-        .map(|row| {
-            format!(
-                "selected: {} ({}, {} {})",
-                row.label,
-                row_kind_label(row.kind),
-                metric_lens_label(lens),
-                format_metric(row.metrics.lens_value(lens))
-            )
-        })
-        .unwrap_or_else(|| "selected: none".to_string());
-
-    RadialModel {
-        center: RadialCenter {
-            scope_label: describe_browse_path(root, path, filter_options),
-            lens_label: metric_lens_label(lens).to_string(),
-            selection_label,
-        },
-        layers,
-    }
+    build_sunburst_model(
+        context.ancestor_layers.clone(),
+        context.current_span,
+        visible_rows,
+        selected_row,
+        &context.descendant_layers,
+        build_sunburst_scope_label(root, path, filter_options),
+        lens,
+    )
 }
 
 fn build_radial_layer(
@@ -4628,22 +4424,7 @@ fn build_radial_layer(
     selected_key: Option<&str>,
     span: RadialSpan,
 ) -> RadialLayer {
-    let segments = rows
-        .iter()
-        .map(|row| RadialSegment {
-            value: row.metrics.lens_value(lens),
-            cached_ratio: cached_ratio(row),
-            bucket: radial_bucket(row),
-            is_selected: selected_key.is_some_and(|key| key == row.key),
-        })
-        .collect::<Vec<_>>();
-    let total_value = segments.iter().map(|segment| segment.value.max(0.0)).sum();
-
-    RadialLayer {
-        span,
-        segments,
-        total_value,
-    }
+    build_sunburst_layer(rows, lens, selected_key, span)
 }
 
 fn radial_ancestor_steps(
@@ -4856,132 +4637,26 @@ fn path_chain(project_root: &str, parent_path: &str) -> Vec<String> {
     paths
 }
 
-fn radial_segment_at_angle(layer: &RadialLayer, angle: f64) -> Option<&RadialSegment> {
-    let local_angle = layer.span.local_angle(angle)?;
-    radial_segment_at_local_angle(layer, local_angle)
-}
-
-fn radial_segment_at_local_angle(layer: &RadialLayer, local_angle: f64) -> Option<&RadialSegment> {
-    if layer.segments.is_empty() {
-        return None;
-    }
-
-    let total_weight = if layer.total_value > 0.0 {
-        layer.total_value
-    } else {
-        layer.segments.len() as f64
-    };
-
-    let mut cursor = 0.0;
-    for (index, segment) in layer.segments.iter().enumerate() {
-        let weight = if layer.total_value > 0.0 {
-            segment.value.max(0.0)
-        } else {
-            1.0
-        };
-        let next = cursor + (weight / total_weight) * layer.span.sweep;
-        if local_angle < next || index + 1 == layer.segments.len() {
-            return Some(segment);
-        }
-        cursor = next;
-    }
-
-    None
-}
-
 fn radial_selected_child_span(layer: &RadialLayer) -> RadialSpan {
-    if layer.segments.is_empty() {
-        return layer.span;
-    }
-
-    let total_weight = if layer.total_value > 0.0 {
-        layer.total_value
-    } else {
-        layer.segments.len() as f64
-    };
-
-    let mut cursor = 0.0;
-    for (index, segment) in layer.segments.iter().enumerate() {
-        let weight = if layer.total_value > 0.0 {
-            segment.value.max(0.0)
-        } else {
-            1.0
-        };
-        let next = cursor + (weight / total_weight) * layer.span.sweep;
-        if segment.is_selected {
-            return layer.span.child_span(cursor, next - cursor);
-        }
-        cursor = next;
-        if index + 1 == layer.segments.len() {
-            break;
-        }
-    }
-
-    layer.span
+    sunburst_selected_child_span(layer, SunburstDistortionPolicy::default())
 }
 
-fn radial_segment_style(segment: &RadialSegment, focused: bool) -> Style {
-    let mut style = Style::default()
-        .bg(radial_bucket_color(segment.bucket))
-        .fg(Color::Black);
-
-    if !focused {
-        style = style.add_modifier(Modifier::DIM);
-    }
-
-    if segment.is_selected {
-        style = style.fg(Color::White).add_modifier(Modifier::BOLD);
-        if focused {
-            style = style.add_modifier(Modifier::UNDERLINED);
-        }
-    }
-
-    style
+#[cfg(test)]
+fn radial_segment_at_angle(layer: &RadialLayer, angle: f64) -> Option<&RadialSegment> {
+    sunburst_segment_at_angle(layer, angle, SunburstDistortionPolicy::default())
 }
 
-fn radial_texture(segment: &RadialSegment) -> char {
-    if segment.is_selected {
-        return '#';
-    }
-
-    match segment.cached_ratio {
-        ratio if ratio >= 0.75 => '*',
-        ratio if ratio >= 0.45 => ';',
-        ratio if ratio >= 0.2 => ':',
-        ratio if ratio > 0.0 => '.',
-        _ => ' ',
-    }
+#[cfg(test)]
+fn radial_center_label_area(inner: Rect) -> Rect {
+    sunburst_center_label_area(inner, SunburstRenderConfig::default())
 }
 
-fn radial_bucket(row: &RollupRow) -> RadialBucket {
-    match row
-        .action
-        .as_ref()
-        .map(|action| action.classification_state)
-    {
-        Some(ClassificationState::Classified) => RadialBucket::Classified,
-        Some(ClassificationState::Mixed) => RadialBucket::Mixed,
-        Some(ClassificationState::Unclassified) => RadialBucket::Unclassified,
-        None => match row.kind {
-            RollupRowKind::Project => RadialBucket::Project,
-            RollupRowKind::ActionCategory => RadialBucket::Category,
-            RollupRowKind::Action => RadialBucket::Unclassified,
-            RollupRowKind::Directory | RollupRowKind::File => RadialBucket::Project,
-        },
-    }
+#[cfg(test)]
+fn radial_center_label_style(focused: bool) -> Style {
+    sunburst_center_label_style(focused)
 }
 
-fn radial_bucket_color(bucket: RadialBucket) -> Color {
-    match bucket {
-        RadialBucket::Project => Color::LightBlue,
-        RadialBucket::Category => Color::LightCyan,
-        RadialBucket::Classified => Color::LightGreen,
-        RadialBucket::Mixed => Color::LightYellow,
-        RadialBucket::Unclassified => Color::Gray,
-    }
-}
-
-fn cached_ratio(row: &RollupRow) -> f64 {
+pub(crate) fn cached_ratio(row: &RollupRow) -> f64 {
     if row.metrics.gross_input <= 0.0 {
         0.0
     } else {
@@ -5775,7 +5450,7 @@ fn project_id_from_path(path: &BrowsePath) -> Option<i64> {
     }
 }
 
-fn describe_browse_path(
+pub(crate) fn describe_browse_path(
     root: &RootView,
     path: &BrowsePath,
     filter_options: &FilterOptions,
@@ -5861,7 +5536,7 @@ fn project_name(project_id: i64, filter_options: &FilterOptions) -> String {
         .unwrap_or_else(|| format!("#{project_id}"))
 }
 
-fn format_metric(value: f64) -> String {
+pub(crate) fn format_metric(value: f64) -> String {
     if (value.fract()).abs() < f64::EPSILON {
         format!("{value:.0}")
     } else {
@@ -6724,6 +6399,43 @@ mod tests {
     }
 
     #[test]
+    fn radial_selected_child_span_expands_tiny_selected_segments() {
+        let layer = build_radial_layer(
+            &[
+                radial_row(RadialRowSpec {
+                    key: "project:1",
+                    label: "project-a",
+                    kind: RollupRowKind::Project,
+                    value: 99.0,
+                    project_id: Some(1),
+                    category: None,
+                    action: None,
+                    full_path: None,
+                }),
+                radial_row(RadialRowSpec {
+                    key: "project:2",
+                    label: "project-b",
+                    kind: RollupRowKind::Project,
+                    value: 1.0,
+                    project_id: Some(2),
+                    category: None,
+                    action: None,
+                    full_path: None,
+                }),
+            ],
+            MetricLens::UncachedInput,
+            Some("project:2"),
+            RadialSpan::full(),
+        );
+
+        let span = radial_selected_child_span(&layer);
+        assert!(
+            span.sweep > TAU / 100.0,
+            "expected the distortion policy to expand tiny selected segments beyond the raw 1% sweep"
+        );
+    }
+
+    #[test]
     fn radial_center_labels_stay_inside_fit_area_on_narrow_layout() -> Result<()> {
         let model = RadialModel {
             center: RadialCenter {
@@ -6757,9 +6469,10 @@ mod tests {
         let mut terminal = Terminal::new(backend)?;
 
         terminal.draw(|frame| {
-            let pane = RadialPane {
+            let pane = SunburstPane {
                 model: &model,
                 focused: false,
+                config: SunburstRenderConfig::default(),
             };
             frame.render_widget(&pane, frame.area());
         })?;
@@ -6788,6 +6501,159 @@ mod tests {
         assert!(
             saw_center_text,
             "expected the fitted center labels to render"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn radial_pane_renders_coarse_segments_through_sunburst_raster_pipeline() -> Result<()> {
+        let model = RadialModel {
+            center: RadialCenter::default(),
+            layers: vec![RadialLayer {
+                span: RadialSpan::full(),
+                segments: vec![
+                    RadialSegment {
+                        value: 8.0,
+                        cached_ratio: 0.0,
+                        bucket: RadialBucket::Project,
+                        is_selected: true,
+                    },
+                    RadialSegment {
+                        value: 4.0,
+                        cached_ratio: 0.6,
+                        bucket: RadialBucket::Category,
+                        is_selected: false,
+                    },
+                ],
+                total_value: 12.0,
+            }],
+        };
+
+        let backend = TestBackend::new(24, 12);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|frame| {
+            frame.render_widget(
+                &SunburstPane {
+                    model: &model,
+                    focused: true,
+                    config: SunburstRenderConfig::default(),
+                },
+                frame.area(),
+            );
+        })?;
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>();
+        assert!(
+            rendered.contains(&"#"),
+            "expected the coarse raster pipeline to emit the selected-segment glyph"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn radial_pane_emits_braille_glyphs_when_braille_mode_is_selected() -> Result<()> {
+        let model = RadialModel {
+            center: RadialCenter::default(),
+            layers: vec![RadialLayer {
+                span: RadialSpan::full(),
+                segments: vec![
+                    RadialSegment {
+                        value: 3.0,
+                        cached_ratio: 0.0,
+                        bucket: RadialBucket::Project,
+                        is_selected: true,
+                    },
+                    RadialSegment {
+                        value: 1.0,
+                        cached_ratio: 0.0,
+                        bucket: RadialBucket::Category,
+                        is_selected: false,
+                    },
+                ],
+                total_value: 4.0,
+            }],
+        };
+
+        let backend = TestBackend::new(24, 12);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|frame| {
+            frame.render_widget(
+                &SunburstPane {
+                    model: &model,
+                    focused: true,
+                    config: SunburstRenderConfig {
+                        mode: SunburstRenderMode::Braille,
+                        ..SunburstRenderConfig::default()
+                    },
+                },
+                frame.area(),
+            );
+        })?;
+
+        let has_braille = terminal.backend().buffer().content.iter().any(|cell| {
+            cell.symbol()
+                .chars()
+                .next()
+                .is_some_and(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch))
+        });
+        assert!(
+            has_braille,
+            "expected Braille render mode to emit Braille glyphs"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn coarse_cached_indicator_uses_a_single_subtle_glyph() -> Result<()> {
+        let model = RadialModel {
+            center: RadialCenter::default(),
+            layers: vec![RadialLayer {
+                span: RadialSpan::full(),
+                segments: vec![RadialSegment {
+                    value: 1.0,
+                    cached_ratio: 0.8,
+                    bucket: RadialBucket::Category,
+                    is_selected: false,
+                }],
+                total_value: 1.0,
+            }],
+        };
+
+        let backend = TestBackend::new(24, 12);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|frame| {
+            frame.render_widget(
+                &SunburstPane {
+                    model: &model,
+                    focused: true,
+                    config: SunburstRenderConfig::default(),
+                },
+                frame.area(),
+            );
+        })?;
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>();
+        assert!(
+            rendered.contains(&"·"),
+            "expected cached-heavy coarse cells to use the subtle cache glyph"
+        );
+        assert!(
+            rendered
+                .iter()
+                .all(|symbol| !matches!(*symbol, "*" | ";" | ":" | ".")),
+            "expected the old texture glyph ladder to stay out of the coarse renderer"
         );
         Ok(())
     }
