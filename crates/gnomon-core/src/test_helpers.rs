@@ -59,6 +59,23 @@ pub(crate) fn run_git<const N: usize>(repo_root: &Path, args: [&str; N]) -> Resu
     Ok(())
 }
 
+/// Runs a git command without a `-C repo_root` prefix.
+/// Useful for commands like `git clone --bare X Y` where no working directory applies.
+pub(crate) fn run_git_freeform(args: &[&str]) -> Result<()> {
+    let output = Command::new("git")
+        .args(args)
+        .output()
+        .with_context(|| format!("unable to run git {:?}", args))?;
+    if !output.status.success() {
+        bail!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
 /// Returns a `PathBuf` guaranteed not to exist in the filesystem.
 /// Useful for testing "path does not exist" branches.
 pub(crate) fn nonexistent_path() -> PathBuf {
