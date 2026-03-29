@@ -9,6 +9,7 @@ use rusqlite::{Connection, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
 use crate::opportunity::OpportunitySummary;
+use crate::opportunity::history_drag::{self, HistoryDragTurn};
 use crate::perf::{PerfLogger, PerfScope};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,10 +333,57 @@ pub struct BrowseReport {
     pub rows: Vec<RollupRow>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpportunitiesReport {
+    pub snapshot: SnapshotBounds,
+    pub rows: Vec<OpportunitiesReportRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpportunitiesReportRow {
+    pub key: String,
+    pub label: String,
+    pub project_id: i64,
+    pub project_name: String,
+    pub conversation_id: i64,
+    pub conversation_title: Option<String>,
+    pub turn_count: u64,
+    pub metrics: MetricTotals,
+    pub opportunities: OpportunitySummary,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OpportunitiesFilters {
+    pub project_id: Option<i64>,
+    pub start_at_utc: Option<String>,
+    pub end_at_utc: Option<String>,
+    pub include_empty: bool,
+}
+
 pub struct QueryEngine<'conn> {
     conn: &'conn Connection,
     perf_logger: Option<PerfLogger>,
 }
+
+const CONVERSATION_TURNS_SQL: &str = "
+    SELECT
+        c.id AS conversation_id,
+        c.project_id,
+        p.display_name AS project_name,
+        c.title,
+        t.sequence_no,
+        COALESCE(t.input_tokens, 0) + COALESCE(t.cache_creation_input_tokens, 0) AS uncached_input,
+        COALESCE(t.cache_read_input_tokens, 0) AS cached_input,
+        COALESCE(t.output_tokens, 0) AS output_tokens
+    FROM turn t
+    JOIN conversation c ON c.id = t.conversation_id
+    JOIN project p ON p.id = c.project_id
+    JOIN import_chunk ic ON ic.id = t.import_chunk_id
+    WHERE ic.state = 'complete'
+      AND ic.publish_seq IS NOT NULL
+      AND ic.publish_seq <= ?1
+    ORDER BY c.project_id, c.id, t.sequence_no
+";
 
 const LATEST_SNAPSHOT_BOUNDS_SQL: &str = "
     SELECT
@@ -709,6 +757,78 @@ impl<'conn> QueryEngine<'conn> {
         Ok(BrowseReport {
             snapshot: request.snapshot.clone(),
             request,
+            rows,
+        })
+    }
+
+    pub fn opportunities_report(
+        &self,
+        snapshot: &SnapshotBounds,
+        filters: &OpportunitiesFilters,
+    ) -> Result<OpportunitiesReport> {
+        let mut perf = self.perf_scope("query.opportunities_report");
+        if snapshot.max_publish_seq == 0 {
+            perf.finish_ok();
+            return Ok(OpportunitiesReport {
+                snapshot: snapshot.clone(),
+                rows: Vec::new(),
+            });
+        }
+
+        let max_publish_seq = i64::try_from(snapshot.max_publish_seq)
+            .context("snapshot publish_seq overflowed i64")?;
+
+        let mut sql = CONVERSATION_TURNS_SQL.to_string();
+        let mut param_values: Vec<Value> = vec![Value::Integer(max_publish_seq)];
+
+        if let Some(project_id) = filters.project_id {
+            sql.push_str(&format!(" AND c.project_id = ?{}", param_values.len() + 1));
+            param_values.push(Value::Integer(project_id));
+        }
+        if let Some(ref start) = filters.start_at_utc {
+            sql.push_str(&format!(
+                " AND datetime(COALESCE(t.ended_at_utc, t.started_at_utc)) >= datetime(?{})",
+                param_values.len() + 1
+            ));
+            param_values.push(Value::Text(start.clone()));
+        }
+        if let Some(ref end) = filters.end_at_utc {
+            sql.push_str(&format!(
+                " AND datetime(COALESCE(t.ended_at_utc, t.started_at_utc)) <= datetime(?{})",
+                param_values.len() + 1
+            ));
+            param_values.push(Value::Text(end.clone()));
+        }
+
+        // Re-append ORDER BY since we built on the base SQL (which already has one,
+        // but additional WHERE clauses don't affect it — the base SQL's ORDER BY is
+        // at the end and remains valid).
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let turn_rows = stmt
+            .query_map(params_from_iter(param_values.iter()), |row| {
+                Ok(ConversationTurnRow {
+                    conversation_id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    project_name: row.get(2)?,
+                    conversation_title: row.get(3)?,
+                    _sequence_no: row.get(4)?,
+                    uncached_input: row.get(5)?,
+                    cached_input: row.get(6)?,
+                    output_tokens: row.get(7)?,
+                })
+            })
+            .context("failed to query conversation turns")?
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to read conversation turn rows")?;
+
+        let rows = build_opportunities_rows(&turn_rows, filters.include_empty);
+
+        perf.field("row_count", rows.len());
+        perf.finish_ok();
+
+        Ok(OpportunitiesReport {
+            snapshot: snapshot.clone(),
             rows,
         })
     }
@@ -1091,6 +1211,81 @@ struct LoadedActionFact {
 }
 
 #[derive(Debug)]
+struct ConversationTurnRow {
+    conversation_id: i64,
+    project_id: i64,
+    project_name: String,
+    conversation_title: Option<String>,
+    _sequence_no: i64,
+    uncached_input: i64,
+    cached_input: i64,
+    output_tokens: i64,
+}
+
+fn build_opportunities_rows(
+    turn_rows: &[ConversationTurnRow],
+    include_empty: bool,
+) -> Vec<OpportunitiesReportRow> {
+    let mut result = Vec::new();
+
+    let mut idx = 0;
+    while idx < turn_rows.len() {
+        let conversation_id = turn_rows[idx].conversation_id;
+        let project_id = turn_rows[idx].project_id;
+        let project_name = turn_rows[idx].project_name.clone();
+        let conversation_title = turn_rows[idx].conversation_title.clone();
+
+        let mut turns = Vec::new();
+        let mut metrics = MetricTotals::zero();
+        let mut turn_count: u64 = 0;
+
+        while idx < turn_rows.len() && turn_rows[idx].conversation_id == conversation_id {
+            let row = &turn_rows[idx];
+            turns.push(HistoryDragTurn {
+                uncached_input: row.uncached_input as f64,
+                cached_input: row.cached_input as f64,
+            });
+            let row_metrics = MetricTotals::from_usage(
+                row.uncached_input, // SQL already sums input_tokens + cache_creation
+                0,                  // cache_creation folded into uncached_input above
+                row.cached_input,
+                row.output_tokens,
+            );
+            metrics.add_assign(&row_metrics);
+            turn_count += 1;
+            idx += 1;
+        }
+
+        let opportunities = history_drag::detect_summary(&turns);
+
+        if !include_empty && opportunities.is_empty() {
+            continue;
+        }
+
+        result.push(OpportunitiesReportRow {
+            key: format!("conversation:{conversation_id}"),
+            label: conversation_title
+                .clone()
+                .unwrap_or_else(|| format!("session {conversation_id}")),
+            project_id,
+            project_name,
+            conversation_id,
+            conversation_title,
+            turn_count,
+            metrics,
+            opportunities,
+        });
+    }
+
+    result.sort_by(|a, b| {
+        b.opportunities
+            .total_score
+            .total_cmp(&a.opportunities.total_score)
+    });
+
+    result
+}
+
 struct ActionFact {
     project_id: i64,
     project_display_name: String,
@@ -2501,10 +2696,11 @@ mod tests {
     };
 
     use super::{
-        ActionKey, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState, FilterOptions,
-        MetricLens, QueryEngine, RootView, SnapshotBounds, SnapshotCoverageSummary,
-        TimeWindowFilter, build_grouped_action_rollup_rows_query, build_scoped_action_facts_query,
-        build_scoped_path_facts_query, display_category,
+        ActionKey, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState,
+        ConversationTurnRow, FilterOptions, MetricLens, QueryEngine, RootView, SnapshotBounds,
+        SnapshotCoverageSummary, TimeWindowFilter, build_grouped_action_rollup_rows_query,
+        build_opportunities_rows, build_scoped_action_facts_query, build_scoped_path_facts_query,
+        display_category,
     };
 
     #[test]
@@ -3879,6 +4075,110 @@ mod tests {
             params![project_id, parent_id, name, full_path, node_kind, depth],
             |row| row.get(0),
         )?)
+    }
+
+    #[test]
+    fn build_opportunities_rows_detects_history_drag() {
+        // Simulate a conversation with growing input across 6 turns — enough to
+        // trigger the history drag detector (min 4 turns, growth ratio > 1.35).
+        let turn_rows: Vec<ConversationTurnRow> = (0..6)
+            .map(|i| ConversationTurnRow {
+                conversation_id: 1,
+                project_id: 10,
+                project_name: "test-project".to_string(),
+                conversation_title: Some("growing session".to_string()),
+                _sequence_no: i,
+                uncached_input: 20 + i * 30, // 20, 50, 80, 110, 140, 170
+                cached_input: 5,
+                output_tokens: 10,
+            })
+            .collect();
+
+        let rows = build_opportunities_rows(&turn_rows, false);
+
+        // With this growth pattern the detector should fire.
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.conversation_id, 1);
+        assert_eq!(row.project_id, 10);
+        assert_eq!(row.turn_count, 6);
+        assert!(!row.opportunities.is_empty());
+        assert_eq!(
+            row.opportunities.top_category,
+            Some(crate::opportunity::OpportunityCategory::HistoryDrag)
+        );
+    }
+
+    #[test]
+    fn build_opportunities_rows_excludes_empty_by_default() {
+        // 2 turns — below the history drag minimum of 4.
+        let turn_rows = vec![
+            ConversationTurnRow {
+                conversation_id: 1,
+                project_id: 10,
+                project_name: "test-project".to_string(),
+                conversation_title: None,
+                _sequence_no: 0,
+                uncached_input: 100,
+                cached_input: 10,
+                output_tokens: 50,
+            },
+            ConversationTurnRow {
+                conversation_id: 1,
+                project_id: 10,
+                project_name: "test-project".to_string(),
+                conversation_title: None,
+                _sequence_no: 1,
+                uncached_input: 100,
+                cached_input: 10,
+                output_tokens: 50,
+            },
+        ];
+
+        let rows = build_opportunities_rows(&turn_rows, false);
+        assert!(rows.is_empty());
+
+        let rows_with_empty = build_opportunities_rows(&turn_rows, true);
+        assert_eq!(rows_with_empty.len(), 1);
+        assert!(rows_with_empty[0].opportunities.is_empty());
+    }
+
+    #[test]
+    fn build_opportunities_rows_groups_by_conversation() {
+        // Two conversations: one with drag, one without.
+        let mut turn_rows = Vec::new();
+
+        // Conversation 1: 6 turns with strong growth.
+        for i in 0..6 {
+            turn_rows.push(ConversationTurnRow {
+                conversation_id: 1,
+                project_id: 10,
+                project_name: "proj".to_string(),
+                conversation_title: Some("has drag".to_string()),
+                _sequence_no: i,
+                uncached_input: 20 + i * 30,
+                cached_input: 5,
+                output_tokens: 10,
+            });
+        }
+
+        // Conversation 2: 2 turns — too few.
+        for i in 0..2 {
+            turn_rows.push(ConversationTurnRow {
+                conversation_id: 2,
+                project_id: 10,
+                project_name: "proj".to_string(),
+                conversation_title: Some("no drag".to_string()),
+                _sequence_no: i,
+                uncached_input: 100,
+                cached_input: 10,
+                output_tokens: 50,
+            });
+        }
+
+        let rows = build_opportunities_rows(&turn_rows, false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].conversation_id, 1);
     }
 
     #[test]

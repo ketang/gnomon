@@ -6,10 +6,11 @@ use gnomon_core::benchmark::{QueryBenchmarkOptions, QueryBenchmarkReport, run_qu
 use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
 use gnomon_core::db::{Database, ResetReport, reset_sqlite_database};
 use gnomon_core::import::{import_all, scan_source_manifest, start_startup_import};
+use gnomon_core::opportunity::{OpportunityCategory, OpportunityConfidence, OpportunitySummary};
 use gnomon_core::perf::PerfLogger;
 use gnomon_core::query::{
     ActionKey, BrowseFilters, BrowsePath, BrowseReport, BrowseRequest, ClassificationState,
-    MetricLens, QueryEngine, RootView, TimeWindowFilter,
+    MetricLens, OpportunitiesFilters, QueryEngine, RootView, TimeWindowFilter,
 };
 
 #[derive(Debug, Parser)]
@@ -48,6 +49,10 @@ enum Command {
     Benchmark(Box<BenchmarkArgs>),
     #[command(about = "Return non-interactive aggregate rollups from the current snapshot.")]
     Report(Box<ReportArgs>),
+    #[command(
+        about = "Emit opportunity annotations with supporting evidence for heuristic calibration."
+    )]
+    Opportunities(Box<OpportunitiesArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -135,6 +140,81 @@ struct BenchmarkArgs {
     /// Number of timing samples to collect for each benchmark scenario.
     #[arg(long, default_value_t = QueryBenchmarkOptions::default().iterations)]
     iterations: usize,
+}
+
+#[derive(Debug, Clone, Args, PartialEq)]
+struct OpportunitiesArgs {
+    /// Restrict to a single project by id.
+    #[arg(long)]
+    project_id: Option<i64>,
+
+    /// Only show annotations matching this opportunity category.
+    #[arg(long, value_enum)]
+    category: Option<OpportunityCategoryArg>,
+
+    /// Minimum confidence level to include (low < medium < high).
+    #[arg(long, value_enum)]
+    min_confidence: Option<OpportunityConfidenceArg>,
+
+    /// Minimum score threshold (0.0–1.0).
+    #[arg(long, default_value_t = 0.0)]
+    min_score: f64,
+
+    /// Start of the inclusive UTC time window filter.
+    #[arg(long)]
+    start_at_utc: Option<String>,
+
+    /// End of the inclusive UTC time window filter.
+    #[arg(long)]
+    end_at_utc: Option<String>,
+
+    /// Include conversations with no opportunity annotations.
+    #[arg(long)]
+    include_empty: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OpportunityCategoryArg {
+    SessionSetup,
+    TaskSetup,
+    HistoryDrag,
+    Delegation,
+    ModelMismatch,
+    PromptYield,
+    SearchChurn,
+    ToolResultBloat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OpportunityConfidenceArg {
+    Low,
+    Medium,
+    High,
+}
+
+impl From<OpportunityCategoryArg> for OpportunityCategory {
+    fn from(arg: OpportunityCategoryArg) -> Self {
+        match arg {
+            OpportunityCategoryArg::SessionSetup => OpportunityCategory::SessionSetup,
+            OpportunityCategoryArg::TaskSetup => OpportunityCategory::TaskSetup,
+            OpportunityCategoryArg::HistoryDrag => OpportunityCategory::HistoryDrag,
+            OpportunityCategoryArg::Delegation => OpportunityCategory::Delegation,
+            OpportunityCategoryArg::ModelMismatch => OpportunityCategory::ModelMismatch,
+            OpportunityCategoryArg::PromptYield => OpportunityCategory::PromptYield,
+            OpportunityCategoryArg::SearchChurn => OpportunityCategory::SearchChurn,
+            OpportunityCategoryArg::ToolResultBloat => OpportunityCategory::ToolResultBloat,
+        }
+    }
+}
+
+impl From<OpportunityConfidenceArg> for OpportunityConfidence {
+    fn from(arg: OpportunityConfidenceArg) -> Self {
+        match arg {
+            OpportunityConfidenceArg::Low => OpportunityConfidence::Low,
+            OpportunityConfidenceArg::Medium => OpportunityConfidence::Medium,
+            OpportunityConfidenceArg::High => OpportunityConfidence::High,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args, Default, PartialEq, Eq)]
@@ -231,6 +311,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::Db(command)) => run_db_command(&config, command.command),
         Some(Command::Benchmark(args)) => run_benchmark_command(&config, &args),
         Some(Command::Report(args)) => run_report_command(&config, &args),
+        Some(Command::Opportunities(args)) => run_opportunities_command(&config, &args),
     }
 }
 
@@ -302,6 +383,61 @@ fn build_browse_report(
         path: args.build_path()?,
     };
     engine.browse_report(request)
+}
+
+fn run_opportunities_command(config: &RuntimeConfig, args: &OpportunitiesArgs) -> Result<()> {
+    config.ensure_dirs()?;
+    let perf_logger = PerfLogger::from_env(&config.state_dir)?;
+    let database = Database::open(&config.db_path)?;
+    let engine = QueryEngine::with_perf(database.connection(), perf_logger);
+    let snapshot = engine.latest_snapshot_bounds()?;
+
+    let filters = OpportunitiesFilters {
+        project_id: args.project_id,
+        start_at_utc: args.start_at_utc.clone(),
+        end_at_utc: args.end_at_utc.clone(),
+        include_empty: args.include_empty,
+    };
+
+    let mut report = engine.opportunities_report(&snapshot, &filters)?;
+
+    let category_filter = args.category.map(OpportunityCategory::from);
+    let min_confidence = args.min_confidence.map(OpportunityConfidence::from);
+    let min_score = args.min_score;
+
+    if category_filter.is_some() || min_confidence.is_some() || min_score > 0.0 {
+        for row in &mut report.rows {
+            row.opportunities = filter_opportunities(
+                &row.opportunities,
+                category_filter,
+                min_confidence,
+                min_score,
+            );
+        }
+        if !args.include_empty {
+            report.rows.retain(|row| !row.opportunities.is_empty());
+        }
+    }
+
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn filter_opportunities(
+    summary: &OpportunitySummary,
+    category: Option<OpportunityCategory>,
+    min_confidence: Option<OpportunityConfidence>,
+    min_score: f64,
+) -> OpportunitySummary {
+    let filtered: Vec<_> = summary
+        .annotations
+        .iter()
+        .filter(|a| category.is_none_or(|c| a.category == c))
+        .filter(|a| min_confidence.is_none_or(|mc| a.confidence >= mc))
+        .filter(|a| a.score >= min_score)
+        .cloned()
+        .collect();
+    OpportunitySummary::from_annotations(filtered)
 }
 
 fn run_benchmark_command(config: &RuntimeConfig, args: &BenchmarkArgs) -> Result<()> {
@@ -619,8 +755,9 @@ mod tests {
 
     use super::{
         BenchmarkArgs, BrowsePathKindArg, ClassificationStateArg, Cli, Command, DbSubcommand,
-        GlobalArgs, MetricLensArg, ReportArgs, ResetArgs, RootViewArg, StartupArgs,
-        build_browse_report, build_query_benchmark_report, count_completed_chunks, run_db_command,
+        GlobalArgs, MetricLensArg, OpportunityCategoryArg, OpportunityConfidenceArg, ReportArgs,
+        ResetArgs, RootViewArg, StartupArgs, build_browse_report, build_query_benchmark_report,
+        count_completed_chunks, filter_opportunities, run_db_command,
     };
     use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
     use gnomon_core::db::Database;
@@ -682,6 +819,7 @@ mod tests {
             },
             Some(Command::Benchmark(_)) => panic!("expected db command"),
             Some(Command::Report(_)) => panic!("expected db command"),
+            Some(Command::Opportunities(_)) => panic!("expected db command"),
             None => panic!("expected db command"),
         }
     }
@@ -712,6 +850,7 @@ mod tests {
             },
             Some(Command::Benchmark(_)) => panic!("expected db command"),
             Some(Command::Report(_)) => panic!("expected db command"),
+            Some(Command::Opportunities(_)) => panic!("expected db command"),
             None => panic!("expected db command"),
         }
     }
@@ -812,6 +951,99 @@ mod tests {
             }
         );
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parse_opportunities_command_with_filters() {
+        let cli = Cli::parse_from([
+            "gnomon",
+            "--db",
+            "/tmp/custom.sqlite3",
+            "opportunities",
+            "--project-id",
+            "3",
+            "--category",
+            "history-drag",
+            "--min-confidence",
+            "medium",
+            "--min-score",
+            "0.5",
+            "--include-empty",
+        ]);
+
+        match cli.command {
+            Some(Command::Opportunities(args)) => {
+                assert_eq!(args.project_id, Some(3));
+                assert_eq!(args.category, Some(OpportunityCategoryArg::HistoryDrag));
+                assert_eq!(args.min_confidence, Some(OpportunityConfidenceArg::Medium));
+                assert!((args.min_score - 0.5).abs() < f64::EPSILON);
+                assert!(args.include_empty);
+            }
+            _ => panic!("expected opportunities command"),
+        }
+    }
+
+    #[test]
+    fn parse_opportunities_command_defaults() {
+        let cli = Cli::parse_from(["gnomon", "opportunities"]);
+
+        match cli.command {
+            Some(Command::Opportunities(args)) => {
+                assert_eq!(args.project_id, None);
+                assert_eq!(args.category, None);
+                assert_eq!(args.min_confidence, None);
+                assert!((args.min_score).abs() < f64::EPSILON);
+                assert!(!args.include_empty);
+            }
+            _ => panic!("expected opportunities command"),
+        }
+    }
+
+    #[test]
+    fn filter_opportunities_by_category_and_confidence() {
+        use gnomon_core::opportunity::{
+            OpportunityAnnotation, OpportunityCategory, OpportunityConfidence, OpportunitySummary,
+        };
+
+        let summary = OpportunitySummary::from_annotations(vec![
+            OpportunityAnnotation {
+                category: OpportunityCategory::HistoryDrag,
+                score: 0.7,
+                confidence: OpportunityConfidence::High,
+                evidence: vec!["drag evidence".to_string()],
+                recommendation: None,
+            },
+            OpportunityAnnotation {
+                category: OpportunityCategory::SessionSetup,
+                score: 0.3,
+                confidence: OpportunityConfidence::Low,
+                evidence: vec!["setup evidence".to_string()],
+                recommendation: None,
+            },
+        ]);
+
+        // Filter by category.
+        let filtered =
+            filter_opportunities(&summary, Some(OpportunityCategory::HistoryDrag), None, 0.0);
+        assert_eq!(filtered.annotations.len(), 1);
+        assert_eq!(
+            filtered.annotations[0].category,
+            OpportunityCategory::HistoryDrag
+        );
+
+        // Filter by min confidence.
+        let filtered =
+            filter_opportunities(&summary, None, Some(OpportunityConfidence::Medium), 0.0);
+        assert_eq!(filtered.annotations.len(), 1);
+        assert_eq!(
+            filtered.annotations[0].confidence,
+            OpportunityConfidence::High
+        );
+
+        // Filter by min score.
+        let filtered = filter_opportunities(&summary, None, None, 0.5);
+        assert_eq!(filtered.annotations.len(), 1);
+        assert!((filtered.annotations[0].score - 0.7).abs() < f64::EPSILON);
     }
 
     #[test]
