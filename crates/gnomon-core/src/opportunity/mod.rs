@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod history_drag;
 pub mod session_setup;
+pub mod task_setup;
 pub mod tool_result_bloat;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
