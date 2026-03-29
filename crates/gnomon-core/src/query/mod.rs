@@ -8,6 +8,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
+use crate::opportunity::OpportunitySummary;
 use crate::perf::{PerfLogger, PerfScope};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,6 +280,8 @@ pub struct RollupRow {
     pub metrics: MetricTotals,
     pub indicators: MetricIndicators,
     pub item_count: u64,
+    #[serde(default)]
+    pub opportunities: OpportunitySummary,
     pub project_id: Option<i64>,
     pub project_identity: Option<ProjectIdentity>,
     pub category: Option<String>,
@@ -1383,6 +1386,7 @@ impl RollupBuilder {
                 uncached_input_reference: self.uncached_input_reference,
             },
             item_count: self.item_count,
+            opportunities: OpportunitySummary::default(),
             project_id: self.project.as_ref().map(|project| project.project_id),
             project_identity: self.project.and_then(|project| project.identity),
             category: self.category,
@@ -1853,6 +1857,7 @@ fn grouped_action_rollup_row_to_rollup_row(
                     uncached_input_reference,
                 },
                 item_count,
+                opportunities: OpportunitySummary::default(),
                 project_id: Some(project_id),
                 project_identity: row.project_identity,
                 category: None,
@@ -1877,6 +1882,7 @@ fn grouped_action_rollup_row_to_rollup_row(
                     uncached_input_reference,
                 },
                 item_count,
+                opportunities: OpportunitySummary::default(),
                 project_id: None,
                 project_identity: None,
                 category: Some(display_category),
@@ -1931,6 +1937,7 @@ fn build_grouped_action_row(
             uncached_input_reference,
         },
         item_count,
+        opportunities: OpportunitySummary::default(),
         project_id,
         project_identity: None,
         category: Some(display_category),
@@ -2489,6 +2496,9 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::db::Database;
+    use crate::opportunity::{
+        OpportunityAnnotation, OpportunityCategory, OpportunityConfidence, OpportunitySummary,
+    };
 
     use super::{
         ActionKey, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState, FilterOptions,
@@ -2539,6 +2549,39 @@ mod tests {
         assert!(engine.has_newer_snapshot(&latest)?);
 
         Ok(())
+    }
+
+    #[test]
+    fn opportunity_summary_defaults_to_no_annotations() {
+        assert_eq!(
+            OpportunitySummary::default(),
+            OpportunitySummary::from_annotations(vec![])
+        );
+    }
+
+    #[test]
+    fn opportunity_summary_derives_top_category_and_total() {
+        let summary = OpportunitySummary::from_annotations(vec![
+            OpportunityAnnotation {
+                category: OpportunityCategory::SearchChurn,
+                score: 0.45,
+                confidence: OpportunityConfidence::Medium,
+                evidence: vec!["looping over the same search path".to_string()],
+                recommendation: Some("narrow the search target earlier".to_string()),
+            },
+            OpportunityAnnotation {
+                category: OpportunityCategory::HistoryDrag,
+                score: 0.7,
+                confidence: OpportunityConfidence::High,
+                evidence: vec!["later turns carry more prior context".to_string()],
+                recommendation: Some("reset after the task boundary".to_string()),
+            },
+        ]);
+
+        assert_eq!(summary.top_category, Some(OpportunityCategory::HistoryDrag));
+        assert_eq!(summary.top_confidence, Some(OpportunityConfidence::High));
+        assert!((summary.total_score - 1.15).abs() < 1e-9);
+        assert_eq!(summary.annotations.len(), 2);
     }
 
     #[test]
