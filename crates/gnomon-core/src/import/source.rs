@@ -715,6 +715,180 @@ mod tests {
     }
 
     #[test]
+    fn separate_clones_of_same_repo_remain_distinct_git_projects() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        let repo_root = temp.path().join("repo");
+        let clone_a = temp.path().join("clone-a");
+        let clone_b = temp.path().join("clone-b");
+
+        init_git_repo(&repo_root)?;
+        run_git_args(&[
+            "clone",
+            repo_root.to_str().context("non-utf8 repo path")?,
+            clone_a.to_str().context("non-utf8 clone-a path")?,
+        ])?;
+        run_git_args(&[
+            "clone",
+            repo_root.to_str().context("non-utf8 repo path")?,
+            clone_b.to_str().context("non-utf8 clone-b path")?,
+        ])?;
+
+        let clone_a_cwd = clone_a.join("src");
+        let clone_b_cwd = clone_b.join("src");
+        fs::create_dir_all(&clone_a_cwd)?;
+        fs::create_dir_all(&clone_b_cwd)?;
+
+        write_jsonl(&source_root.join("clone-a/session.jsonl"), &clone_a_cwd)?;
+        write_jsonl(&source_root.join("clone-b/session.jsonl"), &clone_b_cwd)?;
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let report = scan_source_manifest(&mut db, &source_root)?;
+        assert_eq!(report.discovered_source_files, 2);
+
+        let projects: Vec<(String, String)> = db
+            .connection()
+            .prepare(
+                "
+                SELECT display_name, root_path
+                FROM project
+                WHERE identity_kind = 'git'
+                ORDER BY root_path
+                ",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        assert_eq!(
+            projects,
+            vec![
+                ("clone-a".to_string(), clone_a.display().to_string(),),
+                ("clone-b".to_string(), clone_b.display().to_string(),),
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn nonexistent_cwd_paths_remain_distinct_path_projects() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        let missing_a = temp.path().join("agent-a").join("session-root");
+        let missing_b = temp.path().join("teammate-b").join("session-root");
+
+        write_jsonl(&source_root.join("a/session.jsonl"), &missing_a)?;
+        write_jsonl(&source_root.join("b/session.jsonl"), &missing_b)?;
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let report = scan_source_manifest(&mut db, &source_root)?;
+        assert_eq!(report.discovered_source_files, 2);
+
+        let projects: Vec<(String, String, String)> = db
+            .connection()
+            .prepare(
+                "
+                SELECT display_name, root_path, identity_reason
+                FROM project
+                WHERE identity_kind = 'path'
+                ORDER BY root_path
+                ",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        assert_eq!(
+            projects,
+            vec![
+                (
+                    "session-root".to_string(),
+                    missing_a.display().to_string(),
+                    PATH_REASON_GIT_ROOT_NOT_FOUND.to_string(),
+                ),
+                (
+                    "session-root".to_string(),
+                    missing_b.display().to_string(),
+                    PATH_REASON_GIT_ROOT_NOT_FOUND.to_string(),
+                ),
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn common_dir_backed_worktrees_collapse_into_one_canonical_git_project() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        let repo_root = temp.path().join("repo");
+        let bare_root = temp.path().join("repo.git");
+        let worktree_a = temp.path().join("agent-a");
+        let worktree_b = temp.path().join("agent-b");
+
+        init_git_repo(&repo_root)?;
+        run_git(&repo_root, ["branch", "-m", "main"])?;
+        run_git_args(&[
+            "clone",
+            "--bare",
+            repo_root.to_str().context("non-utf8 repo path")?,
+            bare_root.to_str().context("non-utf8 bare path")?,
+        ])?;
+        run_git_args(&[
+            "-C",
+            bare_root.to_str().context("non-utf8 bare path")?,
+            "worktree",
+            "add",
+            worktree_a.to_str().context("non-utf8 worktree-a path")?,
+            "main",
+        ])?;
+        run_git_args(&[
+            "-C",
+            bare_root.to_str().context("non-utf8 bare path")?,
+            "worktree",
+            "add",
+            "-b",
+            "feature-b",
+            worktree_b.to_str().context("non-utf8 worktree-b path")?,
+            "main",
+        ])?;
+
+        let worktree_a_cwd = worktree_a.join("src");
+        let worktree_b_cwd = worktree_b.join("src");
+        fs::create_dir_all(&worktree_a_cwd)?;
+        fs::create_dir_all(&worktree_b_cwd)?;
+
+        write_jsonl(&source_root.join("a/session.jsonl"), &worktree_a_cwd)?;
+        write_jsonl(&source_root.join("b/session.jsonl"), &worktree_b_cwd)?;
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let report = scan_source_manifest(&mut db, &source_root)?;
+        assert_eq!(report.discovered_source_files, 2);
+
+        let project_count: i64 = db.connection().query_row(
+            "SELECT COUNT(*) FROM project WHERE identity_kind = 'git'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(project_count, 1);
+
+        let canonical_root: String = db.connection().query_row(
+            "SELECT root_path FROM project WHERE identity_kind = 'git'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(canonical_root, bare_root.display().to_string());
+
+        let distinct_project_ids: i64 = db.connection().query_row(
+            "SELECT COUNT(DISTINCT project_id) FROM source_file",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(distinct_project_ids, 1);
+
+        Ok(())
+    }
+
+    #[test]
     fn git_resolution_uses_the_main_repo_root_for_linked_worktrees() -> Result<()> {
         let temp = tempdir()?;
         let repo_root = temp.path().join("repo");
@@ -901,6 +1075,21 @@ mod tests {
         let output = Command::new("git")
             .arg("-C")
             .arg(repo_root)
+            .args(args)
+            .output()
+            .with_context(|| format!("unable to run git {:?}", args))?;
+        if !output.status.success() {
+            bail!(
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
+    fn run_git_args(args: &[&str]) -> Result<()> {
+        let output = Command::new("git")
             .args(args)
             .output()
             .with_context(|| format!("unable to run git {:?}", args))?;
