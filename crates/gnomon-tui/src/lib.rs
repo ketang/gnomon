@@ -1,4 +1,5 @@
 mod app;
+mod benchmark;
 mod gnomon_sunburst;
 mod sunburst;
 
@@ -8,6 +9,8 @@ use gnomon_core::import::{StartupOpenReason, StartupWorkerEvent};
 use gnomon_core::perf::PerfLogger;
 use gnomon_core::query::{BrowsePath, RootView, SnapshotBounds};
 use std::sync::mpsc::Receiver;
+
+pub use benchmark::{SunburstBenchmarkOptions, SunburstBenchmarkReport, run_sunburst_benchmark};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupBrowseState {

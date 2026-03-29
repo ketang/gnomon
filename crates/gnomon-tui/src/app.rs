@@ -6013,7 +6013,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<Vec<_>>();
         assert!(
-            rendered.iter().any(|symbol| *symbol == "#"),
+            rendered.contains(&"#"),
             "expected the coarse raster pipeline to emit the selected-segment glyph"
         );
         Ok(())
@@ -6109,7 +6109,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<Vec<_>>();
         assert!(
-            rendered.iter().any(|symbol| *symbol == "·"),
+            rendered.contains(&"·"),
             "expected cached-heavy coarse cells to use the subtle cache glyph"
         );
         assert!(

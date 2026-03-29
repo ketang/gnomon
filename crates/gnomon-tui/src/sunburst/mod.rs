@@ -13,15 +13,12 @@ mod render;
 pub(crate) use geometry::sunburst_selected_child_span;
 pub(crate) use model::{
     SunburstBucket, SunburstCenter, SunburstDistortionPolicy, SunburstLayer, SunburstModel,
-    SunburstRenderConfig, SunburstSegment, SunburstSpan,
+    SunburstRenderConfig, SunburstRenderMode, SunburstSegment, SunburstSpan,
 };
 pub(crate) use render::SunburstPane;
 
 #[cfg(test)]
 pub(crate) use geometry::sunburst_segment_at_angle;
-
-#[cfg(test)]
-pub(crate) use model::SunburstRenderMode;
 
 #[cfg(test)]
 pub(crate) use render::{sunburst_center_label_area, sunburst_center_label_style};
