@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 pub mod history_drag;
+pub mod prompt_yield;
+pub mod search_churn;
 pub mod session_setup;
 pub mod tool_result_bloat;
 
