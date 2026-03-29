@@ -45,6 +45,7 @@ const REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const WIDE_LAYOUT_WIDTH: u16 = 120;
 const JUMP_MATCH_LIMIT: usize = 8;
 const RADIAL_CENTER_RADIUS: f64 = 0.24;
+const RADIAL_DESCENDANT_DEPTH_LIMIT: usize = 3;
 const ACTIVITY_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 const VIEW_LOAD_PHASE_TOTAL: usize = 8;
 const JUMP_TARGET_PHASE_TOTAL: usize = 4;
@@ -3083,10 +3084,117 @@ fn build_radial_context_for_state(
     );
     perf.finish_ok();
 
+    let descendant_layers = build_radial_descendant_layers(
+        query_cache,
+        query_engine,
+        &request,
+        current_span,
+        browse_stats,
+    )
+    .unwrap_or_default();
+
     Ok(RadialContext {
         ancestor_layers,
         current_span,
+        descendant_layers,
     })
+}
+
+fn build_radial_descendant_layers(
+    query_cache: &mut QueryResultCache,
+    query_engine: &QueryEngine<'_>,
+    request: &RadialContextRequest<'_>,
+    initial_span: RadialSpan,
+    browse_stats: &mut BrowseFanoutStats,
+) -> Result<Vec<RadialLayer>> {
+    if matches!(request.active_path, BrowsePath::Root) {
+        return Ok(Vec::new());
+    }
+
+    let mut layers = Vec::new();
+    let mut query_path = request.active_path.clone();
+    let mut span = initial_span;
+
+    for _ in 0..RADIAL_DESCENDANT_DEPTH_LIMIT {
+        let rows = cached_browse(
+            query_cache,
+            query_engine,
+            BrowseRequest {
+                snapshot: request.snapshot.clone(),
+                root: request.ui_state.root,
+                lens: request.ui_state.lens,
+                filters: request.filters.clone(),
+                path: query_path.clone(),
+            },
+            browse_stats,
+        )?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        let layer = build_radial_layer(&rows, request.ui_state.lens, None, span);
+        layers.push(layer.clone());
+
+        let Some(largest_index) = largest_segment_index(&layer) else {
+            break;
+        };
+
+        span = segment_child_span(&layer, largest_index);
+
+        let Some(next_path) =
+            next_browse_path(&request.ui_state.root, &query_path, &rows[largest_index])
+        else {
+            break;
+        };
+        query_path = next_path;
+    }
+
+    Ok(layers)
+}
+
+fn largest_segment_index(layer: &RadialLayer) -> Option<usize> {
+    if layer.segments.is_empty() {
+        return None;
+    }
+    layer
+        .segments
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| {
+            a.value
+                .partial_cmp(&b.value)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(index, _)| index)
+}
+
+fn segment_child_span(layer: &RadialLayer, target_index: usize) -> RadialSpan {
+    if layer.segments.is_empty() {
+        return layer.span;
+    }
+
+    let total_weight = if layer.total_value > 0.0 {
+        layer.total_value
+    } else {
+        layer.segments.len() as f64
+    };
+
+    let mut cursor = 0.0;
+    for (index, segment) in layer.segments.iter().enumerate() {
+        let weight = if layer.total_value > 0.0 {
+            segment.value.max(0.0)
+        } else {
+            1.0
+        };
+        let sweep = (weight / total_weight) * layer.span.sweep;
+        if index == target_index {
+            return layer.span.child_span(cursor, sweep);
+        }
+        cursor += sweep;
+    }
+
+    layer.span
 }
 
 fn project_root_for_state(
@@ -3332,6 +3440,7 @@ impl PaneFocus {
 struct RadialContext {
     ancestor_layers: Vec<RadialLayer>,
     current_span: RadialSpan,
+    descendant_layers: Vec<RadialLayer>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -4120,6 +4229,7 @@ fn build_radial_model(
             context.current_span,
         ));
     }
+    layers.extend(context.descendant_layers.iter().cloned());
 
     let selection_label = selected_row
         .map(|row| {
@@ -7549,5 +7659,257 @@ mod tests {
             snapshot_coverage_footer_text(&SnapshotCoverageSummary::default()),
             "coverage: no imported data is visible yet"
         );
+    }
+
+    #[test]
+    fn largest_segment_index_picks_highest_value() {
+        let layer = build_radial_layer(
+            &[
+                radial_row(RadialRowSpec {
+                    key: "project:1",
+                    label: "small",
+                    kind: RollupRowKind::Project,
+                    value: 3.0,
+                    project_id: Some(1),
+                    category: None,
+                    action: None,
+                    full_path: None,
+                }),
+                radial_row(RadialRowSpec {
+                    key: "project:2",
+                    label: "large",
+                    kind: RollupRowKind::Project,
+                    value: 10.0,
+                    project_id: Some(2),
+                    category: None,
+                    action: None,
+                    full_path: None,
+                }),
+                radial_row(RadialRowSpec {
+                    key: "project:3",
+                    label: "medium",
+                    kind: RollupRowKind::Project,
+                    value: 5.0,
+                    project_id: Some(3),
+                    category: None,
+                    action: None,
+                    full_path: None,
+                }),
+            ],
+            MetricLens::UncachedInput,
+            None,
+            RadialSpan::full(),
+        );
+        assert_eq!(largest_segment_index(&layer), Some(1));
+    }
+
+    #[test]
+    fn segment_child_span_computes_proportional_arc() {
+        // Three segments: 25%, 50%, 25% of a half-circle
+        let layer = build_radial_layer(
+            &[
+                radial_row(RadialRowSpec {
+                    key: "a",
+                    label: "a",
+                    kind: RollupRowKind::ActionCategory,
+                    value: 2.0,
+                    project_id: None,
+                    category: Some("a"),
+                    action: None,
+                    full_path: None,
+                }),
+                radial_row(RadialRowSpec {
+                    key: "b",
+                    label: "b",
+                    kind: RollupRowKind::ActionCategory,
+                    value: 4.0,
+                    project_id: None,
+                    category: Some("b"),
+                    action: None,
+                    full_path: None,
+                }),
+                radial_row(RadialRowSpec {
+                    key: "c",
+                    label: "c",
+                    kind: RollupRowKind::ActionCategory,
+                    value: 2.0,
+                    project_id: None,
+                    category: Some("c"),
+                    action: None,
+                    full_path: None,
+                }),
+            ],
+            MetricLens::UncachedInput,
+            None,
+            RadialSpan {
+                start: 0.0,
+                sweep: TAU / 2.0,
+            },
+        );
+
+        // Largest is index 1 ("b", 50% of the half-circle)
+        let span = segment_child_span(&layer, 1);
+        // Segment "a" occupies 0..TAU/8, "b" occupies TAU/8..3*TAU/8
+        assert_span_close(span, TAU / 8.0, TAU / 4.0);
+    }
+
+    #[test]
+    fn descendant_model_includes_ancestor_current_and_descendant_layers() {
+        // Build a RadialContext with 1 ancestor layer and 2 descendant layers.
+        let ancestor_layer = build_radial_layer(
+            &[radial_row(RadialRowSpec {
+                key: "project:1",
+                label: "project-a",
+                kind: RollupRowKind::Project,
+                value: 10.0,
+                project_id: Some(1),
+                category: None,
+                action: None,
+                full_path: None,
+            })],
+            MetricLens::UncachedInput,
+            Some("project:1"),
+            RadialSpan::full(),
+        );
+        let descendant_layer_1 = build_radial_layer(
+            &[
+                radial_row(RadialRowSpec {
+                    key: "category:editing",
+                    label: "editing",
+                    kind: RollupRowKind::ActionCategory,
+                    value: 6.0,
+                    project_id: Some(1),
+                    category: Some("editing"),
+                    action: None,
+                    full_path: None,
+                }),
+                radial_row(RadialRowSpec {
+                    key: "category:docs",
+                    label: "docs",
+                    kind: RollupRowKind::ActionCategory,
+                    value: 4.0,
+                    project_id: Some(1),
+                    category: Some("docs"),
+                    action: None,
+                    full_path: None,
+                }),
+            ],
+            MetricLens::UncachedInput,
+            None,
+            RadialSpan::full(),
+        );
+        let descendant_layer_2 = build_radial_layer(
+            &[radial_row(RadialRowSpec {
+                key: "action:read",
+                label: "read",
+                kind: RollupRowKind::Action,
+                value: 6.0,
+                project_id: Some(1),
+                category: Some("editing"),
+                action: Some(sample_action("read file")),
+                full_path: None,
+            })],
+            MetricLens::UncachedInput,
+            None,
+            RadialSpan::full(),
+        );
+
+        let context = RadialContext {
+            ancestor_layers: vec![ancestor_layer],
+            current_span: RadialSpan::full(),
+            descendant_layers: vec![descendant_layer_1, descendant_layer_2],
+        };
+
+        let current_rows = vec![radial_row(RadialRowSpec {
+            key: "project:1",
+            label: "project-a",
+            kind: RollupRowKind::Project,
+            value: 10.0,
+            project_id: Some(1),
+            category: None,
+            action: None,
+            full_path: None,
+        })];
+
+        let model = build_radial_model(
+            &context,
+            &current_rows,
+            current_rows.first(),
+            &RootView::ProjectHierarchy,
+            &BrowsePath::Root,
+            &sample_filter_options(),
+            MetricLens::UncachedInput,
+        );
+
+        // 1 ancestor + 1 current + 2 descendant = 4 layers
+        assert_eq!(model.layers.len(), 4);
+    }
+
+    #[test]
+    fn descendant_layers_for_selected_project() -> Result<()> {
+        // Integration test: from Root with active_path = Project{1},
+        // descendant layers should appear showing categories.
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        app.ui_state.root = RootView::ProjectHierarchy;
+        app.ui_state.path = BrowsePath::Root;
+
+        let active_path = BrowsePath::Project { project_id: 1 };
+
+        let filters = current_query_filters_for(&app.ui_state, &app.snapshot)?;
+        let mut browse_stats = BrowseFanoutStats::default();
+
+        let ctx = app.build_radial_context(&filters, &active_path, &mut browse_stats)?;
+
+        // With an empty database, ancestor layers should exist (1 for Root→Project)
+        // but descendant layers will be empty since there's no data to query.
+        assert_eq!(
+            ctx.ancestor_layers.len(),
+            1,
+            "selecting a project row should yield 1 ancestor layer"
+        );
+        assert!(
+            ctx.descendant_layers.is_empty(),
+            "with no data, descendant layers should be empty"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn no_descendant_layers_at_root_path() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        app.ui_state.root = RootView::ProjectHierarchy;
+        app.ui_state.path = BrowsePath::Root;
+
+        let active_path = BrowsePath::Root;
+        let filters = current_query_filters_for(&app.ui_state, &app.snapshot)?;
+        let mut browse_stats = BrowseFanoutStats::default();
+
+        let ctx = app.build_radial_context(&filters, &active_path, &mut browse_stats)?;
+
+        assert!(
+            ctx.descendant_layers.is_empty(),
+            "Root path should produce no descendant layers"
+        );
+        Ok(())
     }
 }
