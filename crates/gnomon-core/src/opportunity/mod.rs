@@ -9,6 +9,9 @@ pub mod session_setup;
 pub mod task_setup;
 pub mod tool_result_bloat;
 
+#[cfg(test)]
+mod fixtures;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum OpportunityCategory {
     #[serde(rename = "session setup")]
