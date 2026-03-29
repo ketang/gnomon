@@ -98,6 +98,10 @@ paths use the existing hierarchy model, with `--project-id`, `--category`, and
 action fields such as `--classification-state` and `--normalized-action`
 supplying the path context when needed.
 
+Project rows in the report JSON include the project identity metadata used by
+the importer, including `root_path`, `identity_kind`, `git_root_path`,
+`git_origin`, and `identity_reason` when present.
+
 ## Query Benchmarks
 
 `gnomon` can also emit a read-only JSON benchmark report for the hot query

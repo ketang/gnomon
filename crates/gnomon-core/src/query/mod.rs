@@ -280,6 +280,7 @@ pub struct RollupRow {
     pub indicators: MetricIndicators,
     pub item_count: u64,
     pub project_id: Option<i64>,
+    pub project_identity: Option<ProjectIdentity>,
     pub category: Option<String>,
     pub action: Option<ActionKey>,
     pub full_path: Option<String>,
@@ -310,6 +311,15 @@ pub struct FilterOptions {
     pub models: Vec<String>,
     pub categories: Vec<String>,
     pub actions: Vec<ActionFilterOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectIdentity {
+    pub identity_kind: String,
+    pub root_path: String,
+    pub git_root_path: Option<String>,
+    pub git_origin: Option<String>,
+    pub identity_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -362,6 +372,10 @@ const LOAD_ACTION_ROLLUP_FACTS_SQL: &str = "
         p.id,
         p.display_name,
         p.root_path,
+        p.identity_kind,
+        p.git_root_path,
+        p.git_origin,
+        p.identity_reason,
         car.display_category,
         car.normalized_action,
         car.command_family,
@@ -385,6 +399,10 @@ const LOAD_RECENT_ACTION_FACTS_SQL: &str = "
         p.id,
         p.display_name,
         p.root_path,
+        p.identity_kind,
+        p.git_root_path,
+        p.git_origin,
+        p.identity_reason,
         a.category,
         a.normalized_action,
         a.command_family,
@@ -769,17 +787,24 @@ impl<'conn> QueryEngine<'conn> {
                 project_id: row.get(0)?,
                 project_display_name: row.get(1)?,
                 project_root: row.get(2)?,
-                category: row.get(3)?,
-                normalized_action: row.get(4)?,
-                command_family: row.get(5)?,
-                base_command: row.get(6)?,
-                classification_state: row.get(7)?,
-                timestamp: row.get(8)?,
-                input_tokens: row.get(9)?,
-                cache_creation_input_tokens: row.get(10)?,
-                cache_read_input_tokens: row.get(11)?,
-                output_tokens: row.get(12)?,
-                model_names_csv: row.get(13)?,
+                project_identity: ProjectIdentity {
+                    identity_kind: row.get(3)?,
+                    root_path: row.get(2)?,
+                    git_root_path: row.get(4)?,
+                    git_origin: row.get(5)?,
+                    identity_reason: row.get(6)?,
+                },
+                category: row.get(7)?,
+                normalized_action: row.get(8)?,
+                command_family: row.get(9)?,
+                base_command: row.get(10)?,
+                classification_state: row.get(11)?,
+                timestamp: row.get(12)?,
+                input_tokens: row.get(13)?,
+                cache_creation_input_tokens: row.get(14)?,
+                cache_read_input_tokens: row.get(15)?,
+                output_tokens: row.get(16)?,
+                model_names_csv: row.get(17)?,
             })
         })?;
 
@@ -790,6 +815,7 @@ impl<'conn> QueryEngine<'conn> {
                     project_id: row.project_id,
                     project_display_name: row.project_display_name,
                     project_root: row.project_root,
+                    project_identity: row.project_identity,
                     category: display_category(row.category.as_deref(), &row.classification_state)?,
                     action: ActionKey {
                         classification_state: parse_classification_state(
@@ -831,16 +857,23 @@ impl<'conn> QueryEngine<'conn> {
                 project_id: row.get(0)?,
                 project_display_name: row.get(1)?,
                 project_root: row.get(2)?,
-                display_category: row.get(3)?,
-                normalized_action: row.get(4)?,
-                command_family: row.get(5)?,
-                base_command: row.get(6)?,
-                classification_state: row.get(7)?,
-                input_tokens: row.get(8)?,
-                cache_creation_input_tokens: row.get(9)?,
-                cache_read_input_tokens: row.get(10)?,
-                output_tokens: row.get(11)?,
-                action_count: row.get(12)?,
+                project_identity: ProjectIdentity {
+                    identity_kind: row.get(3)?,
+                    root_path: row.get(2)?,
+                    git_root_path: row.get(4)?,
+                    git_origin: row.get(5)?,
+                    identity_reason: row.get(6)?,
+                },
+                display_category: row.get(7)?,
+                normalized_action: row.get(8)?,
+                command_family: row.get(9)?,
+                base_command: row.get(10)?,
+                classification_state: row.get(11)?,
+                input_tokens: row.get(12)?,
+                cache_creation_input_tokens: row.get(13)?,
+                cache_read_input_tokens: row.get(14)?,
+                output_tokens: row.get(15)?,
+                action_count: row.get(16)?,
             })
         })?;
 
@@ -851,6 +884,7 @@ impl<'conn> QueryEngine<'conn> {
                     project_id: row.project_id,
                     project_display_name: row.project_display_name,
                     project_root: row.project_root,
+                    project_identity: row.project_identity,
                     category: row.display_category,
                     action: ActionKey {
                         classification_state: parse_classification_state(
@@ -900,16 +934,23 @@ impl<'conn> QueryEngine<'conn> {
                     project_id: row.get(0)?,
                     project_display_name: row.get(1)?,
                     project_root: row.get(2)?,
-                    category: row.get(3)?,
-                    normalized_action: row.get(4)?,
-                    command_family: row.get(5)?,
-                    base_command: row.get(6)?,
-                    classification_state: row.get(7)?,
-                    timestamp: row.get(8)?,
-                    input_tokens: row.get(9)?,
-                    cache_creation_input_tokens: row.get(10)?,
-                    cache_read_input_tokens: row.get(11)?,
-                    output_tokens: row.get(12)?,
+                    project_identity: ProjectIdentity {
+                        identity_kind: row.get(3)?,
+                        root_path: row.get(2)?,
+                        git_root_path: row.get(4)?,
+                        git_origin: row.get(5)?,
+                        identity_reason: row.get(6)?,
+                    },
+                    category: row.get(7)?,
+                    normalized_action: row.get(8)?,
+                    command_family: row.get(9)?,
+                    base_command: row.get(10)?,
+                    classification_state: row.get(11)?,
+                    timestamp: row.get(12)?,
+                    input_tokens: row.get(13)?,
+                    cache_creation_input_tokens: row.get(14)?,
+                    cache_read_input_tokens: row.get(15)?,
+                    output_tokens: row.get(16)?,
                     model_names_csv: None,
                 })
             },
@@ -922,6 +963,7 @@ impl<'conn> QueryEngine<'conn> {
                     project_id: row.project_id,
                     project_display_name: row.project_display_name,
                     project_root: row.project_root,
+                    project_identity: row.project_identity,
                     category: display_category(row.category.as_deref(), &row.classification_state)?,
                     action: ActionKey {
                         classification_state: parse_classification_state(
@@ -1086,6 +1128,7 @@ struct LoadedActionFact {
     project_id: i64,
     project_display_name: String,
     project_root: String,
+    project_identity: ProjectIdentity,
     category: Option<String>,
     normalized_action: Option<String>,
     command_family: Option<String>,
@@ -1104,6 +1147,7 @@ struct ActionFact {
     project_id: i64,
     project_display_name: String,
     project_root: String,
+    project_identity: ProjectIdentity,
     category: String,
     action: ActionKey,
     timestamp: Option<Timestamp>,
@@ -1117,6 +1161,7 @@ struct LoadedActionRollupFact {
     project_id: i64,
     project_display_name: String,
     project_root: String,
+    project_identity: ProjectIdentity,
     display_category: String,
     normalized_action: Option<String>,
     command_family: Option<String>,
@@ -1318,7 +1363,7 @@ struct RollupBuilder {
     kind: RollupRowKind,
     key: String,
     label: String,
-    project_id: Option<i64>,
+    project: Option<ProjectRollupContext>,
     category: Option<String>,
     action: Option<ActionKey>,
     full_path: Option<String>,
@@ -1329,12 +1374,18 @@ struct RollupBuilder {
     item_count: u64,
 }
 
+#[derive(Debug, Clone)]
+struct ProjectRollupContext {
+    project_id: i64,
+    identity: ProjectIdentity,
+}
+
 impl RollupBuilder {
     fn new(
         kind: RollupRowKind,
         key: impl Into<String>,
         label: impl Into<String>,
-        project_id: Option<i64>,
+        project: Option<ProjectRollupContext>,
         category: Option<String>,
         action: Option<ActionKey>,
         full_path: Option<String>,
@@ -1343,7 +1394,7 @@ impl RollupBuilder {
             kind,
             key: key.into(),
             label: label.into(),
-            project_id,
+            project,
             category,
             action,
             full_path,
@@ -1387,7 +1438,8 @@ impl RollupBuilder {
                 uncached_input_reference: self.uncached_input_reference,
             },
             item_count: self.item_count,
-            project_id: self.project_id,
+            project_id: self.project.as_ref().map(|project| project.project_id),
+            project_identity: self.project.map(|project| project.identity),
             category: self.category,
             action: self.action,
             full_path: self.full_path,
@@ -1417,7 +1469,10 @@ fn aggregate_projects(
                     RollupRowKind::Project,
                     format!("project:{}", fact.project_id),
                     fact.project_display_name.clone(),
-                    Some(fact.project_id),
+                    Some(ProjectRollupContext {
+                        project_id: fact.project_id,
+                        identity: fact.project_identity.clone(),
+                    }),
                     None,
                     None,
                     Some(fact.project_root.clone()),
@@ -1497,7 +1552,7 @@ fn aggregate_actions(
                     RollupRowKind::Action,
                     format!("action:{}", fact.action.stable_key()),
                     fact.action.label(),
-                    project_id,
+                    None,
                     Some(fact.category.clone()),
                     Some(fact.action.clone()),
                     None,
@@ -1569,7 +1624,7 @@ fn aggregate_paths(
                         kind,
                         format!("path:{child_path_string}"),
                         label,
-                        Some(scope.project_id),
+                        None,
                         Some(scope.category.to_string()),
                         Some(scope.action.clone()),
                         Some(child_path_string.clone()),
@@ -1760,13 +1815,17 @@ fn build_scoped_action_facts_query(request: &BrowseRequest) -> Result<(String, V
     let mut sql = format!(
         "
         SELECT
-            p.id,
-            p.display_name,
-            p.root_path,
-            a.category,
-            a.normalized_action,
-            a.command_family,
-            a.base_command,
+        p.id,
+        p.display_name,
+        p.root_path,
+        p.identity_kind,
+        p.git_root_path,
+        p.git_origin,
+        p.identity_reason,
+        a.category,
+        a.normalized_action,
+        a.command_family,
+        a.base_command,
             a.classification_state,
             {ACTION_TIMESTAMP_SQL},
             COALESCE(a.input_tokens, 0),
@@ -1863,6 +1922,10 @@ fn build_scoped_action_facts_query(request: &BrowseRequest) -> Result<(String, V
             p.id,
             p.display_name,
             p.root_path,
+            p.identity_kind,
+            p.git_root_path,
+            p.git_origin,
+            p.identity_reason,
             a.category,
             a.normalized_action,
             a.command_family,
@@ -2120,9 +2183,9 @@ mod tests {
 
     use super::{
         ActionKey, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState, FilterOptions,
-        MetricLens, QueryEngine, RootView, SnapshotBounds, SnapshotCoverageSummary,
-        TimeWindowFilter, build_scoped_action_facts_query, build_scoped_path_facts_query,
-        display_category,
+        MetricLens, ProjectIdentity, QueryEngine, RootView, SnapshotBounds,
+        SnapshotCoverageSummary, TimeWindowFilter, build_scoped_action_facts_query,
+        build_scoped_path_facts_query, display_category,
     };
 
     #[test]
@@ -2342,6 +2405,19 @@ mod tests {
         assert_eq!(root_rows[0].indicators.selected_lens_last_5_hours, 10.0);
         assert_eq!(root_rows[0].indicators.selected_lens_last_week, 10.0);
         assert_eq!(root_rows[0].indicators.uncached_input_reference, 10.0);
+        assert_eq!(
+            root_rows[0]
+                .project_identity
+                .as_ref()
+                .expect("project rows should include identity metadata"),
+            &ProjectIdentity {
+                identity_kind: "path".to_string(),
+                root_path: temp.path().join("project-a").display().to_string(),
+                git_root_path: None,
+                git_origin: None,
+                identity_reason: Some("fixture".to_string()),
+            }
+        );
 
         assert_eq!(root_rows[1].label, "project-b");
         assert_eq!(root_rows[1].metrics.uncached_input, 6.0);
