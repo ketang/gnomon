@@ -1648,6 +1648,7 @@ dependencies = [
  "jiff",
  "nucleo-matcher",
  "ratatui",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
