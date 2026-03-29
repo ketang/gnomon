@@ -24,6 +24,7 @@ use gnomon_core::query::{
     MetricLens, QueryEngine, RollupRow, RollupRowKind, RootView, SnapshotBounds,
     SnapshotCoverageSummary, TimeWindowFilter,
 };
+use gnomon_core::vcs::ProjectIdentityKind;
 use jiff::ToSpan;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as MatcherConfig, Matcher};
@@ -36,6 +37,7 @@ use ratatui::widgets::{
     Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState, Widget, Wrap,
 };
 use ratatui::{Frame, Terminal};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 const UI_STATE_FILENAME: &str = "tui-state.json";
@@ -625,6 +627,7 @@ pub struct App {
     query_cache: QueryResultCache,
     row_cache: Vec<CachedRows>,
     expanded_paths: Vec<BrowsePath>,
+    selected_project_identity: Option<SelectedProjectIdentity>,
 }
 
 impl App {
@@ -700,6 +703,7 @@ impl App {
             query_cache: QueryResultCache::default(),
             row_cache: Vec::new(),
             expanded_paths: Vec::new(),
+            selected_project_identity: None,
         };
 
         let perf_logger = app.perf_logger.clone();
@@ -1662,6 +1666,17 @@ impl App {
         self.selected_tree_row().map(|row| &row.row)
     }
 
+    fn update_selected_node_metadata(&mut self) {
+        let project_id = self.selected_row().and_then(|row| {
+            matches!(row.kind, RollupRowKind::Project)
+                .then_some(row.project_id)
+                .flatten()
+        });
+
+        self.selected_project_identity =
+            project_id.and_then(|project_id| self.project_identity_for(project_id).ok().flatten());
+    }
+
     fn selected_tree_row(&self) -> Option<&TreeRow> {
         self.table_state
             .selected()
@@ -1781,6 +1796,44 @@ impl App {
             .into_iter()
             .find(|row| row.project_id == Some(project_id))
             .and_then(|row| row.full_path))
+    }
+
+    fn project_identity_for(&self, project_id: i64) -> Result<Option<SelectedProjectIdentity>> {
+        self.database
+            .connection()
+            .query_row(
+                "
+                SELECT identity_kind, root_path, identity_reason
+                FROM project
+                WHERE id = ?1
+                ",
+                [project_id],
+                |row| {
+                    let identity_kind: String = row.get(0)?;
+                    let identity_kind = match identity_kind.as_str() {
+                        "git" => ProjectIdentityKind::Git,
+                        "path" => ProjectIdentityKind::Path,
+                        other => {
+                            return Err(rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("unexpected project identity kind: {other}"),
+                                )),
+                            ));
+                        }
+                    };
+
+                    Ok(SelectedProjectIdentity {
+                        identity_kind,
+                        root_path: row.get(1)?,
+                        identity_reason: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .context("unable to load selected project identity metadata")
     }
 
     fn rows_for_path(&self, path: &BrowsePath) -> Option<&Vec<RollupRow>> {
@@ -1906,8 +1959,17 @@ impl App {
                 )
             })
             .unwrap_or_else(|| "none".to_string());
+        let node_metadata = self.selected_row().and_then(|row| {
+            selected_node_metadata_text(row, self.selected_project_identity.as_ref())
+        });
 
-        format!("selected: {selected}  |  row filter: {filter}")
+        let mut parts = vec![format!("selected: {selected}")];
+        if let Some(node_metadata) = node_metadata {
+            parts.push(node_metadata);
+        }
+        parts.push(format!("row filter: {filter}"));
+
+        parts.join("  |  ")
     }
 
     fn header_detail_line(&self) -> Line<'static> {
@@ -2168,6 +2230,7 @@ impl App {
     }
 
     fn refresh_active_context_for_selection(&mut self) {
+        self.update_selected_node_metadata();
         if let Ok(filters) = self.current_query_filters() {
             if self.refresh_active_context(&filters).is_err() {
                 self.rebuild_radial_model();
@@ -2257,6 +2320,13 @@ struct TreeRow {
     node_path: Option<BrowsePath>,
     depth: usize,
     is_expanded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedProjectIdentity {
+    identity_kind: ProjectIdentityKind,
+    root_path: String,
+    identity_reason: Option<String>,
 }
 
 impl TreeRow {
@@ -4488,6 +4558,38 @@ fn row_search_text(row: &RollupRow) -> String {
     parts.join(" ")
 }
 
+fn selected_node_metadata_text(
+    row: &RollupRow,
+    project_identity: Option<&SelectedProjectIdentity>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+
+    match row.kind {
+        RollupRowKind::Project => {
+            let root_path = project_identity
+                .map(|identity| identity.root_path.as_str())
+                .or(row.full_path.as_deref())?;
+            parts.push(format!("root {root_path}"));
+            if let Some(identity) = project_identity {
+                parts.push(format!("identity {}", identity.identity_kind.as_str()));
+                if let Some(reason) = identity.identity_reason.as_deref() {
+                    parts.push(format!("fallback {reason}"));
+                }
+            }
+        }
+        RollupRowKind::Directory | RollupRowKind::File => {
+            let path = row.full_path.as_deref()?;
+            parts.push(format!("path {path}"));
+        }
+        _ => {
+            let path = row.full_path.as_deref()?;
+            parts.push(format!("path {path}"));
+        }
+    }
+
+    Some(parts.join("  |  "))
+}
+
 fn build_jump_matches(query: &str, targets: Vec<JumpTarget>) -> Vec<JumpTarget> {
     if query.trim().is_empty() {
         return targets.into_iter().take(JUMP_MATCH_LIMIT).collect();
@@ -5280,6 +5382,7 @@ mod tests {
     use gnomon_core::validation::{ScaleValidationSpec, run_scale_validation};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use rusqlite::params;
     use serde_json::Value;
     use tempfile::tempdir;
 
@@ -7079,6 +7182,86 @@ mod tests {
         assert!(
             content.contains("quit"),
             "footer should contain 'quit' key hint"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_node_metadata_text_uses_project_root_and_identity_reason() {
+        let mut row = sample_row("project-a", Some("/tmp/project-a".to_string()));
+        row.kind = RollupRowKind::Project;
+        row.label = "project-a".to_string();
+        let metadata = SelectedProjectIdentity {
+            identity_kind: ProjectIdentityKind::Path,
+            root_path: "/tmp/project-a".to_string(),
+            identity_reason: Some("git root could not be resolved from cwd".to_string()),
+        };
+
+        let text = selected_node_metadata_text(&row, Some(&metadata))
+            .expect("project rows should surface metadata");
+
+        assert!(text.contains("root /tmp/project-a"));
+        assert!(text.contains("identity path"));
+        assert!(text.contains("fallback git root could not be resolved from cwd"));
+    }
+
+    #[test]
+    fn selected_node_metadata_text_uses_full_path_for_file_rows() {
+        let mut row = sample_row("lib.rs", Some("/tmp/project-a/src/lib.rs".to_string()));
+        row.kind = RollupRowKind::File;
+        row.full_path = Some("/tmp/project-a/src/lib.rs".to_string());
+        row.label = "lib.rs".to_string();
+
+        let text =
+            selected_node_metadata_text(&row, None).expect("file rows should surface their path");
+
+        assert_eq!(text, "path /tmp/project-a/src/lib.rs");
+    }
+
+    #[test]
+    fn project_identity_for_reads_identity_metadata_from_project_table() -> Result<()> {
+        let temp = tempdir()?;
+        let app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        app.database.connection().execute(
+            "
+            INSERT INTO project (
+                identity_kind,
+                canonical_key,
+                display_name,
+                root_path,
+                git_root_path,
+                git_origin,
+                identity_reason
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ",
+            params![
+                "path",
+                "path:/tmp/project-a",
+                "project-a",
+                "/tmp/project-a",
+                Option::<String>::None,
+                Option::<String>::None,
+                "git root could not be resolved from cwd",
+            ],
+        )?;
+
+        let metadata = app
+            .project_identity_for(1)?
+            .context("project metadata should exist")?;
+
+        assert_eq!(metadata.identity_kind, ProjectIdentityKind::Path);
+        assert_eq!(metadata.root_path, "/tmp/project-a");
+        assert_eq!(
+            metadata.identity_reason.as_deref(),
+            Some("git root could not be resolved from cwd")
         );
         Ok(())
     }
