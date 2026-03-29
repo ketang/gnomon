@@ -30,6 +30,7 @@ crates/
   gnomon-core/
   gnomon-tui/
 docs/
+  opportunity-stability.md
   v1-design.md
 ```
 
@@ -135,6 +136,13 @@ To benchmark the resulting synthetic cache afterward:
 ```bash
 cargo run -p gnomon -- --db /tmp/gnomon-scale/validation.sqlite3 benchmark --iterations 10
 ```
+
+## Opportunity Policy
+
+Opportunity taxonomy and recommendation stability policy live in
+`docs/opportunity-stability.md`. That policy separates stable mechanism
+categories from time-sensitive recommendations so heuristic guidance can evolve
+without renaming the underlying category labels.
 
 ## Agent Instructions
 
