@@ -115,6 +115,8 @@ The reporting mode reuses the same aggregate query engine as the TUI. Drill-down
 paths use the existing hierarchy model, with `--project-id`, `--category`, and
 action fields such as `--classification-state` and `--normalized-action`
 supplying the path context when needed.
+Each rollup row now reserves an `opportunities` object in the JSON output so
+future heuristic annotations can ship without changing the hierarchy shape.
 
 ## Query Benchmarks
 

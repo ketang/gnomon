@@ -612,8 +612,9 @@ mod tests {
 
     use anyhow::{Context, Result, anyhow};
     use clap::{CommandFactory, Parser};
+    use gnomon_core::opportunity::OpportunitySummary;
     use rusqlite::OptionalExtension;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tempfile::tempdir;
 
     use super::{
@@ -623,7 +624,9 @@ mod tests {
     };
     use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
     use gnomon_core::db::Database;
-    use gnomon_core::query::BrowsePath;
+    use gnomon_core::query::{
+        BrowsePath, MetricIndicators, MetricTotals, RollupRow, RollupRowKind,
+    };
     use gnomon_core::validation::{ScaleValidationSpec, run_scale_validation};
 
     #[test]
@@ -953,6 +956,58 @@ mod tests {
         assert_eq!(report.request.path, BrowsePath::Root);
         assert!(report.rows.is_empty());
         assert!(report.snapshot.max_publish_seq > 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn report_json_includes_opportunity_annotation_fields() -> Result<()> {
+        let report = gnomon_core::query::BrowseReport {
+            snapshot: gnomon_core::query::SnapshotBounds::bootstrap(),
+            request: gnomon_core::query::BrowseRequest {
+                snapshot: gnomon_core::query::SnapshotBounds::bootstrap(),
+                root: gnomon_core::query::RootView::ProjectHierarchy,
+                lens: gnomon_core::query::MetricLens::UncachedInput,
+                filters: gnomon_core::query::BrowseFilters::default(),
+                path: gnomon_core::query::BrowsePath::Root,
+            },
+            rows: vec![RollupRow {
+                kind: RollupRowKind::Project,
+                key: "project:1".to_string(),
+                label: "project-a".to_string(),
+                metrics: MetricTotals {
+                    uncached_input: 0.0,
+                    cached_input: 0.0,
+                    gross_input: 0.0,
+                    output: 0.0,
+                    total: 0.0,
+                },
+                indicators: MetricIndicators {
+                    selected_lens_last_5_hours: 0.0,
+                    selected_lens_last_week: 0.0,
+                    uncached_input_reference: 0.0,
+                },
+                item_count: 0,
+                opportunities: OpportunitySummary::default(),
+                project_id: Some(1),
+                project_identity: None,
+                category: None,
+                action: None,
+                full_path: None,
+            }],
+        };
+
+        let json = serde_json::to_value(&report)?;
+        assert_eq!(json["rows"][0]["opportunities"]["annotations"], json!([]));
+        assert_eq!(
+            json["rows"][0]["opportunities"]["top_category"],
+            Value::Null
+        );
+        assert_eq!(json["rows"][0]["opportunities"]["total_score"], json!(0.0));
+        assert_eq!(
+            json["rows"][0]["opportunities"]["top_confidence"],
+            Value::Null
+        );
 
         Ok(())
     }

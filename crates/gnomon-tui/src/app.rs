@@ -5387,6 +5387,7 @@ mod tests {
     use gnomon_core::config::RuntimeConfig;
     use gnomon_core::db::Database;
     use gnomon_core::import::StartupOpenReason;
+    use gnomon_core::opportunity::OpportunitySummary;
     use gnomon_core::perf::PerfLogger;
     use gnomon_core::query::{ClassificationState, QueryEngine, SnapshotBounds};
     use gnomon_core::validation::{ScaleValidationSpec, run_scale_validation};
@@ -5522,6 +5523,7 @@ mod tests {
                     uncached_input_reference: 3.0,
                 },
                 item_count: 1,
+                opportunities: OpportunitySummary::default(),
                 project_id: Some(1),
                 project_identity: None,
                 category: Some("editing".to_string()),
@@ -5678,6 +5680,7 @@ mod tests {
                 uncached_input_reference: 5.0,
             },
             item_count: 1,
+            opportunities: OpportunitySummary::default(),
             project_id: Some(1),
             project_identity: None,
             category: None,
@@ -5713,6 +5716,7 @@ mod tests {
                 uncached_input_reference: 5.0,
             },
             item_count: 1,
+            opportunities: OpportunitySummary::default(),
             project_id: Some(1),
             project_identity: None,
             category: Some("editing".to_string()),
@@ -6489,6 +6493,7 @@ mod tests {
                 uncached_input_reference: 5.0,
             },
             item_count: 1,
+            opportunities: OpportunitySummary::default(),
             project_id: Some(1),
             project_identity: None,
             category: Some("editing".to_string()),
@@ -6526,6 +6531,7 @@ mod tests {
                 uncached_input_reference: spec.value,
             },
             item_count: 1,
+            opportunities: OpportunitySummary::default(),
             project_id: spec.project_id,
             project_identity: None,
             category: spec.category.map(str::to_string),

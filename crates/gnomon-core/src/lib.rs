@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod dirs;
 pub mod import;
+pub mod opportunity;
 pub mod perf;
 pub mod query;
 pub(crate) mod rollup;
