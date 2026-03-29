@@ -2049,6 +2049,7 @@ impl App {
             RadialContextRequest {
                 snapshot: &self.snapshot,
                 ui_state: &self.ui_state,
+                active_path: path,
                 filters,
                 project_root: project_root.as_deref(),
             },
@@ -2668,6 +2669,7 @@ fn load_view_for_state(
         RadialContextRequest {
             snapshot: &snapshot,
             ui_state: &ui_state,
+            active_path: &ui_state.path,
             filters: &filters,
             project_root: current_project_root.as_deref(),
         },
@@ -3011,6 +3013,7 @@ fn browse_rows_with_parent_fallback(
 struct RadialContextRequest<'a> {
     snapshot: &'a SnapshotBounds,
     ui_state: &'a PersistedUiState,
+    active_path: &'a BrowsePath,
     filters: &'a BrowseFilters,
     project_root: Option<&'a str>,
 }
@@ -3025,12 +3028,12 @@ fn build_radial_context_for_state(
     let mut perf = PerfScope::new(perf_logger, "tui.build_radial_context");
     perf.field("snapshot", request.snapshot);
     perf.field("root", request.ui_state.root);
-    perf.field("path", &request.ui_state.path);
+    perf.field("path", request.active_path);
     perf.field("lens", request.ui_state.lens);
     perf.field("filters", request.filters);
     let steps = radial_ancestor_steps(
         &request.ui_state.root,
-        &request.ui_state.path,
+        request.active_path,
         request.project_root,
     );
     let mut ancestor_layers = Vec::new();
@@ -5817,6 +5820,87 @@ mod tests {
                 selected_child: "path:/tmp/project-a/src/lib".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn radial_context_uses_active_path_not_ui_state_path() -> Result<()> {
+        // Regression test for issue #56: build_radial_context must use the
+        // active_path parameter (derived from tree selection), not
+        // ui_state.path.  When a user selects an expanded child row the radial
+        // reveal should reflect that child's path.
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        // ui_state.path stays at Root – this is the stale path that was
+        // previously (incorrectly) used for radial context.
+        app.ui_state.root = RootView::ProjectHierarchy;
+        app.ui_state.path = BrowsePath::Root;
+
+        // The active path simulates a tree row selected inside a project's
+        // category.  radial_ancestor_steps returns 2 steps for this path (Root
+        // → Project, Project → Category).
+        let active_path = BrowsePath::ProjectCategory {
+            project_id: 1,
+            category: "editing".to_string(),
+        };
+
+        let filters = current_query_filters_for(&app.ui_state, &app.snapshot)?;
+        let mut browse_stats = BrowseFanoutStats::default();
+
+        let ctx = app.build_radial_context(&filters, &active_path, &mut browse_stats)?;
+
+        // With the fix, ancestor_layers length == number of ancestor steps for
+        // `active_path` (2 for ProjectCategory).  Before the fix, ui_state.path
+        // was Root which produces 0 ancestor steps.
+        assert_eq!(
+            ctx.ancestor_layers.len(),
+            2,
+            "radial context should reflect active_path (ProjectCategory → 2 ancestor layers), \
+             not ui_state.path (Root → 0)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn radial_context_for_top_level_project_selection() -> Result<()> {
+        // Regression test for issue #56: selecting a top-level project row
+        // should produce a radial context with 1 ancestor layer (Root →
+        // Project), even when ui_state.path is Root.
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        app.ui_state.root = RootView::ProjectHierarchy;
+        app.ui_state.path = BrowsePath::Root;
+
+        let active_path = BrowsePath::Project { project_id: 1 };
+
+        let filters = current_query_filters_for(&app.ui_state, &app.snapshot)?;
+        let mut browse_stats = BrowseFanoutStats::default();
+
+        let ctx = app.build_radial_context(&filters, &active_path, &mut browse_stats)?;
+
+        assert_eq!(
+            ctx.ancestor_layers.len(),
+            1,
+            "selecting a project row should yield 1 ancestor layer (Root → Project)"
+        );
+        Ok(())
     }
 
     #[test]
