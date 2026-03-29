@@ -25,6 +25,62 @@ Definitions:
 - `gross input = uncached input + cached input`
 - `output = output_tokens`
 
+## Opportunity Annotations
+
+Opportunity is a cross-cutting annotation layer over the existing rollup
+hierarchy, not a new hierarchy root or a replacement navigation model.
+
+- Keep the current browse hierarchy as the primary structure:
+  - `project -> action category -> action -> directory/file`
+  - `action category -> action -> project -> directory/file`
+- Attach opportunity metadata to existing rollup rows.
+- Keep the radial + table explorer as the primary interaction surface.
+- Treat opportunity as sparse row-level data:
+  - a row may have zero, one, or several opportunity annotations
+  - absence of annotations means "no confident signal", not "confirmed healthy"
+
+Each rollup row may carry:
+
+- per-category opportunity scores
+- a top opportunity summary
+- confidence for each fired category
+- compact evidence suitable for table/report output
+- recommendation text derived from, but not identical to, the taxonomy label
+
+The opportunity taxonomy for `v1` is:
+
+- `session setup`
+- `task setup`
+- `history drag`
+- `delegation`
+- `model mismatch`
+- `prompt yield`
+- `search churn`
+- `tool-result bloat`
+
+These taxonomy labels are stable mechanism categories. They describe the kind of
+observed overhead, not the exact advice shown to the user at a given point in
+time. Recommendations remain a separate layer so guidance can evolve without
+renaming the category itself.
+
+### Confidence And Suppression
+
+Opportunity annotations should be conservative.
+
+- `high`: strong direct evidence and low ambiguity
+- `medium`: useful signal with some ambiguity
+- `low`: weak or incomplete evidence
+
+Suppression rules:
+
+- Do not surface a category when evidence is too weak to clear the `medium`
+  confidence threshold.
+- Suppress categories when the observed pattern is explainable by multiple
+  equally plausible causes and the system cannot distinguish between them.
+- Suppress categories when the sample is too small for the score to be
+  meaningful.
+- Prefer no annotation over a noisy annotation.
+
 ## Classification
 
 - Deterministic local classifier for `v1`
@@ -121,6 +177,10 @@ Shell commands do not create path attribution.
   - global jump
   - persistent UI state across launches
   - fresh launches start at the top level unless explicit startup drill-down flags are provided
+- Opportunity presentation:
+  - optional table columns and filters augment existing rows
+  - inspect details explain fired opportunities for the selected row
+  - no separate "opportunity tree" is introduced for `v1`
 
 ## Default Column Priority
 
