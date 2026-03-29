@@ -41,6 +41,9 @@ docs/
 - Use a dedicated worktree for active implementation work whenever practical,
   and especially for parallel efforts.
 - If you land on `main`, stop and switch to a feature branch before editing.
+- Rebase finished feature branches onto `origin/main` before integration.
+- Merge finished feature branches into `main` with `git merge --no-ff`.
+- Do not fast-forward feature branch integrations into `main`.
 - Repo-local worktrees live under `.worktrees/`. Treat that directory as local
   orchestration state, not product source.
 

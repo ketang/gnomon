@@ -44,10 +44,18 @@ asks.
 - Use a feature branch or the existing task branch for every implementation task
 - Use a dedicated worktree for implementation work whenever practical, and for
   all parallel work
+- Rebase finished feature branches onto `origin/main` before integration
+- Merge finished feature branches into `main` with `git merge --no-ff`
+- Do not fast-forward feature branch integrations into `main`
 - GitHub Issues is the canonical issue tracker for this repo
 - Do not assume `beads`
 - If the user references a GitHub issue, follow that context
-- Do not create, edit, or close GitHub issues unless the user explicitly asks
+- Claim implementation work in GitHub Issues by adding the `in-progress` label
+  before editing code when the task is tracked there
+- Remove the `in-progress` label when work is handed off or completed unless the
+  user explicitly asks to leave the issue state unchanged
+- Do not create, materially edit, or close GitHub issues unless the user
+  explicitly asks
 
 ## Rust Commands
 
