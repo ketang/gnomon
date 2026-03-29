@@ -169,7 +169,7 @@ pub fn run_query_benchmark(
             detail: engine.latest_snapshot_bounds_query_plan()?,
         },
         QueryPlanReport {
-            name: "load_action_rollup_facts".to_string(),
+            name: "grouped_action_rollup_browse".to_string(),
             used_by_scenarios: vec![
                 "project_root_browse".to_string(),
                 "category_root_browse".to_string(),
@@ -177,7 +177,8 @@ pub fn run_query_benchmark(
                 "project_root_filter_change".to_string(),
                 "jump_target_build".to_string(),
             ],
-            detail: engine.action_rollup_facts_query_plan(&snapshot)?,
+            detail: engine
+                .grouped_action_rollup_browse_query_plan(&project_root_request(&snapshot))?,
         },
         QueryPlanReport {
             name: "load_recent_action_facts".to_string(),
@@ -545,7 +546,7 @@ mod tests {
             report
                 .query_plans
                 .iter()
-                .any(|plan| plan.name == "load_action_rollup_facts")
+                .any(|plan| plan.name == "grouped_action_rollup_browse")
         );
         assert!(
             report
