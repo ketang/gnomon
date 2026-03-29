@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod history_drag;
+pub mod model_mismatch;
 pub mod session_setup;
 pub mod tool_result_bloat;
 
