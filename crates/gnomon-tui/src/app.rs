@@ -1163,7 +1163,7 @@ impl App {
                     separator_span(),
                     Span::raw("t/m filters"),
                     separator_span(),
-                    Span::raw("p/c/a scope"),
+                    Span::raw("p/c/a structural scope"),
                     separator_span(),
                     Span::raw("x opp-filter"),
                     separator_span(),
@@ -2133,13 +2133,13 @@ impl App {
                 .find(|project| project.id == project_id)
                 .map(|project| project.display_name.clone())
                 .unwrap_or_else(|| format!("#{project_id}"));
-            parts.push(format!("project scope {name}"));
+            parts.push(format!("project: {name}"));
         }
         if let Some(category) = &self.ui_state.action_category {
-            parts.push(format!("category scope {category}"));
+            parts.push(format!("category: {category}"));
         }
         if let Some(action) = &self.ui_state.action {
-            parts.push(format!("action scope {}", action_label(action)));
+            parts.push(format!("action: {}", action_label(action)));
         }
         if !self.ui_state.row_filter.is_empty() {
             parts.push(format!("row {}", self.ui_state.row_filter));
@@ -7311,7 +7311,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_summary_labels_scoped_filters_as_scope() -> Result<()> {
+    fn filter_summary_describes_structural_scope_without_filter_language() -> Result<()> {
         let temp = tempdir()?;
         let mut app = App::new(
             make_test_config(temp.path()),
@@ -7329,10 +7329,13 @@ mod tests {
 
         let summary = app.filter_summary();
 
-        assert!(summary.contains("project scope"));
-        assert!(summary.contains("category scope"));
-        assert!(summary.contains("action scope"));
+        assert!(summary.contains("project: #1"));
+        assert!(summary.contains("category: editing"));
+        assert!(summary.contains("action: read file"));
         assert!(summary.contains("row src"));
+        assert!(!summary.contains("project scope"));
+        assert!(!summary.contains("category scope"));
+        assert!(!summary.contains("action scope"));
         Ok(())
     }
 
@@ -7878,7 +7881,7 @@ mod tests {
     }
 
     #[test]
-    fn render_footer_distinguishes_filter_and_scope_controls() -> Result<()> {
+    fn render_footer_demotes_structural_scope_controls() -> Result<()> {
         let temp = tempdir()?;
         let mut app = App::new(
             make_test_config(temp.path()),
@@ -7891,7 +7894,7 @@ mod tests {
         )?;
         let content = render_app_to_string(&mut app, 200, 40)?;
 
-        assert!(content.contains("p/c/a scope"));
+        assert!(content.contains("p/c/a structural scope"));
         assert!(content.contains("t/m filters"));
         assert!(content.contains("quit"));
         Ok(())
