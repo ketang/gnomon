@@ -18,6 +18,7 @@ use crossterm::terminal::{
 use gnomon_core::config::RuntimeConfig;
 use gnomon_core::db::Database;
 use gnomon_core::import::{StartupOpenReason, StartupWorkerEvent};
+use gnomon_core::opportunity::{OpportunityCategory, OpportunityConfidence};
 use gnomon_core::perf::{PerfLogger, PerfScope};
 use gnomon_core::query::{
     ActionKey, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState, FilterOptions,
@@ -554,6 +555,35 @@ fn badge_style(tone: BadgeTone) -> Style {
     }
 }
 
+fn opportunity_category_label(category: OpportunityCategory) -> &'static str {
+    match category {
+        OpportunityCategory::SessionSetup => "session setup",
+        OpportunityCategory::TaskSetup => "task setup",
+        OpportunityCategory::HistoryDrag => "history drag",
+        OpportunityCategory::Delegation => "delegation",
+        OpportunityCategory::ModelMismatch => "model mismatch",
+        OpportunityCategory::PromptYield => "prompt yield",
+        OpportunityCategory::SearchChurn => "search churn",
+        OpportunityCategory::ToolResultBloat => "tool-result bloat",
+    }
+}
+
+fn opportunity_confidence_label(confidence: OpportunityConfidence) -> &'static str {
+    match confidence {
+        OpportunityConfidence::Low => "low",
+        OpportunityConfidence::Medium => "medium",
+        OpportunityConfidence::High => "high",
+    }
+}
+
+fn confidence_color(confidence: OpportunityConfidence) -> Color {
+    match confidence {
+        OpportunityConfidence::Low => Color::DarkGray,
+        OpportunityConfidence::Medium => Color::Yellow,
+        OpportunityConfidence::High => Color::Red,
+    }
+}
+
 fn snapshot_state_badge(snapshot: &SnapshotBounds, has_newer_snapshot: bool) -> Span<'static> {
     if snapshot.is_bootstrap() {
         if has_newer_snapshot {
@@ -628,6 +658,7 @@ pub struct App {
     row_cache: Vec<CachedRows>,
     expanded_paths: Vec<BrowsePath>,
     selected_project_identity: Option<SelectedProjectIdentity>,
+    show_inspect_pane: bool,
 }
 
 impl App {
@@ -704,6 +735,7 @@ impl App {
             row_cache: Vec::new(),
             expanded_paths: Vec::new(),
             selected_project_identity: None,
+            show_inspect_pane: false,
         };
 
         let perf_logger = app.perf_logger.clone();
@@ -895,19 +927,32 @@ impl App {
     }
 
     fn render_body(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        if area.width >= WIDE_LAYOUT_WIDTH {
+        let (main_area, inspect_area) = if self.show_inspect_pane {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(6), Constraint::Length(12)])
+                .split(area);
+            (chunks[0], Some(chunks[1]))
+        } else {
+            (area, None)
+        };
+
+        if main_area.width >= WIDE_LAYOUT_WIDTH {
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-                .split(area);
+                .split(main_area);
             self.render_radial(frame, panes[0]);
             self.render_table(frame, panes[1]);
-            return;
+        } else {
+            match self.ui_state.pane_mode {
+                PaneMode::Table => self.render_table(frame, main_area),
+                PaneMode::Radial => self.render_radial(frame, main_area),
+            }
         }
 
-        match self.ui_state.pane_mode {
-            PaneMode::Table => self.render_table(frame, area),
-            PaneMode::Radial => self.render_radial(frame, area),
+        if let Some(inspect_area) = inspect_area {
+            self.render_inspect_pane(frame, inspect_area);
         }
     }
 
@@ -989,6 +1034,77 @@ impl App {
         );
     }
 
+    fn render_inspect_pane(&self, frame: &mut Frame<'_>, area: Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(
+                " Opportunity Details ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let lines = match self.selected_row() {
+            None => vec![Line::styled(
+                "No row selected",
+                Style::default().fg(Color::DarkGray),
+            )],
+            Some(row) if row.opportunities.is_empty() => vec![Line::styled(
+                "No opportunities detected for this row",
+                Style::default().fg(Color::DarkGray),
+            )],
+            Some(row) => {
+                let mut lines = Vec::new();
+                for annotation in &row.opportunities.annotations {
+                    if !lines.is_empty() {
+                        lines.push(Line::raw(""));
+                    }
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            opportunity_category_label(annotation.category),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw("  score "),
+                        Span::styled(
+                            format!("{:.2}", annotation.score),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::raw("  confidence "),
+                        Span::styled(
+                            opportunity_confidence_label(annotation.confidence),
+                            Style::default().fg(confidence_color(annotation.confidence)),
+                        ),
+                    ]));
+                    for piece in &annotation.evidence {
+                        lines.push(Line::from(vec![
+                            Span::styled("  • ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(piece.as_str()),
+                        ]));
+                    }
+                    if let Some(recommendation) = &annotation.recommendation {
+                        lines.push(Line::from(vec![
+                            Span::styled("  → ", Style::default().fg(Color::Green)),
+                            Span::styled(
+                                recommendation.as_str(),
+                                Style::default().fg(Color::Green),
+                            ),
+                        ]));
+                    }
+                }
+                lines
+            }
+        };
+
+        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, inner);
+    }
+
     fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
         let lines = match self.input_mode {
             InputMode::Normal => vec![
@@ -1012,6 +1128,8 @@ impl App {
                     Span::raw("Tab focus/pane"),
                     separator_span(),
                     Span::raw("o columns"),
+                    separator_span(),
+                    Span::raw("i inspect"),
                     separator_span(),
                     Span::raw("q quit"),
                 ]),
@@ -1328,6 +1446,10 @@ impl App {
             }
             KeyCode::Char('o') => {
                 self.input_mode = InputMode::ColumnChooser;
+                Ok(false)
+            }
+            KeyCode::Char('i') => {
+                self.show_inspect_pane = !self.show_inspect_pane;
                 Ok(false)
             }
             _ if self.focused_pane == PaneFocus::Table => self.handle_table_navigation_key(key),
