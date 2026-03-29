@@ -27,12 +27,18 @@ pub struct ResolvedProject {
     pub identity_kind: ProjectIdentityKind,
     pub canonical_key: String,
     pub display_name: String,
+    /// Canonical project root for Git-backed projects, or the normalized cwd path for path-backed projects.
     pub root_path: PathBuf,
+    /// Present when the project was resolved from a Git repository.
     pub git_root_path: Option<PathBuf>,
+    /// Present when Git resolution fell back to a path identity.
     pub git_origin: Option<String>,
+    /// Human-readable explanation for path-backed identities.
     pub identity_reason: Option<String>,
 }
 
+/// Resolves a project identity from a cwd using Git as the authoritative source when available.
+/// Git-backed projects collapse to a canonical root path; non-Git paths retain the normalized cwd.
 pub fn resolve_project_from_cwd(cwd: &Path) -> ResolvedProject {
     let normalized_cwd = normalize_path(cwd);
 
@@ -78,9 +84,12 @@ fn canonical_git_root(repo: &gix::Repository) -> Option<PathBuf> {
         }
 
         let common_dir = main_repo.common_dir();
+        // Bare or common-dir-backed repositories may not have a workdir; keep the shared repo dir.
         if common_dir.file_name().and_then(|name| name.to_str()) == Some(".git") {
             return common_dir.parent().map(PathBuf::from);
         }
+
+        return Some(common_dir.to_path_buf());
     }
 
     repo.workdir().map(PathBuf::from)
@@ -107,14 +116,15 @@ fn display_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::process::Command;
 
-    use anyhow::Result;
+    use anyhow::{Context, Result, bail};
     use tempfile::tempdir;
 
     use super::{
         PATH_REASON_GIT_ROOT_NOT_FOUND, ProjectIdentityKind, path_project, resolve_project_from_cwd,
     };
-    use crate::test_helpers::make_git_repo;
+    use crate::test_helpers::{make_git_repo, run_git};
 
     #[test]
     fn resolve_git_project_returns_git_kind() -> Result<()> {
@@ -187,6 +197,54 @@ mod tests {
         let project = path_project(&dir, "reason");
 
         assert_eq!(project.display_name, "cool-project-name");
+        Ok(())
+    }
+
+    #[test]
+    fn common_dir_backed_worktrees_use_the_shared_git_dir_for_identity() -> Result<()> {
+        let temp = tempdir()?;
+        let repo_root = temp.path().join("repo");
+        let bare_root = temp.path().join("repo.git");
+        let worktree_root = temp.path().join("agent-a");
+
+        make_git_repo(&repo_root)?;
+        run_git(&repo_root, ["branch", "-m", "main"])?;
+        run_git_args(&[
+            "clone",
+            "--bare",
+            repo_root.to_str().context("non-utf8 repo path")?,
+            bare_root.to_str().context("non-utf8 bare path")?,
+        ])?;
+        run_git_args(&[
+            "-C",
+            bare_root.to_str().context("non-utf8 bare path")?,
+            "worktree",
+            "add",
+            worktree_root.to_str().context("non-utf8 worktree path")?,
+            "main",
+        ])?;
+        fs::create_dir_all(worktree_root.join("nested"))?;
+
+        let project = resolve_project_from_cwd(&worktree_root.join("nested"));
+
+        assert_eq!(project.identity_kind, ProjectIdentityKind::Git);
+        assert_eq!(project.root_path, bare_root.clone());
+        assert_eq!(project.git_root_path, Some(bare_root));
+        Ok(())
+    }
+
+    fn run_git_args(args: &[&str]) -> Result<()> {
+        let output = Command::new("git")
+            .args(args)
+            .output()
+            .with_context(|| format!("unable to run git {:?}", args))?;
+        if !output.status.success() {
+            bail!(
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         Ok(())
     }
 }
