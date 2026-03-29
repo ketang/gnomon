@@ -4,6 +4,7 @@ use std::f64::consts::{FRAC_PI_2, TAU};
 use std::fs;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -44,6 +45,10 @@ use serde::{Deserialize, Serialize};
 const UI_STATE_FILENAME: &str = "tui-state.json";
 const REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const WIDE_LAYOUT_WIDTH: u16 = 120;
+const MAP_PANE_INNER_ASPECT_NUMERATOR: u16 = 9;
+const MAP_PANE_INNER_ASPECT_DENOMINATOR: u16 = 4;
+const MAP_PANE_MIN_WIDTH: u16 = 48;
+const STATISTICS_PANE_MIN_WIDTH: u16 = 56;
 const JUMP_MATCH_LIMIT: usize = 8;
 const RADIAL_CENTER_RADIUS: f64 = 0.24;
 const RADIAL_DESCENDANT_DEPTH_LIMIT: usize = 3;
@@ -959,10 +964,7 @@ impl App {
         };
 
         if main_area.width >= WIDE_LAYOUT_WIDTH {
-            let panes = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-                .split(main_area);
+            let panes = wide_layout_panes(main_area);
             self.render_radial(frame, panes[0]);
             self.render_table(frame, panes[1]);
         } else {
@@ -5889,6 +5891,30 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     horizontal[1]
 }
 
+fn wide_layout_panes(area: Rect) -> Rc<[Rect]> {
+    let map_width = wide_layout_map_pane_width(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(map_width), Constraint::Min(0)])
+        .split(area)
+}
+
+fn wide_layout_map_pane_width(area: Rect) -> u16 {
+    let max_map_width = area.width.saturating_sub(STATISTICS_PANE_MIN_WIDTH);
+    if max_map_width == 0 {
+        return area.width;
+    }
+
+    let ideal_inner_width = area
+        .height
+        .saturating_sub(2)
+        .saturating_mul(MAP_PANE_INNER_ASPECT_NUMERATOR)
+        / MAP_PANE_INNER_ASPECT_DENOMINATOR;
+    let ideal_map_width = ideal_inner_width.saturating_add(2);
+
+    ideal_map_width.clamp(MAP_PANE_MIN_WIDTH.min(max_map_width), max_map_width)
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::{Context, Result};
@@ -7378,6 +7404,26 @@ mod tests {
             "focus should be communicated by pane styling, not status text"
         );
         Ok(())
+    }
+
+    #[test]
+    fn wide_layout_map_width_tracks_terminal_height() {
+        let main_area = Rect::new(0, 0, 240, 49);
+
+        let panes = wide_layout_panes(main_area);
+
+        assert_eq!(panes[0].width, 107);
+        assert_eq!(panes[1].width, 133);
+    }
+
+    #[test]
+    fn wide_layout_map_width_preserves_statistics_minimum_width() {
+        let main_area = Rect::new(0, 0, 120, 29);
+
+        let panes = wide_layout_panes(main_area);
+
+        assert!(panes[1].width >= STATISTICS_PANE_MIN_WIDTH);
+        assert!(panes[0].width < main_area.width);
     }
 
     #[test]
