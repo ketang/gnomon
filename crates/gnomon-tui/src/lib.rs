@@ -1,4 +1,6 @@
 mod app;
+mod gnomon_sunburst;
+mod sunburst;
 
 use anyhow::Result;
 use gnomon_core::config::RuntimeConfig;
