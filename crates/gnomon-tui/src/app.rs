@@ -29,7 +29,7 @@ use gnomon_core::vcs::ProjectIdentityKind;
 use jiff::ToSpan;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as MatcherConfig, Matcher};
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -784,6 +784,24 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Render the TUI once into a fixed-size buffer and return the content as
+    /// a newline-delimited string. Used for non-interactive snapshot testing.
+    pub(crate) fn render_snapshot(&mut self, width: u16, height: u16) -> Result<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|frame| self.render(frame))?;
+
+        let buffer = terminal.backend().buffer();
+        let mut output = String::new();
+        for y in 0..height {
+            for x in 0..width {
+                output.push_str(buffer.cell((x, y)).map_or(" ", |c| c.symbol()));
+            }
+            output.push('\n');
+        }
+        Ok(output)
     }
 
     fn drain_status_updates(&mut self) {

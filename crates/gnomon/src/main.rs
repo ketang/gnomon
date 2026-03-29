@@ -53,6 +53,10 @@ enum Command {
         about = "Emit opportunity annotations with supporting evidence for heuristic calibration."
     )]
     Opportunities(Box<OpportunitiesArgs>),
+    #[command(
+        about = "Render the TUI once to stdout and exit. For snapshot and golden-file testing."
+    )]
+    Snapshot(Box<SnapshotArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -217,6 +221,20 @@ impl From<OpportunityConfidenceArg> for OpportunityConfidence {
     }
 }
 
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+struct SnapshotArgs {
+    /// Viewport width in columns.
+    #[arg(long, default_value_t = 120)]
+    width: u16,
+
+    /// Viewport height in rows.
+    #[arg(long, default_value_t = 40)]
+    height: u16,
+
+    #[command(flatten)]
+    startup: StartupArgs,
+}
+
 #[derive(Debug, Clone, Args, Default, PartialEq, Eq)]
 struct StartupArgs {
     /// Root hierarchy to open on startup when explicitly requested.
@@ -312,6 +330,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::Benchmark(args)) => run_benchmark_command(&config, &args),
         Some(Command::Report(args)) => run_report_command(&config, &args),
         Some(Command::Opportunities(args)) => run_opportunities_command(&config, &args),
+        Some(Command::Snapshot(args)) => run_snapshot_command(&config, &args),
     }
 }
 
@@ -364,6 +383,32 @@ fn run_report_command(config: &RuntimeConfig, args: &ReportArgs) -> Result<()> {
     let perf_logger = PerfLogger::from_env(&config.state_dir)?;
     let report = build_browse_report(config, args, perf_logger)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn run_snapshot_command(config: &RuntimeConfig, args: &SnapshotArgs) -> Result<()> {
+    config.ensure_dirs()?;
+    let mut database = Database::open(&config.db_path)?;
+    let _scan_report = scan_source_manifest(&mut database, &config.source_root)?;
+    let mut startup_import =
+        start_startup_import(database.connection(), &config.db_path, &config.source_root)?;
+    let snapshot = startup_import.snapshot.clone();
+    let open_reason = startup_import.open_reason;
+    let startup_status_message = startup_import.startup_status_message.clone();
+    let startup_browse_state = args.startup.build_startup_browse_state()?;
+    // Drain the import worker so it doesn't outlive the render.
+    drop(startup_import.take_status_updates());
+
+    let output = gnomon_tui::render_snapshot(
+        config,
+        snapshot,
+        open_reason,
+        startup_status_message,
+        startup_browse_state,
+        args.width,
+        args.height,
+    )?;
+    print!("{output}");
     Ok(())
 }
 
@@ -820,6 +865,7 @@ mod tests {
             Some(Command::Benchmark(_)) => panic!("expected db command"),
             Some(Command::Report(_)) => panic!("expected db command"),
             Some(Command::Opportunities(_)) => panic!("expected db command"),
+            Some(Command::Snapshot(_)) => panic!("expected db command"),
             None => panic!("expected db command"),
         }
     }
@@ -851,6 +897,7 @@ mod tests {
             Some(Command::Benchmark(_)) => panic!("expected db command"),
             Some(Command::Report(_)) => panic!("expected db command"),
             Some(Command::Opportunities(_)) => panic!("expected db command"),
+            Some(Command::Snapshot(_)) => panic!("expected db command"),
             None => panic!("expected db command"),
         }
     }

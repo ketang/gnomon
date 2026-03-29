@@ -34,6 +34,30 @@ pub fn run(
     .run()
 }
 
+/// Render the TUI once with the given viewport dimensions and return the
+/// frame content as a newline-delimited string. Exits immediately without
+/// entering an interactive event loop or requiring a terminal.
+pub fn render_snapshot(
+    config: &RuntimeConfig,
+    snapshot: SnapshotBounds,
+    startup_open_reason: StartupOpenReason,
+    startup_status_message: Option<String>,
+    startup_browse_state: Option<StartupBrowseState>,
+    width: u16,
+    height: u16,
+) -> Result<String> {
+    let mut app = app::App::new(
+        config.clone(),
+        snapshot,
+        startup_open_reason,
+        startup_status_message,
+        startup_browse_state,
+        None,
+        None,
+    )?;
+    app.render_snapshot(width, height)
+}
+
 pub fn probe_startup(
     config: &RuntimeConfig,
     snapshot: SnapshotBounds,
@@ -67,7 +91,7 @@ mod tests {
     use serde_json::Value;
     use tempfile::tempdir;
 
-    use super::{StartupBrowseState, probe_startup};
+    use super::{StartupBrowseState, probe_startup, render_snapshot};
 
     #[test]
     fn probe_startup_emits_tui_perf_events() -> Result<()> {
@@ -107,6 +131,34 @@ mod tests {
                 .any(|op| op == "tui.refresh_snapshot_status")
         );
         assert!(operations.iter().any(|op| op == "query.browse"));
+        Ok(())
+    }
+
+    #[test]
+    fn render_snapshot_produces_expected_row_count() -> Result<()> {
+        let temp = tempdir()?;
+        let width = 80;
+        let height = 24;
+
+        let output = render_snapshot(
+            &make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            Some(StartupBrowseState {
+                root: RootView::ProjectHierarchy,
+                path: BrowsePath::Root,
+            }),
+            width,
+            height,
+        )?;
+
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), height as usize);
+        assert!(
+            !output.trim().is_empty(),
+            "snapshot output should not be blank"
+        );
         Ok(())
     }
 
