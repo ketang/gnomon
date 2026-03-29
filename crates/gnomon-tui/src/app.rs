@@ -1014,7 +1014,9 @@ impl App {
                     separator_span(),
                     Span::raw("up/down rows"),
                     separator_span(),
-                    Span::raw("t/m/p/c/a filters"),
+                    Span::raw("t/m filters"),
+                    separator_span(),
+                    Span::raw("p/c/a scope"),
                     separator_span(),
                     Span::raw("0 clear"),
                     separator_span(),
@@ -1874,13 +1876,13 @@ impl App {
                 .find(|project| project.id == project_id)
                 .map(|project| project.display_name.clone())
                 .unwrap_or_else(|| format!("#{project_id}"));
-            parts.push(format!("project {name}"));
+            parts.push(format!("project scope {name}"));
         }
         if let Some(category) = &self.ui_state.action_category {
-            parts.push(format!("category {category}"));
+            parts.push(format!("category scope {category}"));
         }
         if let Some(action) = &self.ui_state.action {
-            parts.push(format!("action {}", action_label(action)));
+            parts.push(format!("action scope {}", action_label(action)));
         }
         if !self.ui_state.row_filter.is_empty() {
             parts.push(format!("row {}", self.ui_state.row_filter));
@@ -3195,15 +3197,21 @@ impl PersistedUiState {
                 self.path = BrowsePath::Root;
             }
         }
+
+        self.clear_scoped_filters();
     }
 
     fn clear_filters(&mut self) {
         self.time_window = TimeWindowPreset::All;
         self.model = None;
+        self.clear_scoped_filters();
+        self.row_filter.clear();
+    }
+
+    fn clear_scoped_filters(&mut self) {
         self.project_id = None;
         self.action_category = None;
         self.action = None;
-        self.row_filter.clear();
     }
 }
 
@@ -6514,6 +6522,10 @@ mod tests {
             path: BrowsePath::Category {
                 category: "editing".to_string(),
             },
+            project_id: Some(1),
+            action_category: Some("editing".to_string()),
+            action: Some(sample_action("read file")),
+            row_filter: "src".to_string(),
             ..PersistedUiState::default()
         };
 
@@ -6521,11 +6533,21 @@ mod tests {
 
         assert_eq!(state.root, RootView::CategoryHierarchy);
         assert_eq!(state.path, BrowsePath::Root);
+        assert_eq!(state.project_id, None);
+        assert_eq!(state.action_category, None);
+        assert_eq!(state.action, None);
+        assert_eq!(state.row_filter, "src");
     }
 
     #[test]
     fn startup_browse_state_applies_explicit_drill_down() {
-        let mut state = PersistedUiState::default();
+        let mut state = PersistedUiState {
+            project_id: Some(1),
+            action_category: Some("editing".to_string()),
+            action: Some(sample_action("read file")),
+            row_filter: "src".to_string(),
+            ..PersistedUiState::default()
+        };
         let startup_browse_state = StartupBrowseState {
             root: RootView::ProjectHierarchy,
             path: BrowsePath::ProjectCategory {
@@ -6544,6 +6566,36 @@ mod tests {
                 category: "editing".to_string(),
             }
         );
+        assert_eq!(state.project_id, None);
+        assert_eq!(state.action_category, None);
+        assert_eq!(state.action, None);
+        assert_eq!(state.row_filter, "src");
+    }
+
+    #[test]
+    fn filter_summary_labels_scoped_filters_as_scope() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        app.ui_state.project_id = Some(1);
+        app.ui_state.action_category = Some("editing".to_string());
+        app.ui_state.action = Some(sample_action("read file"));
+        app.ui_state.row_filter = "src".to_string();
+
+        let summary = app.filter_summary();
+
+        assert!(summary.contains("project scope"));
+        assert!(summary.contains("category scope"));
+        assert!(summary.contains("action scope"));
+        assert!(summary.contains("row src"));
+        Ok(())
     }
 
     #[test]
@@ -7080,6 +7132,26 @@ mod tests {
             content.contains("quit"),
             "footer should contain 'quit' key hint"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn render_footer_distinguishes_filter_and_scope_controls() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        let content = render_app_to_string(&mut app, 200, 40)?;
+
+        assert!(content.contains("p/c/a scope"));
+        assert!(content.contains("t/m filters"));
+        assert!(content.contains("quit"));
         Ok(())
     }
 
