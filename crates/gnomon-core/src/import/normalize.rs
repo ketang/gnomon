@@ -8,6 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
 
 const PRIMARY_STREAM_SEQUENCE_NO: i64 = 0;
+const SOURCE_LINE_PREVIEW_CHAR_LIMIT: usize = 160;
 
 #[derive(Debug, Clone)]
 pub struct NormalizeJsonlFileParams {
@@ -52,8 +53,9 @@ pub fn normalize_jsonl_file(
 
         let record: Value = serde_json::from_str(&line).with_context(|| {
             format!(
-                "unable to parse json on line {line_no} from {}",
-                params.path.display()
+                "unable to parse json on line {line_no} from {} (preview: {})",
+                params.path.display(),
+                preview_source_line(&line)
             )
         })?;
 
@@ -108,6 +110,28 @@ pub fn normalize_jsonl_file(
         message_count: state.message_states.len(),
         turn_count,
     }))
+}
+
+fn preview_source_line(line: &str) -> String {
+    if line.is_empty() {
+        return "<empty line>".to_string();
+    }
+
+    let mut preview = String::new();
+    let mut chars = line.chars();
+
+    for _ in 0..SOURCE_LINE_PREVIEW_CHAR_LIMIT {
+        let Some(ch) = chars.next() else {
+            return preview;
+        };
+        preview.extend(ch.escape_default());
+    }
+
+    if chars.next().is_some() {
+        preview.push_str("...");
+    }
+
+    preview
 }
 
 fn purge_existing_import(
@@ -1440,6 +1464,45 @@ mod tests {
         assert!(rendered.contains("line 2"));
         assert!(rendered.contains("unable to insert normalized message"));
         assert!(rendered.contains("stream_id"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_errors_include_truncated_source_line_preview() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let fixture_path = temp.path().join("bad.jsonl");
+        let malformed_line = format!(
+            "{{\"type\":\"user\",\"uuid\":\"broken\",\"message\":{{\"role\":\"user\",\"content\":\"{}\"}} invalid tail",
+            "x".repeat(200)
+        );
+        std::fs::write(
+            &fixture_path,
+            format!(
+                "{{\"type\":\"user\",\"uuid\":\"ok\",\"timestamp\":\"2026-03-26T10:00:00Z\",\"sessionId\":\"session-1\",\"message\":{{\"role\":\"user\",\"content\":\"ok\"}}}}\n{malformed_line}\n"
+            ),
+        )?;
+
+        let mut db = Database::open(&db_path)?;
+        let ids = seed_import_context(db.connection_mut(), "bad.jsonl")?;
+        let error = normalize_jsonl_file(
+            db.connection_mut(),
+            &NormalizeJsonlFileParams {
+                project_id: ids.project_id,
+                source_file_id: ids.source_file_id,
+                import_chunk_id: ids.import_chunk_id,
+                path: fixture_path.clone(),
+            },
+        )
+        .expect_err("malformed json fixture should fail");
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(&fixture_path.display().to_string()));
+        assert!(rendered.contains("line 2"));
+        assert!(rendered.contains("preview: {\\\"type\\\":\\\"user\\\""));
+        assert!(rendered.contains("..."));
+        assert!(!rendered.contains(&"x".repeat(200)));
 
         Ok(())
     }
