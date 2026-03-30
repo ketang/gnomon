@@ -64,7 +64,6 @@ const MAP_PANE_INNER_ASPECT_DENOMINATOR: u16 = 4;
 const MAP_PANE_MIN_WIDTH: u16 = 48;
 const STATISTICS_PANE_MIN_WIDTH: u16 = 56;
 const JUMP_MATCH_LIMIT: usize = 8;
-const RADIAL_DESCENDANT_DEPTH_LIMIT: usize = 3;
 const ACTIVITY_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 const VIEW_LOAD_PHASE_TOTAL: usize = 8;
 const JUMP_TARGET_PHASE_TOTAL: usize = 4;
@@ -3368,90 +3367,25 @@ fn build_radial_descendant_layers(
         return Ok(Vec::new());
     }
 
-    let mut layers = Vec::new();
-    let mut query_path = request.active_path.clone();
-    let mut span = initial_span;
+    let rows = cached_browse(
+        query_cache,
+        query_engine,
+        BrowseRequest {
+            snapshot: request.snapshot.clone(),
+            root: request.ui_state.root,
+            lens: request.ui_state.lens,
+            filters: request.filters.clone(),
+            path: request.active_path.clone(),
+        },
+        browse_stats,
+    )?;
 
-    for _ in 0..RADIAL_DESCENDANT_DEPTH_LIMIT {
-        let rows = cached_browse(
-            query_cache,
-            query_engine,
-            BrowseRequest {
-                snapshot: request.snapshot.clone(),
-                root: request.ui_state.root,
-                lens: request.ui_state.lens,
-                filters: request.filters.clone(),
-                path: query_path.clone(),
-            },
-            browse_stats,
-        )?;
-
-        if rows.is_empty() {
-            break;
-        }
-
-        let layer = build_radial_layer(&rows, request.ui_state.lens, None, span);
-        layers.push(layer.clone());
-
-        let Some(largest_index) = largest_segment_index(&layer) else {
-            break;
-        };
-
-        span = segment_child_span(&layer, largest_index);
-
-        let Some(next_path) =
-            next_browse_path(&request.ui_state.root, &query_path, &rows[largest_index])
-        else {
-            break;
-        };
-        query_path = next_path;
+    if rows.is_empty() {
+        return Ok(Vec::new());
     }
 
-    Ok(layers)
-}
-
-fn largest_segment_index(layer: &RadialLayer) -> Option<usize> {
-    if layer.segments.is_empty() {
-        return None;
-    }
-    layer
-        .segments
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| {
-            a.value
-                .partial_cmp(&b.value)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(index, _)| index)
-}
-
-fn segment_child_span(layer: &RadialLayer, target_index: usize) -> RadialSpan {
-    if layer.segments.is_empty() {
-        return layer.span;
-    }
-
-    let total_weight = if layer.total_value > 0.0 {
-        layer.total_value
-    } else {
-        layer.segments.len() as f64
-    };
-
-    let mut cursor = 0.0;
-    for (index, segment) in layer.segments.iter().enumerate() {
-        let weight = if layer.total_value > 0.0 {
-            segment.value.max(0.0)
-        } else {
-            1.0
-        };
-        let sweep = (weight / total_weight) * layer.span.sweep;
-        if index == target_index {
-            return layer.span.child_span(cursor, sweep);
-        }
-        cursor += sweep;
-    }
-
-    layer.span
+    let layer = build_radial_layer(&rows, request.ui_state.lens, None, initial_span);
+    Ok(vec![layer])
 }
 
 fn project_root_for_state(
@@ -6144,6 +6078,43 @@ mod tests {
     }
 
     #[test]
+    fn radial_descendant_layers_show_children_not_largest_branch() -> Result<()> {
+        // Regression test for issue #70: selecting a node should produce
+        // exactly one descendant layer (its immediate children), not
+        // auto-follow the largest child branch deeper.
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        app.ui_state.root = RootView::ProjectHierarchy;
+        app.ui_state.path = BrowsePath::Root;
+
+        // Select a project node — its children (categories) should appear as
+        // exactly one descendant layer.  The old code would auto-follow the
+        // largest category and produce up to 3 descendant layers.
+        let active_path = BrowsePath::Project { project_id: 1 };
+        let filters = current_query_filters_for(&app.ui_state, &app.snapshot)?;
+        let mut browse_stats = BrowseFanoutStats::default();
+
+        let ctx = app.build_radial_context(&filters, &active_path, None, &mut browse_stats)?;
+
+        assert!(
+            ctx.descendant_layers.len() <= 1,
+            "descendant layers should contain at most 1 layer (immediate children), \
+             got {} — the renderer must not auto-follow the largest child branch",
+            ctx.descendant_layers.len()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn radial_model_marks_selected_outer_segment() {
         let rows = vec![
             sample_row("src", Some("/tmp/project/src".to_string())),
@@ -8004,98 +7975,6 @@ mod tests {
             snapshot_coverage_footer_text(&SnapshotCoverageSummary::default()),
             "coverage: no imported data is visible yet"
         );
-    }
-
-    #[test]
-    fn largest_segment_index_picks_highest_value() {
-        let layer = build_radial_layer(
-            &[
-                radial_row(RadialRowSpec {
-                    key: "project:1",
-                    label: "small",
-                    kind: RollupRowKind::Project,
-                    value: 3.0,
-                    project_id: Some(1),
-                    category: None,
-                    action: None,
-                    full_path: None,
-                }),
-                radial_row(RadialRowSpec {
-                    key: "project:2",
-                    label: "large",
-                    kind: RollupRowKind::Project,
-                    value: 10.0,
-                    project_id: Some(2),
-                    category: None,
-                    action: None,
-                    full_path: None,
-                }),
-                radial_row(RadialRowSpec {
-                    key: "project:3",
-                    label: "medium",
-                    kind: RollupRowKind::Project,
-                    value: 5.0,
-                    project_id: Some(3),
-                    category: None,
-                    action: None,
-                    full_path: None,
-                }),
-            ],
-            MetricLens::UncachedInput,
-            None,
-            RadialSpan::full(),
-        );
-        assert_eq!(largest_segment_index(&layer), Some(1));
-    }
-
-    #[test]
-    fn segment_child_span_computes_proportional_arc() {
-        // Three segments: 25%, 50%, 25% of a half-circle
-        let layer = build_radial_layer(
-            &[
-                radial_row(RadialRowSpec {
-                    key: "a",
-                    label: "a",
-                    kind: RollupRowKind::ActionCategory,
-                    value: 2.0,
-                    project_id: None,
-                    category: Some("a"),
-                    action: None,
-                    full_path: None,
-                }),
-                radial_row(RadialRowSpec {
-                    key: "b",
-                    label: "b",
-                    kind: RollupRowKind::ActionCategory,
-                    value: 4.0,
-                    project_id: None,
-                    category: Some("b"),
-                    action: None,
-                    full_path: None,
-                }),
-                radial_row(RadialRowSpec {
-                    key: "c",
-                    label: "c",
-                    kind: RollupRowKind::ActionCategory,
-                    value: 2.0,
-                    project_id: None,
-                    category: Some("c"),
-                    action: None,
-                    full_path: None,
-                }),
-            ],
-            MetricLens::UncachedInput,
-            None,
-            RadialSpan {
-                start: 0.0,
-                sweep: TAU / 2.0,
-            },
-        );
-
-        // Largest is index 1 ("b", 50% of the half-circle)
-        let span = segment_child_span(&layer, 1);
-        // Segment "a" occupies 0..TAU/8, "b" occupies TAU/8..3*TAU/8
-        assert_span_close(span, TAU / 8.0, TAU / 4.0);
     }
 
     #[test]
