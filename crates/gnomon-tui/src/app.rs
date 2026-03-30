@@ -3283,7 +3283,7 @@ fn build_radial_context_for_state(
     request: RadialContextRequest<'_>,
     browse_stats: &mut BrowseFanoutStats,
 ) -> Result<RadialContext> {
-    let mut perf = PerfScope::new(perf_logger, "tui.build_radial_context");
+    let mut perf = PerfScope::new_verbose(perf_logger, "tui.build_radial_context");
     perf.field("snapshot", request.snapshot);
     perf.field("root", request.ui_state.root);
     perf.field("path", request.active_path);
@@ -6732,7 +6732,7 @@ mod tests {
     fn app_new_with_perf_logger_emits_tui_and_query_events() -> Result<()> {
         let temp = tempdir()?;
         let log_path = temp.path().join("perf.jsonl");
-        let logger = PerfLogger::open(log_path.clone())?;
+        let logger = PerfLogger::open_jsonl(log_path.clone())?;
 
         let _app = App::new(
             make_test_config(temp.path()),
@@ -6779,7 +6779,7 @@ mod tests {
         )?;
 
         let log_path = temp.path().join("perf.jsonl");
-        let logger = PerfLogger::open(log_path.clone())?;
+        let logger = PerfLogger::open_jsonl(log_path.clone())?;
 
         let project_id = {
             let database = Database::open_read_only(&validation.db_path)?;

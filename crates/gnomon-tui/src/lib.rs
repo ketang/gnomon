@@ -102,7 +102,7 @@ mod tests {
     fn probe_startup_emits_tui_perf_events() -> Result<()> {
         let temp = tempdir()?;
         let log_path = temp.path().join("perf.jsonl");
-        let logger = PerfLogger::open(log_path.clone())?;
+        let logger = PerfLogger::open_jsonl(log_path.clone())?;
 
         probe_startup(
             &make_test_config(temp.path()),
