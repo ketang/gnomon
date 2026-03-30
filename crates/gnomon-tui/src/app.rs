@@ -22,9 +22,12 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use gnomon_core::browse_cache::{BrowseCacheStore, default_browse_cache_path};
 use gnomon_core::config::RuntimeConfig;
-use gnomon_core::db::Database;
-use gnomon_core::import::{StartupOpenReason, StartupWorkerEvent};
+use gnomon_core::db::{Database, reset_sqlite_database, sqlite_artifact_size_bytes};
+use gnomon_core::import::{
+    StartupOpenReason, StartupWorkerEvent, import_all, scan_source_manifest,
+};
 use gnomon_core::opportunity::{OpportunityCategory, OpportunityConfidence};
 use gnomon_core::perf::{PerfLogger, PerfScope};
 use gnomon_core::query::{
@@ -187,6 +190,13 @@ impl QueryResultCache {
         self.snapshots.retain(|bucket| &bucket.snapshot == snapshot);
     }
 
+    fn clear_domain(&mut self, domain: QueryCacheDomain) {
+        for bucket in &mut self.snapshots {
+            bucket.entries.retain(|key, _| key.domain != domain);
+        }
+        self.stats.remove(&domain);
+    }
+
     fn cached<V>(&self, snapshot: &SnapshotBounds, key: &QueryCacheKey) -> Option<V>
     where
         V: Clone + Any + 'static,
@@ -236,11 +246,21 @@ struct QueryWorker {
 }
 
 impl QueryWorker {
-    fn spawn(db_path: PathBuf, perf_logger: Option<PerfLogger>) -> Self {
+    fn spawn(
+        db_path: PathBuf,
+        browse_cache_path: PathBuf,
+        perf_logger: Option<PerfLogger>,
+    ) -> Self {
         let (request_tx, request_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         let handle = thread::spawn(move || {
-            run_query_worker(db_path, perf_logger, request_rx, result_tx);
+            run_query_worker(
+                db_path,
+                browse_cache_path,
+                perf_logger,
+                request_rx,
+                result_tx,
+            );
         });
 
         Self {
@@ -645,7 +665,9 @@ fn phase_label_for(task: PendingTaskKind, phase: &str) -> Option<&'static str> {
 }
 
 pub struct App {
+    config: RuntimeConfig,
     database: Database,
+    browse_cache: BrowseCacheStore,
     worker: QueryWorker,
     ui_state_path: PathBuf,
     ui_state: PersistedUiState,
@@ -678,6 +700,7 @@ pub struct App {
     expanded_paths: Vec<BrowsePath>,
     selected_project_identity: Option<SelectedProjectIdentity>,
     show_inspect_pane: bool,
+    pending_confirmation: Option<ConfirmationAction>,
 }
 
 impl App {
@@ -716,9 +739,16 @@ impl App {
         let focused_pane = PaneFocus::from_pane_mode(ui_state.pane_mode);
 
         let database = Database::open(&config.db_path)?;
-        let worker = QueryWorker::spawn(config.db_path.clone(), perf_logger.clone());
+        let browse_cache = BrowseCacheStore::open(default_browse_cache_path(&config.state_dir))?;
+        let worker = QueryWorker::spawn(
+            config.db_path.clone(),
+            default_browse_cache_path(&config.state_dir),
+            perf_logger.clone(),
+        );
         let mut app = Self {
+            config,
             database,
+            browse_cache,
             worker,
             ui_state_path,
             ui_state,
@@ -756,6 +786,7 @@ impl App {
             expanded_paths: Vec::new(),
             selected_project_identity: None,
             show_inspect_pane: false,
+            pending_confirmation: None,
         };
 
         let perf_logger = app.perf_logger.clone();
@@ -764,6 +795,7 @@ impl App {
         let initial_view = load_view_for_state(
             &query_engine,
             &mut app.query_cache,
+            &mut app.browse_cache,
             perf_logger,
             snapshot,
             app.ui_state.clone(),
@@ -888,7 +920,7 @@ impl App {
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(7),
+                Constraint::Length(9),
                 Constraint::Min(10),
                 Constraint::Length(4),
             ])
@@ -902,6 +934,11 @@ impl App {
             InputMode::JumpInput => self.render_jump_overlay(frame),
             InputMode::BreadcrumbPicker => self.render_breadcrumb_overlay(frame),
             InputMode::ColumnChooser => self.render_columns_overlay(frame),
+            InputMode::BrowseCacheMenu => self.render_browse_cache_overlay(frame),
+            InputMode::BrowseCacheConfirm | InputMode::DatabaseConfirm => {
+                self.render_confirmation_overlay(frame)
+            }
+            InputMode::DatabaseMenu => self.render_database_overlay(frame),
             InputMode::Normal | InputMode::FilterInput => {}
         }
     }
@@ -957,6 +994,8 @@ impl App {
         ];
 
         lines.push(self.header_detail_line());
+        lines.push(self.browse_cache_header_line());
+        lines.push(self.database_header_line());
 
         let header = Paragraph::new(Text::from(lines))
             .block(Block::default().borders(Borders::ALL).title("Status"))
@@ -1189,6 +1228,10 @@ impl App {
                     Span::raw("g jump"),
                     separator_span(),
                     Span::raw("r refresh"),
+                    separator_span(),
+                    Span::raw("B cache"),
+                    separator_span(),
+                    Span::raw("D database"),
                 ]),
                 Line::from({
                     let mut spans = vec![
@@ -1297,6 +1340,44 @@ impl App {
                     )),
                 ]),
             ],
+            InputMode::BrowseCacheMenu => vec![
+                Line::from(vec![
+                    badge("browse cache", BadgeTone::Accent),
+                    separator_span(),
+                    Span::raw("c clear, r rebuild, Esc close"),
+                ]),
+                Line::from(vec![
+                    badge("status", BadgeTone::Muted),
+                    separator_span(),
+                    Span::raw(
+                        "Rebuild clears persisted entries, resets live browse cache state, and reloads the current view.",
+                    ),
+                ]),
+            ],
+            InputMode::BrowseCacheConfirm => vec![Line::from(vec![
+                badge("confirm", BadgeTone::Warning),
+                separator_span(),
+                Span::raw("Enter confirms. Esc cancels."),
+            ])],
+            InputMode::DatabaseMenu => vec![
+                Line::from(vec![
+                    badge("database", BadgeTone::Accent),
+                    separator_span(),
+                    Span::raw("r refresh status, b rebuild database, Esc close"),
+                ]),
+                Line::from(vec![
+                    badge("warning", BadgeTone::Warning),
+                    separator_span(),
+                    Span::raw(
+                        "Database rebuild is separate from browse-cache maintenance and reimports the full derived cache.",
+                    ),
+                ]),
+            ],
+            InputMode::DatabaseConfirm => vec![Line::from(vec![
+                badge("confirm", BadgeTone::Warning),
+                separator_span(),
+                Span::raw("Enter confirms. Esc cancels."),
+            ])],
         };
 
         let footer = Paragraph::new(Text::from(lines))
@@ -1420,6 +1501,117 @@ impl App {
         frame.render_widget(popup, area);
     }
 
+    fn render_browse_cache_overlay(&self, frame: &mut Frame<'_>) {
+        let stats = self.browse_cache.stats().ok();
+        let summary = stats
+            .map(|stats| {
+                format!(
+                    "entries: {}  |  payload: {}",
+                    stats.entry_count,
+                    format_storage_bytes(stats.total_payload_bytes)
+                )
+            })
+            .unwrap_or_else(|| "browse-cache stats unavailable".to_string());
+        self.render_popup(
+            frame,
+            "Browse Cache",
+            76,
+            12,
+            vec![
+                Line::from("Persisted browse-cache management"),
+                Line::from(""),
+                Line::from(summary),
+                Line::from(""),
+                Line::from("c clear cache"),
+                Line::from("r rebuild cache from the current view"),
+                Line::from("Esc closes without changes"),
+            ],
+        );
+    }
+
+    fn render_database_overlay(&self, frame: &mut Frame<'_>) {
+        let size_text = sqlite_artifact_size_bytes(&self.config.db_path)
+            .map(format_storage_bytes)
+            .unwrap_or_else(|_| "unavailable".to_string());
+        self.render_popup(
+            frame,
+            "Database",
+            88,
+            13,
+            vec![
+                Line::from("Database status and maintenance"),
+                Line::from(""),
+                Line::from(format!("path: {}", self.config.db_path.display())),
+                Line::from(format!("size: {size_text}")),
+                Line::from(format!(
+                    "current snapshot: publish_seq <= {} ({} chunks)",
+                    self.snapshot.max_publish_seq, self.snapshot.published_chunk_count
+                )),
+                Line::from(""),
+                Line::from("r refresh database status"),
+                Line::from("b rebuild database and reload the current view"),
+                Line::from("Esc closes without changes"),
+            ],
+        );
+    }
+
+    fn render_confirmation_overlay(&self, frame: &mut Frame<'_>) {
+        let (title, lines) = match self.pending_confirmation {
+            Some(ConfirmationAction::ClearBrowseCache) => (
+                "Confirm Browse-Cache Clear",
+                vec![
+                    Line::from("Clear persisted browse-cache contents?"),
+                    Line::from("The app remains usable immediately."),
+                    Line::from(""),
+                    Line::from("Enter confirms. Esc cancels."),
+                ],
+            ),
+            Some(ConfirmationAction::RebuildBrowseCache) => (
+                "Confirm Browse-Cache Rebuild",
+                vec![
+                    Line::from("Rebuild the browse cache from the current visible view?"),
+                    Line::from(
+                        "This clears persisted entries, resets live browse cache state, and reloads the current view.",
+                    ),
+                    Line::from(""),
+                    Line::from("Enter confirms. Esc cancels."),
+                ],
+            ),
+            Some(ConfirmationAction::RebuildDatabase) => (
+                "Confirm Database Rebuild",
+                vec![
+                    Line::from("Rebuild the derived usage database?"),
+                    Line::from(
+                        "This is separate from browse-cache maintenance and reruns source scan plus full import.",
+                    ),
+                    Line::from(""),
+                    Line::from("Enter confirms. Esc cancels."),
+                ],
+            ),
+            None => (
+                "Confirm",
+                vec![Line::from("No pending action."), Line::from("Esc closes.")],
+            ),
+        };
+        self.render_popup(frame, title, 84, 11, lines);
+    }
+
+    fn render_popup(
+        &self,
+        frame: &mut Frame<'_>,
+        title: &'static str,
+        width: u16,
+        height: u16,
+        lines: Vec<Line<'static>>,
+    ) {
+        let area = centered_rect(frame.area(), width, height);
+        frame.render_widget(Clear, area);
+        let popup = Paragraph::new(Text::from(lines))
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(popup, area);
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         match self.input_mode {
             InputMode::Normal => self.handle_normal_key(key),
@@ -1427,6 +1619,11 @@ impl App {
             InputMode::JumpInput => self.handle_jump_input(key),
             InputMode::BreadcrumbPicker => self.handle_breadcrumb_picker(key),
             InputMode::ColumnChooser => self.handle_column_key(key),
+            InputMode::BrowseCacheMenu => self.handle_browse_cache_menu(key),
+            InputMode::BrowseCacheConfirm | InputMode::DatabaseConfirm => {
+                self.handle_confirmation_key(key)
+            }
+            InputMode::DatabaseMenu => self.handle_database_menu(key),
         }
     }
 
@@ -1530,6 +1727,14 @@ impl App {
             }
             KeyCode::Char('o') => {
                 self.input_mode = InputMode::ColumnChooser;
+                Ok(false)
+            }
+            KeyCode::Char('B') => {
+                self.input_mode = InputMode::BrowseCacheMenu;
+                Ok(false)
+            }
+            KeyCode::Char('D') => {
+                self.input_mode = InputMode::DatabaseMenu;
                 Ok(false)
             }
             KeyCode::Char('i') => {
@@ -1715,6 +1920,58 @@ impl App {
         Ok(false)
     }
 
+    fn handle_browse_cache_menu(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                self.pending_confirmation = None;
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Char('c') => {
+                self.pending_confirmation = Some(ConfirmationAction::ClearBrowseCache);
+                self.input_mode = InputMode::BrowseCacheConfirm;
+            }
+            KeyCode::Char('r') => {
+                self.pending_confirmation = Some(ConfirmationAction::RebuildBrowseCache);
+                self.input_mode = InputMode::BrowseCacheConfirm;
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn handle_database_menu(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                self.pending_confirmation = None;
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Char('r') => {
+                self.refresh_snapshot_status()?;
+                self.status_message = Some(StatusMessage::info("Database status refreshed."));
+            }
+            KeyCode::Char('b') => {
+                self.pending_confirmation = Some(ConfirmationAction::RebuildDatabase);
+                self.input_mode = InputMode::DatabaseConfirm;
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn handle_confirmation_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                self.pending_confirmation = None;
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Enter => {
+                self.execute_confirmation_action()?;
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
     fn descend_into_selection(&mut self) -> Result<()> {
         let Some(row) = self.selected_tree_row().cloned() else {
             return Ok(());
@@ -1854,6 +2111,126 @@ impl App {
         perf.field("has_newer_snapshot", self.has_newer_snapshot);
         perf.finish_ok();
         Ok(())
+    }
+
+    fn execute_confirmation_action(&mut self) -> Result<()> {
+        let action = self.pending_confirmation;
+        self.pending_confirmation = None;
+        self.input_mode = InputMode::Normal;
+
+        match action {
+            Some(ConfirmationAction::ClearBrowseCache) => self.clear_browse_cache(),
+            Some(ConfirmationAction::RebuildBrowseCache) => self.rebuild_browse_cache(),
+            Some(ConfirmationAction::RebuildDatabase) => self.rebuild_database(),
+            None => Ok(()),
+        }
+    }
+
+    fn clear_browse_cache(&mut self) -> Result<()> {
+        self.browse_cache.clear()?;
+        self.status_message = Some(StatusMessage::info("Cleared persisted browse cache."));
+        Ok(())
+    }
+
+    fn rebuild_browse_cache(&mut self) -> Result<()> {
+        self.browse_cache.clear()?;
+        self.query_cache.clear_domain(QueryCacheDomain::Browse);
+        self.row_cache.clear();
+        self.expanded_paths.clear();
+        self.restart_query_worker();
+        self.status_message = Some(StatusMessage::info(
+            "Rebuilding browse cache from the current view.",
+        ));
+        self.enqueue_view_reload("rebuilding browse cache")
+    }
+
+    fn rebuild_database(&mut self) -> Result<()> {
+        let browse_cache_path = default_browse_cache_path(&self.config.state_dir);
+        let placeholder_db_path = self
+            .config
+            .state_dir
+            .join("db-maintenance-placeholder.sqlite3");
+        let placeholder_database = Database::open(&placeholder_db_path)?;
+        let placeholder_worker = QueryWorker::spawn(
+            placeholder_db_path.clone(),
+            browse_cache_path.clone(),
+            self.perf_logger.clone(),
+        );
+
+        let old_database = std::mem::replace(&mut self.database, placeholder_database);
+        let old_worker = std::mem::replace(&mut self.worker, placeholder_worker);
+        drop(old_worker);
+        drop(old_database);
+
+        let reset_report = reset_sqlite_database(&self.config.db_path)?;
+        let mut database = Database::open(&self.config.db_path)?;
+        let scan_report = scan_source_manifest(&mut database, &self.config.source_root)?;
+        let import_report = import_all(
+            database.connection(),
+            &self.config.db_path,
+            &self.config.source_root,
+        )?;
+        let completed_chunks: i64 = database.connection().query_row(
+            "SELECT COUNT(*) FROM import_chunk WHERE state = 'complete'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let worker = QueryWorker::spawn(
+            self.config.db_path.clone(),
+            browse_cache_path,
+            self.perf_logger.clone(),
+        );
+        let placeholder_database = std::mem::replace(&mut self.database, database);
+        let placeholder_worker = std::mem::replace(&mut self.worker, worker);
+        drop(placeholder_worker);
+        drop(placeholder_database);
+        let _ = reset_sqlite_database(&placeholder_db_path);
+
+        self.query_cache = QueryResultCache::default();
+        self.row_cache.clear();
+        self.expanded_paths.clear();
+        self.jump_state.matches.clear();
+        self.jump_state.selected = 0;
+
+        let selected_key = self.selected_tree_row_key();
+        let perf_logger = self.perf_logger.clone();
+        let conn = self.database.connection();
+        let query_engine = QueryEngine::with_perf(conn, perf_logger.clone());
+        let latest_snapshot = query_engine.latest_snapshot_bounds()?;
+        let loaded_view = load_view_for_state(
+            &query_engine,
+            &mut self.query_cache,
+            &mut self.browse_cache,
+            perf_logger,
+            latest_snapshot.clone(),
+            self.ui_state.clone(),
+            selected_key,
+            None,
+        )?;
+        self.apply_loaded_view(loaded_view)?;
+        self.latest_snapshot = latest_snapshot.clone();
+        self.snapshot = latest_snapshot;
+        self.has_newer_snapshot = false;
+        self.status_message = Some(StatusMessage::info(format!(
+            "Rebuilt database: removed {} artifact(s), discovered {} source files, imported {} completed chunks ({} startup, {} deferred).",
+            reset_report.removed_paths.len(),
+            scan_report.discovered_source_files,
+            completed_chunks,
+            import_report.startup_chunk_count,
+            import_report.deferred_chunk_count
+        )));
+        Ok(())
+    }
+
+    fn restart_query_worker(&mut self) {
+        let replacement = QueryWorker::spawn(
+            self.config.db_path.clone(),
+            default_browse_cache_path(&self.config.state_dir),
+            self.perf_logger.clone(),
+        );
+        let old_worker = std::mem::replace(&mut self.worker, replacement);
+        drop(old_worker);
     }
 
     fn current_query_filters(&self) -> Result<BrowseFilters> {
@@ -2262,6 +2639,58 @@ impl App {
         }
     }
 
+    fn browse_cache_header_line(&self) -> Line<'static> {
+        match self.browse_cache.stats() {
+            Ok(stats) => Line::from(vec![
+                badge("browse-cache", BadgeTone::Accent),
+                separator_span(),
+                Span::styled(
+                    format!(
+                        "{} entries  |  payload {}  |  B manage",
+                        stats.entry_count,
+                        format_storage_bytes(stats.total_payload_bytes)
+                    ),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Err(error) => Line::from(vec![
+                badge("browse-cache", BadgeTone::Warning),
+                separator_span(),
+                Span::styled(
+                    compact_status_text(format!("unavailable: {error:#}")),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]),
+        }
+    }
+
+    fn database_header_line(&self) -> Line<'static> {
+        match sqlite_artifact_size_bytes(&self.config.db_path) {
+            Ok(size_bytes) => Line::from(vec![
+                badge("database", BadgeTone::Info),
+                separator_span(),
+                Span::styled(
+                    format!(
+                        "{}  |  size {}  |  publish_seq <= {} ({} chunks)  |  D manage",
+                        self.config.db_path.display(),
+                        format_storage_bytes(size_bytes),
+                        self.snapshot.max_publish_seq,
+                        self.snapshot.published_chunk_count
+                    ),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Err(error) => Line::from(vec![
+                badge("database", BadgeTone::Warning),
+                separator_span(),
+                Span::styled(
+                    compact_status_text(format!("unavailable: {error:#}")),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]),
+        }
+    }
+
     fn build_radial_context(
         &mut self,
         filters: &BrowseFilters,
@@ -2278,6 +2707,7 @@ impl App {
             None => match project_id_from_path(path) {
                 Some(project_id) => project_root_for_state(
                     &mut self.query_cache,
+                    &mut self.browse_cache,
                     &query_engine,
                     &self.snapshot,
                     self.ui_state.lens,
@@ -2290,6 +2720,7 @@ impl App {
         };
         let radial_context = build_radial_context_for_state(
             &mut self.query_cache,
+            &mut self.browse_cache,
             &query_engine,
             perf_logger,
             RadialContextRequest {
@@ -2565,7 +2996,13 @@ impl App {
         let perf_logger = self.perf_logger.clone();
         let conn = self.database.connection();
         let query_engine = QueryEngine::with_perf(conn, perf_logger);
-        cached_browse(&mut self.query_cache, &query_engine, request, browse_stats)
+        cached_browse(
+            &mut self.query_cache,
+            &mut self.browse_cache,
+            &query_engine,
+            request,
+            browse_stats,
+        )
     }
 }
 
@@ -2647,6 +3084,7 @@ impl<'a> QueryProgressReporter<'a> {
 
 fn run_query_worker(
     db_path: PathBuf,
+    browse_cache_path: PathBuf,
     perf_logger: Option<PerfLogger>,
     requests: Receiver<QueryWorkerRequest>,
     results: Sender<QueryWorkerResult>,
@@ -2664,6 +3102,17 @@ fn run_query_worker(
     };
     let query_engine = QueryEngine::with_perf(database.connection(), perf_logger.clone());
     let mut query_cache = QueryResultCache::default();
+    let mut browse_cache = match BrowseCacheStore::open(browse_cache_path) {
+        Ok(browse_cache) => browse_cache,
+        Err(error) => {
+            let _ = results.send(QueryWorkerResult::Failed(QueryWorkerFailure {
+                sequence: 0,
+                task: PendingTaskKind::View,
+                message: format!("Unable to start browse-cache store: {error:#}"),
+            }));
+            return;
+        }
+    };
 
     while let Ok(request) = requests.recv() {
         let result = match request {
@@ -2673,6 +3122,7 @@ fn run_query_worker(
                 load_view_for_state(
                     &query_engine,
                     &mut query_cache,
+                    &mut browse_cache,
                     perf_logger.clone(),
                     request.snapshot,
                     request.ui_state,
@@ -2707,6 +3157,7 @@ fn run_query_worker(
                         load_view_for_state(
                             &query_engine,
                             &mut query_cache,
+                            &mut browse_cache,
                             perf_logger.clone(),
                             latest_snapshot.clone(),
                             request.ui_state,
@@ -2746,6 +3197,7 @@ fn run_query_worker(
                 build_jump_targets_for_state(
                     &query_engine,
                     &mut query_cache,
+                    &mut browse_cache,
                     perf_logger.clone(),
                     request.snapshot,
                     request.ui_state,
@@ -2775,15 +3227,48 @@ fn run_query_worker(
 
 fn cached_browse(
     query_cache: &mut QueryResultCache,
+    browse_cache: &mut BrowseCacheStore,
     query_engine: &QueryEngine<'_>,
     request: BrowseRequest,
     browse_stats: &mut BrowseFanoutStats,
 ) -> Result<Vec<RollupRow>> {
     browse_stats.record(&request);
     let snapshot = request.snapshot.clone();
-    query_cache.memoize(QueryCacheDomain::Browse, &snapshot, &request, || {
-        query_engine.browse(&request)
-    })
+    let key = QueryCacheKey {
+        domain: QueryCacheDomain::Browse,
+        input: serde_json::to_string(&request).context("unable to serialize query cache key")?,
+    };
+
+    if let Some(cached) = query_cache.cached::<Vec<RollupRow>>(&snapshot, &key) {
+        query_cache
+            .stats
+            .entry(QueryCacheDomain::Browse)
+            .or_default()
+            .hits += 1;
+        return Ok(cached);
+    }
+
+    query_cache
+        .stats
+        .entry(QueryCacheDomain::Browse)
+        .or_default()
+        .misses += 1;
+
+    if let Some(rows) = browse_cache.load(&request)? {
+        query_cache
+            .snapshot_bucket_mut(&snapshot)
+            .entries
+            .insert(key, Box::new(rows.clone()));
+        return Ok(rows);
+    }
+
+    let rows = query_engine.browse(&request)?;
+    query_cache
+        .snapshot_bucket_mut(&snapshot)
+        .entries
+        .insert(key, Box::new(rows.clone()));
+    browse_cache.store(&request, &rows)?;
+    Ok(rows)
 }
 
 fn browse_request_signature(request: &BrowseRequest) -> String {
@@ -2810,9 +3295,14 @@ fn cached_snapshot_coverage_summary(
     })
 }
 
+// The view loader coordinates the snapshot, UI state, async progress, and both
+// cache layers in one place; splitting it further would just move the same
+// coupled parameters through more wrapper structs.
+#[allow(clippy::too_many_arguments)]
 fn load_view_for_state(
     query_engine: &QueryEngine<'_>,
     query_cache: &mut QueryResultCache,
+    browse_cache: &mut BrowseCacheStore,
     perf_logger: Option<PerfLogger>,
     snapshot: SnapshotBounds,
     mut ui_state: PersistedUiState,
@@ -2865,6 +3355,7 @@ fn load_view_for_state(
     let browse_started = Instant::now();
     let (path, raw_rows) = browse_rows_with_parent_fallback(
         query_cache,
+        browse_cache,
         query_engine,
         &snapshot,
         &ui_state,
@@ -2885,6 +3376,7 @@ fn load_view_for_state(
     let current_project_root = match project_id_from_path(&ui_state.path) {
         Some(project_id) => project_root_for_state(
             query_cache,
+            browse_cache,
             query_engine,
             &snapshot,
             ui_state.lens,
@@ -2921,6 +3413,7 @@ fn load_view_for_state(
     let radial_started = Instant::now();
     let radial_context = build_radial_context_for_state(
         query_cache,
+        browse_cache,
         query_engine,
         perf_logger.clone(),
         RadialContextRequest {
@@ -2977,6 +3470,7 @@ fn load_view_for_state(
 fn build_jump_targets_for_state(
     query_engine: &QueryEngine<'_>,
     query_cache: &mut QueryResultCache,
+    browse_cache: &mut BrowseCacheStore,
     perf_logger: Option<PerfLogger>,
     snapshot: SnapshotBounds,
     ui_state: PersistedUiState,
@@ -3004,6 +3498,7 @@ fn build_jump_targets_for_state(
     }
     let project_root_rows = cached_browse(
         query_cache,
+        browse_cache,
         query_engine,
         BrowseRequest {
             snapshot: snapshot.clone(),
@@ -3029,6 +3524,7 @@ fn build_jump_targets_for_state(
 
         let categories = cached_browse(
             query_cache,
+            browse_cache,
             query_engine,
             BrowseRequest {
                 snapshot: snapshot.clone(),
@@ -3057,6 +3553,7 @@ fn build_jump_targets_for_state(
 
             let actions = cached_browse(
                 query_cache,
+                browse_cache,
                 query_engine,
                 BrowseRequest {
                     snapshot: snapshot.clone(),
@@ -3096,6 +3593,7 @@ fn build_jump_targets_for_state(
     }
     let category_root_rows = cached_browse(
         query_cache,
+        browse_cache,
         query_engine,
         BrowseRequest {
             snapshot: snapshot.clone(),
@@ -3123,6 +3621,7 @@ fn build_jump_targets_for_state(
 
         let actions = cached_browse(
             query_cache,
+            browse_cache,
             query_engine,
             BrowseRequest {
                 snapshot: snapshot.clone(),
@@ -3153,6 +3652,7 @@ fn build_jump_targets_for_state(
 
             let projects = cached_browse(
                 query_cache,
+                browse_cache,
                 query_engine,
                 BrowseRequest {
                     snapshot: snapshot.clone(),
@@ -3221,6 +3721,7 @@ fn build_jump_targets_for_state(
 
 fn browse_rows_with_parent_fallback(
     query_cache: &mut QueryResultCache,
+    browse_cache: &mut BrowseCacheStore,
     query_engine: &QueryEngine<'_>,
     snapshot: &SnapshotBounds,
     ui_state: &PersistedUiState,
@@ -3232,6 +3733,7 @@ fn browse_rows_with_parent_fallback(
     loop {
         let rows = cached_browse(
             query_cache,
+            browse_cache,
             query_engine,
             BrowseRequest {
                 snapshot: snapshot.clone(),
@@ -3250,6 +3752,7 @@ fn browse_rows_with_parent_fallback(
         let project_root = match project_id_from_path(&path) {
             Some(project_id) => project_root_for_state(
                 query_cache,
+                browse_cache,
                 query_engine,
                 snapshot,
                 ui_state.lens,
@@ -3277,6 +3780,7 @@ struct RadialContextRequest<'a> {
 
 fn build_radial_context_for_state(
     query_cache: &mut QueryResultCache,
+    browse_cache: &mut BrowseCacheStore,
     query_engine: &QueryEngine<'_>,
     perf_logger: Option<PerfLogger>,
     request: RadialContextRequest<'_>,
@@ -3300,6 +3804,7 @@ fn build_radial_context_for_state(
     for step in steps {
         let rows = cached_browse(
             query_cache,
+            browse_cache,
             query_engine,
             BrowseRequest {
                 snapshot: request.snapshot.clone(),
@@ -3342,6 +3847,7 @@ fn build_radial_context_for_state(
 
     let descendant_layers = build_radial_descendant_layers(
         query_cache,
+        browse_cache,
         query_engine,
         &request,
         current_span,
@@ -3358,6 +3864,7 @@ fn build_radial_context_for_state(
 
 fn build_radial_descendant_layers(
     query_cache: &mut QueryResultCache,
+    browse_cache: &mut BrowseCacheStore,
     query_engine: &QueryEngine<'_>,
     request: &RadialContextRequest<'_>,
     initial_span: RadialSpan,
@@ -3369,6 +3876,7 @@ fn build_radial_descendant_layers(
 
     let rows = cached_browse(
         query_cache,
+        browse_cache,
         query_engine,
         BrowseRequest {
             snapshot: request.snapshot.clone(),
@@ -3388,8 +3896,13 @@ fn build_radial_descendant_layers(
     Ok(vec![layer])
 }
 
+// Project-root lookup needs the live query engine, both cache layers, and the
+// active browse filters together because it reuses the exact interactive browse
+// path rather than maintaining a second lookup mechanism.
+#[allow(clippy::too_many_arguments)]
 fn project_root_for_state(
     query_cache: &mut QueryResultCache,
+    browse_cache: &mut BrowseCacheStore,
     query_engine: &QueryEngine<'_>,
     snapshot: &SnapshotBounds,
     lens: MetricLens,
@@ -3406,6 +3919,7 @@ fn project_root_for_state(
     };
     let root_rows = cached_browse(
         query_cache,
+        browse_cache,
         query_engine,
         BrowseRequest {
             snapshot: snapshot.clone(),
@@ -3879,6 +4393,23 @@ fn count_label(count: usize, noun: &str) -> String {
     }
 }
 
+fn format_storage_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    let bytes_f64 = bytes as f64;
+    if bytes_f64 >= GIB {
+        format!("{:.1} GiB", bytes_f64 / GIB)
+    } else if bytes_f64 >= MIB {
+        format!("{:.1} MiB", bytes_f64 / MIB)
+    } else if bytes_f64 >= KIB {
+        format!("{:.1} KiB", bytes_f64 / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputMode {
     Normal,
@@ -3886,6 +4417,17 @@ enum InputMode {
     JumpInput,
     BreadcrumbPicker,
     ColumnChooser,
+    BrowseCacheMenu,
+    BrowseCacheConfirm,
+    DatabaseMenu,
+    DatabaseConfirm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmationAction {
+    ClearBrowseCache,
+    RebuildBrowseCache,
+    RebuildDatabase,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -6786,6 +7328,7 @@ mod tests {
         )?;
 
         let mut query_cache = QueryResultCache::default();
+        let mut browse_cache = BrowseCacheStore::open(default_browse_cache_path(temp.path()))?;
         let database = Database::open_read_only(&validation.db_path)?;
         let query_engine = QueryEngine::with_perf(database.connection(), Some(logger.clone()));
         let ui_state = PersistedUiState {
@@ -6798,6 +7341,7 @@ mod tests {
         let _targets = build_jump_targets_for_state(
             &query_engine,
             &mut query_cache,
+            &mut browse_cache,
             Some(logger),
             validation.final_snapshot.clone(),
             ui_state,
@@ -6875,6 +7419,7 @@ mod tests {
         let _first = load_view_for_state(
             &query_engine,
             &mut app.query_cache,
+            &mut app.browse_cache,
             perf_logger.clone(),
             app.snapshot.clone(),
             app.ui_state.clone(),
@@ -6898,6 +7443,7 @@ mod tests {
         let _second = load_view_for_state(
             &query_engine,
             &mut app.query_cache,
+            &mut app.browse_cache,
             perf_logger,
             app.snapshot.clone(),
             app.ui_state.clone(),
@@ -7454,6 +8000,7 @@ mod tests {
         let mut loaded_view = load_view_for_state(
             &query_engine,
             &mut query_cache,
+            &mut app.browse_cache,
             perf_logger,
             app.snapshot.clone(),
             app.ui_state.clone(),
@@ -7684,6 +8231,7 @@ mod tests {
         let mut loaded_view = load_view_for_state(
             &query_engine,
             &mut query_cache,
+            &mut app.browse_cache,
             perf_logger,
             app.snapshot.clone(),
             app.ui_state.clone(),

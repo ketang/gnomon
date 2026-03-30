@@ -1,4 +1,5 @@
 pub mod benchmark;
+pub mod browse_cache;
 pub mod classify;
 pub mod config;
 pub mod db;

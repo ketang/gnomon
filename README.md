@@ -138,6 +138,15 @@ cargo run -p gnomon -- db rebuild
 Use `db reset --force` only when you want to remove the cache artifacts first;
 `db rebuild` is the normal recovery command after identity-related fixes.
 
+## Browse Cache
+
+The TUI now persists warmed browse results in a separate SQLite sidecar at
+`<state_dir>/browse-cache.sqlite3`. The browse cache is scoped to the published
+snapshot generation, reused across launches, pruned automatically when newer
+snapshots appear, and bounded by a default `64 MiB` payload budget.
+
+Implementation notes and retention details live in `docs/browse-cache.md`.
+
 ## Non-Interactive Reports
 
 `gnomon` can emit stable JSON rollups from the current imported snapshot without
