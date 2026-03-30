@@ -119,6 +119,64 @@ pub struct BrowseRequest {
     pub path: BrowsePath,
 }
 
+/// A batch request that shares immutable context (snapshot, root, lens, filters)
+/// across many parent paths whose children should be fetched.
+///
+/// This is the primary API for prefetch: submit many paths in one call and receive
+/// per-parent results that decompose into individual cache entries.
+///
+/// There is no hard limit on the number of paths, but callers should cap batch size
+/// (the design default is 20 paths) to avoid holding the database connection too long.
+/// Recursion depth limiting is the caller's responsibility (see the prefetch coordinator).
+///
+/// For path-drill paths (`ProjectAction`, `CategoryActionProject`), each subtree is
+/// queried independently — batching amortizes filter compilation and snapshot setup
+/// overhead but does not combine SQL queries across parents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchBrowseRequest {
+    pub snapshot: SnapshotBounds,
+    pub root: RootView,
+    pub lens: MetricLens,
+    pub filters: BrowseFilters,
+    pub paths: Vec<BrowsePath>,
+}
+
+/// Per-parent results from a batched browse query, keyed by the original `BrowsePath`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchBrowseResponse {
+    pub results: Vec<BatchBrowseResult>,
+}
+
+impl BatchBrowseResponse {
+    /// Decompose batch results into `(BrowseRequest, Vec<RollupRow>)` pairs suitable
+    /// for writing into the per-parent browse cache.
+    pub fn into_cache_pairs(
+        self,
+        request: &BatchBrowseRequest,
+    ) -> Vec<(BrowseRequest, Vec<RollupRow>)> {
+        self.results
+            .into_iter()
+            .map(|result| {
+                let browse_request = BrowseRequest {
+                    snapshot: request.snapshot.clone(),
+                    root: request.root,
+                    lens: request.lens,
+                    filters: request.filters.clone(),
+                    path: result.path,
+                };
+                (browse_request, result.rows)
+            })
+            .collect()
+    }
+}
+
+/// A single parent's child rows from a batch browse query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchBrowseResult {
+    pub path: BrowsePath,
+    pub rows: Vec<RollupRow>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct BrowseBatchGroupKey<'a> {
     snapshot: &'a SnapshotBounds,
@@ -827,6 +885,39 @@ impl<'conn> QueryEngine<'conn> {
         );
         perf.finish_ok();
         Ok(outputs)
+    }
+
+    /// Execute a batched browse query for many parent paths sharing the same
+    /// snapshot, root, lens, and filters. Returns per-parent results that can be
+    /// decomposed into individual cache entries via [`BatchBrowseResponse::into_cache_pairs`].
+    pub fn browse_batch(&self, batch: &BatchBrowseRequest) -> Result<BatchBrowseResponse> {
+        let mut perf = self.perf_scope("query.browse_batch");
+        perf.field("path_count", batch.paths.len());
+
+        let requests: Vec<BrowseRequest> = batch
+            .paths
+            .iter()
+            .map(|path| BrowseRequest {
+                snapshot: batch.snapshot.clone(),
+                root: batch.root,
+                lens: batch.lens,
+                filters: batch.filters.clone(),
+                path: path.clone(),
+            })
+            .collect();
+
+        let row_sets = self.browse_many(&requests)?;
+
+        let results = batch
+            .paths
+            .iter()
+            .cloned()
+            .zip(row_sets)
+            .map(|(path, rows)| BatchBrowseResult { path, rows })
+            .collect();
+
+        perf.finish_ok();
+        Ok(BatchBrowseResponse { results })
     }
 
     pub fn browse_report(&self, request: BrowseRequest) -> Result<BrowseReport> {
@@ -3468,11 +3559,11 @@ mod tests {
     use crate::perf::PerfLogger;
 
     use super::{
-        ActionKey, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState,
-        ConversationTurnRow, FilterOptions, MetricLens, QueryEngine, RootView, SnapshotBounds,
-        SnapshotCoverageSummary, TimeWindowFilter, build_grouped_action_rollup_rows_query,
-        build_opportunities_rows, build_scoped_action_facts_query, build_scoped_path_facts_query,
-        display_category,
+        ActionKey, BatchBrowseRequest, BrowseFilters, BrowsePath, BrowseRequest,
+        ClassificationState, ConversationTurnRow, FilterOptions, MetricLens, QueryEngine, RootView,
+        SnapshotBounds, SnapshotCoverageSummary, TimeWindowFilter,
+        build_grouped_action_rollup_rows_query, build_opportunities_rows,
+        build_scoped_action_facts_query, build_scoped_path_facts_query, display_category,
     };
 
     #[test]
@@ -4081,6 +4172,172 @@ mod tests {
         for (request, rows) in path_requests.iter().zip(path_batch.iter()) {
             assert_eq!(*rows, engine.browse(request)?);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn browse_batch_single_path_matches_individual_browse() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let conn = db.connection_mut();
+        let fixture = seed_query_fixture(conn, temp.path())?;
+        let engine = QueryEngine::new(conn);
+        let snapshot = engine.latest_snapshot_bounds()?;
+
+        let editing_action = ActionKey {
+            classification_state: ClassificationState::Classified,
+            normalized_action: Some("read file".to_string()),
+            command_family: None,
+            base_command: None,
+        };
+        let path = BrowsePath::ProjectAction {
+            project_id: fixture.project_a_id,
+            category: "editing".to_string(),
+            action: editing_action.clone(),
+            parent_path: None,
+        };
+
+        let individual = engine.browse(&BrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            path: path.clone(),
+        })?;
+
+        let batch_response = engine.browse_batch(&BatchBrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            paths: vec![path.clone()],
+        })?;
+
+        assert_eq!(batch_response.results.len(), 1);
+        assert_eq!(batch_response.results[0].path, path);
+        assert_eq!(batch_response.results[0].rows, individual);
+
+        Ok(())
+    }
+
+    #[test]
+    fn browse_batch_multi_parent_path_drill() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let conn = db.connection_mut();
+        let fixture = seed_query_fixture(conn, temp.path())?;
+        let engine = QueryEngine::new(conn);
+        let snapshot = engine.latest_snapshot_bounds()?;
+
+        let editing_action = ActionKey {
+            classification_state: ClassificationState::Classified,
+            normalized_action: Some("read file".to_string()),
+            command_family: None,
+            base_command: None,
+        };
+
+        let root_path = BrowsePath::ProjectAction {
+            project_id: fixture.project_a_id,
+            category: "editing".to_string(),
+            action: editing_action.clone(),
+            parent_path: None,
+        };
+        let root_rows = engine.browse(&BrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            path: root_path.clone(),
+        })?;
+
+        let child_path = BrowsePath::ProjectAction {
+            project_id: fixture.project_a_id,
+            category: "editing".to_string(),
+            action: editing_action,
+            parent_path: root_rows[0].full_path.clone(),
+        };
+
+        let batch_response = engine.browse_batch(&BatchBrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            paths: vec![root_path.clone(), child_path.clone()],
+        })?;
+
+        assert_eq!(batch_response.results.len(), 2);
+        assert_eq!(batch_response.results[0].path, root_path);
+        assert_eq!(batch_response.results[1].path, child_path);
+        assert_eq!(batch_response.results[0].rows, root_rows);
+
+        // Each result is attributable to its specific parent path
+        for result in &batch_response.results {
+            assert!(
+                matches!(&result.path, BrowsePath::ProjectAction { .. }),
+                "result path must be a ProjectAction variant"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn browse_batch_into_cache_pairs_produces_valid_browse_requests() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let conn = db.connection_mut();
+        let fixture = seed_query_fixture(conn, temp.path())?;
+        let engine = QueryEngine::new(conn);
+        let snapshot = engine.latest_snapshot_bounds()?;
+
+        let editing_action = ActionKey {
+            classification_state: ClassificationState::Classified,
+            normalized_action: Some("read file".to_string()),
+            command_family: None,
+            base_command: None,
+        };
+
+        let batch_request = BatchBrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            paths: vec![BrowsePath::ProjectAction {
+                project_id: fixture.project_a_id,
+                category: "editing".to_string(),
+                action: editing_action.clone(),
+                parent_path: None,
+            }],
+        };
+        let batch_response = engine.browse_batch(&batch_request)?;
+        let cache_pairs = batch_response.into_cache_pairs(&batch_request);
+
+        assert_eq!(cache_pairs.len(), 1);
+        let (cached_request, cached_rows) = &cache_pairs[0];
+
+        // The decomposed request should produce identical results when used individually
+        let individual_rows = engine.browse(cached_request)?;
+        assert_eq!(*cached_rows, individual_rows);
+
+        Ok(())
+    }
+
+    #[test]
+    fn browse_batch_empty_paths_returns_empty_response() -> Result<()> {
+        let temp = tempdir()?;
+        let db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let engine = QueryEngine::new(db.connection());
+
+        let batch_response = engine.browse_batch(&BatchBrowseRequest {
+            snapshot: SnapshotBounds::bootstrap(),
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            paths: Vec::new(),
+        })?;
+
+        assert!(batch_response.results.is_empty());
+
         Ok(())
     }
 
