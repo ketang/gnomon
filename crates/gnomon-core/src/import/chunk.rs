@@ -29,6 +29,7 @@ pub struct StartupImport {
     pub snapshot: SnapshotBounds,
     pub open_reason: StartupOpenReason,
     pub startup_status_message: Option<String>,
+    pub startup_progress_update: Option<StartupProgressUpdate>,
     status_updates: Option<Receiver<StartupWorkerEvent>>,
     worker: Option<JoinHandle<Result<()>>>,
 }
@@ -57,12 +58,24 @@ struct ImportWorkerOptions {
 
 #[derive(Debug)]
 pub enum StartupWorkerEvent {
+    Progress {
+        update: StartupProgressUpdate,
+    },
     StartupSettled {
         startup_status_message: Option<String>,
     },
     DeferredFailures {
         deferred_status_message: Option<String>,
     },
+    Finished,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupProgressUpdate {
+    pub label: &'static str,
+    pub current: usize,
+    pub total: usize,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,12 +159,25 @@ pub fn start_startup_import(
     db_path: &Path,
     source_root: &Path,
 ) -> Result<StartupImport> {
+    start_startup_import_with_progress(conn, db_path, source_root, |_| {})
+}
+
+pub fn start_startup_import_with_progress<F>(
+    conn: &Connection,
+    db_path: &Path,
+    source_root: &Path,
+    mut on_progress: F,
+) -> Result<StartupImport>
+where
+    F: FnMut(&StartupProgressUpdate),
+{
     start_startup_import_with_options(
         conn,
         db_path,
         source_root,
         Duration::from_secs(STARTUP_OPEN_DEADLINE_SECS),
         ImportWorkerOptions::default(),
+        Some(&mut on_progress),
     )
 }
 
@@ -214,6 +240,7 @@ fn start_startup_import_with_options(
     source_root: &Path,
     wait_timeout: Duration,
     worker_options: ImportWorkerOptions,
+    mut on_progress: Option<&mut dyn FnMut(&StartupProgressUpdate)>,
 ) -> Result<StartupImport> {
     let now = Timestamp::now();
     let time_zone = TimeZone::system();
@@ -225,6 +252,7 @@ fn start_startup_import_with_options(
             snapshot: SnapshotBounds::load(conn)?,
             open_reason: StartupOpenReason::Last24hReady,
             startup_status_message: None,
+            startup_progress_update: None,
             status_updates: None,
             worker: None,
         });
@@ -254,12 +282,20 @@ fn start_startup_import_with_options(
         }
     };
 
+    let mut startup_progress_update = None;
     let (open_reason, startup_status_message) = loop {
         match receiver.recv_timeout(wait_timeout) {
+            Ok(StartupWorkerEvent::Progress { update }) => {
+                startup_progress_update = Some(update.clone());
+                if let Some(callback) = on_progress.as_mut() {
+                    callback(&update);
+                }
+            }
             Ok(StartupWorkerEvent::StartupSettled {
                 startup_status_message,
             }) => break (StartupOpenReason::Last24hReady, startup_status_message),
             Ok(StartupWorkerEvent::DeferredFailures { .. }) => continue,
+            Ok(StartupWorkerEvent::Finished) => continue,
             Err(RecvTimeoutError::Timeout) => break (StartupOpenReason::TimedOut, None),
             Err(RecvTimeoutError::Disconnected) => {
                 let worker_result = join_worker(Some(worker));
@@ -274,6 +310,7 @@ fn start_startup_import_with_options(
         snapshot: SnapshotBounds::load(conn)?,
         open_reason,
         startup_status_message,
+        startup_progress_update,
         status_updates: Some(receiver),
         worker: Some(worker),
     })
@@ -568,7 +605,14 @@ fn run_import_worker(
         });
     }
 
-    for chunk in &plan.startup_chunks {
+    for (index, chunk) in plan.startup_chunks.iter().enumerate() {
+        send_progress(
+            &sender,
+            "rebuilding database",
+            index + 1,
+            plan.startup_chunks.len(),
+            chunk,
+        );
         if let Err(err) = import_chunk(&mut database, source_root, chunk, options) {
             startup_failures.push(compact_status_text(format!("{err:#}")));
         }
@@ -580,7 +624,14 @@ fn run_import_worker(
         });
     }
 
-    for chunk in &plan.deferred_chunks {
+    for (index, chunk) in plan.deferred_chunks.iter().enumerate() {
+        send_progress(
+            &sender,
+            "importing older history",
+            index + 1,
+            plan.deferred_chunks.len(),
+            chunk,
+        );
         if let Err(err) = import_chunk(&mut database, source_root, chunk, options) {
             deferred_failures.push(compact_status_text(format!("{err:#}")));
         }
@@ -591,8 +642,26 @@ fn run_import_worker(
             deferred_status_message: summarize_deferred_failures(&deferred_failures),
         });
     }
+    let _ = sender.send(StartupWorkerEvent::Finished);
 
     Ok(())
+}
+
+fn send_progress(
+    sender: &mpsc::Sender<StartupWorkerEvent>,
+    label: &'static str,
+    current: usize,
+    total: usize,
+    chunk: &PreparedChunk,
+) {
+    let _ = sender.send(StartupWorkerEvent::Progress {
+        update: StartupProgressUpdate {
+            label,
+            current,
+            total,
+            detail: format!("{}:{}", chunk.project_key, chunk.chunk_day_local),
+        },
+    });
 }
 
 fn summarize_startup_failures(failures: &[String]) -> Option<String> {
@@ -974,6 +1043,7 @@ mod tests {
             &source_root,
             Duration::from_secs(2),
             ImportWorkerOptions::default(),
+            None,
         )?;
 
         assert_eq!(startup.open_reason, StartupOpenReason::Last24hReady);
@@ -1050,11 +1120,20 @@ mod tests {
             ImportWorkerOptions {
                 per_chunk_delay: Duration::from_millis(WORKER_DELAY_MS),
             },
+            None,
         )?;
 
         assert_eq!(startup.open_reason, StartupOpenReason::TimedOut);
         assert_eq!(startup.snapshot.max_publish_seq, 0);
         assert_eq!(startup.startup_status_message, None);
+        assert_eq!(
+            startup.startup_progress_update.as_ref().map(|update| (
+                update.label,
+                update.current,
+                update.total
+            )),
+            Some(("rebuilding database", 1, 1))
+        );
         startup.wait_for_completion()?;
 
         let complete_count: i64 = db.connection().query_row(
@@ -1123,6 +1202,7 @@ mod tests {
             &source_root,
             Duration::from_secs(2),
             ImportWorkerOptions::default(),
+            None,
         )?;
 
         assert_eq!(startup.open_reason, StartupOpenReason::Last24hReady);
@@ -1219,6 +1299,7 @@ mod tests {
             &source_root,
             Duration::from_secs(2),
             ImportWorkerOptions::default(),
+            None,
         )?;
 
         let status_updates = startup
@@ -1232,14 +1313,17 @@ mod tests {
         assert!(startup_status.contains(&startup_source_path.display().to_string()));
         assert!(startup_status.contains("line 2"));
 
-        let deferred_update = status_updates
-            .recv_timeout(Duration::from_secs(2))
-            .context("missing deferred failure status update")?;
-        let deferred_status_message = match deferred_update {
-            StartupWorkerEvent::DeferredFailures {
-                deferred_status_message,
-            } => deferred_status_message.context("missing deferred failure summary")?,
-            other => panic!("expected deferred failure update, got {other:?}"),
+        let deferred_status_message = loop {
+            let deferred_update = status_updates
+                .recv_timeout(Duration::from_secs(2))
+                .context("missing deferred failure status update")?;
+            match deferred_update {
+                StartupWorkerEvent::DeferredFailures {
+                    deferred_status_message,
+                } => break deferred_status_message.context("missing deferred failure summary")?,
+                StartupWorkerEvent::Progress { .. } | StartupWorkerEvent::Finished => continue,
+                other => panic!("expected deferred failure update, got {other:?}"),
+            }
         };
         assert!(deferred_status_message.contains("deferred import failed for 2 chunks"));
         assert!(deferred_status_message.contains(&deferred_one_source_path.display().to_string()));
