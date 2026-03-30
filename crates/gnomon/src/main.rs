@@ -519,6 +519,9 @@ fn rebuild_database(config: &RuntimeConfig) -> Result<()> {
         import_report.startup_chunk_count,
         import_report.deferred_chunk_count
     );
+    if let Some(summary) = import_report.deferred_failure_summary.as_deref() {
+        println!("Warning: {summary}");
+    }
 
     Ok(())
 }
@@ -802,7 +805,7 @@ mod tests {
         BenchmarkArgs, BrowsePathKindArg, ClassificationStateArg, Cli, Command, DbSubcommand,
         GlobalArgs, MetricLensArg, OpportunityCategoryArg, OpportunityConfidenceArg, ReportArgs,
         ResetArgs, RootViewArg, StartupArgs, build_browse_report, build_query_benchmark_report,
-        count_completed_chunks, filter_opportunities, run_db_command,
+        count_completed_chunks, filter_opportunities, rebuild_database, run_db_command,
     };
     use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
     use gnomon_core::db::Database;
@@ -1197,6 +1200,50 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_succeeds_with_deferred_chunk_failures_and_reports_them() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let project_root = temp.path().join("project");
+        init_git_repo(&project_root)?;
+        write_jsonl(
+            &source_root.join("project/recent/session.jsonl"),
+            &project_root,
+        )?;
+        std::fs::create_dir_all(source_root.join("project/older"))?;
+        std::fs::write(
+            source_root.join("project/older/bad.jsonl"),
+            concat!(
+                "{\"type\":\"user\",\"uuid\":\"bad-user\",\"timestamp\":\"2026-03-26T10:00:00Z\",\"sessionId\":\"bad-session\",\"message\":{\"role\":\"user\",\"content\":\"Inspect the project\"}}\n",
+                "{\"type\":\"assistant\",\"uuid\":\"bad-assistant\",\"timestamp\":\"2026-03-26T10:00:01Z\",\"sessionId\":\"bad-session\",\"message\":{\"id\":\"msg-bad\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"broken\"}]"
+            ),
+        )?;
+        set_file_modified_days_ago(&source_root.join("project/older/bad.jsonl"), 5)?;
+
+        let config = RuntimeConfig::load(ConfigOverrides {
+            db_path: Some(db_path.clone()),
+            source_root: Some(source_root),
+        })?;
+
+        rebuild_database(&config)?;
+
+        let database = Database::open(&db_path)?;
+        let counts: (i64, i64) = database.connection().query_row(
+            "
+            SELECT
+                COUNT(*) FILTER (WHERE state = 'complete'),
+                COUNT(*) FILTER (WHERE state = 'failed')
+            FROM import_chunk
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(counts, (1, 1));
+
+        Ok(())
+    }
+
+    #[test]
     fn report_returns_top_level_rollups_without_launching_tui() -> Result<()> {
         let temp = tempdir()?;
         let db_path = temp.path().join("usage.sqlite3");
@@ -1431,6 +1478,25 @@ mod tests {
         fs::write(repo_root.join("README.md"), "seed\n")?;
         run_git(repo_root, ["add", "."])?;
         run_git(repo_root, ["commit", "-m", "seed"])?;
+        Ok(())
+    }
+
+    fn set_file_modified_days_ago(path: &Path, days_ago: i64) -> Result<()> {
+        let spec = format!("{days_ago} days ago");
+        let output = ProcessCommand::new("touch")
+            .arg("-d")
+            .arg(&spec)
+            .arg(path)
+            .output()
+            .with_context(|| format!("unable to backdate {}", path.display()))?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "touch -d {:?} {} failed: {}",
+                spec,
+                path.display(),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
         Ok(())
     }
 

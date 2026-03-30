@@ -136,6 +136,8 @@ struct SourceFileRow {
 pub struct ImportExecutionReport {
     pub startup_chunk_count: usize,
     pub deferred_chunk_count: usize,
+    pub deferred_failure_count: usize,
+    pub deferred_failure_summary: Option<String>,
 }
 
 pub fn start_startup_import(
@@ -161,11 +163,6 @@ pub fn import_all(
     let time_zone = TimeZone::system();
     let plan = build_import_plan(conn, now, &time_zone)?;
     let prepared = prepare_import_plan(conn, &plan)?;
-    let report = ImportExecutionReport {
-        startup_chunk_count: prepared.startup_chunks.len(),
-        deferred_chunk_count: prepared.deferred_chunks.len(),
-    };
-
     let mut database =
         Database::open(db_path).with_context(|| format!("unable to open {}", db_path.display()))?;
 
@@ -184,8 +181,9 @@ pub fn import_all(
         })?;
     }
 
+    let mut deferred_failures = Vec::new();
     for chunk in &prepared.deferred_chunks {
-        import_chunk(
+        if let Err(err) = import_chunk(
             &mut database,
             source_root,
             chunk,
@@ -196,10 +194,17 @@ pub fn import_all(
                 "unable to import deferred chunk {}:{}",
                 chunk.project_key, chunk.chunk_day_local
             )
-        })?;
+        }) {
+            deferred_failures.push(compact_status_text(format!("{err:#}")));
+        }
     }
 
-    Ok(report)
+    Ok(ImportExecutionReport {
+        startup_chunk_count: prepared.startup_chunks.len(),
+        deferred_chunk_count: prepared.deferred_chunks.len(),
+        deferred_failure_count: deferred_failures.len(),
+        deferred_failure_summary: summarize_deferred_failures(&deferred_failures),
+    })
 }
 
 fn start_startup_import_with_options(
@@ -833,7 +838,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ImportWorkerOptions, StartupOpenReason, StartupWorkerEvent, build_import_plan,
+        ImportWorkerOptions, StartupOpenReason, StartupWorkerEvent, build_import_plan, import_all,
         start_startup_import_with_options,
     };
     use crate::db::Database;
@@ -1248,6 +1253,79 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         assert_eq!(counts, (0, 3));
+
+        Ok(())
+    }
+
+    #[test]
+    fn import_all_reports_deferred_failures_without_returning_error() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root)?;
+
+        let startup_relative_path = "startup/recent/session.jsonl";
+        let deferred_relative_path = "deferred/older/session.jsonl";
+        let startup_source_path = source_root.join(startup_relative_path);
+        let deferred_source_path = source_root.join(deferred_relative_path);
+        let startup_size = write_session_fixture(&startup_source_path, "startup-good")?;
+        let deferred_size = write_malformed_session_fixture(&deferred_source_path, "deferred-bad")?;
+
+        let recent = Timestamp::now()
+            .checked_sub(1_i64.hours())
+            .context("unable to construct recent startup test timestamp")?
+            .to_string();
+        let older = Timestamp::now()
+            .checked_sub(72_i64.hours())
+            .context("unable to construct older deferred test timestamp")?
+            .to_string();
+
+        let mut db = Database::open(&db_path)?;
+        let project_id = insert_project_with_root(
+            db.connection_mut(),
+            "path:/import-all-deferred",
+            "import-all-deferred",
+            &project_root,
+        )?;
+        let _ = insert_seeded_source_file(
+            db.connection_mut(),
+            project_id,
+            startup_relative_path,
+            &recent,
+            startup_size,
+        )?;
+        let _ = insert_seeded_source_file(
+            db.connection_mut(),
+            project_id,
+            deferred_relative_path,
+            &older,
+            deferred_size,
+        )?;
+
+        let report = import_all(db.connection(), &db_path, &source_root)?;
+
+        assert_eq!(report.startup_chunk_count, 1);
+        assert_eq!(report.deferred_chunk_count, 1);
+        assert_eq!(report.deferred_failure_count, 1);
+        let summary = report
+            .deferred_failure_summary
+            .context("missing deferred failure summary")?;
+        assert!(summary.contains("deferred import failed"));
+        assert!(summary.contains(&deferred_source_path.display().to_string()));
+        assert!(summary.contains("line 2"));
+
+        let counts: (i64, i64) = db.connection().query_row(
+            "
+            SELECT
+                COUNT(*) FILTER (WHERE state = 'complete'),
+                COUNT(*) FILTER (WHERE state = 'failed')
+            FROM import_chunk
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(counts, (1, 1));
 
         Ok(())
     }
