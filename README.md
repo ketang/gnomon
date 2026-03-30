@@ -76,6 +76,30 @@ Fresh launches open at the top level by default. Use `--startup-*` flags to
 open directly into a narrower drill-down view when you want to skip the root
 landing state.
 
+## Performance Logs
+
+Performance logging is enabled by default.
+
+- Default path: `<state_dir>/logs/perf.log`
+- Default format: human-readable line logs
+- Default granularity: `normal`
+- Rotation: `perf.log` plus `perf.log.1` through `perf.log.5`
+- Active file size cap: `10 MiB`
+
+The default `normal` granularity records user-visible phases such as startup,
+filter loading, view reloads, jump-target generation, and similar waits.
+Verbose per-node query logging is available when you need to identify which
+specific drill-down or stats query is slow.
+
+Useful overrides:
+
+```bash
+GNOMON_PERF_LOG=off cargo run -p gnomon
+GNOMON_PERF_LOG_GRANULARITY=verbose cargo run -p gnomon
+GNOMON_PERF_LOG_FORMAT=jsonl cargo run -p gnomon
+GNOMON_PERF_LOG=/tmp/gnomon-perf.log cargo run -p gnomon
+```
+
 ## Database Maintenance
 
 The SQLite cache is derived data and can be maintained from the CLI:
