@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
 
+use crate::import::NormalizedToolUsePartMetadata;
+
 #[derive(Debug, Clone)]
 pub struct BuildActionsParams {
     pub conversation_id: i64,
@@ -350,8 +352,7 @@ fn build_tool_use_lookup(messages: &[LoadedMessage]) -> HashMap<String, ToolInvo
             let input = part
                 .metadata_json
                 .as_deref()
-                .and_then(parse_json_value)
-                .and_then(|json| json.get("input").cloned());
+                .and_then(tool_use_input_from_metadata_json);
 
             lookup.insert(tool_call_id, ToolInvocation { tool_name, input });
         }
@@ -471,8 +472,7 @@ fn tool_invocation_from_part(part: &LoadedPart) -> Option<ToolInvocation> {
     let input = part
         .metadata_json
         .as_deref()
-        .and_then(parse_json_value)
-        .and_then(|json| json.get("input").cloned());
+        .and_then(tool_use_input_from_metadata_json);
 
     Some(ToolInvocation { tool_name, input })
 }
@@ -876,8 +876,8 @@ fn is_documentation_path(path: &Path) -> bool {
     })
 }
 
-fn parse_json_value(raw_json: &str) -> Option<Value> {
-    serde_json::from_str(raw_json).ok()
+fn tool_use_input_from_metadata_json(raw_json: &str) -> Option<Value> {
+    NormalizedToolUsePartMetadata::parse(raw_json).map(|metadata| metadata.input)
 }
 
 fn persist_path_refs(
