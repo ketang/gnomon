@@ -497,6 +497,10 @@ impl<'conn> QueryEngine<'conn> {
         PerfScope::new(self.perf_logger.clone(), operation)
     }
 
+    fn verbose_perf_scope(&self, operation: &str) -> PerfScope {
+        PerfScope::new_verbose(self.perf_logger.clone(), operation)
+    }
+
     pub fn latest_snapshot_bounds(&self) -> Result<SnapshotBounds> {
         let mut perf = self.perf_scope("query.latest_snapshot_bounds");
         let row = self
@@ -661,8 +665,8 @@ impl<'conn> QueryEngine<'conn> {
     }
 
     pub fn browse(&self, request: &BrowseRequest) -> Result<Vec<RollupRow>> {
-        let mut perf = self.perf_scope("query.browse");
-        perf.field("request", request);
+        let mut perf = self.verbose_perf_scope("query.browse");
+        record_browse_request_perf_fields(&mut perf, request);
 
         let filter_compile_started = Instant::now();
         let compiled_filters = CompiledFilters::compile(&request.filters)?;
@@ -870,8 +874,8 @@ impl<'conn> QueryEngine<'conn> {
     }
 
     fn load_action_facts(&self, request: &BrowseRequest) -> Result<Vec<ActionFact>> {
-        let mut perf = self.perf_scope("query.load_action_facts");
-        perf.field("request", request);
+        let mut perf = self.verbose_perf_scope("query.load_action_facts");
+        record_browse_request_perf_fields(&mut perf, request);
         if request.snapshot.max_publish_seq == 0 {
             perf.field("row_count", 0usize);
             perf.finish_ok();
@@ -942,8 +946,8 @@ impl<'conn> QueryEngine<'conn> {
     }
 
     fn load_grouped_action_rollup_rows(&self, request: &BrowseRequest) -> Result<Vec<RollupRow>> {
-        let mut perf = self.perf_scope("query.load_grouped_action_rollup_rows");
-        perf.field("request", request);
+        let mut perf = self.verbose_perf_scope("query.load_grouped_action_rollup_rows");
+        record_browse_request_perf_fields(&mut perf, request);
         if request.snapshot.max_publish_seq == 0 {
             perf.field("row_count", 0usize);
             perf.finish_ok();
@@ -1002,7 +1006,7 @@ impl<'conn> QueryEngine<'conn> {
         snapshot: &SnapshotBounds,
         start_at: Timestamp,
     ) -> Result<Vec<ActionFact>> {
-        let mut perf = self.perf_scope("query.load_recent_action_facts");
+        let mut perf = self.verbose_perf_scope("query.load_recent_action_facts");
         perf.field("snapshot", snapshot);
         perf.field("start_at", start_at.to_string());
         if snapshot.max_publish_seq == 0 {
@@ -1076,8 +1080,8 @@ impl<'conn> QueryEngine<'conn> {
     }
 
     fn load_path_facts(&self, request: &BrowseRequest) -> Result<Vec<PathFact>> {
-        let mut perf = self.perf_scope("query.load_path_facts");
-        perf.field("request", request);
+        let mut perf = self.verbose_perf_scope("query.load_path_facts");
+        record_browse_request_perf_fields(&mut perf, request);
         if request.snapshot.max_publish_seq == 0 {
             perf.field("row_count", 0usize);
             perf.finish_ok();
@@ -1808,6 +1812,40 @@ struct PathBrowseScope<'a> {
 
 fn can_use_action_rollups(filters: &BrowseFilters) -> bool {
     filters.time_window.is_none() && filters.model.is_none()
+}
+
+fn record_browse_request_perf_fields(perf: &mut PerfScope, request: &BrowseRequest) {
+    perf.field("root", request.root);
+    perf.field("path", &request.path);
+    perf.field("lens", request.lens);
+    perf.field("snapshot_publish_seq", request.snapshot.max_publish_seq);
+    perf.field(
+        "filter_project_id",
+        request
+            .filters
+            .project_id
+            .map_or_else(|| "any".to_string(), |id| id.to_string()),
+    );
+    perf.field(
+        "filter_category",
+        request
+            .filters
+            .action_category
+            .clone()
+            .unwrap_or_else(|| "any".to_string()),
+    );
+    perf.field(
+        "filter_model",
+        request
+            .filters
+            .model
+            .clone()
+            .unwrap_or_else(|| "any".to_string()),
+    );
+    if let Some(time_window) = &request.filters.time_window {
+        perf.field("filter_start_at_utc", &time_window.start_at_utc);
+        perf.field("filter_end_at_utc", &time_window.end_at_utc);
+    }
 }
 
 fn is_path_browse(path: &BrowsePath) -> bool {
@@ -2688,12 +2726,14 @@ mod tests {
     use anyhow::{Context, Result};
     use rusqlite::types::Value;
     use rusqlite::{Connection, OptionalExtension, params};
+    use serde_json::Value as JsonValue;
     use tempfile::tempdir;
 
     use crate::db::Database;
     use crate::opportunity::{
         OpportunityAnnotation, OpportunityCategory, OpportunityConfidence, OpportunitySummary,
     };
+    use crate::perf::PerfLogger;
 
     use super::{
         ActionKey, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState,
@@ -3236,6 +3276,47 @@ mod tests {
         })?;
         assert!(no_path_rows.is_empty());
 
+        Ok(())
+    }
+
+    #[test]
+    fn verbose_perf_logging_captures_per_node_browse_context() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let conn = db.connection_mut();
+        let fixture = seed_query_fixture(conn, temp.path())?;
+        let log_path = temp.path().join("perf.jsonl");
+        let logger = PerfLogger::open_jsonl(log_path.clone())?;
+        let engine = QueryEngine::with_perf(conn, Some(logger));
+        let snapshot = engine.latest_snapshot_bounds()?;
+
+        let _rows = engine.browse(&BrowseRequest {
+            snapshot,
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            path: BrowsePath::Project {
+                project_id: fixture.project_a_id,
+            },
+        })?;
+
+        let payloads = fs::read_to_string(log_path)?
+            .lines()
+            .map(serde_json::from_str::<JsonValue>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let browse = payloads
+            .iter()
+            .find(|payload| payload["operation"] == "query.browse")
+            .context("missing query.browse perf event")?;
+
+        assert_eq!(browse["root"], "ProjectHierarchy");
+        assert_eq!(browse["lens"], "UncachedInput");
+        assert_eq!(
+            browse["path"]["Project"]["project_id"],
+            fixture.project_a_id
+        );
+        assert_eq!(browse["granularity"], "verbose");
+        assert!(browse["row_count"].as_u64().unwrap_or(0) > 0);
         Ok(())
     }
 
