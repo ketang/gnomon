@@ -11,6 +11,9 @@ use super::model::{
 const SUPPORTED_RENDER_MODES: [SunburstRenderMode; 2] =
     [SunburstRenderMode::Coarse, SunburstRenderMode::Braille];
 
+/// Uniform fill glyph for coarse mode — geometry carries the signal, not texture.
+const COARSE_FILL: char = '█';
+
 pub(crate) fn rasterize_sunburst(
     buf: &mut Buffer,
     inner: ratatui::layout::Rect,
@@ -69,7 +72,7 @@ fn rasterize_coarse(
 
             if let Some(cell) = buf.cell_mut((x, y)) {
                 cell.set_style(sunburst_segment_style(segment, focused));
-                cell.set_char(sunburst_coarse_glyph(segment));
+                cell.set_char(COARSE_FILL);
             }
         }
     }
@@ -170,9 +173,6 @@ fn sunburst_segment_style(segment: &SunburstSegment, focused: bool) -> Style {
 
     if segment.is_selected {
         style = style.fg(Color::White).add_modifier(Modifier::BOLD);
-        if focused {
-            style = style.add_modifier(Modifier::UNDERLINED);
-        }
     }
 
     style
@@ -187,32 +187,114 @@ fn sunburst_braille_style(segment: &SunburstSegment, focused: bool) -> Style {
 
     if segment.is_selected {
         style = style.fg(Color::White).add_modifier(Modifier::BOLD);
-        if focused {
-            style = style.add_modifier(Modifier::UNDERLINED);
-        }
     }
 
     style
 }
 
-fn sunburst_coarse_glyph(segment: &SunburstSegment) -> char {
-    if segment.is_selected {
-        return '#';
-    }
-
-    if segment.cached_ratio >= 0.7 {
-        '·'
-    } else {
-        ' '
+fn sunburst_bucket_color(bucket: SunburstBucket) -> Color {
+    match bucket {
+        SunburstBucket::Project => Color::Blue,
+        SunburstBucket::Category => Color::Cyan,
+        SunburstBucket::Classified => Color::Green,
+        SunburstBucket::Mixed => Color::Yellow,
+        SunburstBucket::Unclassified => Color::DarkGray,
     }
 }
 
-fn sunburst_bucket_color(bucket: SunburstBucket) -> Color {
-    match bucket {
-        SunburstBucket::Project => Color::LightBlue,
-        SunburstBucket::Category => Color::LightCyan,
-        SunburstBucket::Classified => Color::LightGreen,
-        SunburstBucket::Mixed => Color::LightYellow,
-        SunburstBucket::Unclassified => Color::Gray,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_segment(
+        bucket: SunburstBucket,
+        cached_ratio: f64,
+        is_selected: bool,
+    ) -> SunburstSegment {
+        SunburstSegment {
+            value: 100.0,
+            cached_ratio,
+            bucket,
+            is_selected,
+        }
+    }
+
+    #[test]
+    fn bucket_colors_use_standard_variants() {
+        assert_eq!(sunburst_bucket_color(SunburstBucket::Project), Color::Blue);
+        assert_eq!(sunburst_bucket_color(SunburstBucket::Category), Color::Cyan);
+        assert_eq!(
+            sunburst_bucket_color(SunburstBucket::Classified),
+            Color::Green
+        );
+        assert_eq!(sunburst_bucket_color(SunburstBucket::Mixed), Color::Yellow);
+        assert_eq!(
+            sunburst_bucket_color(SunburstBucket::Unclassified),
+            Color::DarkGray
+        );
+    }
+
+    #[test]
+    fn coarse_fill_is_full_block() {
+        assert_eq!(COARSE_FILL, '█');
+    }
+
+    #[test]
+    fn segment_style_no_underline_when_selected() {
+        let seg = make_segment(SunburstBucket::Project, 0.0, true);
+        let style = sunburst_segment_style(&seg, true);
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+        assert!(!style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn braille_style_no_underline_when_selected() {
+        let seg = make_segment(SunburstBucket::Project, 0.0, true);
+        let style = sunburst_braille_style(&seg, true);
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+        assert!(!style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn segment_style_dim_when_cached() {
+        let seg = make_segment(SunburstBucket::Classified, 0.8, false);
+        let style = sunburst_segment_style(&seg, true);
+        assert!(style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn segment_style_dim_when_unfocused() {
+        let seg = make_segment(SunburstBucket::Classified, 0.0, false);
+        let style = sunburst_segment_style(&seg, false);
+        assert!(style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn segment_style_not_dim_when_focused_and_uncached() {
+        let seg = make_segment(SunburstBucket::Classified, 0.0, false);
+        let style = sunburst_segment_style(&seg, true);
+        assert!(!style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn braille_style_dim_when_cached() {
+        let seg = make_segment(SunburstBucket::Category, 0.9, false);
+        let style = sunburst_braille_style(&seg, true);
+        assert!(style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn braille_style_selected_overrides_fg_to_white() {
+        let seg = make_segment(SunburstBucket::Mixed, 0.0, true);
+        let style = sunburst_braille_style(&seg, true);
+        assert_eq!(style.fg, Some(Color::White));
+    }
+
+    #[test]
+    fn segment_style_selected_overrides_fg_to_white() {
+        let seg = make_segment(SunburstBucket::Mixed, 0.0, true);
+        let style = sunburst_segment_style(&seg, true);
+        assert_eq!(style.fg, Some(Color::White));
+        assert_eq!(style.bg, Some(Color::Yellow));
     }
 }
