@@ -228,6 +228,11 @@ struct ExtractedMessage {
     parts: Vec<ExtractedMessagePart>,
 }
 
+/// Normalized message part fields extracted during import.
+///
+/// Only fields consumed by downstream modules (classify, query) are populated.
+/// See [`IMPORT_SCHEMA_VERSION`](super::IMPORT_SCHEMA_VERSION) for the field
+/// contract.
 #[derive(Debug, Clone)]
 struct ExtractedMessagePart {
     part_kind: String,
@@ -1010,7 +1015,7 @@ fn extract_message_parts(
         Value::String(text) => Ok(vec![ExtractedMessagePart {
             part_kind: "text".to_string(),
             mime_type: None,
-            text_value: Some(text.clone()),
+            text_value: None,
             tool_name: None,
             tool_call_id: None,
             metadata_json: None,
@@ -1029,20 +1034,17 @@ fn extract_message_parts(
                     format!("unable to serialize message part on source line {source_line_no}")
                 })?;
 
-                let text_value = match part_type.as_str() {
-                    "text" | "thinking" => optional_string(part.get("text")),
-                    "tool_result" => extract_tool_result_text(part),
-                    _ => None,
-                };
+                let text_value = None;
 
                 let tool_name = optional_string(part.get("name"));
                 let tool_call_id = optional_string(part.get("id"))
                     .or_else(|| optional_string(part.get("tool_use_id")));
-                let mime_type = optional_string(part.get("mime_type"));
-                let metadata_json = if part_type == "text" || part_type == "thinking" {
-                    None
-                } else {
-                    Some(dedupe_key.clone())
+                let mime_type = None;
+                let metadata_json = match part_type.as_str() {
+                    "tool_use" => part
+                        .get("input")
+                        .map(|input| serde_json::json!({ "input": input }).to_string()),
+                    _ => None,
                 };
                 let is_error = part
                     .get("is_error")
@@ -1064,29 +1066,6 @@ fn extract_message_parts(
             Ok(extracted_parts)
         }
         _ => Ok(Vec::new()),
-    }
-}
-
-fn extract_tool_result_text(part: &Value) -> Option<String> {
-    match part.get("content") {
-        Some(Value::String(text)) => Some(text.clone()),
-        Some(Value::Array(values)) => {
-            let texts: Vec<String> = values
-                .iter()
-                .filter_map(|value| {
-                    value
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
-                })
-                .collect();
-            if texts.is_empty() {
-                None
-            } else {
-                Some(texts.join("\n"))
-            }
-        }
-        _ => None,
     }
 }
 

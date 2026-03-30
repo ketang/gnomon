@@ -13,8 +13,8 @@ use jiff::{Timestamp, ToSpan, tz::TimeZone};
 use rusqlite::{Connection, Transaction, params};
 
 use super::{
-    NormalizeJsonlFileParams, STARTUP_IMPORT_WINDOW_HOURS, STARTUP_OPEN_DEADLINE_SECS,
-    normalize_jsonl_file,
+    IMPORT_SCHEMA_VERSION, NormalizeJsonlFileParams, STARTUP_IMPORT_WINDOW_HOURS,
+    STARTUP_OPEN_DEADLINE_SECS, normalize_jsonl_file,
 };
 
 const IMPORTER_THREAD_NAME: &str = "gnomon-importer";
@@ -130,6 +130,7 @@ struct SourceFileRow {
     size_bytes: i64,
     imported_size_bytes: Option<i64>,
     imported_modified_at_utc: Option<String>,
+    imported_schema_version: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,7 +365,8 @@ fn load_source_files(conn: &Connection) -> Result<Vec<SourceFileRow>> {
                 source_file.discovered_at_utc,
                 source_file.size_bytes,
                 source_file.imported_size_bytes,
-                source_file.imported_modified_at_utc
+                source_file.imported_modified_at_utc,
+                source_file.imported_schema_version
             FROM source_file
             JOIN project ON project.id = source_file.project_id
             ORDER BY project.canonical_key, source_file.relative_path
@@ -384,6 +386,7 @@ fn load_source_files(conn: &Connection) -> Result<Vec<SourceFileRow>> {
                 size_bytes: row.get(6)?,
                 imported_size_bytes: row.get(7)?,
                 imported_modified_at_utc: row.get(8)?,
+                imported_schema_version: row.get(9)?,
             })
         })
         .context("unable to enumerate source files for import planning")?;
@@ -401,6 +404,7 @@ fn current_chunk_timestamp(row: &SourceFileRow) -> &str {
 fn source_file_needs_import(row: &SourceFileRow) -> bool {
     row.imported_size_bytes != Some(row.size_bytes)
         || row.imported_modified_at_utc != row.modified_at_utc
+        || row.imported_schema_version != Some(IMPORT_SCHEMA_VERSION)
 }
 
 fn startup_days(now: Timestamp, time_zone: &TimeZone) -> Result<BTreeSet<String>> {
@@ -753,10 +757,11 @@ fn finalize_chunk_import(conn: &mut Connection, chunk: &PreparedChunk) -> Result
             UPDATE source_file
             SET
                 imported_size_bytes = size_bytes,
-                imported_modified_at_utc = modified_at_utc
+                imported_modified_at_utc = modified_at_utc,
+                imported_schema_version = ?2
             WHERE id = ?1
             ",
-            [source_file.source_file_id],
+            params![source_file.source_file_id, IMPORT_SCHEMA_VERSION],
         )
         .with_context(|| {
             format!(
