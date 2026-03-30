@@ -141,6 +141,25 @@ pub struct BatchBrowseRequest {
     pub paths: Vec<BrowsePath>,
 }
 
+impl BatchBrowseRequest {
+    /// Decompose into individual `BrowseRequest` values, one per path.
+    ///
+    /// Useful for callers that need per-parent cache keys (e.g., the prefetch
+    /// coordinator writes each result under its own `PersistedBrowseRequest` key).
+    pub fn to_individual_requests(&self) -> Vec<BrowseRequest> {
+        self.paths
+            .iter()
+            .map(|path| BrowseRequest {
+                snapshot: self.snapshot.clone(),
+                root: self.root,
+                lens: self.lens,
+                filters: self.filters.clone(),
+                path: path.clone(),
+            })
+            .collect()
+    }
+}
+
 /// Per-parent results from a batched browse query, keyed by the original `BrowsePath`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BatchBrowseResponse {
@@ -894,18 +913,7 @@ impl<'conn> QueryEngine<'conn> {
         let mut perf = self.perf_scope("query.browse_batch");
         perf.field("path_count", batch.paths.len());
 
-        let requests: Vec<BrowseRequest> = batch
-            .paths
-            .iter()
-            .map(|path| BrowseRequest {
-                snapshot: batch.snapshot.clone(),
-                root: batch.root,
-                lens: batch.lens,
-                filters: batch.filters.clone(),
-                path: path.clone(),
-            })
-            .collect();
-
+        let requests = batch.to_individual_requests();
         let row_sets = self.browse_many(&requests)?;
 
         let results = batch
@@ -3559,7 +3567,7 @@ mod tests {
     use crate::perf::PerfLogger;
 
     use super::{
-        ActionKey, BatchBrowseRequest, BrowseFilters, BrowsePath, BrowseRequest,
+        ActionKey, BatchBrowseRequest, BatchBrowseResult, BrowseFilters, BrowsePath, BrowseRequest,
         ClassificationState, ConversationTurnRow, FilterOptions, MetricLens, QueryEngine, RootView,
         SnapshotBounds, SnapshotCoverageSummary, TimeWindowFilter,
         build_grouped_action_rollup_rows_query, build_opportunities_rows,
@@ -5347,5 +5355,186 @@ mod tests {
 
         assert_eq!(timestamp.to_string(), "2026-03-27T18:28:38Z");
         Ok(())
+    }
+
+    #[test]
+    fn browse_batch_multi_parent_grouped_matches_individual() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let conn = db.connection_mut();
+        let fixture = seed_query_fixture(conn, temp.path())?;
+        let engine = QueryEngine::new(conn);
+        let snapshot = engine.latest_snapshot_bounds()?;
+
+        let batch_request = BatchBrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            paths: vec![
+                BrowsePath::Project {
+                    project_id: fixture.project_a_id,
+                },
+                BrowsePath::Root,
+            ],
+        };
+
+        let batch_response = engine.browse_batch(&batch_request)?;
+        assert_eq!(batch_response.results.len(), 2);
+
+        for result in &batch_response.results {
+            let individual = engine.browse(&BrowseRequest {
+                snapshot: snapshot.clone(),
+                root: RootView::ProjectHierarchy,
+                lens: MetricLens::UncachedInput,
+                filters: BrowseFilters::default(),
+                path: result.path.clone(),
+            })?;
+            assert_eq!(
+                *result,
+                BatchBrowseResult {
+                    path: result.path.clone(),
+                    rows: individual,
+                }
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn browse_batch_single_element_matches_browse() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let conn = db.connection_mut();
+        let fixture = seed_query_fixture(conn, temp.path())?;
+        let engine = QueryEngine::new(conn);
+        let snapshot = engine.latest_snapshot_bounds()?;
+
+        let path = BrowsePath::Project {
+            project_id: fixture.project_a_id,
+        };
+        let batch_response = engine.browse_batch(&BatchBrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            paths: vec![path.clone()],
+        })?;
+
+        let individual = engine.browse(&BrowseRequest {
+            snapshot,
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            path: path.clone(),
+        })?;
+
+        assert_eq!(batch_response.results.len(), 1);
+        assert_eq!(
+            batch_response.results[0],
+            BatchBrowseResult {
+                path,
+                rows: individual,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn browse_batch_empty_paths_returns_empty_results() -> Result<()> {
+        let temp = tempdir()?;
+        let db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let engine = QueryEngine::new(db.connection());
+        let snapshot = SnapshotBounds::bootstrap();
+
+        let response = engine.browse_batch(&BatchBrowseRequest {
+            snapshot,
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            paths: vec![],
+        })?;
+
+        assert!(response.results.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn browse_batch_path_browse_falls_back_to_individual() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let conn = db.connection_mut();
+        let fixture = seed_query_fixture(conn, temp.path())?;
+        let engine = QueryEngine::new(conn);
+        let snapshot = engine.latest_snapshot_bounds()?;
+
+        let editing_action = ActionKey {
+            classification_state: ClassificationState::Classified,
+            normalized_action: Some("read file".to_string()),
+            command_family: None,
+            base_command: None,
+        };
+        let path_browse = BrowsePath::ProjectAction {
+            project_id: fixture.project_a_id,
+            category: "editing".to_string(),
+            action: editing_action,
+            parent_path: None,
+        };
+
+        let batch_response = engine.browse_batch(&BatchBrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            paths: vec![path_browse.clone()],
+        })?;
+
+        let individual = engine.browse(&BrowseRequest {
+            snapshot,
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            path: path_browse.clone(),
+        })?;
+
+        assert_eq!(batch_response.results.len(), 1);
+        assert_eq!(
+            batch_response.results[0],
+            BatchBrowseResult {
+                path: path_browse,
+                rows: individual,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn batch_browse_request_to_individual_requests_decomposes_correctly() {
+        let batch = BatchBrowseRequest {
+            snapshot: SnapshotBounds::bootstrap(),
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::Total,
+            filters: BrowseFilters::default(),
+            paths: vec![
+                BrowsePath::Root,
+                BrowsePath::Project { project_id: 1 },
+                BrowsePath::Category {
+                    category: "editing".to_string(),
+                },
+            ],
+        };
+
+        let individual = batch.to_individual_requests();
+        assert_eq!(individual.len(), 3);
+        for (request, path) in individual.iter().zip(batch.paths.iter()) {
+            assert_eq!(&request.path, path);
+            assert_eq!(request.snapshot, batch.snapshot);
+            assert_eq!(request.root, batch.root);
+            assert_eq!(request.lens, batch.lens);
+            assert_eq!(request.filters, batch.filters);
+        }
     }
 }
