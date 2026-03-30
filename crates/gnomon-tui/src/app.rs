@@ -6504,7 +6504,7 @@ mod tests {
     }
 
     #[test]
-    fn radial_pane_renders_coarse_segments_through_sunburst_raster_pipeline() -> Result<()> {
+    fn radial_pane_renders_coarse_segments_through_coarse_raster_pipeline() -> Result<()> {
         let model = RadialModel {
             center: RadialCenter::default(),
             layers: vec![RadialLayer {
@@ -6534,7 +6534,10 @@ mod tests {
                 &SunburstPane {
                     model: &model,
                     focused: true,
-                    config: SunburstRenderConfig::default(),
+                    config: SunburstRenderConfig {
+                        mode: SunburstRenderMode::Coarse,
+                        ..SunburstRenderConfig::default()
+                    },
                 },
                 frame.area(),
             );
@@ -6630,7 +6633,10 @@ mod tests {
                 &SunburstPane {
                     model: &model,
                     focused: true,
-                    config: SunburstRenderConfig::default(),
+                    config: SunburstRenderConfig {
+                        mode: SunburstRenderMode::Coarse,
+                        ..SunburstRenderConfig::default()
+                    },
                 },
                 frame.area(),
             );
