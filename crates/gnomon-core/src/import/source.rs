@@ -107,6 +107,7 @@ pub fn scan_source_manifest(database: &mut Database, source_root: &Path) -> Resu
     }
 
     report.deleted_source_files = delete_missing_source_files(&tx, &seen_files)?;
+    delete_orphaned_projects(&tx)?;
     tx.commit()
         .context("unable to commit the source manifest scan transaction")?;
 
@@ -489,6 +490,35 @@ fn delete_missing_source_files(
     Ok(delete_ids.len())
 }
 
+fn delete_orphaned_projects(tx: &Transaction<'_>) -> Result<usize> {
+    let mut stmt = tx
+        .prepare(
+            "
+            SELECT project.id
+            FROM project
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM source_file
+                WHERE source_file.project_id = project.id
+            )
+            ",
+        )
+        .context("unable to prepare orphaned project query")?;
+    let project_ids = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .context("unable to enumerate orphaned projects")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("unable to decode orphaned project rows")?;
+    drop(stmt);
+
+    for id in &project_ids {
+        tx.execute("DELETE FROM project WHERE id = ?1", [id])
+            .with_context(|| format!("unable to delete orphaned project row {id}"))?;
+    }
+
+    Ok(project_ids.len())
+}
+
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -500,6 +530,7 @@ mod tests {
     use std::process::Command;
 
     use anyhow::{Context, Result, bail};
+    use rusqlite::params;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -1019,6 +1050,72 @@ mod tests {
             "only the new file should be inserted"
         );
         assert_eq!(second.discovered_source_files, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn rescan_removes_orphaned_projects_after_identity_changes() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        let db_path = temp.path().join("usage.sqlite3");
+        let stale_cwd = temp.path().join("agent-a").join("session-root");
+        let repo_root = temp.path().join("repo");
+        let canonical_cwd = repo_root.join("src");
+        let source_file_path = source_root.join("session.jsonl");
+
+        write_jsonl(&source_file_path, &stale_cwd)?;
+
+        let mut db = Database::open(&db_path)?;
+        let first = scan_source_manifest(&mut db, &source_root)?;
+        assert_eq!(first.inserted_projects, 1);
+        assert_eq!(first.inserted_source_files, 1);
+
+        let stale_project_id: i64 = db.connection().query_row(
+            "SELECT id FROM project WHERE identity_kind = 'path'",
+            [],
+            |row| row.get(0),
+        )?;
+        db.connection().execute(
+            "INSERT INTO import_chunk (project_id, chunk_day_local, state) VALUES (?1, ?2, ?3)",
+            params![stale_project_id, "2026-03-29", "complete"],
+        )?;
+
+        init_git_repo(&repo_root)?;
+        fs::create_dir_all(&canonical_cwd)?;
+        write_jsonl(&source_file_path, &canonical_cwd)?;
+
+        let second = scan_source_manifest(&mut db, &source_root)?;
+        assert_eq!(second.discovered_source_files, 1);
+        assert_eq!(second.inserted_projects, 1);
+        assert_eq!(second.inserted_source_files, 1);
+        assert_eq!(second.deleted_source_files, 1);
+
+        let remaining_projects: Vec<(String, String)> = db
+            .connection()
+            .prepare(
+                "
+                SELECT identity_kind, root_path
+                FROM project
+                ORDER BY root_path
+                ",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            remaining_projects,
+            vec![("git".to_string(), repo_root.display().to_string())]
+        );
+
+        let stale_chunks: i64 = db.connection().query_row(
+            "SELECT COUNT(*) FROM import_chunk WHERE project_id = ?1",
+            [stale_project_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            stale_chunks, 0,
+            "deleting the orphaned project should cascade stale import state"
+        );
+
         Ok(())
     }
 
