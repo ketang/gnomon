@@ -60,7 +60,7 @@ mod chunk;
 mod normalize;
 
 pub use chunk::{
-    ImportExecutionReport, StartupImport, StartupOpenReason, StartupWorkerEvent, import_all,
-    start_startup_import,
+    ImportExecutionReport, StartupImport, StartupOpenReason, StartupProgressUpdate,
+    StartupWorkerEvent, import_all, start_startup_import, start_startup_import_with_progress,
 };
 pub use normalize::{NormalizeJsonlFileParams, NormalizeJsonlFileResult, normalize_jsonl_file};

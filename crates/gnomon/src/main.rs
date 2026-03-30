@@ -1,3 +1,4 @@
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -5,7 +6,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use gnomon_core::benchmark::{QueryBenchmarkOptions, QueryBenchmarkReport, run_query_benchmark};
 use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
 use gnomon_core::db::{Database, ResetReport, reset_sqlite_database};
-use gnomon_core::import::{import_all, scan_source_manifest, start_startup_import};
+use gnomon_core::import::{
+    StartupProgressUpdate, import_all, scan_source_manifest, start_startup_import,
+    start_startup_import_with_progress,
+};
 use gnomon_core::opportunity::{OpportunityCategory, OpportunityConfidence, OpportunitySummary};
 use gnomon_core::perf::PerfLogger;
 use gnomon_core::query::{
@@ -337,23 +341,31 @@ fn run(cli: Cli) -> Result<()> {
 fn run_app(config: &RuntimeConfig, startup_args: StartupArgs) -> Result<()> {
     config.ensure_dirs()?;
     let perf_logger = PerfLogger::from_env(&config.state_dir)?;
+    let mut startup_progress = StartupConsoleProgress::stderr();
     let mut database = Database::open(&config.db_path)?;
     let _scan_report = scan_source_manifest(&mut database, &config.source_root)?;
-    let mut startup_import =
-        start_startup_import(database.connection(), &config.db_path, &config.source_root)?;
+    let mut startup_import = start_startup_import_with_progress(
+        database.connection(),
+        &config.db_path,
+        &config.source_root,
+        |update| startup_progress.import_progress(update),
+    )?;
     let snapshot = startup_import.snapshot.clone();
     let open_reason = startup_import.open_reason;
     let startup_status_message = startup_import.startup_status_message.clone();
+    let startup_progress_update = startup_import.startup_progress_update.clone();
     let startup_browse_state = startup_args.build_startup_browse_state()?;
     let status_updates = startup_import.take_status_updates();
 
-    gnomon_tui::run(
+    gnomon_tui::run_with_progress(
         config,
         snapshot,
         open_reason,
         startup_status_message,
+        startup_progress_update,
         startup_browse_state,
         status_updates,
+        |update| startup_progress.query_progress(update),
         perf_logger,
     )
 }
@@ -395,6 +407,7 @@ fn run_snapshot_command(config: &RuntimeConfig, args: &SnapshotArgs) -> Result<(
     let snapshot = startup_import.snapshot.clone();
     let open_reason = startup_import.open_reason;
     let startup_status_message = startup_import.startup_status_message.clone();
+    let startup_progress_update = startup_import.startup_progress_update.clone();
     let startup_browse_state = args.startup.build_startup_browse_state()?;
     // Drain the import worker so it doesn't outlive the render.
     drop(startup_import.take_status_updates());
@@ -404,6 +417,7 @@ fn run_snapshot_command(config: &RuntimeConfig, args: &SnapshotArgs) -> Result<(
         snapshot,
         open_reason,
         startup_status_message,
+        startup_progress_update,
         startup_browse_state,
         args.width,
         args.height,
@@ -524,6 +538,49 @@ fn rebuild_database(config: &RuntimeConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+struct StartupConsoleProgress {
+    enabled: bool,
+    rendered_width: usize,
+}
+
+impl StartupConsoleProgress {
+    fn stderr() -> Self {
+        Self {
+            enabled: io::stderr().is_terminal(),
+            rendered_width: 0,
+        }
+    }
+
+    fn import_progress(&mut self, update: &StartupProgressUpdate) {
+        self.render_line(format!(
+            "Starting gnomon: {} [{}/{}] {}",
+            update.label, update.current, update.total, update.detail
+        ));
+    }
+
+    fn query_progress(&mut self, update: gnomon_tui::StartupLoadProgressUpdate) {
+        let progress = match (update.current, update.total) {
+            (Some(current), Some(total)) => format!("[{current}/{total}] "),
+            _ => String::new(),
+        };
+        self.render_line(format!(
+            "Starting gnomon: precomputing queries {progress}{}",
+            update.phase
+        ));
+    }
+
+    fn render_line(&mut self, line: String) {
+        if !self.enabled {
+            return;
+        }
+
+        let padding = self.rendered_width.saturating_sub(line.len());
+        eprint!("\r{line}{}", " ".repeat(padding));
+        let _ = io::stderr().flush();
+        self.rendered_width = line.len();
+    }
 }
 
 fn print_reset_report(db_path: &Path, report: &ResetReport) {

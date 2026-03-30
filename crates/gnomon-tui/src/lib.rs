@@ -5,7 +5,7 @@ mod sunburst;
 
 use anyhow::Result;
 use gnomon_core::config::RuntimeConfig;
-use gnomon_core::import::{StartupOpenReason, StartupWorkerEvent};
+use gnomon_core::import::{StartupOpenReason, StartupProgressUpdate, StartupWorkerEvent};
 use gnomon_core::perf::PerfLogger;
 use gnomon_core::query::{BrowsePath, RootView, SnapshotBounds};
 use std::sync::mpsc::Receiver;
@@ -18,22 +18,64 @@ pub struct StartupBrowseState {
     pub path: BrowsePath,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupLoadProgressUpdate {
+    pub phase: String,
+    pub current: Option<usize>,
+    pub total: Option<usize>,
+}
+
+// These entry points intentionally keep startup state explicit so callers can
+// thread snapshot context, import progress, and prelaunch query progress
+// without hiding them behind process-global state.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     config: &RuntimeConfig,
     snapshot: SnapshotBounds,
     startup_open_reason: StartupOpenReason,
     startup_status_message: Option<String>,
+    startup_progress_update: Option<StartupProgressUpdate>,
     startup_browse_state: Option<StartupBrowseState>,
     status_updates: Option<Receiver<StartupWorkerEvent>>,
     perf_logger: Option<PerfLogger>,
 ) -> Result<()> {
+    run_with_progress(
+        config,
+        snapshot,
+        startup_open_reason,
+        startup_status_message,
+        startup_progress_update,
+        startup_browse_state,
+        status_updates,
+        |_| {},
+        perf_logger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_progress<F>(
+    config: &RuntimeConfig,
+    snapshot: SnapshotBounds,
+    startup_open_reason: StartupOpenReason,
+    startup_status_message: Option<String>,
+    startup_progress_update: Option<StartupProgressUpdate>,
+    startup_browse_state: Option<StartupBrowseState>,
+    status_updates: Option<Receiver<StartupWorkerEvent>>,
+    mut on_progress: F,
+    perf_logger: Option<PerfLogger>,
+) -> Result<()>
+where
+    F: FnMut(StartupLoadProgressUpdate),
+{
     app::App::new(
         config.clone(),
         snapshot,
         startup_open_reason,
         startup_status_message,
+        startup_progress_update,
         startup_browse_state,
         status_updates,
+        Some(&mut on_progress),
         perf_logger,
     )?
     .run()
@@ -42,11 +84,13 @@ pub fn run(
 /// Render the TUI once with the given viewport dimensions and return the
 /// frame content as a newline-delimited string. Exits immediately without
 /// entering an interactive event loop or requiring a terminal.
+#[allow(clippy::too_many_arguments)]
 pub fn render_snapshot(
     config: &RuntimeConfig,
     snapshot: SnapshotBounds,
     startup_open_reason: StartupOpenReason,
     startup_status_message: Option<String>,
+    startup_progress_update: Option<StartupProgressUpdate>,
     startup_browse_state: Option<StartupBrowseState>,
     width: u16,
     height: u16,
@@ -56,18 +100,22 @@ pub fn render_snapshot(
         snapshot,
         startup_open_reason,
         startup_status_message,
+        startup_progress_update,
         startup_browse_state,
+        None,
         None,
         None,
     )?;
     app.render_snapshot(width, height)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn probe_startup(
     config: &RuntimeConfig,
     snapshot: SnapshotBounds,
     startup_open_reason: StartupOpenReason,
     startup_status_message: Option<String>,
+    startup_progress_update: Option<StartupProgressUpdate>,
     startup_browse_state: Option<StartupBrowseState>,
     status_updates: Option<Receiver<StartupWorkerEvent>>,
     perf_logger: Option<PerfLogger>,
@@ -77,8 +125,10 @@ pub fn probe_startup(
         snapshot,
         startup_open_reason,
         startup_status_message,
+        startup_progress_update,
         startup_browse_state,
         status_updates,
+        None,
         perf_logger,
     )?;
     Ok(())
@@ -108,6 +158,7 @@ mod tests {
             &make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
             None,
             Some(StartupBrowseState {
                 root: RootView::CategoryHierarchy,
@@ -149,6 +200,7 @@ mod tests {
             &make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
             None,
             Some(StartupBrowseState {
                 root: RootView::ProjectHierarchy,

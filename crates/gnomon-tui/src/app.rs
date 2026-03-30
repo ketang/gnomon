@@ -8,7 +8,6 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::StartupBrowseState;
 use crate::gnomon_sunburst::{
     build_sunburst_layer, build_sunburst_model, build_sunburst_scope_label,
 };
@@ -16,6 +15,7 @@ use crate::sunburst::{
     SunburstDistortionPolicy, SunburstLayer, SunburstModel, SunburstPane, SunburstRenderConfig,
     SunburstSpan, sunburst_selected_child_span,
 };
+use crate::{StartupBrowseState, StartupLoadProgressUpdate};
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::execute;
@@ -26,7 +26,7 @@ use gnomon_core::browse_cache::{BrowseCacheStore, default_browse_cache_path};
 use gnomon_core::config::RuntimeConfig;
 use gnomon_core::db::{Database, reset_sqlite_database, sqlite_artifact_size_bytes};
 use gnomon_core::import::{
-    StartupOpenReason, StartupWorkerEvent, import_all, scan_source_manifest,
+    StartupOpenReason, StartupProgressUpdate, StartupWorkerEvent, import_all, scan_source_manifest,
 };
 use gnomon_core::opportunity::{OpportunityCategory, OpportunityConfidence};
 use gnomon_core::perf::{PerfLogger, PerfScope};
@@ -370,6 +370,18 @@ struct PhaseProgress {
     total: usize,
 }
 
+trait ProgressSink {
+    fn update(&mut self, phase: String, progress: Option<PhaseProgress>);
+
+    fn phase(&mut self, phase: String) {
+        self.update(phase, None);
+    }
+
+    fn step(&mut self, current: usize, total: usize, phase: String) {
+        self.update(phase, Some(PhaseProgress { current, total }));
+    }
+}
+
 #[derive(Debug)]
 struct LoadedView {
     snapshot: SnapshotBounds,
@@ -424,6 +436,14 @@ enum PendingTaskState {
 struct PendingAsyncWork {
     view: PendingTaskTracker,
     jump: PendingTaskTracker,
+}
+
+#[derive(Debug, Clone)]
+struct StartupActivity {
+    label: String,
+    detail: String,
+    progress: PhaseProgress,
+    updated_at: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -524,6 +544,31 @@ impl PendingAsyncWork {
         } else {
             Some(parts.join("  |  "))
         }
+    }
+}
+
+impl StartupActivity {
+    fn from_progress(update: StartupProgressUpdate) -> Self {
+        Self {
+            label: update.label.to_string(),
+            detail: update.detail,
+            progress: PhaseProgress {
+                current: update.current,
+                total: update.total,
+            },
+            updated_at: Instant::now(),
+        }
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "{} {} [{}/{}]: {}",
+            spinner_frame_for(self.updated_at),
+            self.label,
+            self.progress.current,
+            self.progress.total,
+            self.detail
+        )
     }
 }
 
@@ -690,6 +735,7 @@ pub struct App {
     radial_model: RadialModel,
     jump_state: JumpState,
     status_message: Option<StatusMessage>,
+    startup_activity: Option<StartupActivity>,
     status_updates: Option<Receiver<StartupWorkerEvent>>,
     last_refresh_check: Instant,
     next_request_sequence: u64,
@@ -704,13 +750,18 @@ pub struct App {
 }
 
 impl App {
+    // Startup construction necessarily threads snapshot state, startup-import
+    // channels, and optional prelaunch progress hooks through one boundary.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: RuntimeConfig,
         snapshot: SnapshotBounds,
         startup_open_reason: StartupOpenReason,
         startup_status_message: Option<String>,
+        startup_progress_update: Option<StartupProgressUpdate>,
         startup_browse_state: Option<StartupBrowseState>,
         status_updates: Option<Receiver<StartupWorkerEvent>>,
+        startup_load_progress: Option<&mut dyn FnMut(StartupLoadProgressUpdate)>,
         perf_logger: Option<PerfLogger>,
     ) -> Result<Self> {
         let ui_state_path = config.state_dir.join(UI_STATE_FILENAME);
@@ -776,6 +827,7 @@ impl App {
             radial_model: RadialModel::default(),
             jump_state: JumpState::default(),
             status_message,
+            startup_activity: startup_progress_update.map(StartupActivity::from_progress),
             status_updates,
             last_refresh_check: Instant::now(),
             next_request_sequence: 1,
@@ -792,6 +844,7 @@ impl App {
         let perf_logger = app.perf_logger.clone();
         let conn = app.database.connection();
         let query_engine = QueryEngine::with_perf(conn, perf_logger.clone());
+        let mut load_progress_reporter = startup_load_progress.map(LoadProgressReporter::new);
         let initial_view = load_view_for_state(
             &query_engine,
             &mut app.query_cache,
@@ -800,7 +853,9 @@ impl App {
             snapshot,
             app.ui_state.clone(),
             None,
-            None,
+            load_progress_reporter
+                .as_mut()
+                .map(|reporter| reporter as &mut dyn ProgressSink),
         )?;
         app.apply_loaded_view(initial_view)?;
         app.refresh_snapshot_status()?;
@@ -888,6 +943,9 @@ impl App {
 
     fn apply_status_update(&mut self, update: StartupWorkerEvent) {
         match update {
+            StartupWorkerEvent::Progress { update } => {
+                self.startup_activity = Some(StartupActivity::from_progress(update));
+            }
             StartupWorkerEvent::StartupSettled {
                 startup_status_message,
             } => {
@@ -901,6 +959,9 @@ impl App {
                 if let Some(message) = deferred_status_message {
                     self.push_status_message(message);
                 }
+            }
+            StartupWorkerEvent::Finished => {
+                self.startup_activity = None;
             }
         }
     }
@@ -2596,10 +2657,17 @@ impl App {
     }
 
     fn header_detail_line(&self) -> Line<'static> {
-        match (
+        let activity = match (
+            self.startup_activity.as_ref().map(StartupActivity::summary),
             self.pending_async_work.summary(),
-            self.status_message.as_ref(),
         ) {
+            (Some(startup), Some(async_work)) => Some(format!("{startup}  |  {async_work}")),
+            (Some(startup), None) => Some(startup),
+            (None, Some(async_work)) => Some(async_work),
+            (None, None) => None,
+        };
+
+        match (activity, self.status_message.as_ref()) {
             (Some(activity), Some(message)) => Line::from(vec![
                 badge("activity", BadgeTone::Accent),
                 separator_span(),
@@ -3061,16 +3129,10 @@ impl<'a> QueryProgressReporter<'a> {
             task,
         }
     }
+}
 
-    fn phase(&self, phase: impl Into<String>) {
-        self.update(phase.into(), None);
-    }
-
-    fn step(&self, current: usize, total: usize, phase: impl Into<String>) {
-        self.update(phase.into(), Some(PhaseProgress { current, total }));
-    }
-
-    fn update(&self, phase: String, progress: Option<PhaseProgress>) {
+impl ProgressSink for QueryProgressReporter<'_> {
+    fn update(&mut self, phase: String, progress: Option<PhaseProgress>) {
         let _ = self
             .results
             .send(QueryWorkerResult::Progress(QueryProgressUpdate {
@@ -3079,6 +3141,26 @@ impl<'a> QueryProgressReporter<'a> {
                 phase,
                 progress,
             }));
+    }
+}
+
+struct LoadProgressReporter<'a> {
+    callback: &'a mut dyn FnMut(StartupLoadProgressUpdate),
+}
+
+impl<'a> LoadProgressReporter<'a> {
+    fn new(callback: &'a mut dyn FnMut(StartupLoadProgressUpdate)) -> Self {
+        Self { callback }
+    }
+}
+
+impl ProgressSink for LoadProgressReporter<'_> {
+    fn update(&mut self, phase: String, progress: Option<PhaseProgress>) {
+        (self.callback)(StartupLoadProgressUpdate {
+            phase,
+            current: progress.map(|progress| progress.current),
+            total: progress.map(|progress| progress.total),
+        });
     }
 }
 
@@ -3117,7 +3199,7 @@ fn run_query_worker(
     while let Ok(request) = requests.recv() {
         let result = match request {
             QueryWorkerRequest::LoadView(request) => {
-                let progress =
+                let mut progress =
                     QueryProgressReporter::new(&results, request.sequence, PendingTaskKind::View);
                 load_view_for_state(
                     &query_engine,
@@ -3127,7 +3209,7 @@ fn run_query_worker(
                     request.snapshot,
                     request.ui_state,
                     request.selected_key,
-                    Some(&progress),
+                    Some(&mut progress),
                 )
                 .map(|loaded_view| {
                     QueryWorkerResult::ViewLoaded(ViewLoadResult {
@@ -3144,16 +3226,16 @@ fn run_query_worker(
                 })
             }
             QueryWorkerRequest::RefreshLatest(request) => {
-                let progress =
+                let mut progress =
                     QueryProgressReporter::new(&results, request.sequence, PendingTaskKind::View);
-                progress.phase("checking for newer snapshot");
+                progress.phase("checking for newer snapshot".to_string());
                 let latest_snapshot = query_engine.latest_snapshot_bounds();
                 match latest_snapshot {
                     Ok(latest_snapshot)
                         if latest_snapshot.max_publish_seq
                             > request.current_snapshot.max_publish_seq =>
                     {
-                        progress.phase("loading filter options");
+                        progress.phase("loading filter options".to_string());
                         load_view_for_state(
                             &query_engine,
                             &mut query_cache,
@@ -3162,7 +3244,7 @@ fn run_query_worker(
                             latest_snapshot.clone(),
                             request.ui_state,
                             request.selected_key,
-                            Some(&progress),
+                            Some(&mut progress),
                         )
                         .map(|loaded_view| {
                             QueryWorkerResult::RefreshCompleted(RefreshViewResult {
@@ -3192,7 +3274,7 @@ fn run_query_worker(
                 }
             }
             QueryWorkerRequest::BuildJumpTargets(request) => {
-                let progress =
+                let mut progress =
                     QueryProgressReporter::new(&results, request.sequence, PendingTaskKind::Jump);
                 build_jump_targets_for_state(
                     &query_engine,
@@ -3201,7 +3283,7 @@ fn run_query_worker(
                     perf_logger.clone(),
                     request.snapshot,
                     request.ui_state,
-                    Some(&progress),
+                    Some(&mut progress),
                 )
                 .map(|targets| {
                     QueryWorkerResult::JumpTargetsBuilt(JumpTargetsResult {
@@ -3307,7 +3389,7 @@ fn load_view_for_state(
     snapshot: SnapshotBounds,
     mut ui_state: PersistedUiState,
     selected_key: Option<TreeRowKey>,
-    progress: Option<&QueryProgressReporter<'_>>,
+    mut progress: Option<&mut dyn ProgressSink>,
 ) -> Result<LoadedView> {
     let mut perf = PerfScope::new(perf_logger.clone(), "tui.reload_view");
     perf.field("snapshot", &snapshot);
@@ -3318,8 +3400,12 @@ fn load_view_for_state(
     perf.field("selected_key", &selected_key);
     let mut browse_stats = BrowseFanoutStats::default();
 
-    if let Some(progress) = progress {
-        progress.step(1, VIEW_LOAD_PHASE_TOTAL, "loading filter options");
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.step(
+            1,
+            VIEW_LOAD_PHASE_TOTAL,
+            "loading filter options".to_string(),
+        );
     }
     let filter_options_started = Instant::now();
     let filter_options = cached_filter_options(query_cache, query_engine, &snapshot)?;
@@ -3328,8 +3414,8 @@ fn load_view_for_state(
         filter_options_started.elapsed().as_secs_f64() * 1000.0,
     );
 
-    if let Some(progress) = progress {
-        progress.step(2, VIEW_LOAD_PHASE_TOTAL, "sanitizing UI state");
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.step(2, VIEW_LOAD_PHASE_TOTAL, "sanitizing UI state".to_string());
     }
     let sanitize_started = Instant::now();
     sanitize_ui_state(&mut ui_state, &filter_options);
@@ -3338,8 +3424,12 @@ fn load_view_for_state(
         sanitize_started.elapsed().as_secs_f64() * 1000.0,
     );
 
-    if let Some(progress) = progress {
-        progress.step(3, VIEW_LOAD_PHASE_TOTAL, "applying active filters");
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.step(
+            3,
+            VIEW_LOAD_PHASE_TOTAL,
+            "applying active filters".to_string(),
+        );
     }
     let filters_started = Instant::now();
     let filters = current_query_filters_for(&ui_state, &snapshot)?;
@@ -3349,8 +3439,12 @@ fn load_view_for_state(
     );
     perf.field("filters", &filters);
 
-    if let Some(progress) = progress {
-        progress.step(4, VIEW_LOAD_PHASE_TOTAL, "browsing current path");
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.step(
+            4,
+            VIEW_LOAD_PHASE_TOTAL,
+            "browsing current path".to_string(),
+        );
     }
     let browse_started = Instant::now();
     let (path, raw_rows) = browse_rows_with_parent_fallback(
@@ -3369,8 +3463,12 @@ fn load_view_for_state(
     perf.field("raw_row_count", raw_rows.len());
     ui_state.path = path;
 
-    if let Some(progress) = progress {
-        progress.step(5, VIEW_LOAD_PHASE_TOTAL, "resolving project root");
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.step(
+            5,
+            VIEW_LOAD_PHASE_TOTAL,
+            "resolving project root".to_string(),
+        );
     }
     let project_root_started = Instant::now();
     let current_project_root = match project_id_from_path(&ui_state.path) {
@@ -3391,8 +3489,8 @@ fn load_view_for_state(
         project_root_started.elapsed().as_secs_f64() * 1000.0,
     );
 
-    if let Some(progress) = progress {
-        progress.step(6, VIEW_LOAD_PHASE_TOTAL, "building breadcrumbs");
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.step(6, VIEW_LOAD_PHASE_TOTAL, "building breadcrumbs".to_string());
     }
     let breadcrumb_started = Instant::now();
     let breadcrumb_targets = build_breadcrumb_targets(
@@ -3407,8 +3505,12 @@ fn load_view_for_state(
     );
     perf.field("breadcrumb_count", breadcrumb_targets.len());
 
-    if let Some(progress) = progress {
-        progress.step(7, VIEW_LOAD_PHASE_TOTAL, "recomputing map context");
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.step(
+            7,
+            VIEW_LOAD_PHASE_TOTAL,
+            "recomputing map context".to_string(),
+        );
     }
     let radial_started = Instant::now();
     let radial_context = build_radial_context_for_state(
@@ -3430,8 +3532,12 @@ fn load_view_for_state(
         radial_started.elapsed().as_secs_f64() * 1000.0,
     );
 
-    if let Some(progress) = progress {
-        progress.step(8, VIEW_LOAD_PHASE_TOTAL, "refreshing snapshot coverage");
+    if let Some(progress) = progress.as_mut() {
+        progress.step(
+            8,
+            VIEW_LOAD_PHASE_TOTAL,
+            "refreshing snapshot coverage".to_string(),
+        );
     }
     let coverage_started = Instant::now();
     let snapshot_coverage = cached_snapshot_coverage_summary(query_cache, query_engine, &snapshot)?;
@@ -3474,10 +3580,14 @@ fn build_jump_targets_for_state(
     perf_logger: Option<PerfLogger>,
     snapshot: SnapshotBounds,
     ui_state: PersistedUiState,
-    progress: Option<&QueryProgressReporter<'_>>,
+    mut progress: Option<&mut dyn ProgressSink>,
 ) -> Result<Vec<JumpTarget>> {
-    if let Some(progress) = progress {
-        progress.step(1, JUMP_TARGET_PHASE_TOTAL, "loading current filters");
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.step(
+            1,
+            JUMP_TARGET_PHASE_TOTAL,
+            "loading current filters".to_string(),
+        );
     }
     let filters = current_query_filters_for(&ui_state, &snapshot)?;
     let mut perf = PerfScope::new(perf_logger, "tui.build_jump_targets");
@@ -3493,8 +3603,12 @@ fn build_jump_targets_for_state(
     let mut action_count = 0usize;
     let browse_started = Instant::now();
 
-    if let Some(progress) = progress {
-        progress.step(2, JUMP_TARGET_PHASE_TOTAL, "walking project hierarchy");
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.step(
+            2,
+            JUMP_TARGET_PHASE_TOTAL,
+            "walking project hierarchy".to_string(),
+        );
     }
     let project_root_rows = cached_browse(
         query_cache,
@@ -3588,8 +3702,12 @@ fn build_jump_targets_for_state(
         }
     }
 
-    if let Some(progress) = progress {
-        progress.step(3, JUMP_TARGET_PHASE_TOTAL, "walking category hierarchy");
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.step(
+            3,
+            JUMP_TARGET_PHASE_TOTAL,
+            "walking category hierarchy".to_string(),
+        );
     }
     let category_root_rows = cached_browse(
         query_cache,
@@ -3690,8 +3808,12 @@ fn build_jump_targets_for_state(
         }
     }
 
-    if let Some(progress) = progress {
-        progress.step(4, JUMP_TARGET_PHASE_TOTAL, "finalizing jump targets");
+    if let Some(progress) = progress.as_mut() {
+        progress.step(
+            4,
+            JUMP_TARGET_PHASE_TOTAL,
+            "finalizing jump targets".to_string(),
+        );
     }
     perf.field(
         "browse_work_ms",
@@ -6203,6 +6325,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )?;
         app.ui_state.root = RootView::ProjectHierarchy;
         app.ui_state.path = BrowsePath::ProjectAction {
@@ -6276,6 +6400,8 @@ mod tests {
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
+            None,
             None,
             None,
             None,
@@ -6553,6 +6679,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )?;
 
         // ui_state.path stays at Root – this is the stale path that was
@@ -6599,6 +6727,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )?;
 
         app.ui_state.root = RootView::ProjectHierarchy;
@@ -6629,6 +6759,8 @@ mod tests {
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
+            None,
             None,
             None,
             None,
@@ -7213,6 +7345,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )?;
         app.breadcrumb_targets = build_breadcrumb_targets(
             &RootView::ProjectHierarchy,
@@ -7255,6 +7389,8 @@ mod tests {
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
+            None,
             None,
             None,
             None,
@@ -7319,10 +7455,12 @@ mod tests {
             validation.final_snapshot.clone(),
             StartupOpenReason::Last24hReady,
             None,
+            None,
             Some(StartupBrowseState {
                 root: RootView::ProjectHierarchy,
                 path: BrowsePath::Project { project_id },
             }),
+            None,
             None,
             Some(logger.clone()),
         )?;
@@ -7406,6 +7544,8 @@ mod tests {
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
+            None,
             None,
             None,
             None,
@@ -7637,6 +7777,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )?;
         if let Some(latest_snapshot) = latest_snapshot {
             app.latest_snapshot = latest_snapshot;
@@ -7731,6 +7873,8 @@ mod tests {
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
+            None,
             None,
             None,
             None,
@@ -7854,6 +7998,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )?;
 
         let content = render_app_to_string(&mut app, 140, 40)?;
@@ -7880,6 +8026,8 @@ mod tests {
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
+            None,
             None,
             None,
             None,
@@ -7955,6 +8103,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )?;
         app.status_message = Some(StatusMessage::error(
             "deferred import failed for 2 chunks; first error: unable to normalize source file source/path/to/session.jsonl: unexpected EOF while parsing malformed json",
@@ -7986,6 +8136,8 @@ mod tests {
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
+            None,
             None,
             None,
             None,
@@ -8037,6 +8189,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )?;
         app.pending_async_work.begin_view(2, "loading view");
 
@@ -8069,6 +8223,8 @@ mod tests {
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
+            None,
             None,
             None,
             None,
@@ -8108,6 +8264,8 @@ mod tests {
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
+            None,
             None,
             None,
             None,
@@ -8153,6 +8311,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )?;
         app.pending_async_work.begin_view(1, "loading view");
 
@@ -8164,12 +8324,43 @@ mod tests {
     }
 
     #[test]
+    fn render_shows_startup_import_activity_from_progress_updates() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::TimedOut,
+            None,
+            Some(StartupProgressUpdate {
+                label: "rebuilding database",
+                current: 2,
+                total: 5,
+                detail: "git:/projects/demo:2026-03-29".to_string(),
+            }),
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        let content = render_app_to_string(&mut app, 120, 40)?;
+
+        assert!(content.contains("[activity]"));
+        assert!(content.contains("rebuilding database"));
+        assert!(content.contains("[2/5]"));
+        assert!(content.contains("git:/projects/demo:2026-03-29"));
+        Ok(())
+    }
+
+    #[test]
     fn render_shows_running_and_superseding_view_requests_together() -> Result<()> {
         let temp = tempdir()?;
         let mut app = App::new(
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
+            None,
             None,
             None,
             None,
@@ -8205,6 +8396,8 @@ mod tests {
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
+            None,
             None,
             None,
             None,
@@ -8268,6 +8461,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )?;
         app.focused_pane = PaneFocus::Radial;
         app.ui_state.pane_mode = PaneMode::Radial;
@@ -8303,6 +8498,8 @@ mod tests {
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
+            None,
             None,
             None,
             None,
@@ -8372,6 +8569,8 @@ mod tests {
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
+            None,
             None,
             None,
             None,
@@ -8634,6 +8833,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )?;
 
         app.ui_state.root = RootView::ProjectHierarchy;
@@ -8671,6 +8872,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )?;
 
         app.ui_state.root = RootView::ProjectHierarchy;
@@ -8696,6 +8899,8 @@ mod tests {
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
+            None,
             None,
             None,
             None,
@@ -8731,6 +8936,8 @@ mod tests {
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
+            None,
             None,
             None,
             None,
@@ -8987,6 +9194,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )?;
         app.ui_state.project_id = Some(1);
         app.ui_state.action_category = Some("editing".to_string());
@@ -9013,6 +9222,8 @@ mod tests {
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
+            None,
             None,
             None,
             None,
@@ -9047,6 +9258,8 @@ mod tests {
             make_test_config(temp.path()),
             SnapshotBounds::bootstrap(),
             StartupOpenReason::Last24hReady,
+            None,
+            None,
             None,
             None,
             None,
