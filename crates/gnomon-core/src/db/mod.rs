@@ -94,6 +94,26 @@ pub fn reset_sqlite_database(path: impl AsRef<Path>) -> Result<ResetReport> {
     Ok(report)
 }
 
+pub fn sqlite_artifact_size_bytes(path: impl AsRef<Path>) -> Result<u64> {
+    let mut total = 0u64;
+    for candidate in sqlite_artifact_paths(path.as_ref()) {
+        match fs::metadata(&candidate) {
+            Ok(metadata) => {
+                total = total
+                    .checked_add(metadata.len())
+                    .context("sqlite artifact size overflowed u64")?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("unable to stat sqlite artifact {}", candidate.display())
+                });
+            }
+        }
+    }
+    Ok(total)
+}
+
 fn sqlite_artifact_paths(path: &Path) -> [PathBuf; 3] {
     let db_path = path.to_path_buf();
     let wal_path = sqlite_sidecar_path(path, "wal");
