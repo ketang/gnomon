@@ -7,6 +7,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
 
+use super::NormalizedToolUsePartMetadata;
+
 const PRIMARY_STREAM_SEQUENCE_NO: i64 = 0;
 const SOURCE_LINE_PREVIEW_CHAR_LIMIT: usize = 160;
 
@@ -1041,11 +1043,17 @@ fn extract_message_parts(
                     .or_else(|| optional_string(part.get("tool_use_id")));
                 let mime_type = None;
                 let metadata_json = match part_type.as_str() {
-                    "tool_use" => part
-                        .get("input")
-                        .map(|input| serde_json::json!({ "input": input }).to_string()),
+                    "tool_use" => part.get("input").map(|input| {
+                        serde_json::to_string(&NormalizedToolUsePartMetadata::from_input(input))
+                    }),
                     _ => None,
-                };
+                }
+                .transpose()
+                .with_context(|| {
+                    format!(
+                        "unable to serialize normalized tool input on source line {source_line_no}"
+                    )
+                })?;
                 let is_error = part
                     .get("is_error")
                     .and_then(Value::as_bool)
@@ -1194,6 +1202,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::db::Database;
+    use crate::import::NormalizedToolUsePartMetadata;
 
     use super::{NormalizeJsonlFileParams, normalize_jsonl_file};
 
@@ -1214,6 +1223,15 @@ mod tests {
     );
 
     const SNAPSHOT_ONLY_FIXTURE: &str = "{\"type\":\"file-history-snapshot\",\"messageId\":\"snap-only-1\",\"snapshot\":{\"messageId\":\"snap-only-1\",\"trackedFileBackups\":{},\"timestamp\":\"2026-03-26T09:00:00Z\"},\"isSnapshotUpdate\":false}\n";
+
+    type MessagePartRow = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        i64,
+    );
 
     #[test]
     fn normalizes_main_session_and_deduplicates_assistant_usage() -> Result<()> {
@@ -1348,6 +1366,84 @@ mod tests {
             })?;
         assert_eq!(stream.0, "sidechain");
         assert_eq!(stream.1.as_deref(), Some("agent-side"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn persists_only_consumed_message_part_fields_for_v1_import_schema() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let fixture_path = temp.path().join("session.jsonl");
+        std::fs::write(&fixture_path, MAIN_SESSION_FIXTURE)?;
+
+        let mut db = Database::open(&db_path)?;
+        let ids = seed_import_context(db.connection_mut(), "session.jsonl")?;
+        normalize_jsonl_file(
+            db.connection_mut(),
+            &NormalizeJsonlFileParams {
+                project_id: ids.project_id,
+                source_file_id: ids.source_file_id,
+                import_chunk_id: ids.import_chunk_id,
+                path: fixture_path,
+            },
+        )?
+        .expect("main session fixture should import");
+
+        let parts: Vec<MessagePartRow> = {
+            let mut stmt = db.connection().prepare(
+                "
+                SELECT part_kind, mime_type, text_value, tool_name, metadata_json, is_error
+                FROM message_part
+                WHERE message_id = (SELECT id FROM message WHERE external_id = 'msg-a')
+                ORDER BY ordinal
+                ",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], ("text".to_string(), None, None, None, None, 0));
+
+        let expected_tool_use = serde_json::to_string(&NormalizedToolUsePartMetadata::from_input(
+            &serde_json::json!({
+                "file_path": "/tmp/project/src/lib.rs"
+            }),
+        ))?;
+        assert_eq!(
+            parts[1],
+            (
+                "tool_use".to_string(),
+                None,
+                None,
+                Some("Read".to_string()),
+                Some(expected_tool_use),
+                0,
+            )
+        );
+
+        let tool_result_part: (Option<String>, Option<String>, Option<String>) =
+            db.connection().query_row(
+                "
+                SELECT mime_type, text_value, metadata_json
+                FROM message_part
+                WHERE part_kind = 'tool_result'
+                LIMIT 1
+                ",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        assert_eq!(tool_result_part, (None, None, None));
 
         Ok(())
     }

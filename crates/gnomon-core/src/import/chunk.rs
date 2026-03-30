@@ -1335,6 +1335,54 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn import_plan_reimports_files_when_import_schema_version_changes() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let tz = TimeZone::get("America/Chicago")?;
+        let now: Timestamp = "2026-03-26T18:00:00Z".parse()?;
+
+        let project_id = insert_project(db.connection_mut(), "git:/projects/schema", "schema")?;
+        let source_file_id = insert_source_file(
+            db.connection_mut(),
+            project_id,
+            "schema/session.jsonl",
+            "2026-03-26T15:00:00Z",
+        )?;
+
+        db.connection_mut().execute(
+            "
+            UPDATE source_file
+            SET
+                imported_size_bytes = size_bytes,
+                imported_modified_at_utc = modified_at_utc,
+                imported_schema_version = 0
+            WHERE id = ?1
+            ",
+            [source_file_id],
+        )?;
+
+        let plan = build_import_plan(db.connection(), now, &tz)?;
+        assert_eq!(plan.startup_chunks.len(), 1);
+        assert_eq!(plan.startup_chunks[0].project_id, project_id);
+        assert_eq!(plan.startup_chunks[0].chunk_day_local, "2026-03-26");
+
+        db.connection_mut().execute(
+            "
+            UPDATE source_file
+            SET imported_schema_version = ?2
+            WHERE id = ?1
+            ",
+            params![source_file_id, crate::import::IMPORT_SCHEMA_VERSION],
+        )?;
+
+        let settled_plan = build_import_plan(db.connection(), now, &tz)?;
+        assert!(settled_plan.startup_chunks.is_empty());
+        assert!(settled_plan.deferred_chunks.is_empty());
+
+        Ok(())
+    }
+
     fn insert_project(
         conn: &mut Connection,
         canonical_key: &str,

@@ -1,3 +1,6 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
 mod source;
 
 pub use source::{ScanReport, ScanWarning, scan_source_manifest};
@@ -30,6 +33,28 @@ pub const IMPORT_CHUNK_UNIT: &str = "project x day";
 /// - `tool_call_id` — joins `tool_use` with its `tool_result`
 /// - `metadata_json` — only the `input` key, only for `tool_use` parts
 pub const IMPORT_SCHEMA_VERSION: i64 = 1;
+
+/// Stable normalized payload contract for persisted `tool_use` message parts.
+///
+/// This is the only structured `message_part.metadata_json` shape consumed by
+/// `v1`. Any future expansion should add an explicit schema-version bump.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalizedToolUsePartMetadata {
+    pub input: Value,
+}
+
+impl NormalizedToolUsePartMetadata {
+    pub fn from_input(input: &Value) -> Self {
+        Self {
+            input: input.clone(),
+        }
+    }
+
+    pub fn parse(raw_json: &str) -> Option<Self> {
+        serde_json::from_str(raw_json).ok()
+    }
+}
 
 mod chunk;
 mod normalize;

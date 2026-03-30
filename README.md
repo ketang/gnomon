@@ -118,6 +118,10 @@ to refresh existing cached aggregates and filters.
 Run `db rebuild` after pulling a version that changes project identity
 resolution as well. Identity fixes only affect newly imported manifest rows, so
 an existing cache can keep stale project records until it is rebuilt.
+Apply the same rebuild step after pulling a version that bumps the importer
+schema version. Import-schema bumps mean `gnomon` now consumes a different
+normalized source-field set, so existing cached rows need reimport to match the
+new contract.
 
 Common stale-identity symptoms include:
 
