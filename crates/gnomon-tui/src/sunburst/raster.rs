@@ -162,13 +162,17 @@ fn rasterize_braille(
     }
 }
 
+/// Color used to de-emphasize cached or unfocused segments instead of the
+/// terminal-dependent `DIM` modifier, which can make braille dots invisible.
+const CACHE_DEEMPH_COLOR: Color = Color::Indexed(239);
+
 fn sunburst_segment_style(segment: &SunburstSegment, focused: bool) -> Style {
     let mut style = Style::default()
         .bg(sunburst_bucket_color(segment.bucket))
         .fg(Color::Black);
 
     if !focused || segment.cached_ratio >= 0.7 {
-        style = style.add_modifier(Modifier::DIM);
+        style = style.bg(CACHE_DEEMPH_COLOR);
     }
 
     if segment.is_selected {
@@ -182,7 +186,7 @@ fn sunburst_braille_style(segment: &SunburstSegment, focused: bool) -> Style {
     let mut style = Style::default().fg(sunburst_bucket_color(segment.bucket));
 
     if !focused || segment.cached_ratio >= 0.7 {
-        style = style.add_modifier(Modifier::DIM);
+        style = style.fg(CACHE_DEEMPH_COLOR);
     }
 
     if segment.is_selected {
@@ -192,13 +196,15 @@ fn sunburst_braille_style(segment: &SunburstSegment, focused: bool) -> Style {
     style
 }
 
+/// Muted ANSI-256 palette — geometry carries the primary signal, color stays
+/// secondary.
 fn sunburst_bucket_color(bucket: SunburstBucket) -> Color {
     match bucket {
-        SunburstBucket::Project => Color::Blue,
-        SunburstBucket::Category => Color::Cyan,
-        SunburstBucket::Classified => Color::Green,
-        SunburstBucket::Mixed => Color::Yellow,
-        SunburstBucket::Unclassified => Color::DarkGray,
+        SunburstBucket::Project => Color::Indexed(67), // steel blue
+        SunburstBucket::Category => Color::Indexed(73), // muted teal
+        SunburstBucket::Classified => Color::Indexed(107), // sage green
+        SunburstBucket::Mixed => Color::Indexed(179),  // muted gold
+        SunburstBucket::Unclassified => Color::Indexed(243), // mid gray
     }
 }
 
@@ -220,17 +226,26 @@ mod tests {
     }
 
     #[test]
-    fn bucket_colors_use_standard_variants() {
-        assert_eq!(sunburst_bucket_color(SunburstBucket::Project), Color::Blue);
-        assert_eq!(sunburst_bucket_color(SunburstBucket::Category), Color::Cyan);
+    fn bucket_colors_use_muted_indexed_palette() {
+        assert_eq!(
+            sunburst_bucket_color(SunburstBucket::Project),
+            Color::Indexed(67)
+        );
+        assert_eq!(
+            sunburst_bucket_color(SunburstBucket::Category),
+            Color::Indexed(73)
+        );
         assert_eq!(
             sunburst_bucket_color(SunburstBucket::Classified),
-            Color::Green
+            Color::Indexed(107)
         );
-        assert_eq!(sunburst_bucket_color(SunburstBucket::Mixed), Color::Yellow);
+        assert_eq!(
+            sunburst_bucket_color(SunburstBucket::Mixed),
+            Color::Indexed(179)
+        );
         assert_eq!(
             sunburst_bucket_color(SunburstBucket::Unclassified),
-            Color::DarkGray
+            Color::Indexed(243)
         );
     }
 
@@ -256,31 +271,34 @@ mod tests {
     }
 
     #[test]
-    fn segment_style_dim_when_cached() {
+    fn segment_style_deemphasized_when_cached() {
         let seg = make_segment(SunburstBucket::Classified, 0.8, false);
         let style = sunburst_segment_style(&seg, true);
-        assert!(style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(style.bg, Some(CACHE_DEEMPH_COLOR));
     }
 
     #[test]
-    fn segment_style_dim_when_unfocused() {
+    fn segment_style_deemphasized_when_unfocused() {
         let seg = make_segment(SunburstBucket::Classified, 0.0, false);
         let style = sunburst_segment_style(&seg, false);
-        assert!(style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(style.bg, Some(CACHE_DEEMPH_COLOR));
     }
 
     #[test]
-    fn segment_style_not_dim_when_focused_and_uncached() {
+    fn segment_style_bucket_color_when_focused_and_uncached() {
         let seg = make_segment(SunburstBucket::Classified, 0.0, false);
         let style = sunburst_segment_style(&seg, true);
-        assert!(!style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(
+            style.bg,
+            Some(sunburst_bucket_color(SunburstBucket::Classified))
+        );
     }
 
     #[test]
-    fn braille_style_dim_when_cached() {
+    fn braille_style_deemphasized_when_cached() {
         let seg = make_segment(SunburstBucket::Category, 0.9, false);
         let style = sunburst_braille_style(&seg, true);
-        assert!(style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(style.fg, Some(CACHE_DEEMPH_COLOR));
     }
 
     #[test]
@@ -295,6 +313,14 @@ mod tests {
         let seg = make_segment(SunburstBucket::Mixed, 0.0, true);
         let style = sunburst_segment_style(&seg, true);
         assert_eq!(style.fg, Some(Color::White));
-        assert_eq!(style.bg, Some(Color::Yellow));
+        assert_eq!(style.bg, Some(Color::Indexed(179)));
+    }
+
+    #[test]
+    fn default_render_mode_is_braille() {
+        assert_eq!(
+            SunburstRenderConfig::default().mode,
+            SunburstRenderMode::Braille
+        );
     }
 }

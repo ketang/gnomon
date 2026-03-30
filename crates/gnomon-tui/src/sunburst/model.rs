@@ -91,7 +91,7 @@ impl Default for SunburstRenderConfig {
         Self {
             center_radius: 0.24,
             outer_radius: 0.96,
-            mode: SunburstRenderMode::Coarse,
+            mode: SunburstRenderMode::Braille,
             distortion_policy: SunburstDistortionPolicy::default(),
         }
     }
