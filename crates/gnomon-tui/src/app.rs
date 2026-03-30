@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -68,6 +68,9 @@ const RADIAL_DESCENDANT_DEPTH_LIMIT: usize = 3;
 const ACTIVITY_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 const VIEW_LOAD_PHASE_TOTAL: usize = 8;
 const JUMP_TARGET_PHASE_TOTAL: usize = 4;
+const PREFETCH_RECURSION_DEPTH_LIMIT: usize = 3;
+const PREFETCH_RECURSION_BREADTH_LIMIT: usize = 4;
+const PREFETCH_NEARBY_VISIBLE_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum QueryCacheDomain {
@@ -219,6 +222,22 @@ impl QueryResultCache {
             .expect("snapshot cache bucket inserted")
     }
 
+    fn insert_browse_rows(
+        &mut self,
+        snapshot: &SnapshotBounds,
+        request: &BrowseRequest,
+        rows: Vec<RollupRow>,
+    ) -> Result<()> {
+        let key = QueryCacheKey {
+            domain: QueryCacheDomain::Browse,
+            input: serde_json::to_string(request).context("unable to serialize query cache key")?,
+        };
+        self.snapshot_bucket_mut(snapshot)
+            .entries
+            .insert(key, Box::new(rows));
+        Ok(())
+    }
+
     #[cfg(test)]
     fn stats_for(&self, domain: QueryCacheDomain) -> QueryCacheStats {
         self.stats.get(&domain).copied().unwrap_or_default()
@@ -274,6 +293,7 @@ enum QueryWorkerRequest {
     LoadView(ViewLoadRequest),
     RefreshLatest(RefreshViewRequest),
     BuildJumpTargets(JumpTargetRequest),
+    Prefetch(PrefetchRequest),
 }
 
 #[derive(Debug)]
@@ -303,11 +323,19 @@ struct JumpTargetRequest {
 }
 
 #[derive(Debug)]
+struct PrefetchRequest {
+    sequence: u64,
+    label: &'static str,
+    requests: Vec<BrowseRequest>,
+}
+
+#[derive(Debug)]
 enum QueryWorkerResult {
     Progress(QueryProgressUpdate),
     ViewLoaded(ViewLoadResult),
     RefreshCompleted(RefreshViewResult),
     JumpTargetsBuilt(JumpTargetsResult),
+    PrefetchCompleted(PrefetchResult),
     Failed(QueryWorkerFailure),
 }
 
@@ -336,6 +364,13 @@ struct RefreshViewResult {
 struct JumpTargetsResult {
     sequence: u64,
     targets: Vec<JumpTarget>,
+}
+
+#[derive(Debug)]
+struct PrefetchResult {
+    sequence: u64,
+    requests: Vec<BrowseRequest>,
+    row_sets: Vec<Vec<RollupRow>>,
 }
 
 #[derive(Debug)]
@@ -368,6 +403,7 @@ struct LoadedView {
 enum PendingTaskKind {
     View,
     Jump,
+    Prefetch,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -405,6 +441,7 @@ enum PendingTaskState {
 struct PendingAsyncWork {
     view: PendingTaskTracker,
     jump: PendingTaskTracker,
+    prefetch: PendingTaskTracker,
 }
 
 #[derive(Debug, Default)]
@@ -481,10 +518,15 @@ impl PendingAsyncWork {
         self.jump.begin(sequence, label);
     }
 
+    fn begin_prefetch(&mut self, sequence: u64, label: &'static str) {
+        self.prefetch.begin(sequence, label);
+    }
+
     fn apply_progress(&mut self, progress: QueryProgressUpdate) -> bool {
         match progress.task {
             PendingTaskKind::View => self.view.apply_progress(&progress),
             PendingTaskKind::Jump => self.jump.apply_progress(&progress),
+            PendingTaskKind::Prefetch => self.prefetch.apply_progress(&progress),
         }
     }
 
@@ -492,6 +534,7 @@ impl PendingAsyncWork {
         match task {
             PendingTaskKind::View => self.view.finish(sequence),
             PendingTaskKind::Jump => self.jump.finish(sequence),
+            PendingTaskKind::Prefetch => self.prefetch.finish(sequence),
         }
     }
 
@@ -499,6 +542,7 @@ impl PendingAsyncWork {
         let mut parts = Vec::new();
         parts.extend(self.view.summary_parts());
         parts.extend(self.jump.summary_parts());
+        parts.extend(self.prefetch.summary_parts());
 
         if parts.is_empty() {
             None
@@ -2354,6 +2398,23 @@ impl App {
             }))
     }
 
+    fn enqueue_prefetch(&mut self) -> Result<()> {
+        let requests = self.build_prefetch_requests()?;
+        if requests.is_empty() {
+            return Ok(());
+        }
+
+        let sequence = self.next_request_sequence();
+        self.pending_async_work
+            .begin_prefetch(sequence, "warming browse neighborhood");
+        self.worker
+            .send(QueryWorkerRequest::Prefetch(PrefetchRequest {
+                sequence,
+                label: "warming browse neighborhood",
+                requests,
+            }))
+    }
+
     fn drain_query_results(&mut self) {
         while let Ok(result) = self.worker.results.try_recv() {
             if let Err(error) = self.apply_query_result(result) {
@@ -2412,6 +2473,20 @@ impl App {
                     self.jump_state.selected = 0;
                 }
             }
+            QueryWorkerResult::PrefetchCompleted(result) => {
+                if self
+                    .pending_async_work
+                    .finish(PendingTaskKind::Prefetch, result.sequence)
+                    == PendingFinish::Apply
+                {
+                    for (request, rows) in
+                        result.requests.into_iter().zip(result.row_sets.into_iter())
+                    {
+                        self.query_cache
+                            .insert_browse_rows(&request.snapshot, &request, rows)?;
+                    }
+                }
+            }
             QueryWorkerResult::Failed(failure) => {
                 if self
                     .pending_async_work
@@ -2445,6 +2520,7 @@ impl App {
         self.apply_row_filter()?;
         self.restore_selection(loaded_view.selected_key)?;
         self.refresh_active_context_for_selection();
+        let _ = self.enqueue_prefetch();
         self.save_state();
         Ok(())
     }
@@ -2492,15 +2568,70 @@ impl App {
         let new_active_path = self.active_path();
         if new_active_path == self.radial_context_path {
             self.rebuild_radial_model();
-            return;
-        }
-        if let Ok(filters) = self.current_query_filters() {
+        } else if let Ok(filters) = self.current_query_filters() {
             if self.refresh_active_context(&filters).is_err() {
                 self.rebuild_radial_model();
             }
         } else {
             self.rebuild_radial_model();
         }
+        let _ = self.enqueue_prefetch();
+    }
+
+    fn build_prefetch_requests(&self) -> Result<Vec<BrowseRequest>> {
+        let filters = self.current_query_filters()?;
+        let mut requests = Vec::new();
+        let mut seen = BTreeSet::new();
+
+        let mut push_path = |path: BrowsePath, requests: &mut Vec<BrowseRequest>| -> Result<()> {
+            let request = BrowseRequest {
+                snapshot: self.snapshot.clone(),
+                root: self.ui_state.root,
+                lens: self.ui_state.lens,
+                filters: filters.clone(),
+                path,
+            };
+            let signature =
+                serde_json::to_string(&request).context("unable to serialize prefetch request")?;
+            if seen.insert(signature) {
+                requests.push(request);
+            }
+            Ok(())
+        };
+
+        let selected_index = self.table_state.selected();
+        if let Some(selected) = self.selected_tree_row()
+            && let Some(path) = selected.node_path.clone()
+        {
+            push_path(path, &mut requests)?;
+            for row in self
+                .visible_rows
+                .iter()
+                .filter(|row| row.parent_path == selected.parent_path)
+            {
+                if let Some(path) = row.node_path.clone() {
+                    push_path(path, &mut requests)?;
+                }
+            }
+        }
+
+        if let Some(selected_index) = selected_index {
+            let start = selected_index.saturating_sub(PREFETCH_NEARBY_VISIBLE_LIMIT / 2);
+            let end = (start + PREFETCH_NEARBY_VISIBLE_LIMIT).min(self.visible_rows.len());
+            for row in &self.visible_rows[start..end] {
+                if let Some(path) = row.node_path.clone() {
+                    push_path(path, &mut requests)?;
+                }
+            }
+        }
+
+        for row in &self.visible_rows {
+            if let Some(path) = row.node_path.clone() {
+                push_path(path, &mut requests)?;
+            }
+        }
+
+        Ok(requests)
     }
 
     fn active_path(&self) -> BrowsePath {
@@ -2766,12 +2897,74 @@ fn run_query_worker(
                     })
                 })
             }
+            QueryWorkerRequest::Prefetch(request) => {
+                let sequence = request.sequence;
+                let label = request.label;
+                run_prefetch_requests(&query_engine, request)
+                    .map(|(requests, row_sets)| {
+                        QueryWorkerResult::PrefetchCompleted(PrefetchResult {
+                            sequence,
+                            requests,
+                            row_sets,
+                        })
+                    })
+                    .unwrap_or_else(|error| {
+                        QueryWorkerResult::Failed(QueryWorkerFailure {
+                            sequence,
+                            task: PendingTaskKind::Prefetch,
+                            message: format!("Unable to {}: {error:#}", label),
+                        })
+                    })
+            }
         };
 
         if results.send(result).is_err() {
             break;
         }
     }
+}
+
+fn run_prefetch_requests(
+    query_engine: &QueryEngine<'_>,
+    request: PrefetchRequest,
+) -> Result<(Vec<BrowseRequest>, Vec<Vec<RollupRow>>)> {
+    let mut queue = request
+        .requests
+        .into_iter()
+        .map(|request| (request, 0usize))
+        .collect::<Vec<_>>();
+    let mut seen = queue
+        .iter()
+        .map(|(request, _)| serde_json::to_string(request))
+        .collect::<Result<BTreeSet<_>, _>>()
+        .context("unable to serialize prefetch seed request")?;
+    let mut warmed_requests = Vec::new();
+    let mut warmed_row_sets = Vec::new();
+
+    while !queue.is_empty() {
+        let batch = std::mem::take(&mut queue);
+        let batch_requests = batch
+            .iter()
+            .map(|(request, _)| request.clone())
+            .collect::<Vec<_>>();
+        let batch_row_sets = query_engine.browse_many(&batch_requests)?;
+
+        for ((request, depth), rows) in batch.into_iter().zip(batch_row_sets.into_iter()) {
+            if depth < PREFETCH_RECURSION_DEPTH_LIMIT {
+                for child_request in prefetch_child_requests(&request, &rows) {
+                    let signature = serde_json::to_string(&child_request)
+                        .context("unable to serialize recursive prefetch request")?;
+                    if seen.insert(signature) {
+                        queue.push((child_request, depth + 1));
+                    }
+                }
+            }
+            warmed_requests.push(request);
+            warmed_row_sets.push(rows);
+        }
+    }
+
+    Ok((warmed_requests, warmed_row_sets))
 }
 
 fn cached_browse(
@@ -2785,6 +2978,55 @@ fn cached_browse(
     query_cache.memoize(QueryCacheDomain::Browse, &snapshot, &request, || {
         query_engine.browse(&request)
     })
+}
+
+fn cached_browse_many(
+    query_cache: &mut QueryResultCache,
+    query_engine: &QueryEngine<'_>,
+    requests: Vec<BrowseRequest>,
+    browse_stats: &mut BrowseFanoutStats,
+) -> Result<Vec<Vec<RollupRow>>> {
+    let mut outputs = vec![Vec::new(); requests.len()];
+    let mut missed_indexes = Vec::new();
+    let mut missed_requests = Vec::new();
+
+    for (index, request) in requests.iter().enumerate() {
+        browse_stats.record(request);
+        let key = QueryCacheKey {
+            domain: QueryCacheDomain::Browse,
+            input: serde_json::to_string(request).context("unable to serialize query cache key")?,
+        };
+        if let Some(cached) = query_cache.cached::<Vec<RollupRow>>(&request.snapshot, &key) {
+            query_cache
+                .stats
+                .entry(QueryCacheDomain::Browse)
+                .or_default()
+                .hits += 1;
+            outputs[index] = cached;
+        } else {
+            query_cache
+                .stats
+                .entry(QueryCacheDomain::Browse)
+                .or_default()
+                .misses += 1;
+            missed_indexes.push(index);
+            missed_requests.push(request.clone());
+        }
+    }
+
+    if !missed_requests.is_empty() {
+        let missed_rows = query_engine.browse_many(&missed_requests)?;
+        for ((request_index, request), rows) in missed_indexes
+            .into_iter()
+            .zip(missed_requests.into_iter())
+            .zip(missed_rows.into_iter())
+        {
+            query_cache.insert_browse_rows(&request.snapshot, &request, rows.clone())?;
+            outputs[request_index] = rows;
+        }
+    }
+
+    Ok(outputs)
 }
 
 fn browse_request_signature(request: &BrowseRequest) -> String {
@@ -3015,8 +3257,27 @@ fn build_jump_targets_for_state(
         },
         &mut browse_stats,
     )?;
+    let project_category_requests = project_root_rows
+        .iter()
+        .filter_map(|project| {
+            project.project_id.map(|project_id| BrowseRequest {
+                snapshot: snapshot.clone(),
+                root: RootView::ProjectHierarchy,
+                lens: ui_state.lens,
+                filters: filters.clone(),
+                path: BrowsePath::Project { project_id },
+            })
+        })
+        .collect::<Vec<_>>();
+    let project_category_sets = cached_browse_many(
+        query_cache,
+        query_engine,
+        project_category_requests.clone(),
+        &mut browse_stats,
+    )?;
+    let mut project_action_requests = Vec::new();
 
-    for project in &project_root_rows {
+    for (project, categories) in project_root_rows.iter().zip(project_category_sets.iter()) {
         let Some(project_id) = project.project_id else {
             continue;
         };
@@ -3028,20 +3289,7 @@ fn build_jump_targets_for_state(
             path: BrowsePath::Project { project_id },
         });
 
-        let categories = cached_browse(
-            query_cache,
-            query_engine,
-            BrowseRequest {
-                snapshot: snapshot.clone(),
-                root: RootView::ProjectHierarchy,
-                lens: ui_state.lens,
-                filters: filters.clone(),
-                path: BrowsePath::Project { project_id },
-            },
-            &mut browse_stats,
-        )?;
-
-        for category in &categories {
+        for category in categories {
             let Some(category_name) = category.category.clone() else {
                 continue;
             };
@@ -3055,40 +3303,56 @@ fn build_jump_targets_for_state(
                     category: category_name.clone(),
                 },
             });
-
-            let actions = cached_browse(
-                query_cache,
-                query_engine,
-                BrowseRequest {
-                    snapshot: snapshot.clone(),
-                    root: RootView::ProjectHierarchy,
-                    lens: ui_state.lens,
-                    filters: filters.clone(),
-                    path: BrowsePath::ProjectCategory {
-                        project_id,
-                        category: category_name.clone(),
-                    },
+            project_action_requests.push(BrowseRequest {
+                snapshot: snapshot.clone(),
+                root: RootView::ProjectHierarchy,
+                lens: ui_state.lens,
+                filters: filters.clone(),
+                path: BrowsePath::ProjectCategory {
+                    project_id,
+                    category: category_name,
                 },
-                &mut browse_stats,
-            )?;
-
-            for action in actions {
-                let Some(action_key) = action.action.clone() else {
-                    continue;
-                };
-                action_count += 1;
-                targets.push(JumpTarget {
-                    label: format!("{} / {} / {}", project.label, category_name, action.label),
-                    detail: "project action".to_string(),
-                    root: RootView::ProjectHierarchy,
-                    path: BrowsePath::ProjectAction {
-                        project_id,
-                        category: category_name.clone(),
-                        action: action_key,
-                        parent_path: None,
-                    },
-                });
-            }
+            });
+        }
+    }
+    let project_action_sets = cached_browse_many(
+        query_cache,
+        query_engine,
+        project_action_requests.clone(),
+        &mut browse_stats,
+    )?;
+    for (request, actions) in project_action_requests
+        .iter()
+        .zip(project_action_sets.into_iter())
+    {
+        let BrowsePath::ProjectCategory {
+            project_id,
+            category,
+        } = &request.path
+        else {
+            continue;
+        };
+        for action in actions {
+            let Some(action_key) = action.action.clone() else {
+                continue;
+            };
+            action_count += 1;
+            let project_label = project_root_rows
+                .iter()
+                .find(|project| project.project_id == Some(*project_id))
+                .map(|project| project.label.as_str())
+                .unwrap_or("project");
+            targets.push(JumpTarget {
+                label: format!("{project_label} / {category} / {}", action.label),
+                detail: "project action".to_string(),
+                root: RootView::ProjectHierarchy,
+                path: BrowsePath::ProjectAction {
+                    project_id: *project_id,
+                    category: category.clone(),
+                    action: action_key,
+                    parent_path: None,
+                },
+            });
         }
     }
 
@@ -3107,8 +3371,32 @@ fn build_jump_targets_for_state(
         },
         &mut browse_stats,
     )?;
+    let category_action_requests = category_root_rows
+        .iter()
+        .filter_map(|category| {
+            category
+                .category
+                .clone()
+                .map(|category_name| BrowseRequest {
+                    snapshot: snapshot.clone(),
+                    root: RootView::CategoryHierarchy,
+                    lens: ui_state.lens,
+                    filters: filters.clone(),
+                    path: BrowsePath::Category {
+                        category: category_name,
+                    },
+                })
+        })
+        .collect::<Vec<_>>();
+    let category_action_sets = cached_browse_many(
+        query_cache,
+        query_engine,
+        category_action_requests.clone(),
+        &mut browse_stats,
+    )?;
+    let mut category_project_requests = Vec::new();
 
-    for category in &category_root_rows {
+    for (category, actions) in category_root_rows.iter().zip(category_action_sets.iter()) {
         let Some(category_name) = category.category.clone() else {
             continue;
         };
@@ -3122,22 +3410,7 @@ fn build_jump_targets_for_state(
             },
         });
 
-        let actions = cached_browse(
-            query_cache,
-            query_engine,
-            BrowseRequest {
-                snapshot: snapshot.clone(),
-                root: RootView::CategoryHierarchy,
-                lens: ui_state.lens,
-                filters: filters.clone(),
-                path: BrowsePath::Category {
-                    category: category_name.clone(),
-                },
-            },
-            &mut browse_stats,
-        )?;
-
-        for action in &actions {
+        for action in actions {
             let Some(action_key) = action.action.clone() else {
                 continue;
             };
@@ -3151,43 +3424,47 @@ fn build_jump_targets_for_state(
                     action: action_key.clone(),
                 },
             });
-
-            let projects = cached_browse(
-                query_cache,
-                query_engine,
-                BrowseRequest {
-                    snapshot: snapshot.clone(),
-                    root: RootView::CategoryHierarchy,
-                    lens: ui_state.lens,
-                    filters: filters.clone(),
-                    path: BrowsePath::CategoryAction {
-                        category: category_name.clone(),
-                        action: action_key,
-                    },
+            category_project_requests.push(BrowseRequest {
+                snapshot: snapshot.clone(),
+                root: RootView::CategoryHierarchy,
+                lens: ui_state.lens,
+                filters: filters.clone(),
+                path: BrowsePath::CategoryAction {
+                    category: category_name.clone(),
+                    action: action_key,
                 },
-                &mut browse_stats,
-            )?;
-
-            for project in projects {
-                let Some(project_id) = project.project_id else {
-                    continue;
-                };
-                project_count += 1;
-                targets.push(JumpTarget {
-                    label: format!("{} / {} / {}", category_name, action.label, project.label),
-                    detail: "category project".to_string(),
-                    root: RootView::CategoryHierarchy,
-                    path: BrowsePath::CategoryActionProject {
-                        category: category_name.clone(),
-                        action: project
-                            .action
-                            .clone()
-                            .unwrap_or_else(|| action_key_from_row(&project)),
-                        project_id,
-                        parent_path: None,
-                    },
-                });
-            }
+            });
+        }
+    }
+    let category_project_sets = cached_browse_many(
+        query_cache,
+        query_engine,
+        category_project_requests.clone(),
+        &mut browse_stats,
+    )?;
+    for (request, projects) in category_project_requests
+        .iter()
+        .zip(category_project_sets.into_iter())
+    {
+        let BrowsePath::CategoryAction { category, action } = &request.path else {
+            continue;
+        };
+        for project in projects {
+            let Some(project_id) = project.project_id else {
+                continue;
+            };
+            project_count += 1;
+            targets.push(JumpTarget {
+                label: format!("{} / {} / {}", category, action.label(), project.label),
+                detail: "category project".to_string(),
+                root: RootView::CategoryHierarchy,
+                path: BrowsePath::CategoryActionProject {
+                    category: category.clone(),
+                    action: project.action.clone().unwrap_or_else(|| action.clone()),
+                    project_id,
+                    parent_path: None,
+                },
+            });
         }
     }
 
@@ -4923,15 +5200,6 @@ fn action_label(action: &ActionKey) -> String {
     action.label()
 }
 
-fn action_key_from_row(row: &RollupRow) -> ActionKey {
-    row.action.clone().unwrap_or_else(|| ActionKey {
-        classification_state: gnomon_core::query::ClassificationState::Unclassified,
-        normalized_action: Some(row.label.clone()),
-        command_family: None,
-        base_command: None,
-    })
-}
-
 fn build_breadcrumb_targets(
     root: &RootView,
     path: &BrowsePath,
@@ -5225,6 +5493,20 @@ fn next_browse_path(root: &RootView, current: &BrowsePath, row: &RollupRow) -> O
             }),
         _ => None,
     }
+}
+
+fn prefetch_child_requests(request: &BrowseRequest, rows: &[RollupRow]) -> Vec<BrowseRequest> {
+    rows.iter()
+        .filter_map(|row| next_browse_path(&request.root, &request.path, row))
+        .take(PREFETCH_RECURSION_BREADTH_LIMIT)
+        .map(|path| BrowseRequest {
+            snapshot: request.snapshot.clone(),
+            root: request.root,
+            lens: request.lens,
+            filters: request.filters.clone(),
+            path,
+        })
+        .collect()
 }
 
 fn parent_browse_path(path: &BrowsePath, project_root: Option<&str>) -> BrowsePath {

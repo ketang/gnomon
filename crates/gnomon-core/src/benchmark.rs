@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::Database;
 use crate::query::{
-    ActionKey, BrowseFilters, BrowsePath, BrowseRequest, MetricLens, QueryEngine, RootView,
-    SnapshotBounds,
+    ActionKey, BrowseFilters, BrowsePath, BrowseRequest, MetricLens, QueryEngine, RollupRowKind,
+    RootView, SnapshotBounds,
 };
 
 const DEFAULT_ITERATIONS: usize = 5;
@@ -54,6 +54,38 @@ pub struct QueryBenchmarkScenario {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowseFootprintBreakdown {
+    pub level: String,
+    pub request_count: usize,
+    pub row_count: usize,
+    pub payload_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowseFootprintScenario {
+    pub name: String,
+    pub request_count: usize,
+    pub row_count: usize,
+    pub payload_bytes: u64,
+    pub by_level: Vec<BrowseFootprintBreakdown>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowseFootprintRecommendations {
+    pub estimated_budget_bytes: u64,
+    pub snapshot_retention_count: usize,
+    pub recursion_depth_limit: usize,
+    pub recursion_breadth_limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowseFootprintReport {
+    pub snapshot_max_publish_seq: u64,
+    pub scenarios: Vec<BrowseFootprintScenario>,
+    pub recommendations: BrowseFootprintRecommendations,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryBenchmarkReport {
     pub db_path: PathBuf,
     pub snapshot: SnapshotBounds,
@@ -61,6 +93,7 @@ pub struct QueryBenchmarkReport {
     pub selection: QueryBenchmarkSelection,
     pub scenarios: Vec<QueryBenchmarkScenario>,
     pub query_plans: Vec<QueryPlanReport>,
+    pub browse_footprint: BrowseFootprintReport,
 }
 
 pub fn run_query_benchmark(
@@ -117,6 +150,9 @@ pub fn run_query_benchmark(
             category: selection.category.clone(),
         },
     };
+    let non_path_prefetch_requests =
+        collect_non_path_prefetch_requests(&engine, &snapshot, &selection)?;
+    let path_prefetch_requests = collect_path_prefetch_requests(&engine, &path_browse_request)?;
 
     let scenarios = vec![
         measure_scenario("refresh_snapshot_status", options.iterations, || {
@@ -157,6 +193,27 @@ pub fn run_query_benchmark(
         measure_scenario("jump_target_build", options.iterations, || {
             build_jump_target_count(&engine, &snapshot)
         })?,
+        measure_scenario("non_path_prefetch_individual", options.iterations, || {
+            browse_many_individually(&engine, &non_path_prefetch_requests)
+        })?
+        .with_notes("warms multiple non-path sibling sets one request at a time".to_string()),
+        measure_scenario("non_path_prefetch_batched", options.iterations, || {
+            browse_many_batched(&engine, &non_path_prefetch_requests)
+        })?
+        .with_notes(
+            "warms the same non-path sibling sets through QueryEngine::browse_many".to_string(),
+        ),
+        measure_scenario("path_prefetch_individual", options.iterations, || {
+            browse_many_individually(&engine, &path_prefetch_requests)
+        })?
+        .with_notes("warms recursive path drill parents one request at a time".to_string()),
+        measure_scenario("path_prefetch_batched", options.iterations, || {
+            browse_many_batched(&engine, &path_prefetch_requests)
+        })?
+        .with_notes(
+            "warms the same recursive path drill parents through QueryEngine::browse_many"
+                .to_string(),
+        ),
     ];
 
     let query_plans = vec![
@@ -197,11 +254,27 @@ pub fn run_query_benchmark(
             detail: engine.path_browse_query_plan(&path_browse_request)?,
         },
         QueryPlanReport {
+            name: "batched_non_path_browse".to_string(),
+            used_by_scenarios: vec!["non_path_prefetch_batched".to_string()],
+            detail: engine.batched_non_path_browse_query_plan(&non_path_prefetch_requests)?,
+        },
+        QueryPlanReport {
+            name: "batched_path_browse".to_string(),
+            used_by_scenarios: vec!["path_prefetch_batched".to_string()],
+            detail: engine.batched_path_browse_query_plan(&path_prefetch_requests)?,
+        },
+        QueryPlanReport {
             name: "action_browse_scope".to_string(),
             used_by_scenarios: vec!["project_category_model_filter_browse".to_string()],
             detail: engine.action_browse_query_plan(&scoped_action_browse_request)?,
         },
     ];
+    let browse_footprint = build_browse_footprint_report(
+        &engine,
+        &snapshot,
+        &non_path_prefetch_requests,
+        &path_prefetch_requests,
+    )?;
 
     Ok(QueryBenchmarkReport {
         db_path: db_path.to_path_buf(),
@@ -215,6 +288,7 @@ pub fn run_query_benchmark(
         },
         scenarios,
         query_plans,
+        browse_footprint,
     })
 }
 
@@ -259,6 +333,22 @@ fn run_browse(
     engine.browse(&request)
 }
 
+fn browse_many_individually(engine: &QueryEngine<'_>, requests: &[BrowseRequest]) -> Result<usize> {
+    let mut total_rows = 0usize;
+    for request in requests {
+        total_rows += run_browse(engine, request.clone())?.len();
+    }
+    Ok(total_rows)
+}
+
+fn browse_many_batched(engine: &QueryEngine<'_>, requests: &[BrowseRequest]) -> Result<usize> {
+    Ok(engine
+        .browse_many(requests)?
+        .into_iter()
+        .map(|rows| rows.len())
+        .sum())
+}
+
 fn project_root_request(snapshot: &SnapshotBounds) -> BrowseRequest {
     BrowseRequest {
         snapshot: snapshot.clone(),
@@ -276,6 +366,193 @@ fn category_root_request(snapshot: &SnapshotBounds) -> BrowseRequest {
         lens: MetricLens::UncachedInput,
         filters: BrowseFilters::default(),
         path: BrowsePath::Root,
+    }
+}
+
+fn collect_non_path_prefetch_requests(
+    engine: &QueryEngine<'_>,
+    snapshot: &SnapshotBounds,
+    selection: &BenchmarkSelectionInternal,
+) -> Result<Vec<BrowseRequest>> {
+    let categories = run_browse(
+        engine,
+        BrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            path: BrowsePath::Project {
+                project_id: selection.project_id,
+            },
+        },
+    )?;
+
+    let mut requests = categories
+        .iter()
+        .take(4)
+        .filter_map(|row| row.category.clone())
+        .map(|category| BrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            path: BrowsePath::ProjectCategory {
+                project_id: selection.project_id,
+                category,
+            },
+        })
+        .collect::<Vec<_>>();
+
+    if requests.is_empty() {
+        requests.push(BrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            path: BrowsePath::ProjectCategory {
+                project_id: selection.project_id,
+                category: selection.category.clone(),
+            },
+        });
+    }
+
+    Ok(requests)
+}
+
+fn collect_path_prefetch_requests(
+    engine: &QueryEngine<'_>,
+    path_browse_request: &BrowseRequest,
+) -> Result<Vec<BrowseRequest>> {
+    let mut requests = vec![path_browse_request.clone()];
+    let root_rows = run_browse(engine, path_browse_request.clone())?;
+    for row in root_rows
+        .iter()
+        .filter(|row| row.kind == RollupRowKind::Directory)
+        .take(4)
+    {
+        if let Some(parent_path) = row.full_path.clone() {
+            let mut request = path_browse_request.clone();
+            match &mut request.path {
+                BrowsePath::ProjectAction {
+                    parent_path: path, ..
+                }
+                | BrowsePath::CategoryActionProject {
+                    parent_path: path, ..
+                } => *path = Some(parent_path),
+                _ => {}
+            }
+            requests.push(request);
+        }
+    }
+    Ok(requests)
+}
+
+fn build_browse_footprint_report(
+    engine: &QueryEngine<'_>,
+    snapshot: &SnapshotBounds,
+    non_path_prefetch_requests: &[BrowseRequest],
+    path_prefetch_requests: &[BrowseRequest],
+) -> Result<BrowseFootprintReport> {
+    let non_path_shallow_requests = non_path_prefetch_requests
+        .iter()
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>();
+    let path_shallow_requests = path_prefetch_requests
+        .iter()
+        .take(1)
+        .cloned()
+        .collect::<Vec<_>>();
+    let scenarios = vec![
+        measure_footprint_scenario(
+            engine,
+            "non_path_shallow_prefetch",
+            &non_path_shallow_requests,
+        )?,
+        measure_footprint_scenario(engine, "non_path_deep_prefetch", non_path_prefetch_requests)?,
+        measure_footprint_scenario(engine, "path_shallow_prefetch", &path_shallow_requests)?,
+        measure_footprint_scenario(engine, "path_deep_prefetch", path_prefetch_requests)?,
+    ];
+    let max_payload = scenarios
+        .iter()
+        .map(|scenario| scenario.payload_bytes)
+        .max()
+        .unwrap_or(0);
+    Ok(BrowseFootprintReport {
+        snapshot_max_publish_seq: snapshot.max_publish_seq,
+        scenarios,
+        recommendations: BrowseFootprintRecommendations {
+            estimated_budget_bytes: max_payload.saturating_mul(4).max(4 * 1024 * 1024),
+            snapshot_retention_count: 2,
+            recursion_depth_limit: 3,
+            recursion_breadth_limit: 4,
+        },
+    })
+}
+
+fn measure_footprint_scenario(
+    engine: &QueryEngine<'_>,
+    name: &str,
+    requests: &[BrowseRequest],
+) -> Result<BrowseFootprintScenario> {
+    let row_sets = engine.browse_many(requests)?;
+    let mut by_level = std::collections::BTreeMap::<String, BrowseFootprintBreakdown>::new();
+    let mut total_rows = 0usize;
+    let mut total_payload_bytes = 0u64;
+
+    for (request, rows) in requests.iter().zip(row_sets.iter()) {
+        let payload_bytes = u64::try_from(
+            serde_json::to_vec(rows)
+                .context("unable to serialize browse rows for footprint measurement")?
+                .len(),
+        )
+        .context("browse footprint payload size overflowed u64")?;
+        let level = browse_level_label(&request.path).to_string();
+        let breakdown = by_level
+            .entry(level.clone())
+            .or_insert(BrowseFootprintBreakdown {
+                level,
+                request_count: 0,
+                row_count: 0,
+                payload_bytes: 0,
+            });
+        breakdown.request_count += 1;
+        breakdown.row_count += rows.len();
+        breakdown.payload_bytes += payload_bytes;
+        total_rows += rows.len();
+        total_payload_bytes += payload_bytes;
+    }
+
+    Ok(BrowseFootprintScenario {
+        name: name.to_string(),
+        request_count: requests.len(),
+        row_count: total_rows,
+        payload_bytes: total_payload_bytes,
+        by_level: by_level.into_values().collect(),
+    })
+}
+
+fn browse_level_label(path: &BrowsePath) -> &'static str {
+    match path {
+        BrowsePath::Root => "root",
+        BrowsePath::Project { .. } => "project",
+        BrowsePath::ProjectCategory { .. } => "project-category",
+        BrowsePath::ProjectAction {
+            parent_path: None, ..
+        } => "project-action-root-path",
+        BrowsePath::ProjectAction {
+            parent_path: Some(_),
+            ..
+        } => "project-action-child-path",
+        BrowsePath::Category { .. } => "category",
+        BrowsePath::CategoryAction { .. } => "category-action",
+        BrowsePath::CategoryActionProject {
+            parent_path: None, ..
+        } => "category-action-project-root-path",
+        BrowsePath::CategoryActionProject {
+            parent_path: Some(_),
+            ..
+        } => "category-action-project-child-path",
     }
 }
 
@@ -541,7 +818,7 @@ mod tests {
             run_query_benchmark(&validation.db_path, QueryBenchmarkOptions { iterations: 2 })?;
 
         assert_eq!(report.iterations, 2);
-        assert_eq!(report.query_plans.len(), 5);
+        assert_eq!(report.query_plans.len(), 7);
         assert!(
             report
                 .query_plans
@@ -553,6 +830,18 @@ mod tests {
                 .query_plans
                 .iter()
                 .any(|plan| plan.name == "action_browse_scope")
+        );
+        assert!(
+            report
+                .query_plans
+                .iter()
+                .any(|plan| plan.name == "batched_non_path_browse")
+        );
+        assert!(
+            report
+                .query_plans
+                .iter()
+                .any(|plan| plan.name == "batched_path_browse")
         );
         assert!(
             report
@@ -571,6 +860,36 @@ mod tests {
                 .scenarios
                 .iter()
                 .any(|scenario| scenario.name == "project_category_model_filter_browse")
+        );
+        assert!(
+            report
+                .scenarios
+                .iter()
+                .any(|scenario| scenario.name == "non_path_prefetch_batched")
+        );
+        assert!(
+            report
+                .scenarios
+                .iter()
+                .any(|scenario| scenario.name == "path_prefetch_batched")
+        );
+        assert_eq!(
+            report.browse_footprint.snapshot_max_publish_seq,
+            report.snapshot.max_publish_seq
+        );
+        assert!(
+            report
+                .browse_footprint
+                .scenarios
+                .iter()
+                .any(|scenario| scenario.name == "path_deep_prefetch")
+        );
+        assert!(
+            report
+                .browse_footprint
+                .recommendations
+                .estimated_budget_bytes
+                > 0
         );
 
         Ok(())
