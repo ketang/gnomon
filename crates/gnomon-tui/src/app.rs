@@ -6548,8 +6548,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<Vec<_>>();
         assert!(
-            rendered.contains(&"#"),
-            "expected the coarse raster pipeline to emit the selected-segment glyph"
+            rendered.contains(&"█"),
+            "expected the coarse raster pipeline to emit the uniform fill glyph"
         );
         Ok(())
     }
@@ -6644,14 +6644,12 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<Vec<_>>();
         assert!(
-            rendered.contains(&"·"),
-            "expected cached-heavy coarse cells to use the subtle cache glyph"
+            rendered.contains(&"█"),
+            "expected cached-heavy coarse cells to use the uniform fill glyph"
         );
         assert!(
-            rendered
-                .iter()
-                .all(|symbol| !matches!(*symbol, "*" | ";" | ":" | ".")),
-            "expected the old texture glyph ladder to stay out of the coarse renderer"
+            !rendered.contains(&"·"),
+            "expected no texture glyphs — coarse mode uses uniform fill"
         );
         Ok(())
     }
