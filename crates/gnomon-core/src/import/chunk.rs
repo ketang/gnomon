@@ -13,8 +13,9 @@ use jiff::{Timestamp, ToSpan, tz::TimeZone};
 use rusqlite::{Connection, Transaction, params};
 
 use super::{
-    IMPORT_SCHEMA_VERSION, NormalizeJsonlFileParams, STARTUP_IMPORT_WINDOW_HOURS,
-    STARTUP_OPEN_DEADLINE_SECS, normalize_jsonl_file,
+    IMPORT_SCHEMA_VERSION, NormalizeImportWarning, NormalizeJsonlFileOutcome,
+    NormalizeJsonlFileParams, STARTUP_IMPORT_WINDOW_HOURS, STARTUP_OPEN_DEADLINE_SECS,
+    normalize_jsonl_file,
 };
 
 const IMPORTER_THREAD_NAME: &str = "gnomon-importer";
@@ -633,7 +634,7 @@ fn import_chunk(
     let import_result = (|| {
         for source_file in &chunk.source_files {
             let path = source_root.join(&source_file.relative_path);
-            let conversation = normalize_jsonl_file(
+            let outcome = normalize_jsonl_file(
                 database.connection_mut(),
                 &NormalizeJsonlFileParams {
                     project_id: chunk.project_id,
@@ -649,19 +650,30 @@ fn import_chunk(
                 )
             })?;
 
-            if let Some(conversation) = conversation {
-                let _ = build_actions(
-                    database.connection_mut(),
-                    &BuildActionsParams {
-                        conversation_id: conversation.conversation_id,
-                    },
-                )
-                .with_context(|| {
-                    format!(
-                        "unable to build actions for source file {}",
-                        source_root.join(&source_file.relative_path).display()
+            match outcome {
+                NormalizeJsonlFileOutcome::Imported(conversation) => {
+                    let _ = build_actions(
+                        database.connection_mut(),
+                        &BuildActionsParams {
+                            conversation_id: conversation.conversation_id,
+                        },
                     )
-                })?;
+                    .with_context(|| {
+                        format!(
+                            "unable to build actions for source file {}",
+                            source_root.join(&source_file.relative_path).display()
+                        )
+                    })?;
+                }
+                NormalizeJsonlFileOutcome::Skipped => {}
+                NormalizeJsonlFileOutcome::Warning(warning) => {
+                    insert_import_warning(
+                        database.connection_mut(),
+                        chunk.import_chunk_id,
+                        source_file.source_file_id,
+                        &warning,
+                    )?;
+                }
             }
         }
 
@@ -743,6 +755,30 @@ fn purge_chunk_data(tx: &Transaction<'_>, import_chunk_id: i64) -> Result<()> {
     )
     .context("unable to clear prior conversation state for import chunk")?;
 
+    Ok(())
+}
+
+fn insert_import_warning(
+    conn: &Connection,
+    import_chunk_id: i64,
+    source_file_id: i64,
+    warning: &NormalizeImportWarning,
+) -> Result<()> {
+    conn.execute(
+        "
+        INSERT INTO import_warning (import_chunk_id, source_file_id, code, severity, message)
+        VALUES (?1, ?2, ?3, 'warning', ?4)
+        ",
+        params![
+            import_chunk_id,
+            source_file_id,
+            warning.code,
+            warning.message
+        ],
+    )
+    .with_context(|| {
+        format!("unable to record import warning for source file id {source_file_id}")
+    })?;
     Ok(())
 }
 
@@ -843,7 +879,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ImportWorkerOptions, StartupOpenReason, StartupWorkerEvent, build_import_plan, import_all,
+        ImportWorkerOptions, StartupOpenReason, build_import_plan, import_all,
         start_startup_import_with_options,
     };
     use crate::db::Database;
@@ -1068,7 +1104,8 @@ mod tests {
     }
 
     #[test]
-    fn startup_import_failure_is_non_fatal_and_reports_source_file_and_line() -> Result<()> {
+    fn startup_import_records_warning_for_malformed_source_file_and_completes_chunk() -> Result<()>
+    {
         let temp = tempdir()?;
         let db_path = temp.path().join("usage.sqlite3");
         let source_root = temp.path().join("source");
@@ -1126,14 +1163,8 @@ mod tests {
         )?;
 
         assert_eq!(startup.open_reason, StartupOpenReason::Last24hReady);
-        assert_eq!(startup.snapshot.max_publish_seq, 1);
-        let status_message = startup
-            .startup_status_message
-            .clone()
-            .context("missing startup failure status message")?;
-        assert!(status_message.contains("startup import failed"));
-        assert!(status_message.contains(&bad_source_path.display().to_string()));
-        assert!(status_message.contains("line 2"));
+        assert_eq!(startup.snapshot.max_publish_seq, 2);
+        assert!(startup.startup_status_message.is_none());
         startup.wait_for_completion()?;
 
         let counts: (i64, i64) = db.connection().query_row(
@@ -1146,13 +1177,28 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        assert_eq!(counts, (1, 1));
+        assert_eq!(counts, (2, 0));
+
+        let warnings: Vec<String> = {
+            let mut stmt = db.connection().prepare(
+                "
+                SELECT message
+                FROM import_warning
+                ORDER BY id
+                ",
+            )?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains(&bad_source_path.display().to_string()));
+        assert!(warnings[0].contains("line 2"));
 
         Ok(())
     }
 
     #[test]
-    fn deferred_import_failures_are_aggregated_and_surface_through_status_updates() -> Result<()> {
+    fn deferred_import_records_warnings_without_failure_status_updates() -> Result<()> {
         let temp = tempdir()?;
         let db_path = temp.path().join("usage.sqlite3");
         let source_root = temp.path().join("source");
@@ -1224,26 +1270,12 @@ mod tests {
         let status_updates = startup
             .take_status_updates()
             .context("missing deferred status update receiver")?;
-        let startup_status = startup
-            .startup_status_message
-            .clone()
-            .context("missing startup failure status message")?;
-        assert!(startup_status.contains("startup import failed"));
-        assert!(startup_status.contains(&startup_source_path.display().to_string()));
-        assert!(startup_status.contains("line 2"));
-
-        let deferred_update = status_updates
-            .recv_timeout(Duration::from_secs(2))
-            .context("missing deferred failure status update")?;
-        let deferred_status_message = match deferred_update {
-            StartupWorkerEvent::DeferredFailures {
-                deferred_status_message,
-            } => deferred_status_message.context("missing deferred failure summary")?,
-            other => panic!("expected deferred failure update, got {other:?}"),
-        };
-        assert!(deferred_status_message.contains("deferred import failed for 2 chunks"));
-        assert!(deferred_status_message.contains(&deferred_one_source_path.display().to_string()));
-        assert!(deferred_status_message.contains("line 2"));
+        assert!(startup.startup_status_message.is_none());
+        assert!(
+            status_updates
+                .recv_timeout(Duration::from_millis(200))
+                .is_err()
+        );
 
         startup.wait_for_completion()?;
 
@@ -1257,13 +1289,29 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        assert_eq!(counts, (0, 3));
+        assert_eq!(counts, (3, 0));
+
+        let warnings: Vec<String> = {
+            let mut stmt = db.connection().prepare(
+                "
+                SELECT message
+                FROM import_warning
+                ORDER BY id
+                ",
+            )?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings[0].contains(&startup_source_path.display().to_string()));
+        assert!(warnings[1].contains(&deferred_one_source_path.display().to_string()));
+        assert!(warnings[2].contains(&deferred_two_source_path.display().to_string()));
 
         Ok(())
     }
 
     #[test]
-    fn import_all_reports_deferred_failures_without_returning_error() -> Result<()> {
+    fn import_all_completes_when_deferred_file_is_malformed_and_records_warning() -> Result<()> {
         let temp = tempdir()?;
         let db_path = temp.path().join("usage.sqlite3");
         let source_root = temp.path().join("source");
@@ -1312,13 +1360,8 @@ mod tests {
 
         assert_eq!(report.startup_chunk_count, 1);
         assert_eq!(report.deferred_chunk_count, 1);
-        assert_eq!(report.deferred_failure_count, 1);
-        let summary = report
-            .deferred_failure_summary
-            .context("missing deferred failure summary")?;
-        assert!(summary.contains("deferred import failed"));
-        assert!(summary.contains(&deferred_source_path.display().to_string()));
-        assert!(summary.contains("line 2"));
+        assert_eq!(report.deferred_failure_count, 0);
+        assert!(report.deferred_failure_summary.is_none());
 
         let counts: (i64, i64) = db.connection().query_row(
             "
@@ -1330,7 +1373,15 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        assert_eq!(counts, (1, 1));
+        assert_eq!(counts, (2, 0));
+
+        let warning: String =
+            db.connection()
+                .query_row("SELECT message FROM import_warning LIMIT 1", [], |row| {
+                    row.get(0)
+                })?;
+        assert!(warning.contains(&deferred_source_path.display().to_string()));
+        assert!(warning.contains("line 2"));
 
         Ok(())
     }

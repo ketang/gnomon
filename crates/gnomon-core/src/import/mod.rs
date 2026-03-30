@@ -63,4 +63,7 @@ pub use chunk::{
     ImportExecutionReport, StartupImport, StartupOpenReason, StartupWorkerEvent, import_all,
     start_startup_import,
 };
-pub use normalize::{NormalizeJsonlFileParams, NormalizeJsonlFileResult, normalize_jsonl_file};
+pub use normalize::{
+    NormalizeImportWarning, NormalizeJsonlFileOutcome, NormalizeJsonlFileParams,
+    NormalizeJsonlFileResult, normalize_jsonl_file,
+};

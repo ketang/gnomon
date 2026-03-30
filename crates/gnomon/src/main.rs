@@ -1200,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_succeeds_with_deferred_chunk_failures_and_reports_them() -> Result<()> {
+    fn rebuild_skips_malformed_deferred_file_with_warning_and_completes() -> Result<()> {
         let temp = tempdir()?;
         let db_path = temp.path().join("usage.sqlite3");
         let source_root = temp.path().join("source");
@@ -1211,14 +1211,13 @@ mod tests {
             &project_root,
         )?;
         std::fs::create_dir_all(source_root.join("project/older"))?;
-        std::fs::write(
-            source_root.join("project/older/bad.jsonl"),
-            concat!(
-                "{\"type\":\"user\",\"uuid\":\"bad-user\",\"timestamp\":\"2026-03-26T10:00:00Z\",\"sessionId\":\"bad-session\",\"message\":{\"role\":\"user\",\"content\":\"Inspect the project\"}}\n",
-                "{\"type\":\"assistant\",\"uuid\":\"bad-assistant\",\"timestamp\":\"2026-03-26T10:00:01Z\",\"sessionId\":\"bad-session\",\"message\":{\"id\":\"msg-bad\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"broken\"}]"
-            ),
-        )?;
-        set_file_modified_days_ago(&source_root.join("project/older/bad.jsonl"), 5)?;
+        let bad_path = source_root.join("project/older/bad.jsonl");
+        let mut malformed_bytes = "{\"type\":\"user\",\"uuid\":\"bad-user\",\"timestamp\":\"2026-03-26T10:00:00Z\",\"sessionId\":\"bad-session\",\"message\":{\"role\":\"user\",\"content\":\"Inspect the project\"}}\n"
+            .as_bytes()
+            .to_vec();
+        malformed_bytes.extend([0_u8; 256]);
+        std::fs::write(&bad_path, malformed_bytes)?;
+        set_file_modified_days_ago(&bad_path, 5)?;
 
         let config = RuntimeConfig::load(ConfigOverrides {
             db_path: Some(db_path.clone()),
@@ -1238,7 +1237,16 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        assert_eq!(counts, (1, 1));
+        assert_eq!(counts, (2, 0));
+
+        let warning: (String, String) = database.connection().query_row(
+            "SELECT code, message FROM import_warning LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(warning.0, "invalid_json");
+        assert!(warning.1.contains(&bad_path.display().to_string()));
+        assert!(warning.1.contains("line 2"));
 
         Ok(())
     }

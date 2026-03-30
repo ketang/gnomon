@@ -11,6 +11,7 @@ use super::NormalizedToolUsePartMetadata;
 
 const PRIMARY_STREAM_SEQUENCE_NO: i64 = 0;
 const SOURCE_LINE_PREVIEW_CHAR_LIMIT: usize = 160;
+const WARNING_INVALID_JSON: &str = "invalid_json";
 
 #[derive(Debug, Clone)]
 pub struct NormalizeJsonlFileParams {
@@ -29,10 +30,23 @@ pub struct NormalizeJsonlFileResult {
     pub turn_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizeImportWarning {
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NormalizeJsonlFileOutcome {
+    Imported(NormalizeJsonlFileResult),
+    Skipped,
+    Warning(NormalizeImportWarning),
+}
+
 pub fn normalize_jsonl_file(
     conn: &mut Connection,
     params: &NormalizeJsonlFileParams,
-) -> Result<Option<NormalizeJsonlFileResult>> {
+) -> Result<NormalizeJsonlFileOutcome> {
     let mut tx = conn
         .transaction()
         .context("unable to start normalization transaction")?;
@@ -53,13 +67,21 @@ pub fn normalize_jsonl_file(
             )
         })?;
 
-        let record: Value = serde_json::from_str(&line).with_context(|| {
-            format!(
-                "unable to parse json on line {line_no} from {} (preview: {})",
-                params.path.display(),
-                preview_source_line(&line)
-            )
-        })?;
+        let record: Value = match serde_json::from_str(&line) {
+            Ok(record) => record,
+            Err(_) => {
+                tx.rollback()
+                    .context("unable to roll back malformed jsonl import")?;
+                return Ok(NormalizeJsonlFileOutcome::Warning(NormalizeImportWarning {
+                    code: WARNING_INVALID_JSON,
+                    message: format!(
+                        "unable to parse json on line {line_no} from {} (preview: {})",
+                        params.path.display(),
+                        preview_source_line(&line)
+                    ),
+                }));
+            }
+        };
 
         if state.conversation.is_none() {
             if extract_session_id(&record).is_some() {
@@ -81,7 +103,7 @@ pub fn normalize_jsonl_file(
         if file_contains_only_sessionless_metadata(&state.buffered_records) {
             tx.commit()
                 .context("unable to commit skipped metadata-only import")?;
-            return Ok(None);
+            return Ok(NormalizeJsonlFileOutcome::Skipped);
         }
         bail!(
             "no sessionId found in {}; unable to normalize file",
@@ -97,21 +119,23 @@ pub fn normalize_jsonl_file(
     state.finish_import(&mut tx, turn_count)?;
     tx.commit().context("unable to commit normalized import")?;
 
-    Ok(Some(NormalizeJsonlFileResult {
-        conversation_id: state
-            .conversation
-            .as_ref()
-            .map(|conversation| conversation.id)
-            .ok_or_else(|| anyhow!("conversation missing after import"))?,
-        stream_id: state
-            .stream
-            .as_ref()
-            .map(|stream| stream.id)
-            .ok_or_else(|| anyhow!("stream missing after import"))?,
-        record_count: state.record_count,
-        message_count: state.message_states.len(),
-        turn_count,
-    }))
+    Ok(NormalizeJsonlFileOutcome::Imported(
+        NormalizeJsonlFileResult {
+            conversation_id: state
+                .conversation
+                .as_ref()
+                .map(|conversation| conversation.id)
+                .ok_or_else(|| anyhow!("conversation missing after import"))?,
+            stream_id: state
+                .stream
+                .as_ref()
+                .map(|stream| stream.id)
+                .ok_or_else(|| anyhow!("stream missing after import"))?,
+            record_count: state.record_count,
+            message_count: state.message_states.len(),
+            turn_count,
+        },
+    ))
 }
 
 fn preview_source_line(line: &str) -> String {
@@ -1204,7 +1228,7 @@ mod tests {
     use crate::db::Database;
     use crate::import::NormalizedToolUsePartMetadata;
 
-    use super::{NormalizeJsonlFileParams, normalize_jsonl_file};
+    use super::{NormalizeJsonlFileOutcome, NormalizeJsonlFileParams, normalize_jsonl_file};
 
     const MAIN_SESSION_FIXTURE: &str = concat!(
         "{\"type\":\"file-history-snapshot\",\"messageId\":\"snap-1\",\"snapshot\":{\"messageId\":\"snap-1\",\"trackedFileBackups\":{},\"timestamp\":\"2026-03-26T10:00:00Z\"},\"isSnapshotUpdate\":false}\n",
@@ -1250,8 +1274,10 @@ mod tests {
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
             },
-        )?
-        .expect("main session fixture should import");
+        )?;
+        let NormalizeJsonlFileOutcome::Imported(result) = result else {
+            panic!("main session fixture should import");
+        };
 
         assert_eq!(result.record_count, 8);
         assert_eq!(result.message_count, 6);
@@ -1340,8 +1366,10 @@ mod tests {
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
             },
-        )?
-        .expect("sidechain fixture should import");
+        )?;
+        let NormalizeJsonlFileOutcome::Imported(result) = result else {
+            panic!("sidechain fixture should import");
+        };
 
         assert_eq!(result.record_count, 2);
         assert_eq!(result.message_count, 2);
@@ -1379,7 +1407,7 @@ mod tests {
 
         let mut db = Database::open(&db_path)?;
         let ids = seed_import_context(db.connection_mut(), "session.jsonl")?;
-        normalize_jsonl_file(
+        let result = normalize_jsonl_file(
             db.connection_mut(),
             &NormalizeJsonlFileParams {
                 project_id: ids.project_id,
@@ -1387,8 +1415,8 @@ mod tests {
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
             },
-        )?
-        .expect("main session fixture should import");
+        )?;
+        assert!(matches!(result, NormalizeJsonlFileOutcome::Imported(_)));
 
         let parts: Vec<MessagePartRow> = {
             let mut stmt = db.connection().prepare(
@@ -1544,7 +1572,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_errors_include_truncated_source_line_preview() -> Result<()> {
+    fn parse_errors_return_warning_with_truncated_source_line_preview() -> Result<()> {
         let temp = tempdir()?;
         let db_path = temp.path().join("usage.sqlite3");
         let fixture_path = temp.path().join("bad.jsonl");
@@ -1561,7 +1589,7 @@ mod tests {
 
         let mut db = Database::open(&db_path)?;
         let ids = seed_import_context(db.connection_mut(), "bad.jsonl")?;
-        let error = normalize_jsonl_file(
+        let outcome = normalize_jsonl_file(
             db.connection_mut(),
             &NormalizeJsonlFileParams {
                 project_id: ids.project_id,
@@ -1569,15 +1597,30 @@ mod tests {
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path.clone(),
             },
-        )
-        .expect_err("malformed json fixture should fail");
+        )?;
 
-        let rendered = format!("{error:#}");
-        assert!(rendered.contains(&fixture_path.display().to_string()));
-        assert!(rendered.contains("line 2"));
-        assert!(rendered.contains("preview: {\\\"type\\\":\\\"user\\\""));
-        assert!(rendered.contains("..."));
-        assert!(!rendered.contains(&"x".repeat(200)));
+        let NormalizeJsonlFileOutcome::Warning(warning) = outcome else {
+            panic!("malformed json fixture should return a warning");
+        };
+        assert_eq!(warning.code, "invalid_json");
+        assert!(
+            warning
+                .message
+                .contains(&fixture_path.display().to_string())
+        );
+        assert!(warning.message.contains("line 2"));
+        assert!(
+            warning
+                .message
+                .contains("preview: {\\\"type\\\":\\\"user\\\"")
+        );
+        assert!(warning.message.contains("..."));
+        assert!(!warning.message.contains(&"x".repeat(200)));
+
+        let conversation_count: i64 =
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM conversation", [], |row| row.get(0))?;
+        assert_eq!(conversation_count, 0);
 
         Ok(())
     }
@@ -1601,7 +1644,7 @@ mod tests {
             },
         )?;
 
-        assert!(result.is_none());
+        assert!(matches!(result, NormalizeJsonlFileOutcome::Skipped));
 
         let conn = db.connection();
         let conversation_count: i64 =
@@ -1649,8 +1692,10 @@ mod tests {
                 import_chunk_id: first_ids.import_chunk_id,
                 path: first_fixture_path,
             },
-        )?
-        .expect("first fixture should import");
+        )?;
+        let NormalizeJsonlFileOutcome::Imported(first_result) = first_result else {
+            panic!("first fixture should import");
+        };
         let second_result = normalize_jsonl_file(
             db.connection_mut(),
             &NormalizeJsonlFileParams {
@@ -1659,8 +1704,10 @@ mod tests {
                 import_chunk_id: second_ids.import_chunk_id,
                 path: second_fixture_path,
             },
-        )?
-        .expect("second fixture should import");
+        )?;
+        let NormalizeJsonlFileOutcome::Imported(second_result) = second_result else {
+            panic!("second fixture should import");
+        };
 
         let conversations: Vec<(i64, i64, String)> = {
             let mut stmt = db.connection().prepare(

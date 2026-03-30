@@ -1168,7 +1168,9 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::db::Database;
-    use crate::import::{NormalizeJsonlFileParams, normalize_jsonl_file};
+    use crate::import::{
+        NormalizeJsonlFileOutcome, NormalizeJsonlFileParams, normalize_jsonl_file,
+    };
 
     use super::{BuildActionsParams, build_actions};
 
@@ -1207,8 +1209,10 @@ mod tests {
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
             },
-        )?
-        .expect("classification fixture should import");
+        )?;
+        let NormalizeJsonlFileOutcome::Imported(normalized) = normalized else {
+            panic!("classification fixture should import");
+        };
         let result = build_actions(
             db.connection_mut(),
             &BuildActionsParams {
@@ -1285,8 +1289,10 @@ mod tests {
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
             },
-        )?
-        .expect("mixed fixture should import");
+        )?;
+        let NormalizeJsonlFileOutcome::Imported(normalized) = normalized else {
+            panic!("mixed fixture should import");
+        };
         let result = build_actions(
             db.connection_mut(),
             &BuildActionsParams {
