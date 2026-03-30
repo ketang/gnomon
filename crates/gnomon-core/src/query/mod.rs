@@ -4011,6 +4011,7 @@ mod tests {
         Ok(())
     }
 
+    #[test]
     fn browse_many_matches_individual_non_path_and_path_requests() -> Result<()> {
         let temp = tempdir()?;
         let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
@@ -4115,7 +4116,10 @@ mod tests {
 
         assert_eq!(browse["root"], "ProjectHierarchy");
         assert_eq!(browse["lens"], "UncachedInput");
-        assert_eq!(browse["path"]["Project"]["project_id"], fixture.project_a_id);
+        assert_eq!(
+            browse["path"]["Project"]["project_id"],
+            fixture.project_a_id
+        );
         assert_eq!(browse["granularity"], "verbose");
         assert!(browse["row_count"].as_u64().unwrap_or(0) > 0);
         Ok(())

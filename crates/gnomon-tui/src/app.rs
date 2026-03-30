@@ -2912,8 +2912,11 @@ impl App {
                     for (request, rows) in
                         result.requests.into_iter().zip(result.row_sets.into_iter())
                     {
-                        self.query_cache
-                            .insert_browse_rows(&request.snapshot, &request, rows.clone())?;
+                        self.query_cache.insert_browse_rows(
+                            &request.snapshot,
+                            &request,
+                            rows.clone(),
+                        )?;
                         self.browse_cache.store(&request, &rows)?;
                     }
                 }
@@ -3780,49 +3783,49 @@ fn build_jump_targets_for_state(
         .collect::<Vec<_>>();
     let project_category_sets = cached_browse_many(
         query_cache,
+        browse_cache,
         query_engine,
         project_category_requests.clone(),
         &mut browse_stats,
     )?;
     let mut project_action_requests = Vec::new();
 
-        for (project, categories) in project_root_rows.iter().zip(project_category_sets.iter()) {
-            let Some(project_id) = project.project_id else {
-                continue;
-            };
-            project_count += 1;
-            targets.push(JumpTarget {
+    for (project, categories) in project_root_rows.iter().zip(project_category_sets.iter()) {
+        let Some(project_id) = project.project_id else {
+            continue;
+        };
+        project_count += 1;
+        targets.push(JumpTarget {
             label: project.label.clone(),
             detail: "project".to_string(),
-                root: RootView::ProjectHierarchy,
-                path: BrowsePath::Project { project_id },
-            });
+            root: RootView::ProjectHierarchy,
+            path: BrowsePath::Project { project_id },
+        });
 
-            for category in categories {
-                let Some(category_name) = category.category.clone() else {
-                    continue;
-                };
-                category_count += 1;
-                targets.push(JumpTarget {
+        for category in categories {
+            let Some(category_name) = category.category.clone() else {
+                continue;
+            };
+            category_count += 1;
+            targets.push(JumpTarget {
                 label: format!("{} / {}", project.label, category_name),
                 detail: "project category".to_string(),
                 root: RootView::ProjectHierarchy,
-                    path: BrowsePath::ProjectCategory {
-                        project_id,
-                        category: category_name.clone(),
-                    },
-                });
-                project_action_requests.push(BrowseRequest {
-                    snapshot: snapshot.clone(),
-                    root: RootView::ProjectHierarchy,
-                    lens: ui_state.lens,
-                    filters: filters.clone(),
-                    path: BrowsePath::ProjectCategory {
-                        project_id,
-                        category: category_name,
-                    },
-                });
-            }
+                path: BrowsePath::ProjectCategory {
+                    project_id,
+                    category: category_name.clone(),
+                },
+            });
+            project_action_requests.push(BrowseRequest {
+                snapshot: snapshot.clone(),
+                root: RootView::ProjectHierarchy,
+                lens: ui_state.lens,
+                filters: filters.clone(),
+                path: BrowsePath::ProjectCategory {
+                    project_id,
+                    category: category_name,
+                },
+            });
         }
     }
     let project_action_sets = cached_browse_many(
@@ -3902,6 +3905,7 @@ fn build_jump_targets_for_state(
         .collect::<Vec<_>>();
     let category_action_sets = cached_browse_many(
         query_cache,
+        browse_cache,
         query_engine,
         category_action_requests.clone(),
         &mut browse_stats,
