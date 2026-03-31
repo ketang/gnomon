@@ -1,6 +1,7 @@
 mod app;
 mod benchmark;
 mod gnomon_sunburst;
+mod prefetch;
 mod sunburst;
 
 use anyhow::Result;

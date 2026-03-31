@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use crate::gnomon_sunburst::{
     build_sunburst_layer, build_sunburst_model, build_sunburst_scope_label,
 };
+use crate::prefetch::{PrefetchContext, PrefetchCoordinator, VisibleRowInfo};
 use crate::sunburst::{
     SunburstDistortionPolicy, SunburstLayer, SunburstModel, SunburstPane, SunburstRenderConfig,
     SunburstSpan, sunburst_selected_child_span,
@@ -70,9 +71,7 @@ const JUMP_MATCH_LIMIT: usize = 8;
 const ACTIVITY_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 const VIEW_LOAD_PHASE_TOTAL: usize = 8;
 const JUMP_TARGET_PHASE_TOTAL: usize = 4;
-const PREFETCH_RECURSION_DEPTH_LIMIT: usize = 3;
 const PREFETCH_RECURSION_BREADTH_LIMIT: usize = 4;
-const PREFETCH_NEARBY_VISIBLE_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum QueryCacheDomain {
@@ -791,6 +790,7 @@ pub struct App {
     selected_project_identity: Option<SelectedProjectIdentity>,
     show_inspect_pane: bool,
     pending_confirmation: Option<ConfirmationAction>,
+    prefetch: PrefetchCoordinator,
 }
 
 impl App {
@@ -883,6 +883,7 @@ impl App {
             selected_project_identity: None,
             show_inspect_pane: false,
             pending_confirmation: None,
+            prefetch: PrefetchCoordinator::new(),
         };
 
         let perf_logger = app.perf_logger.clone();
@@ -2896,12 +2897,76 @@ impl App {
             }))
     }
 
-    fn enqueue_prefetch(&mut self) -> Result<()> {
-        let requests = self.build_prefetch_requests()?;
-        if requests.is_empty() {
+    fn prefetch_context(&self) -> Result<PrefetchContext> {
+        Ok(PrefetchContext {
+            snapshot: self.snapshot.clone(),
+            root: self.ui_state.root,
+            lens: self.ui_state.lens,
+            filters: self.current_query_filters()?,
+        })
+    }
+
+    fn visible_row_infos(&self) -> Vec<VisibleRowInfo> {
+        self.visible_rows
+            .iter()
+            .map(|row| VisibleRowInfo {
+                parent_path: row.parent_path.clone(),
+                node_path: row.node_path.clone(),
+            })
+            .collect()
+    }
+
+    fn populate_prefetch(&mut self) {
+        let Ok(context) = self.prefetch_context() else {
+            return;
+        };
+        let selected = self.selected_tree_row();
+        let selected_path = selected.and_then(|r| r.node_path.clone());
+        let selected_parent = selected.map(|r| r.parent_path.clone());
+        let selected_index = self.table_state.selected();
+        let row_infos = self.visible_row_infos();
+        self.prefetch.populate(
+            context,
+            selected_path.as_ref(),
+            selected_parent.as_ref(),
+            &row_infos,
+            selected_index,
+        );
+        let _ = self.submit_next_prefetch_batch();
+    }
+
+    fn reprioritize_prefetch(&mut self) {
+        let selected = self.selected_tree_row();
+        let selected_path = selected.and_then(|r| r.node_path.clone());
+        let selected_parent = selected.map(|r| r.parent_path.clone());
+        let selected_index = self.table_state.selected();
+        let row_infos = self.visible_row_infos();
+        self.prefetch.reprioritize(
+            selected_path.as_ref(),
+            selected_parent.as_ref(),
+            &row_infos,
+            selected_index,
+        );
+        let _ = self.submit_next_prefetch_batch();
+    }
+
+    fn submit_next_prefetch_batch(&mut self) -> Result<()> {
+        if self.prefetch.has_in_flight() || !self.prefetch.has_pending() {
             return Ok(());
         }
-
+        let Some((context, paths)) = self.prefetch.drain_batch() else {
+            return Ok(());
+        };
+        let requests: Vec<BrowseRequest> = paths
+            .into_iter()
+            .map(|path| BrowseRequest {
+                snapshot: context.snapshot.clone(),
+                root: context.root,
+                lens: context.lens,
+                filters: context.filters.clone(),
+                path,
+            })
+            .collect();
         let sequence = self.next_request_sequence();
         self.pending_async_work
             .begin_prefetch(sequence, "warming browse neighborhood");
@@ -2977,9 +3042,15 @@ impl App {
                     .finish(PendingTaskKind::Prefetch, result.sequence)
                     == PendingFinish::Apply
                 {
+                    let mut child_paths_per_parent = Vec::new();
                     for (request, rows) in
                         result.requests.into_iter().zip(result.row_sets.into_iter())
                     {
+                        let children: Vec<BrowsePath> = prefetch_child_requests(&request, &rows)
+                            .into_iter()
+                            .map(|r| r.path)
+                            .collect();
+                        child_paths_per_parent.push((request.path.clone(), children));
                         self.query_cache.insert_browse_rows(
                             &request.snapshot,
                             &request,
@@ -2987,15 +3058,25 @@ impl App {
                         )?;
                         self.browse_cache.store(&request, &rows)?;
                     }
+                    self.prefetch.complete_batch(&child_paths_per_parent);
+                    let _ = self.submit_next_prefetch_batch();
                 }
             }
             QueryWorkerResult::Failed(failure) => {
+                let is_prefetch = failure.task == PendingTaskKind::Prefetch;
                 if self
                     .pending_async_work
                     .finish(failure.task, failure.sequence)
                     == PendingFinish::Apply
                 {
                     self.status_message = Some(StatusMessage::error(failure.message));
+                }
+                if is_prefetch {
+                    // Clear in-flight state so the next batch can be submitted.
+                    // We don't know which paths failed, so we can't call
+                    // fail_batch precisely. Reset in_flight and try next batch.
+                    self.prefetch.reset();
+                    let _ = self.submit_next_prefetch_batch();
                 }
             }
         }
@@ -3022,7 +3103,7 @@ impl App {
         self.apply_row_filter()?;
         self.restore_selection(loaded_view.selected_key)?;
         self.refresh_active_context_for_selection();
-        let _ = self.enqueue_prefetch();
+        self.populate_prefetch();
         self.save_state();
         Ok(())
     }
@@ -3077,63 +3158,7 @@ impl App {
         } else {
             self.rebuild_radial_model();
         }
-        let _ = self.enqueue_prefetch();
-    }
-
-    fn build_prefetch_requests(&self) -> Result<Vec<BrowseRequest>> {
-        let filters = self.current_query_filters()?;
-        let mut requests = Vec::new();
-        let mut seen = BTreeSet::new();
-
-        let mut push_path = |path: BrowsePath, requests: &mut Vec<BrowseRequest>| -> Result<()> {
-            let request = BrowseRequest {
-                snapshot: self.snapshot.clone(),
-                root: self.ui_state.root,
-                lens: self.ui_state.lens,
-                filters: filters.clone(),
-                path,
-            };
-            let signature =
-                serde_json::to_string(&request).context("unable to serialize prefetch request")?;
-            if seen.insert(signature) {
-                requests.push(request);
-            }
-            Ok(())
-        };
-
-        let selected_index = self.table_state.selected();
-        if let Some(selected) = self.selected_tree_row()
-            && let Some(path) = selected.node_path.clone()
-        {
-            push_path(path, &mut requests)?;
-            for row in self
-                .visible_rows
-                .iter()
-                .filter(|row| row.parent_path == selected.parent_path)
-            {
-                if let Some(path) = row.node_path.clone() {
-                    push_path(path, &mut requests)?;
-                }
-            }
-        }
-
-        if let Some(selected_index) = selected_index {
-            let start = selected_index.saturating_sub(PREFETCH_NEARBY_VISIBLE_LIMIT / 2);
-            let end = (start + PREFETCH_NEARBY_VISIBLE_LIMIT).min(self.visible_rows.len());
-            for row in &self.visible_rows[start..end] {
-                if let Some(path) = row.node_path.clone() {
-                    push_path(path, &mut requests)?;
-                }
-            }
-        }
-
-        for row in &self.visible_rows {
-            if let Some(path) = row.node_path.clone() {
-                push_path(path, &mut requests)?;
-            }
-        }
-
-        Ok(requests)
+        self.reprioritize_prefetch();
     }
 
     fn active_path(&self) -> BrowsePath {
@@ -3467,50 +3492,15 @@ fn run_prefetch_requests(
     query_engine: &QueryEngine<'_>,
     request: PrefetchRequest,
 ) -> Result<(Vec<BrowseRequest>, Vec<Vec<RollupRow>>)> {
-    let mut queue = request
-        .requests
-        .into_iter()
-        .map(|request| (request, 0usize))
-        .collect::<Vec<_>>();
-    let mut seen = queue
-        .iter()
-        .map(|(request, _)| serde_json::to_string(request))
-        .collect::<Result<BTreeSet<_>, _>>()
-        .context("unable to serialize prefetch seed request")?;
-    let mut warmed_requests = Vec::new();
-    let mut warmed_row_sets = Vec::new();
-
-    while !queue.is_empty() {
-        let batch = std::mem::take(&mut queue);
-        let batch_requests = batch
-            .iter()
-            .map(|(request, _)| request.clone())
-            .collect::<Vec<_>>();
-        let mut browse_stats = BrowseFanoutStats::default();
-        let batch_row_sets = cached_browse_many(
-            query_cache,
-            browse_cache,
-            query_engine,
-            batch_requests,
-            &mut browse_stats,
-        )?;
-
-        for ((request, depth), rows) in batch.into_iter().zip(batch_row_sets.into_iter()) {
-            if depth < PREFETCH_RECURSION_DEPTH_LIMIT {
-                for child_request in prefetch_child_requests(&request, &rows) {
-                    let signature = serde_json::to_string(&child_request)
-                        .context("unable to serialize recursive prefetch request")?;
-                    if seen.insert(signature) {
-                        queue.push((child_request, depth + 1));
-                    }
-                }
-            }
-            warmed_requests.push(request);
-            warmed_row_sets.push(rows);
-        }
-    }
-
-    Ok((warmed_requests, warmed_row_sets))
+    let mut browse_stats = BrowseFanoutStats::default();
+    let row_sets = cached_browse_many(
+        query_cache,
+        browse_cache,
+        query_engine,
+        request.requests.clone(),
+        &mut browse_stats,
+    )?;
+    Ok((request.requests, row_sets))
 }
 
 fn cached_browse(
