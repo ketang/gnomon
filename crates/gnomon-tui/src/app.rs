@@ -171,6 +171,43 @@ struct QueryCacheKey {
     input: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SelectionContextKey {
+    snapshot: SnapshotBounds,
+    root: RootView,
+    lens: MetricLens,
+    filters: BrowseFilters,
+    selected_row_key: Option<TreeRowKey>,
+    active_path: BrowsePath,
+}
+
+#[derive(Debug, Clone)]
+struct SelectionContextValue {
+    active_path: BrowsePath,
+    current_project_root: Option<String>,
+    breadcrumb_targets: Vec<BreadcrumbTarget>,
+    radial_context: RadialContext,
+    selected_project_identity: Option<SelectedProjectIdentity>,
+}
+
+#[derive(Debug, Clone)]
+struct SelectionContextEntry {
+    key: SelectionContextKey,
+    value: SelectionContextValue,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SelectionContextCacheStats {
+    hits: usize,
+    misses: usize,
+}
+
+#[derive(Default)]
+struct SelectionContextCache {
+    entries: BTreeMap<String, SelectionContextEntry>,
+    stats: SelectionContextCacheStats,
+}
+
 struct SnapshotQueryCache {
     snapshot: SnapshotBounds,
     entries: BTreeMap<QueryCacheKey, Box<dyn Any>>,
@@ -279,6 +316,60 @@ impl QueryResultCache {
     #[cfg(test)]
     fn snapshot_count(&self) -> usize {
         self.snapshots.len()
+    }
+}
+
+impl SelectionContextCache {
+    #[cfg(test)]
+    fn memoize<F>(&mut self, key: SelectionContextKey, build: F) -> Result<SelectionContextValue>
+    where
+        F: FnOnce() -> Result<SelectionContextValue>,
+    {
+        let serialized_key = serde_json::to_string(&key)
+            .context("unable to serialize selection context cache key")?;
+
+        if let Some(entry) = self.entries.get(&serialized_key) {
+            self.stats.hits += 1;
+            return Ok(entry.value.clone());
+        }
+
+        self.stats.misses += 1;
+        let value = build()?;
+        self.entries.insert(
+            serialized_key,
+            SelectionContextEntry {
+                key,
+                value: value.clone(),
+            },
+        );
+        Ok(value)
+    }
+
+    fn lookup(&mut self, key: &SelectionContextKey) -> Result<Option<SelectionContextValue>> {
+        let serialized_key = serde_json::to_string(key)
+            .context("unable to serialize selection context cache key")?;
+        Ok(self
+            .entries
+            .get(&serialized_key)
+            .map(|entry| entry.value.clone()))
+    }
+
+    fn store(&mut self, key: SelectionContextKey, value: SelectionContextValue) -> Result<()> {
+        let serialized_key = serde_json::to_string(&key)
+            .context("unable to serialize selection context cache key")?;
+        self.entries
+            .insert(serialized_key, SelectionContextEntry { key, value });
+        Ok(())
+    }
+
+    fn retain_snapshot(&mut self, snapshot: &SnapshotBounds) {
+        self.entries
+            .retain(|_, entry| &entry.key.snapshot == snapshot);
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> SelectionContextCacheStats {
+        self.stats
     }
 }
 
@@ -810,6 +901,7 @@ pub struct App {
     pending_async_work: PendingAsyncWork,
     perf_logger: Option<PerfLogger>,
     query_cache: QueryResultCache,
+    selection_context_cache: SelectionContextCache,
     row_cache: Vec<CachedRows>,
     expanded_paths: Vec<BrowsePath>,
     selected_project_identity: Option<SelectedProjectIdentity>,
@@ -903,6 +995,7 @@ impl App {
             pending_async_work: PendingAsyncWork::default(),
             perf_logger,
             query_cache: QueryResultCache::default(),
+            selection_context_cache: SelectionContextCache::default(),
             row_cache: Vec::new(),
             expanded_paths: Vec::new(),
             selected_project_identity: None,
@@ -2416,17 +2509,6 @@ impl App {
         self.selected_tree_row().map(|row| &row.row)
     }
 
-    fn update_selected_node_metadata(&mut self) {
-        let project_id = self.selected_row().and_then(|row| {
-            matches!(row.kind, RollupRowKind::Project)
-                .then_some(row.project_id)
-                .flatten()
-        });
-
-        self.selected_project_identity =
-            project_id.and_then(|project_id| self.project_identity_for(project_id).ok().flatten());
-    }
-
     fn selected_tree_row(&self) -> Option<&TreeRow> {
         self.table_state
             .selected()
@@ -2896,6 +2978,49 @@ impl App {
         Ok(radial_context)
     }
 
+    fn build_selection_context(
+        &mut self,
+        filters: &BrowseFilters,
+        active_path: BrowsePath,
+        selected_row: Option<TreeRow>,
+    ) -> Result<SelectionContextValue> {
+        let mut browse_stats = BrowseFanoutStats::default();
+        let selected_project_identity = selected_row.as_ref().and_then(|row| {
+            matches!(row.row.kind, RollupRowKind::Project)
+                .then_some(row.row.project_id)
+                .flatten()
+        });
+        let current_project_root = match project_id_from_path(&active_path) {
+            Some(project_id) => self.project_root_for(project_id, &mut browse_stats)?,
+            None => None,
+        };
+        let breadcrumb_targets = build_breadcrumb_targets(
+            &self.ui_state.root,
+            &active_path,
+            &self.filter_options,
+            current_project_root.as_deref(),
+        );
+        let radial_context = self.build_radial_context(
+            filters,
+            &active_path,
+            Some(current_project_root.clone()),
+            &mut browse_stats,
+        )?;
+
+        let selected_project_identity = match selected_project_identity {
+            Some(project_id) => self.project_identity_for(project_id).ok().flatten(),
+            None => None,
+        };
+
+        Ok(SelectionContextValue {
+            active_path,
+            current_project_root,
+            breadcrumb_targets,
+            radial_context,
+            selected_project_identity,
+        })
+    }
+
     fn next_request_sequence(&mut self) -> u64 {
         let sequence = self.next_request_sequence;
         self.next_request_sequence += 1;
@@ -3120,6 +3245,7 @@ impl App {
     fn apply_loaded_view(&mut self, loaded_view: LoadedView) -> Result<()> {
         self.snapshot = loaded_view.snapshot;
         self.query_cache.retain_snapshot(&self.snapshot);
+        self.selection_context_cache.retain_snapshot(&self.snapshot);
         self.snapshot_coverage = loaded_view.snapshot_coverage;
         self.ui_state = loaded_view.ui_state;
         self.filter_options = loaded_view.filter_options;
@@ -3154,46 +3280,49 @@ impl App {
         );
     }
 
-    fn refresh_active_context(&mut self, filters: &BrowseFilters) -> Result<()> {
-        let active_path = self.active_path();
-        let mut browse_stats = BrowseFanoutStats::default();
-        let project_root = match project_id_from_path(&active_path) {
-            Some(project_id) => self.project_root_for(project_id, &mut browse_stats)?,
-            None => None,
-        };
-        self.breadcrumb_targets = build_breadcrumb_targets(
-            &self.ui_state.root,
-            &active_path,
-            &self.filter_options,
-            project_root.as_deref(),
-        );
-        self.breadcrumb_picker.selected = self.breadcrumb_targets.len().saturating_sub(1);
-        self.radial_context = self.build_radial_context(
-            filters,
-            &active_path,
-            Some(project_root),
-            &mut browse_stats,
-        )?;
-        self.radial_context_path = active_path;
-        self.rebuild_radial_model();
-        Ok(())
-    }
-
     fn refresh_active_context_for_selection(&mut self) {
+        let selected_row = self.selected_tree_row().cloned();
+        let active_path = self.active_path();
+        let selected_row_key = selected_row.as_ref().map(TreeRow::key);
         let mut perf = self.slow_perf_scope("tui.selection_change");
-        perf.field("selected_tree_row_key", self.selected_tree_row_key());
-        perf.field("active_path", self.active_path());
-        self.update_selected_node_metadata();
-        let new_active_path = self.active_path();
-        if new_active_path == self.radial_context_path {
-            self.rebuild_radial_model();
-        } else if let Ok(filters) = self.current_query_filters() {
-            if self.refresh_active_context(&filters).is_err() {
-                self.rebuild_radial_model();
+        perf.field("selected_tree_row_key", &selected_row_key);
+        perf.field("active_path", &active_path);
+
+        if let Ok(filters) = self.current_query_filters() {
+            let key = SelectionContextKey {
+                snapshot: self.snapshot.clone(),
+                root: self.ui_state.root,
+                lens: self.ui_state.lens,
+                filters: filters.clone(),
+                selected_row_key,
+                active_path: active_path.clone(),
+            };
+
+            let context = match self.selection_context_cache.lookup(&key) {
+                Ok(Some(context)) => {
+                    self.selection_context_cache.stats.hits += 1;
+                    Some(context)
+                }
+                Ok(None) => {
+                    match self.build_selection_context(&filters, active_path.clone(), selected_row)
+                    {
+                        Ok(context) => {
+                            self.selection_context_cache.stats.misses += 1;
+                            let _ = self.selection_context_cache.store(key, context.clone());
+                            Some(context)
+                        }
+                        Err(_) => None,
+                    }
+                }
+                Err(_) => None,
+            };
+
+            if let Some(context) = context {
+                self.apply_selection_context(context);
             }
-        } else {
-            self.rebuild_radial_model();
         }
+
+        self.rebuild_radial_model();
         self.reprioritize_prefetch();
         perf.field("radial_context_path", &self.radial_context_path);
         perf.finish_ok();
@@ -3223,6 +3352,15 @@ impl App {
             self.raw_rows.clone(),
             Some(selected.row.clone()),
         )
+    }
+
+    fn apply_selection_context(&mut self, context: SelectionContextValue) {
+        self.current_project_root = context.current_project_root;
+        self.breadcrumb_targets = context.breadcrumb_targets;
+        self.breadcrumb_picker.selected = self.breadcrumb_targets.len().saturating_sub(1);
+        self.radial_context = context.radial_context;
+        self.radial_context_path = context.active_path;
+        self.selected_project_identity = context.selected_project_identity;
     }
 
     fn save_state(&mut self) {
@@ -8247,6 +8385,141 @@ mod tests {
             QueryCacheStats { hits: 1, misses: 1 }
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn selection_context_cache_memoize_reuses_same_key() -> Result<()> {
+        let mut cache = SelectionContextCache::default();
+        let key = SelectionContextKey {
+            snapshot: SnapshotBounds {
+                max_publish_seq: 42,
+                published_chunk_count: 1,
+                upper_bound_utc: Some("2026-03-28T10:00:00Z".to_string()),
+            },
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            selected_row_key: Some(TreeRowKey {
+                parent_path: BrowsePath::Root,
+                row_key: "project:1".to_string(),
+            }),
+            active_path: BrowsePath::Project { project_id: 1 },
+        };
+        let mut build_count = 0usize;
+
+        let first = cache.memoize(key.clone(), || {
+            build_count += 1;
+            Ok::<_, anyhow::Error>(SelectionContextValue {
+                active_path: BrowsePath::Project { project_id: 1 },
+                current_project_root: Some("/tmp/project-a".to_string()),
+                breadcrumb_targets: Vec::new(),
+                radial_context: RadialContext::default(),
+                selected_project_identity: None,
+            })
+        })?;
+        let second = cache.memoize(key, || {
+            build_count += 1;
+            Ok::<_, anyhow::Error>(SelectionContextValue {
+                active_path: BrowsePath::Project { project_id: 1 },
+                current_project_root: Some("/tmp/project-a".to_string()),
+                breadcrumb_targets: Vec::new(),
+                radial_context: RadialContext::default(),
+                selected_project_identity: None,
+            })
+        })?;
+
+        assert_eq!(build_count, 1);
+        assert_eq!(
+            cache.stats(),
+            SelectionContextCacheStats { hits: 1, misses: 1 }
+        );
+        assert_eq!(first.active_path, second.active_path);
+        Ok(())
+    }
+
+    #[test]
+    fn selection_context_cache_reuses_context_when_selection_returns_to_row() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        app.selection_context_cache = SelectionContextCache::default();
+        app.ui_state.root = RootView::ProjectHierarchy;
+        app.ui_state.path = BrowsePath::Root;
+
+        let row_a = radial_row(RadialRowSpec {
+            key: "project:1",
+            label: "project-a",
+            kind: RollupRowKind::Project,
+            value: 9.0,
+            project_id: Some(1),
+            category: None,
+            action: None,
+            full_path: Some("/tmp/project-a"),
+        });
+        let row_b = radial_row(RadialRowSpec {
+            key: "project:2",
+            label: "project-b",
+            kind: RollupRowKind::Project,
+            value: 8.0,
+            project_id: Some(2),
+            category: None,
+            action: None,
+            full_path: Some("/tmp/project-b"),
+        });
+
+        app.raw_rows = vec![row_a.clone(), row_b.clone()];
+        app.cache_rows(BrowsePath::Root, app.raw_rows.clone());
+        app.visible_rows = vec![
+            TreeRow {
+                row: row_a,
+                parent_path: BrowsePath::Root,
+                node_path: Some(BrowsePath::Project { project_id: 1 }),
+                depth: 0,
+                is_expanded: false,
+            },
+            TreeRow {
+                row: row_b,
+                parent_path: BrowsePath::Root,
+                node_path: Some(BrowsePath::Project { project_id: 2 }),
+                depth: 0,
+                is_expanded: false,
+            },
+        ];
+
+        app.table_state.select(Some(0));
+        app.refresh_active_context_for_selection();
+        assert_eq!(
+            app.selection_context_cache.stats(),
+            SelectionContextCacheStats { hits: 0, misses: 1 }
+        );
+
+        app.table_state.select(Some(1));
+        app.refresh_active_context_for_selection();
+        assert_eq!(
+            app.selection_context_cache.stats(),
+            SelectionContextCacheStats { hits: 0, misses: 2 }
+        );
+
+        app.table_state.select(Some(0));
+        app.refresh_active_context_for_selection();
+        assert_eq!(
+            app.selection_context_cache.stats(),
+            SelectionContextCacheStats { hits: 1, misses: 2 }
+        );
+        assert_eq!(
+            app.radial_context_path,
+            BrowsePath::Project { project_id: 1 }
+        );
         Ok(())
     }
 
