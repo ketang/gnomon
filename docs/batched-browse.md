@@ -359,10 +359,12 @@ indistinguishable from user-initiated entries in the persistence layer.
 |----------------------------------|----------|------------------|
 | `browse_cache_max_bytes`         | 64 MiB   | `BrowseCacheStore` |
 | `max_batch_size`                 | 20       | Prefetch coordinator |
-| `max_recursive_depth`            | 2        | Prefetch coordinator |
+| `max_recursive_depth`            | 1        | Prefetch coordinator |
 
-Issue #80 will measure actual cache footprint under prefetch workloads and
-adjust `browse_cache_max_bytes` if the 64 MiB default is insufficient.
+Issue #80 measured actual cache footprint under prefetch workloads. The 64 MiB
+budget is well-calibrated for depth 1. `max_recursive_depth` was reduced from
+2 → 1 because depth 2 causes geometric entry growth that exceeds the budget at
+20+ projects. See `docs/browse-cache-footprint.md` for the full analysis.
 
 ---
 

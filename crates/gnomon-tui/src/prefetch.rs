@@ -7,7 +7,10 @@ const MAX_BATCH_SIZE: usize = 20;
 
 /// Maximum recursive depth for prefetch expansion (0-indexed: depth 0 spawns
 /// depth 1, depth 1 spawns depth 2, depth 2 does not spawn further).
-const MAX_RECURSIVE_DEPTH: u8 = 2;
+/// Maximum recursive depth for prefetch expansion. Reduced from 2 to 1 based
+/// on footprint analysis (docs/browse-cache-footprint.md): depth 2 causes
+/// geometric entry growth that exceeds the 64 MiB cache budget at 20+ projects.
+const MAX_RECURSIVE_DEPTH: u8 = 1;
 
 /// Number of visible rows above/below the selection to prefetch.
 const NEARBY_VISIBLE_HALF_WINDOW: usize = 4;
