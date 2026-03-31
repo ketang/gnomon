@@ -17,11 +17,11 @@ const NEARBY_VISIBLE_HALF_WINDOW: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum PrefetchPriority {
-    /// Children of the currently selected node (highest priority).
-    SelectedChildren,
-    /// Siblings of the selected node (same parent).
-    SelectedSiblings,
-    /// Children of other visible expandable nodes.
+    /// The selected row's selection context.
+    SelectedRowContext,
+    /// Nearby visible rows around the current selection.
+    NearbyVisibleRow,
+    /// The rest of the visible window.
     VisibleExpanded,
     /// Recursive depth: children of prefetched nodes.
     RecursiveDepth(u8),
@@ -31,6 +31,14 @@ pub(crate) enum PrefetchPriority {
 pub(crate) struct PrefetchEntry {
     pub path: BrowsePath,
     pub priority: PrefetchPriority,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PrefetchBatchProfile {
+    pub selected_row_count: usize,
+    pub nearby_visible_row_count: usize,
+    pub visible_row_count: usize,
+    pub recursive_depth_count: usize,
 }
 
 /// Immutable context shared across all entries in one prefetch generation.
@@ -44,7 +52,6 @@ pub(crate) struct PrefetchContext {
 
 /// Minimal view of a TreeRow needed for priority classification.
 pub(crate) struct VisibleRowInfo {
-    pub parent_path: BrowsePath,
     pub node_path: Option<BrowsePath>,
 }
 
@@ -102,8 +109,13 @@ impl PrefetchCoordinator {
     ) {
         // Re-classify existing pending entries.
         for entry in &mut self.pending {
-            entry.priority =
-                Self::classify_priority(&entry.path, selected_path, selected_parent, visible_rows);
+            entry.priority = Self::classify_priority(
+                &entry.path,
+                selected_path,
+                selected_parent,
+                selected_index,
+                visible_rows,
+            );
         }
 
         // Add any new paths from the view that aren't already tracked.
@@ -127,9 +139,12 @@ impl PrefetchCoordinator {
     ///
     /// Returns `None` if nothing to submit. Moves drained paths into
     /// `in_flight`.
-    pub fn drain_batch(&mut self) -> Option<(PrefetchContext, Vec<BrowsePath>)> {
+    pub fn drain_batch(
+        &mut self,
+    ) -> Option<(PrefetchContext, Vec<BrowsePath>, PrefetchBatchProfile)> {
         let context = self.context.as_ref()?.clone();
         let mut batch = Vec::new();
+        let mut profile = PrefetchBatchProfile::default();
 
         while batch.len() < MAX_BATCH_SIZE && !self.pending.is_empty() {
             let entry = self.pending.remove(0);
@@ -141,6 +156,7 @@ impl PrefetchCoordinator {
             }
 
             self.in_flight.insert(key.clone());
+            profile.record(entry.priority.clone());
             self.in_flight_priorities.insert(key, entry.priority);
             batch.push(entry.path);
         }
@@ -149,7 +165,7 @@ impl PrefetchCoordinator {
             return None;
         }
 
-        Some((context, batch))
+        Some((context, batch, profile))
     }
 
     /// Record that results have arrived for these paths.
@@ -208,38 +224,27 @@ impl PrefetchCoordinator {
     fn enqueue_from_view(
         &mut self,
         selected_path: Option<&BrowsePath>,
-        selected_parent: Option<&BrowsePath>,
+        _selected_parent: Option<&BrowsePath>,
         visible_rows: &[VisibleRowInfo],
         selected_index: Option<usize>,
     ) {
-        // 1. Selected node children (highest priority).
+        // 1. The selected row's selection context.
         if let Some(sel_path) = selected_path {
-            self.enqueue_if_new(sel_path.clone(), PrefetchPriority::SelectedChildren);
+            self.enqueue_if_new(sel_path.clone(), PrefetchPriority::SelectedRowContext);
         }
 
-        // 2. Siblings of the selected node (same parent_path).
-        if let Some(sel_parent) = selected_parent {
-            for row in visible_rows {
-                if row.parent_path == *sel_parent
-                    && let Some(ref node_path) = row.node_path
-                {
-                    self.enqueue_if_new(node_path.clone(), PrefetchPriority::SelectedSiblings);
-                }
-            }
-        }
-
-        // 3. Nearby visible rows (window around selection).
+        // 2. Nearby visible rows (window around selection).
         if let Some(sel_idx) = selected_index {
             let start = sel_idx.saturating_sub(NEARBY_VISIBLE_HALF_WINDOW);
             let end = (sel_idx + NEARBY_VISIBLE_HALF_WINDOW + 1).min(visible_rows.len());
             for row in &visible_rows[start..end] {
                 if let Some(ref node_path) = row.node_path {
-                    self.enqueue_if_new(node_path.clone(), PrefetchPriority::VisibleExpanded);
+                    self.enqueue_if_new(node_path.clone(), PrefetchPriority::NearbyVisibleRow);
                 }
             }
         }
 
-        // 4. All remaining visible rows.
+        // 3. All remaining visible rows.
         for row in visible_rows {
             if let Some(ref node_path) = row.node_path {
                 self.enqueue_if_new(node_path.clone(), PrefetchPriority::VisibleExpanded);
@@ -250,24 +255,26 @@ impl PrefetchCoordinator {
     fn classify_priority(
         path: &BrowsePath,
         selected_path: Option<&BrowsePath>,
-        selected_parent: Option<&BrowsePath>,
+        _selected_parent: Option<&BrowsePath>,
+        selected_index: Option<usize>,
         visible_rows: &[VisibleRowInfo],
     ) -> PrefetchPriority {
-        // If this is the selected node's path, it's SelectedChildren.
+        // If this is the selected node's path, it is the selected row's context.
         if let Some(sel_path) = selected_path
             && path == sel_path
         {
-            return PrefetchPriority::SelectedChildren;
+            return PrefetchPriority::SelectedRowContext;
         }
 
-        // If this path shares the selected node's parent, it's a sibling.
-        if let Some(sel_parent) = selected_parent {
-            for row in visible_rows {
-                if row.parent_path == *sel_parent
-                    && let Some(ref node_path) = row.node_path
+        // If this path is inside the nearby selection window, keep it ahead of the rest.
+        if let Some(sel_idx) = selected_index {
+            let start = sel_idx.saturating_sub(NEARBY_VISIBLE_HALF_WINDOW);
+            let end = (sel_idx + NEARBY_VISIBLE_HALF_WINDOW + 1).min(visible_rows.len());
+            for row in &visible_rows[start..end] {
+                if let Some(ref node_path) = row.node_path
                     && node_path == path
                 {
-                    return PrefetchPriority::SelectedSiblings;
+                    return PrefetchPriority::NearbyVisibleRow;
                 }
             }
         }
@@ -285,8 +292,8 @@ impl PrefetchCoordinator {
     /// Returns `None` if children should not be enqueued (depth exceeded).
     /// We track depth via the entry's `PrefetchPriority::RecursiveDepth(d)`
     /// value, but once an entry is completed we no longer have its priority.
-    /// Top-level entries (SelectedChildren/Siblings/Visible) spawn children
-    /// at depth 0. The depth is approximate but bounded by `MAX_RECURSIVE_DEPTH`.
+    /// Top-level entries (selected row / nearby / visible) spawn children at
+    /// depth 0. The depth is approximate but bounded by `MAX_RECURSIVE_DEPTH`.
     fn child_depth_for_priority(priority: &PrefetchPriority) -> Option<u8> {
         match priority {
             PrefetchPriority::RecursiveDepth(d) => {
@@ -298,6 +305,17 @@ impl PrefetchCoordinator {
                 }
             }
             _ => Some(0),
+        }
+    }
+}
+
+impl PrefetchBatchProfile {
+    fn record(&mut self, priority: PrefetchPriority) {
+        match priority {
+            PrefetchPriority::SelectedRowContext => self.selected_row_count += 1,
+            PrefetchPriority::NearbyVisibleRow => self.nearby_visible_row_count += 1,
+            PrefetchPriority::VisibleExpanded => self.visible_row_count += 1,
+            PrefetchPriority::RecursiveDepth(_) => self.recursive_depth_count += 1,
         }
     }
 }
@@ -326,44 +344,46 @@ mod tests {
         }
     }
 
-    fn make_row(parent: BrowsePath, node: Option<BrowsePath>) -> VisibleRowInfo {
-        VisibleRowInfo {
-            parent_path: parent,
-            node_path: node,
-        }
+    fn make_row(_parent: BrowsePath, node: Option<BrowsePath>) -> VisibleRowInfo {
+        VisibleRowInfo { node_path: node }
     }
 
     #[test]
-    fn populate_enqueues_selected_children_first() {
+    fn populate_enqueues_selected_context_then_nearby_visible_rows() {
         let mut coord = PrefetchCoordinator::new();
-        let selected = project_path(1);
-        let rows = vec![
-            make_row(BrowsePath::Root, Some(project_path(1))),
-            make_row(BrowsePath::Root, Some(project_path(2))),
-            make_row(BrowsePath::Root, Some(project_path(3))),
-        ];
+        let rows: Vec<VisibleRowInfo> = (0..12)
+            .map(|i| make_row(BrowsePath::Root, Some(project_path(i))))
+            .collect();
+        let selected = project_path(5);
 
         coord.populate(
             test_context(),
             Some(&selected),
             Some(&BrowsePath::Root),
             &rows,
-            Some(0),
+            Some(5),
         );
 
         assert!(!coord.pending.is_empty());
         assert_eq!(coord.pending[0].path, selected);
         assert_eq!(
             coord.pending[0].priority,
-            PrefetchPriority::SelectedChildren
+            PrefetchPriority::SelectedRowContext
         );
+
+        let (_, batch, profile) = coord.drain_batch().expect("should have entries");
+        assert_eq!(batch.first(), Some(&selected));
+        assert_eq!(profile.selected_row_count, 1);
+        assert_eq!(profile.nearby_visible_row_count, 8);
+        assert_eq!(profile.visible_row_count, 3);
+        assert_eq!(profile.recursive_depth_count, 0);
     }
 
     #[test]
     fn populate_deduplicates_paths() {
         let mut coord = PrefetchCoordinator::new();
         let selected = project_path(1);
-        // The selected path appears as both SelectedChildren and a sibling.
+        // The selected path appears both as the selected row and in the visible window.
         let rows = vec![
             make_row(BrowsePath::Root, Some(project_path(1))),
             make_row(BrowsePath::Root, Some(project_path(2))),
@@ -390,7 +410,7 @@ mod tests {
 
         coord.populate(test_context(), None, None, &rows, None);
 
-        let (_, batch) = coord.drain_batch().expect("should have entries");
+        let (_, batch, _) = coord.drain_batch().expect("should have entries");
         assert!(batch.len() <= MAX_BATCH_SIZE);
         assert_eq!(batch.len(), MAX_BATCH_SIZE);
     }
@@ -410,7 +430,7 @@ mod tests {
             .completed
             .insert(PrefetchCoordinator::path_key(&project_path(1)));
 
-        let (_, batch) = coord.drain_batch().expect("should have entries");
+        let (_, batch, _) = coord.drain_batch().expect("should have entries");
         assert!(!batch.contains(&project_path(1)));
         assert!(batch.contains(&project_path(2)));
     }
@@ -430,7 +450,7 @@ mod tests {
             .in_flight
             .insert(PrefetchCoordinator::path_key(&project_path(1)));
 
-        let (_, batch) = coord.drain_batch().expect("should have entries");
+        let (_, batch, _) = coord.drain_batch().expect("should have entries");
         assert!(!batch.contains(&project_path(1)));
         assert!(batch.contains(&project_path(2)));
     }
@@ -484,7 +504,7 @@ mod tests {
         );
 
         // Drain and simulate completion.
-        let (_, batch) = coord.drain_batch().expect("should have entries");
+        let (_, batch, _) = coord.drain_batch().expect("should have entries");
         assert!(batch.contains(&deep_path));
 
         let child = category_path("deep-child");
@@ -530,7 +550,7 @@ mod tests {
         assert_eq!(coord.pending[0].path, project_path(3));
         assert_eq!(
             coord.pending[0].priority,
-            PrefetchPriority::SelectedChildren
+            PrefetchPriority::SelectedRowContext
         );
     }
 
@@ -674,7 +694,7 @@ mod tests {
         coord.populate(test_context(), None, None, &rows, None);
 
         let mut all_batched = Vec::new();
-        while let Some((_, batch)) = coord.drain_batch() {
+        while let Some((_, batch, _)) = coord.drain_batch() {
             // Simulate completion with no children.
             let completions: Vec<(BrowsePath, Vec<BrowsePath>)> =
                 batch.iter().map(|p| (p.clone(), vec![])).collect();
