@@ -746,6 +746,59 @@ mod tests {
     }
 
     #[test]
+    fn deleted_worktree_cwds_recover_to_the_main_repo_project() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        let repo_root = temp.path().join("repo");
+        let worktree_root = repo_root
+            .join(".claude")
+            .join("worktrees")
+            .join("feature-worktree");
+
+        init_git_repo(&repo_root)?;
+        run_git(&repo_root, ["branch", "-m", "main"])?;
+        run_git(&repo_root, ["branch", "feature"])?;
+        run_git_args(&[
+            "-C",
+            repo_root.to_str().context("non-utf8 repo path")?,
+            "worktree",
+            "add",
+            worktree_root.to_str().context("non-utf8 worktree path")?,
+            "feature",
+        ])?;
+
+        write_jsonl(&source_root.join("worktree/session.jsonl"), &worktree_root)?;
+        run_git_args(&[
+            "-C",
+            repo_root.to_str().context("non-utf8 repo path")?,
+            "worktree",
+            "remove",
+            "--force",
+            worktree_root.to_str().context("non-utf8 worktree path")?,
+        ])?;
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let report = scan_source_manifest(&mut db, &source_root)?;
+        assert_eq!(report.discovered_source_files, 1);
+
+        let project: (String, String, String, Option<String>) = db.connection().query_row(
+            "
+            SELECT identity_kind, display_name, root_path, identity_reason
+            FROM project
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+
+        assert_eq!(project.0, "git");
+        assert_eq!(project.1, "repo");
+        assert_eq!(project.2, repo_root.display().to_string());
+        assert_eq!(project.3, None);
+
+        Ok(())
+    }
+
+    #[test]
     fn separate_clones_of_same_repo_remain_distinct_git_projects() -> Result<()> {
         let temp = tempdir()?;
         let source_root = temp.path().join("source");
