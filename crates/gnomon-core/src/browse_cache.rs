@@ -455,4 +455,413 @@ mod tests {
             full_path: Some(format!("/tmp/{label}")),
         }
     }
+
+    // --- footprint measurement helpers and report ---
+
+    use crate::query::ProjectIdentity;
+
+    const CATEGORIES: &[&str] = &["coding", "review", "testing", "debugging", "documentation"];
+    const ACTIONS: &[&str] = &["editing", "reading", "searching", "refactoring"];
+    const PATH_PREFIXES: &[&str] = &[
+        "src/components/auth/middleware",
+        "src/services/api/handlers",
+        "src/models/database/migrations",
+        "lib/utils/formatting",
+        "tests/integration/e2e",
+    ];
+    const FILE_NAMES: &[&str] = &["handler.rs", "mod.rs", "config.rs", "tests.rs", "types.rs"];
+
+    fn project_row(id: i64, name: &str) -> RollupRow {
+        RollupRow {
+            kind: RollupRowKind::Project,
+            key: format!("project:{id}"),
+            label: name.to_string(),
+            metrics: MetricTotals {
+                uncached_input: 45_000.0,
+                cached_input: 12_000.0,
+                gross_input: 57_000.0,
+                output: 8_500.0,
+                total: 65_500.0,
+            },
+            indicators: MetricIndicators {
+                selected_lens_last_5_hours: 15_000.0,
+                selected_lens_last_week: 45_000.0,
+                uncached_input_reference: 45_000.0,
+            },
+            item_count: 42,
+            opportunities: Default::default(),
+            project_id: Some(id),
+            project_identity: Some(ProjectIdentity {
+                identity_kind: "git_origin".to_string(),
+                root_path: format!("/home/user/projects/{name}"),
+                git_root_path: Some(format!("/home/user/projects/{name}")),
+                git_origin: Some(format!("git@github.com:user/{name}.git")),
+                identity_reason: Some("git remote origin".to_string()),
+            }),
+            category: None,
+            action: None,
+            full_path: None,
+        }
+    }
+
+    fn category_row(cat: &str) -> RollupRow {
+        RollupRow {
+            kind: RollupRowKind::ActionCategory,
+            key: format!("category:{cat}"),
+            label: cat.to_string(),
+            metrics: MetricTotals {
+                uncached_input: 20_000.0,
+                cached_input: 5_000.0,
+                gross_input: 25_000.0,
+                output: 4_000.0,
+                total: 29_000.0,
+            },
+            indicators: MetricIndicators {
+                selected_lens_last_5_hours: 8_000.0,
+                selected_lens_last_week: 20_000.0,
+                uncached_input_reference: 20_000.0,
+            },
+            item_count: 15,
+            opportunities: Default::default(),
+            project_id: None,
+            project_identity: None,
+            category: Some(cat.to_string()),
+            action: None,
+            full_path: None,
+        }
+    }
+
+    fn action_row(cat: &str, action: &str) -> RollupRow {
+        RollupRow {
+            kind: RollupRowKind::Action,
+            key: format!("action:{cat}:{action}"),
+            label: action.to_string(),
+            metrics: MetricTotals {
+                uncached_input: 10_000.0,
+                cached_input: 2_500.0,
+                gross_input: 12_500.0,
+                output: 2_000.0,
+                total: 14_500.0,
+            },
+            indicators: MetricIndicators {
+                selected_lens_last_5_hours: 4_000.0,
+                selected_lens_last_week: 10_000.0,
+                uncached_input_reference: 10_000.0,
+            },
+            item_count: 8,
+            opportunities: Default::default(),
+            project_id: None,
+            project_identity: None,
+            category: Some(cat.to_string()),
+            action: Some(ActionKey {
+                classification_state: ClassificationState::Classified,
+                normalized_action: Some(action.to_string()),
+                command_family: Some("editor".to_string()),
+                base_command: Some("vim".to_string()),
+            }),
+            full_path: None,
+        }
+    }
+
+    fn path_row(kind: RollupRowKind, dir: &str, file: &str) -> RollupRow {
+        let full = format!("{dir}/{file}");
+        RollupRow {
+            kind,
+            key: format!("path:{full}"),
+            label: file.to_string(),
+            metrics: MetricTotals {
+                uncached_input: 3_000.0,
+                cached_input: 800.0,
+                gross_input: 3_800.0,
+                output: 600.0,
+                total: 4_400.0,
+            },
+            indicators: MetricIndicators {
+                selected_lens_last_5_hours: 1_200.0,
+                selected_lens_last_week: 3_000.0,
+                uncached_input_reference: 3_000.0,
+            },
+            item_count: 2,
+            opportunities: Default::default(),
+            project_id: Some(1),
+            project_identity: None,
+            category: Some("coding".to_string()),
+            action: Some(ActionKey {
+                classification_state: ClassificationState::Classified,
+                normalized_action: Some("editing".to_string()),
+                command_family: Some("editor".to_string()),
+                base_command: Some("vim".to_string()),
+            }),
+            full_path: Some(full),
+        }
+    }
+
+    fn json_bytes(rows: &[RollupRow]) -> usize {
+        serde_json::to_string(rows).expect("serialize").len()
+    }
+
+    #[test]
+    #[ignore] // Run with: cargo test -p gnomon-core footprint_report -- --ignored --nocapture
+    fn footprint_report() {
+        // --- per-entry sizes by level ---
+        let project_names = [
+            "gnomon",
+            "claude-code",
+            "anthropic-sdk",
+            "web-dashboard",
+            "data-pipeline",
+            "ml-training",
+            "infra-deploy",
+            "docs-site",
+            "mobile-app",
+            "shared-lib",
+        ];
+
+        let root_rows: Vec<RollupRow> = project_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| project_row(i as i64 + 1, name))
+            .collect();
+
+        let cat_rows: Vec<RollupRow> = CATEGORIES.iter().map(|c| category_row(c)).collect();
+
+        let action_rows: Vec<RollupRow> = ACTIONS.iter().map(|a| action_row("coding", a)).collect();
+
+        let dir_rows: Vec<RollupRow> = PATH_PREFIXES
+            .iter()
+            .flat_map(|prefix| {
+                FILE_NAMES
+                    .iter()
+                    .map(move |file| path_row(RollupRowKind::File, prefix, file))
+            })
+            .collect();
+
+        // Sub-path rows (depth-1 children of a directory)
+        let subdir_rows: Vec<RollupRow> = (0..10)
+            .map(|i| {
+                path_row(
+                    RollupRowKind::File,
+                    "src/components/auth/middleware/session/validators",
+                    &format!("validator_{i}.rs"),
+                )
+            })
+            .collect();
+
+        let root_bytes = json_bytes(&root_rows);
+        let cat_bytes = json_bytes(&cat_rows);
+        let action_bytes = json_bytes(&action_rows);
+        let dir_bytes = json_bytes(&dir_rows);
+        let subdir_bytes = json_bytes(&subdir_rows);
+
+        let root_per_entry = root_bytes / root_rows.len();
+        let cat_per_entry = cat_bytes / cat_rows.len();
+        let action_per_entry = action_bytes / action_rows.len();
+        let dir_per_entry = dir_bytes / dir_rows.len();
+        let subdir_per_entry = subdir_bytes / subdir_rows.len();
+
+        println!("\n========================================");
+        println!("  Browse Cache Footprint Report");
+        println!("========================================\n");
+
+        println!("## Per-Entry Payload Sizes (JSON serialized)\n");
+        println!("| Level               | Rows | Total bytes | Bytes/entry |");
+        println!("|---------------------|------|-------------|-------------|");
+        println!(
+            "| Root (projects)     | {:>4} | {:>11} | {:>11} |",
+            root_rows.len(),
+            root_bytes,
+            root_per_entry
+        );
+        println!(
+            "| Category            | {:>4} | {:>11} | {:>11} |",
+            cat_rows.len(),
+            cat_bytes,
+            cat_per_entry
+        );
+        println!(
+            "| Action              | {:>4} | {:>11} | {:>11} |",
+            action_rows.len(),
+            action_bytes,
+            action_per_entry
+        );
+        println!(
+            "| Path (dir/file)     | {:>4} | {:>11} | {:>11} |",
+            dir_rows.len(),
+            dir_bytes,
+            dir_per_entry
+        );
+        println!(
+            "| Sub-path (depth 1+) | {:>4} | {:>11} | {:>11} |",
+            subdir_rows.len(),
+            subdir_bytes,
+            subdir_per_entry
+        );
+
+        // --- per-cache-entry sizes (one store() call = one JSON array) ---
+        // Each cache entry is the JSON for the full Vec<RollupRow> for that parent.
+        println!("\n## Per-Cache-Entry Sizes (one store() = one parent's children)\n");
+        println!("| Entry type                     | Rows/entry | Bytes/entry |");
+        println!("|--------------------------------|------------|-------------|");
+        println!(
+            "| Root → projects                | {:>10} | {:>11} |",
+            root_rows.len(),
+            root_bytes
+        );
+        println!(
+            "| Project → categories           | {:>10} | {:>11} |",
+            cat_rows.len(),
+            cat_bytes
+        );
+        println!(
+            "| Category → actions             | {:>10} | {:>11} |",
+            action_rows.len(),
+            action_bytes
+        );
+        println!(
+            "| Action → paths (typical)       | {:>10} | {:>11} |",
+            15,
+            dir_per_entry * 15
+        );
+        println!(
+            "| Path → sub-paths (depth 1)     | {:>10} | {:>11} |",
+            subdir_rows.len(),
+            subdir_bytes
+        );
+
+        // --- projection for different corpus sizes and depths ---
+        println!("\n## Projected Total Cache Footprint\n");
+        println!(
+            "Assumptions: each project has {} categories, each category has {} actions,",
+            CATEGORIES.len(),
+            ACTIONS.len()
+        );
+        println!("each action has ~15 path children, each path has ~5 sub-paths at depth 1,");
+        println!("each sub-path has ~3 sub-paths at depth 2.\n");
+
+        for &num_projects in &[5usize, 10, 20, 50] {
+            let num_categories = CATEGORIES.len();
+            let num_actions = ACTIONS.len();
+            let paths_per_action: usize = 15;
+            let subpaths_depth1: usize = 5;
+            let subpaths_depth2: usize = 3;
+
+            // Grouped entries (root + project + category + action levels)
+            let root_entry_count: usize = 1;
+            let project_entries = num_projects;
+            let category_entries = num_projects * num_categories;
+            let action_entries = num_projects * num_categories * num_actions;
+
+            let grouped_entries =
+                root_entry_count + project_entries + category_entries + action_entries;
+
+            let grouped_bytes = root_bytes
+                + project_entries * cat_bytes
+                + category_entries * action_bytes
+                + action_entries * (dir_per_entry * paths_per_action);
+
+            // Path entries (depth 0 = action children already counted above)
+            let path_entries_d0 = num_projects * num_categories * num_actions * paths_per_action;
+            let path_entries_d1 = path_entries_d0 * subpaths_depth1;
+            let path_entries_d2 = path_entries_d1 * subpaths_depth2;
+
+            let path_bytes_d0 = path_entries_d0 * (subdir_per_entry * subpaths_depth1);
+            let path_bytes_d1 = path_entries_d1 * (subdir_per_entry * subpaths_depth2);
+
+            // Depth 0: grouped only (no recursive path prefetch)
+            let total_d0_entries = grouped_entries;
+            let total_d0_bytes = grouped_bytes;
+
+            // Depth 1: grouped + path depth-0 children
+            let total_d1_entries = grouped_entries + path_entries_d0;
+            let total_d1_bytes = grouped_bytes + path_bytes_d0;
+
+            // Depth 2: grouped + depth-0 + depth-1 children
+            let total_d2_entries = grouped_entries + path_entries_d0 + path_entries_d1;
+            let total_d2_bytes = grouped_bytes + path_bytes_d0 + path_bytes_d1;
+
+            let _ = path_entries_d2; // acknowledged but not stored at depth 2
+
+            println!("### {} projects\n", num_projects);
+            println!("| Depth | Cache entries | Payload bytes |    MiB |");
+            println!("|-------|---------------|---------------|--------|");
+            println!(
+                "| No recursion | {:>13} | {:>13} | {:>6.2} |",
+                total_d0_entries,
+                total_d0_bytes,
+                total_d0_bytes as f64 / (1024.0 * 1024.0)
+            );
+            println!(
+                "| Depth 1      | {:>13} | {:>13} | {:>6.2} |",
+                total_d1_entries,
+                total_d1_bytes,
+                total_d1_bytes as f64 / (1024.0 * 1024.0)
+            );
+            println!(
+                "| Depth 2      | {:>13} | {:>13} | {:>6.2} |",
+                total_d2_entries,
+                total_d2_bytes,
+                total_d2_bytes as f64 / (1024.0 * 1024.0)
+            );
+            println!();
+        }
+
+        // --- actual store/measure with BrowseCacheStore ---
+        println!("## Actual SQLite Store Measurement\n");
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("footprint-test.sqlite3");
+        let mut store =
+            BrowseCacheStore::open_with_max_bytes(&db_path, u64::MAX).expect("open store");
+        let snapshot_seq = 100u64;
+
+        // Store representative entries
+        let entries: Vec<(BrowsePath, Vec<RollupRow>)> = vec![
+            (BrowsePath::Root, root_rows.clone()),
+            (BrowsePath::Project { project_id: 1 }, cat_rows.clone()),
+            (
+                BrowsePath::ProjectCategory {
+                    project_id: 1,
+                    category: "coding".to_string(),
+                },
+                action_rows.clone(),
+            ),
+            (
+                BrowsePath::ProjectAction {
+                    project_id: 1,
+                    category: "coding".to_string(),
+                    action: ActionKey {
+                        classification_state: ClassificationState::Classified,
+                        normalized_action: Some("editing".to_string()),
+                        command_family: Some("editor".to_string()),
+                        base_command: Some("vim".to_string()),
+                    },
+                    parent_path: None,
+                },
+                dir_rows.clone(),
+            ),
+        ];
+
+        for (path, rows) in &entries {
+            let request = sample_request(snapshot_seq, path.clone());
+            store.store(&request, rows).expect("store");
+        }
+
+        let stats = store.stats().expect("stats");
+        let db_file_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+
+        println!("| Metric              | Value        |");
+        println!("|---------------------|--------------|");
+        println!("| Cache entries       | {:>12} |", stats.entry_count);
+        println!(
+            "| Total payload bytes | {:>12} |",
+            stats.total_payload_bytes
+        );
+        println!("| SQLite file size    | {:>12} |", db_file_size);
+        println!(
+            "| Overhead ratio      | {:>11.2}x |",
+            db_file_size as f64 / stats.total_payload_bytes as f64
+        );
+
+        println!("\n## Recommendations\n");
+        println!("See docs/browse-cache-footprint.md for full analysis.");
+    }
 }
