@@ -3221,7 +3221,6 @@ impl App {
                             &request,
                             rows.clone(),
                         )?;
-                        self.browse_cache.store(&request, &rows)?;
                     }
                     self.prefetch.complete_batch(&child_paths_per_parent);
                     let _ = self.submit_next_prefetch_batch();
