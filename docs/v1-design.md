@@ -111,6 +111,12 @@ Working top-level action taxonomy:
 - Authoritative project identity is discovered from Git
 - `v1` supports `git` only
 - If a path cannot be resolved to a Git root, it becomes its own path-based project with a warning/reason
+- Missing Claude worktree paths under a recognized `.../.claude/worktrees/...`
+  layout are a narrow exception:
+  `v1` recovers the candidate repo root above that worktree segment and uses it
+  only when Git can still resolve a canonical root from that recovered path
+- `v1` does not perform broad longest-prefix or cross-session project inference
+  for missing paths beyond that stale-worktree recovery
 
 ## Path Attribution
 
