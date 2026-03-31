@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crate::gnomon_sunburst::{
     build_sunburst_layer, build_sunburst_model, build_sunburst_scope_label,
 };
-use crate::prefetch::{PrefetchContext, PrefetchCoordinator, VisibleRowInfo};
+use crate::prefetch::{PrefetchBatchProfile, PrefetchContext, PrefetchCoordinator, VisibleRowInfo};
 use crate::sunburst::{
     SunburstDistortionPolicy, SunburstLayer, SunburstModel, SunburstPane, SunburstRenderConfig,
     SunburstSpan, sunburst_selected_child_span,
@@ -461,6 +461,7 @@ struct PrefetchRequest {
     sequence: u64,
     label: &'static str,
     requests: Vec<BrowseRequest>,
+    profile: PrefetchBatchProfile,
 }
 
 #[derive(Debug)]
@@ -3068,7 +3069,6 @@ impl App {
         self.visible_rows
             .iter()
             .map(|row| VisibleRowInfo {
-                parent_path: row.parent_path.clone(),
                 node_path: row.node_path.clone(),
             })
             .collect()
@@ -3112,7 +3112,7 @@ impl App {
         if self.prefetch.has_in_flight() || !self.prefetch.has_pending() {
             return Ok(());
         }
-        let Some((context, paths)) = self.prefetch.drain_batch() else {
+        let Some((context, paths, profile)) = self.prefetch.drain_batch() else {
             return Ok(());
         };
         let requests: Vec<BrowseRequest> = paths
@@ -3127,12 +3127,13 @@ impl App {
             .collect();
         let sequence = self.next_request_sequence();
         self.pending_async_work
-            .begin_prefetch(sequence, "warming browse neighborhood");
+            .begin_prefetch(sequence, "warming visible selection contexts");
         self.worker
             .send(QueryWorkerRequest::Prefetch(PrefetchRequest {
                 sequence,
-                label: "warming browse neighborhood",
+                label: "warming visible selection contexts",
                 requests,
+                profile,
             }))
     }
 
@@ -3682,6 +3683,22 @@ fn run_prefetch_requests(
 ) -> Result<(Vec<BrowseRequest>, Vec<Vec<RollupRow>>)> {
     let mut perf = prefetch_batch_perf_scope(perf_logger);
     perf.field("request_count", request.requests.len());
+    perf.field(
+        "selected_row_request_count",
+        request.profile.selected_row_count,
+    );
+    perf.field(
+        "nearby_visible_row_request_count",
+        request.profile.nearby_visible_row_count,
+    );
+    perf.field(
+        "visible_row_request_count",
+        request.profile.visible_row_count,
+    );
+    perf.field(
+        "recursive_depth_request_count",
+        request.profile.recursive_depth_count,
+    );
 
     let mut browse_stats = BrowseFanoutStats::default();
     let mut cache_sources = BrowseCacheSourceStats::default();
