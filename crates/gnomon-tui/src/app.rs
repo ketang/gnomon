@@ -55,6 +55,10 @@ use serde::{Deserialize, Serialize};
 use std::f64::consts::TAU;
 
 #[cfg(test)]
+#[path = "selection_lag_measurement.rs"]
+mod selection_lag_measurement;
+
+#[cfg(test)]
 use crate::sunburst::{
     SunburstBucket, SunburstCenter, SunburstRenderMode, SunburstSegment,
     sunburst_center_label_area, sunburst_center_label_style, sunburst_segment_at_angle,
@@ -460,6 +464,7 @@ struct JumpTargetRequest {
 struct PrefetchRequest {
     sequence: u64,
     label: &'static str,
+    queued_at: Instant,
     requests: Vec<BrowseRequest>,
 }
 
@@ -3132,6 +3137,7 @@ impl App {
             .send(QueryWorkerRequest::Prefetch(PrefetchRequest {
                 sequence,
                 label: "warming browse neighborhood",
+                queued_at: Instant::now(),
                 requests,
             }))
     }
@@ -3287,6 +3293,7 @@ impl App {
         let mut perf = self.slow_perf_scope("tui.selection_change");
         perf.field("selected_tree_row_key", &selected_row_key);
         perf.field("active_path", &active_path);
+        let mut selection_context_cache_hit = None;
 
         if let Ok(filters) = self.current_query_filters() {
             let key = SelectionContextKey {
@@ -3301,9 +3308,11 @@ impl App {
             let context = match self.selection_context_cache.lookup(&key) {
                 Ok(Some(context)) => {
                     self.selection_context_cache.stats.hits += 1;
+                    selection_context_cache_hit = Some(true);
                     Some(context)
                 }
                 Ok(None) => {
+                    selection_context_cache_hit = Some(false);
                     match self.build_selection_context(&filters, active_path.clone(), selected_row)
                     {
                         Ok(context) => {
@@ -3324,6 +3333,7 @@ impl App {
 
         self.rebuild_radial_model();
         self.reprioritize_prefetch();
+        perf.field("selection_context_cache_hit", selection_context_cache_hit);
         perf.field("radial_context_path", &self.radial_context_path);
         perf.finish_ok();
     }
@@ -3681,6 +3691,10 @@ fn run_prefetch_requests(
     request: PrefetchRequest,
 ) -> Result<(Vec<BrowseRequest>, Vec<Vec<RollupRow>>)> {
     let mut perf = prefetch_batch_perf_scope(perf_logger);
+    perf.field(
+        "queue_wait_ms",
+        request.queued_at.elapsed().as_secs_f64() * 1000.0,
+    );
     perf.field("request_count", request.requests.len());
 
     let mut browse_stats = BrowseFanoutStats::default();
