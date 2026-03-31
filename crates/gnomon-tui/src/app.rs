@@ -72,6 +72,7 @@ const ACTIVITY_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 const VIEW_LOAD_PHASE_TOTAL: usize = 8;
 const JUMP_TARGET_PHASE_TOTAL: usize = 4;
 const PREFETCH_RECURSION_BREADTH_LIMIT: usize = 4;
+const SELECTION_SLOW_LOG_THRESHOLD: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum QueryCacheDomain {
@@ -138,6 +139,30 @@ impl BrowseFanoutStats {
 struct QueryCacheStats {
     hits: usize,
     misses: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BrowseCacheSourceStats {
+    memory_hits: usize,
+    persisted_hits: usize,
+    live_queries: usize,
+}
+
+impl BrowseCacheSourceStats {
+    fn record(&mut self, source: BrowseCacheSource) {
+        match source {
+            BrowseCacheSource::Memory => self.memory_hits += 1,
+            BrowseCacheSource::Persisted => self.persisted_hits += 1,
+            BrowseCacheSource::Live => self.live_queries += 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowseCacheSource {
+    Memory,
+    Persisted,
+    Live,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2811,14 +2836,17 @@ impl App {
         pre_resolved_project_root: Option<Option<String>>,
         browse_stats: &mut BrowseFanoutStats,
     ) -> Result<RadialContext> {
-        let mut perf = self.perf_scope_with_filters("tui.build_radial_context", filters);
+        let mut perf = self.slow_perf_scope_with_filters("tui.selection_context_load", filters);
+        perf.field("active_path", path);
+        perf.field("selected_tree_row_key", self.selected_tree_row_key());
         let perf_logger = self.perf_logger.clone();
         let conn = self.database.connection();
         let query_engine = QueryEngine::with_perf(conn, perf_logger.clone());
+        let mut cache_sources = BrowseCacheSourceStats::default();
         let project_root = match pre_resolved_project_root {
             Some(resolved) => resolved,
             None => match project_id_from_path(path) {
-                Some(project_id) => project_root_for_state(
+                Some(project_id) => project_root_for_state_with_source(
                     &mut self.query_cache,
                     &mut self.browse_cache,
                     &query_engine,
@@ -2827,11 +2855,12 @@ impl App {
                     filters,
                     project_id,
                     browse_stats,
+                    &mut cache_sources,
                 )?,
                 None => None,
             },
         };
-        let radial_context = build_radial_context_for_state(
+        let radial_context = build_radial_context_for_state_with_source(
             &mut self.query_cache,
             &mut self.browse_cache,
             &query_engine,
@@ -2844,6 +2873,7 @@ impl App {
                 project_root: project_root.as_deref(),
             },
             browse_stats,
+            &mut cache_sources,
         )?;
         perf.field("browse_request_count", browse_stats.total_requests());
         perf.field(
@@ -2858,6 +2888,9 @@ impl App {
             "repeated_browse_requests",
             browse_stats.repeated_requests(3),
         );
+        perf.field("cache_memory_hit_count", cache_sources.memory_hits);
+        perf.field("cache_persisted_hit_count", cache_sources.persisted_hits);
+        perf.field("cache_live_query_count", cache_sources.live_queries);
         perf.finish_ok();
 
         Ok(radial_context)
@@ -3147,6 +3180,9 @@ impl App {
     }
 
     fn refresh_active_context_for_selection(&mut self) {
+        let mut perf = self.slow_perf_scope("tui.selection_change");
+        perf.field("selected_tree_row_key", self.selected_tree_row_key());
+        perf.field("active_path", self.active_path());
         self.update_selected_node_metadata();
         let new_active_path = self.active_path();
         if new_active_path == self.radial_context_path {
@@ -3159,6 +3195,8 @@ impl App {
             self.rebuild_radial_model();
         }
         self.reprioritize_prefetch();
+        perf.field("radial_context_path", &self.radial_context_path);
+        perf.finish_ok();
     }
 
     fn active_path(&self) -> BrowsePath {
@@ -3206,8 +3244,13 @@ impl App {
         scope
     }
 
-    fn perf_scope_with_filters(&self, operation: &str, filters: &BrowseFilters) -> PerfScope {
-        let mut scope = self.perf_scope(operation);
+    fn slow_perf_scope(&self, operation: &str) -> PerfScope {
+        self.perf_scope(operation)
+            .with_min_duration(SELECTION_SLOW_LOG_THRESHOLD)
+    }
+
+    fn slow_perf_scope_with_filters(&self, operation: &str, filters: &BrowseFilters) -> PerfScope {
+        let mut scope = self.slow_perf_scope(operation);
         scope.field("filters", filters);
         scope
     }
@@ -3462,21 +3505,27 @@ fn run_query_worker(
             QueryWorkerRequest::Prefetch(request) => {
                 let sequence = request.sequence;
                 let label = request.label;
-                run_prefetch_requests(&mut query_cache, &mut browse_cache, &query_engine, request)
-                    .map(|(requests, row_sets)| {
-                        QueryWorkerResult::PrefetchCompleted(PrefetchResult {
-                            sequence,
-                            requests,
-                            row_sets,
-                        })
+                run_prefetch_requests(
+                    &mut query_cache,
+                    &mut browse_cache,
+                    &query_engine,
+                    perf_logger.clone(),
+                    request,
+                )
+                .map(|(requests, row_sets)| {
+                    QueryWorkerResult::PrefetchCompleted(PrefetchResult {
+                        sequence,
+                        requests,
+                        row_sets,
                     })
-                    .unwrap_or_else(|error| {
-                        QueryWorkerResult::Failed(QueryWorkerFailure {
-                            sequence,
-                            task: PendingTaskKind::Prefetch,
-                            message: format!("Unable to {}: {error:#}", label),
-                        })
+                })
+                .unwrap_or_else(|error| {
+                    QueryWorkerResult::Failed(QueryWorkerFailure {
+                        sequence,
+                        task: PendingTaskKind::Prefetch,
+                        message: format!("Unable to {}: {error:#}", label),
                     })
+                })
             }
         };
 
@@ -3490,17 +3539,41 @@ fn run_prefetch_requests(
     query_cache: &mut QueryResultCache,
     browse_cache: &mut BrowseCacheStore,
     query_engine: &QueryEngine<'_>,
+    perf_logger: Option<PerfLogger>,
     request: PrefetchRequest,
 ) -> Result<(Vec<BrowseRequest>, Vec<Vec<RollupRow>>)> {
+    let mut perf = prefetch_batch_perf_scope(perf_logger);
+    perf.field("request_count", request.requests.len());
+
     let mut browse_stats = BrowseFanoutStats::default();
-    let row_sets = cached_browse_many(
+    let mut cache_sources = BrowseCacheSourceStats::default();
+    let row_sets = cached_browse_many_with_source(
         query_cache,
         browse_cache,
         query_engine,
         request.requests.clone(),
         &mut browse_stats,
+        &mut cache_sources,
     )?;
+    perf.field("browse_request_count", browse_stats.total_requests());
+    perf.field(
+        "distinct_browse_request_count",
+        browse_stats.distinct_request_count(),
+    );
+    perf.field(
+        "duplicate_browse_request_count",
+        browse_stats.duplicate_request_count(),
+    );
+    perf.field("cache_memory_hit_count", cache_sources.memory_hits);
+    perf.field("cache_persisted_hit_count", cache_sources.persisted_hits);
+    perf.field("cache_live_query_count", cache_sources.live_queries);
+    perf.finish_ok();
     Ok((request.requests, row_sets))
+}
+
+fn prefetch_batch_perf_scope(perf_logger: Option<PerfLogger>) -> PerfScope {
+    PerfScope::new(perf_logger, "tui.prefetch_batch")
+        .with_min_duration(SELECTION_SLOW_LOG_THRESHOLD)
 }
 
 fn cached_browse(
@@ -3510,6 +3583,23 @@ fn cached_browse(
     request: BrowseRequest,
     browse_stats: &mut BrowseFanoutStats,
 ) -> Result<Vec<RollupRow>> {
+    let (rows, _) = cached_browse_with_source(
+        query_cache,
+        browse_cache,
+        query_engine,
+        request,
+        browse_stats,
+    )?;
+    Ok(rows)
+}
+
+fn cached_browse_with_source(
+    query_cache: &mut QueryResultCache,
+    browse_cache: &mut BrowseCacheStore,
+    query_engine: &QueryEngine<'_>,
+    request: BrowseRequest,
+    browse_stats: &mut BrowseFanoutStats,
+) -> Result<(Vec<RollupRow>, BrowseCacheSource)> {
     browse_stats.record(&request);
     let snapshot = request.snapshot.clone();
     let key = QueryCacheKey {
@@ -3523,7 +3613,7 @@ fn cached_browse(
             .entry(QueryCacheDomain::Browse)
             .or_default()
             .hits += 1;
-        return Ok(cached);
+        return Ok((cached, BrowseCacheSource::Memory));
     }
 
     query_cache
@@ -3537,7 +3627,7 @@ fn cached_browse(
             .snapshot_bucket_mut(&snapshot)
             .entries
             .insert(key, Box::new(rows.clone()));
-        return Ok(rows);
+        return Ok((rows, BrowseCacheSource::Persisted));
     }
 
     let rows = query_engine.browse(&request)?;
@@ -3546,7 +3636,7 @@ fn cached_browse(
         .entries
         .insert(key, Box::new(rows.clone()));
     browse_cache.store(&request, &rows)?;
-    Ok(rows)
+    Ok((rows, BrowseCacheSource::Live))
 }
 
 fn cached_browse_many(
@@ -3555,6 +3645,25 @@ fn cached_browse_many(
     query_engine: &QueryEngine<'_>,
     requests: Vec<BrowseRequest>,
     browse_stats: &mut BrowseFanoutStats,
+) -> Result<Vec<Vec<RollupRow>>> {
+    let rows = cached_browse_many_with_source(
+        query_cache,
+        browse_cache,
+        query_engine,
+        requests,
+        browse_stats,
+        &mut BrowseCacheSourceStats::default(),
+    )?;
+    Ok(rows)
+}
+
+fn cached_browse_many_with_source(
+    query_cache: &mut QueryResultCache,
+    browse_cache: &mut BrowseCacheStore,
+    query_engine: &QueryEngine<'_>,
+    requests: Vec<BrowseRequest>,
+    browse_stats: &mut BrowseFanoutStats,
+    cache_sources: &mut BrowseCacheSourceStats,
 ) -> Result<Vec<Vec<RollupRow>>> {
     let mut outputs = vec![Vec::new(); requests.len()];
     let mut missed_indexes = Vec::new();
@@ -3573,9 +3682,11 @@ fn cached_browse_many(
                 .or_default()
                 .hits += 1;
             outputs[index] = cached;
+            cache_sources.record(BrowseCacheSource::Memory);
         } else if let Some(rows) = browse_cache.load(request)? {
             query_cache.insert_browse_rows(&request.snapshot, request, rows.clone())?;
             outputs[index] = rows;
+            cache_sources.record(BrowseCacheSource::Persisted);
         } else {
             query_cache
                 .stats
@@ -3584,6 +3695,7 @@ fn cached_browse_many(
                 .misses += 1;
             missed_indexes.push(index);
             missed_requests.push(request.clone());
+            cache_sources.record(BrowseCacheSource::Live);
         }
     }
 
@@ -4342,6 +4454,172 @@ fn project_root_for_state(
         .into_iter()
         .find(|row| row.project_id == Some(project_id))
         .and_then(|row| row.full_path))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_root_for_state_with_source(
+    query_cache: &mut QueryResultCache,
+    browse_cache: &mut BrowseCacheStore,
+    query_engine: &QueryEngine<'_>,
+    snapshot: &SnapshotBounds,
+    lens: MetricLens,
+    filters: &BrowseFilters,
+    project_id: i64,
+    browse_stats: &mut BrowseFanoutStats,
+    cache_sources: &mut BrowseCacheSourceStats,
+) -> Result<Option<String>> {
+    let relaxed_filters = BrowseFilters {
+        time_window: filters.time_window.clone(),
+        model: filters.model.clone(),
+        project_id: None,
+        action_category: None,
+        action: None,
+    };
+    let (root_rows, source) = cached_browse_with_source(
+        query_cache,
+        browse_cache,
+        query_engine,
+        BrowseRequest {
+            snapshot: snapshot.clone(),
+            root: RootView::ProjectHierarchy,
+            lens,
+            filters: relaxed_filters,
+            path: BrowsePath::Root,
+        },
+        browse_stats,
+    )?;
+    cache_sources.record(source);
+
+    Ok(root_rows
+        .into_iter()
+        .find(|row| row.project_id == Some(project_id))
+        .and_then(|row| row.full_path))
+}
+
+fn build_radial_context_for_state_with_source(
+    query_cache: &mut QueryResultCache,
+    browse_cache: &mut BrowseCacheStore,
+    query_engine: &QueryEngine<'_>,
+    perf_logger: Option<PerfLogger>,
+    request: RadialContextRequest<'_>,
+    browse_stats: &mut BrowseFanoutStats,
+    cache_sources: &mut BrowseCacheSourceStats,
+) -> Result<RadialContext> {
+    let mut perf = PerfScope::new_verbose(perf_logger, "tui.build_radial_context");
+    perf.field("snapshot", request.snapshot);
+    perf.field("root", request.ui_state.root);
+    perf.field("path", request.active_path);
+    perf.field("lens", request.ui_state.lens);
+    perf.field("filters", request.filters);
+    let steps = radial_ancestor_steps(
+        &request.ui_state.root,
+        request.active_path,
+        request.project_root,
+    );
+    let mut ancestor_layers = Vec::new();
+    let mut current_span = RadialSpan::full();
+    let browse_started = Instant::now();
+
+    for step in steps {
+        let (rows, source) = cached_browse_with_source(
+            query_cache,
+            browse_cache,
+            query_engine,
+            BrowseRequest {
+                snapshot: request.snapshot.clone(),
+                root: request.ui_state.root,
+                lens: request.ui_state.lens,
+                filters: request.filters.clone(),
+                path: step.query_path,
+            },
+            browse_stats,
+        )?;
+        cache_sources.record(source);
+        let layer = build_sunburst_layer(
+            &rows,
+            request.ui_state.lens,
+            Some(&step.selected_child),
+            current_span,
+        );
+        current_span = radial_selected_child_span(&layer);
+        ancestor_layers.push(layer);
+    }
+
+    perf.field(
+        "browse_work_ms",
+        browse_started.elapsed().as_secs_f64() * 1000.0,
+    );
+    perf.field("ancestor_layer_count", ancestor_layers.len());
+    perf.field("browse_request_count", browse_stats.total_requests());
+    perf.field(
+        "distinct_browse_request_count",
+        browse_stats.distinct_request_count(),
+    );
+    perf.field(
+        "duplicate_browse_request_count",
+        browse_stats.duplicate_request_count(),
+    );
+    perf.field(
+        "repeated_browse_requests",
+        browse_stats.repeated_requests(5),
+    );
+    perf.field("cache_memory_hit_count", cache_sources.memory_hits);
+    perf.field("cache_persisted_hit_count", cache_sources.persisted_hits);
+    perf.field("cache_live_query_count", cache_sources.live_queries);
+    perf.finish_ok();
+
+    let descendant_layers = build_radial_descendant_layers_with_source(
+        query_cache,
+        browse_cache,
+        query_engine,
+        &request,
+        current_span,
+        browse_stats,
+        cache_sources,
+    )
+    .unwrap_or_default();
+
+    Ok(RadialContext {
+        ancestor_layers,
+        current_span,
+        descendant_layers,
+    })
+}
+
+fn build_radial_descendant_layers_with_source(
+    query_cache: &mut QueryResultCache,
+    browse_cache: &mut BrowseCacheStore,
+    query_engine: &QueryEngine<'_>,
+    request: &RadialContextRequest<'_>,
+    initial_span: RadialSpan,
+    browse_stats: &mut BrowseFanoutStats,
+    cache_sources: &mut BrowseCacheSourceStats,
+) -> Result<Vec<RadialLayer>> {
+    if matches!(request.active_path, BrowsePath::Root) {
+        return Ok(Vec::new());
+    }
+
+    let (rows, source) = cached_browse_with_source(
+        query_cache,
+        browse_cache,
+        query_engine,
+        BrowseRequest {
+            snapshot: request.snapshot.clone(),
+            root: request.ui_state.root,
+            lens: request.ui_state.lens,
+            filters: request.filters.clone(),
+            path: request.active_path.clone(),
+        },
+        browse_stats,
+    )?;
+    cache_sources.record(source);
+
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let layer = build_radial_layer(&rows, request.ui_state.lens, None, initial_span);
+    Ok(vec![layer])
 }
 
 fn current_query_filters_for(
@@ -7828,6 +8106,81 @@ mod tests {
     }
 
     #[test]
+    fn selection_move_logs_selection_change_and_context_load() -> Result<()> {
+        let temp = tempdir()?;
+        let validation = run_scale_validation(
+            temp.path(),
+            ScaleValidationSpec {
+                project_count: 12,
+                day_count: 8,
+                sessions_per_day: 4,
+            },
+        )?;
+
+        let log_path = temp.path().join("perf.jsonl");
+        let logger = PerfLogger::open_jsonl(log_path.clone())?;
+
+        let project_id = {
+            let database = Database::open_read_only(&validation.db_path)?;
+            let engine = QueryEngine::new(database.connection());
+            engine
+                .filter_options(&validation.final_snapshot)?
+                .projects
+                .first()
+                .context("expected a visible project in the validation fixture")?
+                .id
+        };
+
+        let mut app = App::new(
+            RuntimeConfig {
+                app_name: "gnomon",
+                state_dir: temp.path().to_path_buf(),
+                db_path: validation.db_path.clone(),
+                source_root: validation.source_root.clone(),
+            },
+            validation.final_snapshot.clone(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            Some(StartupBrowseState {
+                root: RootView::ProjectHierarchy,
+                path: BrowsePath::Project { project_id },
+            }),
+            None,
+            None,
+            Some(logger),
+        )?;
+
+        for _ in 0..5 {
+            app.handle_normal_key(KeyEvent::from(KeyCode::Down))?;
+        }
+
+        let operations = fs::read_to_string(log_path)?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|payload| {
+                payload["operation"]
+                    .as_str()
+                    .map(std::string::ToString::to_string)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            operations.iter().any(|op| op == "tui.selection_change"),
+            "selection change should emit a perf event"
+        );
+        assert!(
+            operations
+                .iter()
+                .any(|op| op == "tui.selection_context_load"),
+            "selection context load should emit a perf event"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn repeated_view_load_reuses_cached_query_results_for_same_snapshot() -> Result<()> {
         let temp = tempdir()?;
         let mut app = App::new(
@@ -7894,6 +8247,44 @@ mod tests {
             QueryCacheStats { hits: 1, misses: 1 }
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn prefetch_batch_logs_source_counts() -> Result<()> {
+        let temp = tempdir()?;
+        let log_path = temp.path().join("perf.jsonl");
+        let logger = PerfLogger::open_jsonl(log_path.clone())?;
+
+        let mut perf = prefetch_batch_perf_scope(Some(logger));
+        std::thread::sleep(Duration::from_millis(20));
+        perf.field("request_count", 4usize);
+        perf.field("browse_request_count", 6usize);
+        perf.field("distinct_browse_request_count", 4usize);
+        perf.field("duplicate_browse_request_count", 2usize);
+        perf.field("cache_memory_hit_count", 1usize);
+        perf.field("cache_persisted_hit_count", 2usize);
+        perf.field("cache_live_query_count", 3usize);
+        perf.finish_ok();
+
+        let payloads = fs::read_to_string(log_path)?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let prefetch = payloads
+            .iter()
+            .find(|payload| payload["operation"] == "tui.prefetch_batch")
+            .context("missing prefetch batch perf event")?;
+
+        assert_eq!(prefetch["request_count"].as_u64(), Some(4));
+        assert_eq!(prefetch["browse_request_count"].as_u64(), Some(6));
+        assert_eq!(prefetch["distinct_browse_request_count"].as_u64(), Some(4));
+        assert_eq!(prefetch["duplicate_browse_request_count"].as_u64(), Some(2));
+        assert_eq!(prefetch["cache_memory_hit_count"].as_u64(), Some(1));
+        assert_eq!(prefetch["cache_persisted_hit_count"].as_u64(), Some(2));
+        assert_eq!(prefetch["cache_live_query_count"].as_u64(), Some(3));
+        assert!(prefetch["duration_ms"].as_f64().unwrap_or(0.0) >= 10.0);
         Ok(())
     }
 
