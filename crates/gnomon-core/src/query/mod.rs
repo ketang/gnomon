@@ -770,14 +770,25 @@ impl<'conn> QueryEngine<'conn> {
 
         let aggregate_started = Instant::now();
         let mut rows = if is_path_browse(&request.path) {
-            let path_load_started = Instant::now();
-            let path_facts = self.load_path_facts(request)?;
-            perf.field(
-                "path_load_ms",
-                path_load_started.elapsed().as_secs_f64() * 1000.0,
-            );
-            perf.field("path_fact_count", path_facts.len());
-            aggregate_path_request(request, &compiled_filters, &windows, &path_facts)?
+            if can_use_path_rollups(&request.filters) {
+                let path_load_started = Instant::now();
+                let rows = self.load_path_rollup_rows(request)?;
+                perf.field(
+                    "path_rollup_load_ms",
+                    path_load_started.elapsed().as_secs_f64() * 1000.0,
+                );
+                perf.field("path_rollup_count", rows.len());
+                rows
+            } else {
+                let path_load_started = Instant::now();
+                let path_facts = self.load_path_facts(request)?;
+                perf.field(
+                    "path_load_ms",
+                    path_load_started.elapsed().as_secs_f64() * 1000.0,
+                );
+                perf.field("path_fact_count", path_facts.len());
+                aggregate_path_request(request, &compiled_filters, &windows, &path_facts)?
+            }
         } else if can_use_action_rollups(&request.filters) {
             let action_load_started = Instant::now();
             let action_rollups = self.load_grouped_action_rollup_rows(request)?;
@@ -1041,7 +1052,11 @@ impl<'conn> QueryEngine<'conn> {
     }
 
     pub fn path_browse_query_plan(&self, request: &BrowseRequest) -> Result<Vec<String>> {
-        let (sql, query_params) = build_scoped_path_facts_query(request)?;
+        let (sql, query_params) = if can_use_path_rollups(&request.filters) {
+            build_path_rollup_rows_query(request)?
+        } else {
+            build_scoped_path_facts_query(request)?
+        };
         self.explain_query_plan_with_params(&sql, query_params)
     }
 
@@ -1057,7 +1072,14 @@ impl<'conn> QueryEngine<'conn> {
         &self,
         requests: &[BrowseRequest],
     ) -> Result<Vec<String>> {
-        let (sql, query_params) = build_batched_path_facts_query(requests)?;
+        let (sql, query_params) = if requests
+            .first()
+            .is_some_and(|request| can_use_path_rollups(&request.filters))
+        {
+            build_batched_path_rollup_rows_query(requests)?
+        } else {
+            build_batched_path_facts_query(requests)?
+        };
         self.explain_query_plan_with_params(&sql, query_params)
     }
 
@@ -1313,6 +1335,46 @@ impl<'conn> QueryEngine<'conn> {
             return Ok(vec![Vec::new(); requests.len()]);
         }
 
+        if can_use_path_rollups(&requests[0].filters) {
+            let (sql, query_params) = build_batched_path_rollup_rows_query(requests)?;
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(query_params.iter()), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    LoadedPathRollupRow {
+                        child_path: row.get(1)?,
+                        child_label: row.get(2)?,
+                        child_kind: row.get(3)?,
+                        input_tokens: row.get(4)?,
+                        cache_creation_input_tokens: row.get(5)?,
+                        cache_read_input_tokens: row.get(6)?,
+                        output_tokens: row.get(7)?,
+                        item_count: row.get(8)?,
+                    },
+                ))
+            })?;
+
+            let mut row_sets = vec![Vec::new(); requests.len()];
+            for row in rows {
+                let (request_index, loaded_row) =
+                    row.context("unable to read a batched path rollup row")?;
+                let request_index = usize::try_from(request_index)
+                    .context("batched path rollup request index overflowed usize")?;
+                let request = requests
+                    .get(request_index)
+                    .context("batched path rollup row referenced an unknown request")?;
+                row_sets[request_index].push(path_rollup_row_to_rollup_row(request, loaded_row)?);
+            }
+
+            for (request, rows) in requests.iter().zip(row_sets.iter_mut()) {
+                finalize_browse_rows(request, rows);
+            }
+
+            perf.field("row_set_count", row_sets.len());
+            perf.finish_ok();
+            return Ok(row_sets);
+        }
+
         let (sql, query_params) = build_batched_path_facts_query(requests)?;
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(query_params.iter()), |row| {
@@ -1532,6 +1594,41 @@ impl<'conn> QueryEngine<'conn> {
         Ok(facts)
     }
 
+    fn load_path_rollup_rows(&self, request: &BrowseRequest) -> Result<Vec<RollupRow>> {
+        let mut perf = self.verbose_perf_scope("query.load_path_rollup_rows");
+        record_browse_request_perf_fields(&mut perf, request);
+        if request.snapshot.max_publish_seq == 0 {
+            perf.field("row_count", 0usize);
+            perf.finish_ok();
+            return Ok(Vec::new());
+        }
+
+        let (sql, query_params) = build_path_rollup_rows_query(request)?;
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(query_params.iter()), |row| {
+            Ok(LoadedPathRollupRow {
+                child_path: row.get(0)?,
+                child_label: row.get(1)?,
+                child_kind: row.get(2)?,
+                input_tokens: row.get(3)?,
+                cache_creation_input_tokens: row.get(4)?,
+                cache_read_input_tokens: row.get(5)?,
+                output_tokens: row.get(6)?,
+                item_count: row.get(7)?,
+            })
+        })?;
+
+        let rollup_rows = rows
+            .map(|row| {
+                let row = row.context("unable to read a path rollup row")?;
+                path_rollup_row_to_rollup_row(request, row)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        perf.field("row_count", rollup_rows.len());
+        perf.finish_ok();
+        Ok(rollup_rows)
+    }
+
     fn explain_query_plan(&self, sql: &str) -> Result<Vec<String>> {
         let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
         let mut stmt = self
@@ -1724,6 +1821,18 @@ struct LoadedPathFact {
     model_name: Option<String>,
     file_path: String,
     ref_count: i64,
+}
+
+#[derive(Debug)]
+struct LoadedPathRollupRow {
+    child_path: String,
+    child_label: String,
+    child_kind: String,
+    input_tokens: f64,
+    cache_creation_input_tokens: f64,
+    cache_read_input_tokens: f64,
+    output_tokens: f64,
+    item_count: i64,
 }
 
 #[derive(Debug)]
@@ -2197,6 +2306,10 @@ struct PathBrowseScope<'a> {
 }
 
 fn can_use_action_rollups(filters: &BrowseFilters) -> bool {
+    filters.time_window.is_none() && filters.model.is_none()
+}
+
+fn can_use_path_rollups(filters: &BrowseFilters) -> bool {
     filters.time_window.is_none() && filters.model.is_none()
 }
 
@@ -2771,6 +2884,77 @@ fn grouped_action_rollup_row_to_rollup_row(
     }
 }
 
+fn path_rollup_row_to_rollup_row(
+    request: &BrowseRequest,
+    row: LoadedPathRollupRow,
+) -> Result<RollupRow> {
+    let (project_id, category, action) = match (&request.root, &request.path) {
+        (
+            RootView::ProjectHierarchy,
+            BrowsePath::ProjectAction {
+                project_id,
+                category,
+                action,
+                ..
+            },
+        ) => (*project_id, category.clone(), action.clone()),
+        (
+            RootView::CategoryHierarchy,
+            BrowsePath::CategoryActionProject {
+                category,
+                action,
+                project_id,
+                ..
+            },
+        ) => (*project_id, category.clone(), action.clone()),
+        _ => {
+            bail!(
+                "browse path {:?} is incompatible with {:?}",
+                request.path,
+                request.root
+            )
+        }
+    };
+
+    let kind = match row.child_kind.as_str() {
+        "directory" => RollupRowKind::Directory,
+        "file" => RollupRowKind::File,
+        other => bail!("unexpected child kind {other} in path rollup"),
+    };
+    let item_count = u64::try_from(row.item_count).context("path rollup item_count overflowed")?;
+    let metrics = MetricTotals {
+        uncached_input: row.input_tokens + row.cache_creation_input_tokens,
+        cached_input: row.cache_read_input_tokens,
+        gross_input: row.input_tokens
+            + row.cache_creation_input_tokens
+            + row.cache_read_input_tokens,
+        output: row.output_tokens,
+        total: row.input_tokens
+            + row.cache_creation_input_tokens
+            + row.cache_read_input_tokens
+            + row.output_tokens,
+    };
+
+    Ok(RollupRow {
+        kind,
+        key: format!("path:{}", row.child_path),
+        label: row.child_label,
+        metrics: metrics.clone(),
+        indicators: MetricIndicators {
+            selected_lens_last_5_hours: 0.0,
+            selected_lens_last_week: 0.0,
+            uncached_input_reference: metrics.uncached_input,
+        },
+        item_count,
+        opportunities: OpportunitySummary::default(),
+        project_id: Some(project_id),
+        project_identity: None,
+        category: Some(category),
+        action: Some(action),
+        full_path: Some(row.child_path),
+    })
+}
+
 fn build_grouped_action_row(
     row: LoadedGroupedActionRollupRow,
     metrics: MetricTotals,
@@ -3246,6 +3430,96 @@ fn build_scoped_path_facts_query(request: &BrowseRequest) -> Result<(String, Vec
     Ok((sql, query_params))
 }
 
+fn build_path_rollup_rows_query(request: &BrowseRequest) -> Result<(String, Vec<Value>)> {
+    let max_publish_seq = i64::try_from(request.snapshot.max_publish_seq)
+        .context("snapshot publish_seq overflowed i64")?;
+    let (scope_project_id, scope_category, scope_action, parent_path) =
+        match (&request.root, &request.path) {
+            (
+                RootView::ProjectHierarchy,
+                BrowsePath::ProjectAction {
+                    project_id,
+                    category,
+                    action,
+                    parent_path,
+                },
+            ) => (
+                *project_id,
+                category.as_str(),
+                action,
+                parent_path.as_deref(),
+            ),
+            (
+                RootView::CategoryHierarchy,
+                BrowsePath::CategoryActionProject {
+                    category,
+                    action,
+                    project_id,
+                    parent_path,
+                },
+            ) => (
+                *project_id,
+                category.as_str(),
+                action,
+                parent_path.as_deref(),
+            ),
+            _ => {
+                bail!(
+                    "browse path {:?} is incompatible with {:?}",
+                    request.path,
+                    request.root
+                )
+            }
+        };
+
+    let mut sql = "
+        SELECT
+            cpr.child_path,
+            cpr.child_label,
+            cpr.child_kind,
+            COALESCE(SUM(cpr.input_tokens), 0.0),
+            COALESCE(SUM(cpr.cache_creation_input_tokens), 0.0),
+            COALESCE(SUM(cpr.cache_read_input_tokens), 0.0),
+            COALESCE(SUM(cpr.output_tokens), 0.0),
+            COUNT(DISTINCT cpr.leaf_file_path)
+        FROM chunk_path_rollup cpr
+        JOIN import_chunk ic ON ic.id = cpr.import_chunk_id
+        JOIN project p ON p.id = ic.project_id
+        WHERE ic.state = 'complete'
+          AND ic.publish_seq IS NOT NULL
+          AND ic.publish_seq <= ?
+          AND p.id = ?
+          AND cpr.display_category = ?
+        "
+    .to_string();
+    let mut query_params = vec![
+        Value::Integer(max_publish_seq),
+        Value::Integer(scope_project_id),
+        Value::Text(scope_category.to_string()),
+    ];
+    append_path_rollup_action_match(&mut sql, &mut query_params, scope_action);
+    append_path_rollup_parent_match(&mut sql, &mut query_params, parent_path);
+
+    if let Some(project_id) = request.filters.project_id {
+        append_project_match(&mut sql, &mut query_params, project_id);
+    }
+    if let Some(category) = request.filters.action_category.as_deref() {
+        sql.push_str(" AND cpr.display_category = ?");
+        query_params.push(Value::Text(category.to_string()));
+    }
+    if let Some(action) = request.filters.action.as_ref() {
+        append_path_rollup_action_match(&mut sql, &mut query_params, action);
+    }
+
+    sql.push_str(
+        "
+        GROUP BY cpr.child_path, cpr.child_label, cpr.child_kind
+        ",
+    );
+
+    Ok((sql, query_params))
+}
+
 fn build_batched_path_facts_query(requests: &[BrowseRequest]) -> Result<(String, Vec<Value>)> {
     let first = requests
         .first()
@@ -3404,6 +3678,135 @@ fn build_batched_path_facts_query(requests: &[BrowseRequest]) -> Result<(String,
     Ok((sql, query_params))
 }
 
+fn build_batched_path_rollup_rows_query(
+    requests: &[BrowseRequest],
+) -> Result<(String, Vec<Value>)> {
+    let first = requests
+        .first()
+        .context("batched path browse requires at least one request")?;
+    let max_publish_seq = i64::try_from(first.snapshot.max_publish_seq)
+        .context("snapshot publish_seq overflowed i64")?;
+    let mut sql = String::from(
+        "
+        WITH requested_parent(
+            request_index,
+            project_id,
+            category,
+            classification_state,
+            normalized_action,
+            command_family,
+            base_command,
+            parent_path
+        ) AS (VALUES
+        ",
+    );
+    let mut query_params = Vec::new();
+
+    for (index, request) in requests.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str("(?, ?, ?, ?, ?, ?, ?, ?)");
+        let (project_id, category, action, parent_path) = match (&request.root, &request.path) {
+            (
+                RootView::ProjectHierarchy,
+                BrowsePath::ProjectAction {
+                    project_id,
+                    category,
+                    action,
+                    parent_path,
+                },
+            ) => (*project_id, category, action, parent_path.as_ref()),
+            (
+                RootView::CategoryHierarchy,
+                BrowsePath::CategoryActionProject {
+                    category,
+                    action,
+                    project_id,
+                    parent_path,
+                },
+            ) => (*project_id, category, action, parent_path.as_ref()),
+            _ => bail!("batched path browse requires compatible requests"),
+        };
+        query_params.push(Value::Integer(
+            i64::try_from(index).context("browse batch index overflowed i64")?,
+        ));
+        query_params.push(Value::Integer(project_id));
+        query_params.push(Value::Text(category.clone()));
+        query_params.push(Value::Text(
+            action.classification_state.as_str().to_string(),
+        ));
+        match &action.normalized_action {
+            Some(value) => query_params.push(Value::Text(value.clone())),
+            None => query_params.push(Value::Null),
+        }
+        match &action.command_family {
+            Some(value) => query_params.push(Value::Text(value.clone())),
+            None => query_params.push(Value::Null),
+        }
+        match &action.base_command {
+            Some(value) => query_params.push(Value::Text(value.clone())),
+            None => query_params.push(Value::Null),
+        }
+        match parent_path {
+            Some(value) => query_params.push(Value::Text(value.clone())),
+            None => query_params.push(Value::Null),
+        }
+    }
+
+    sql.push_str(
+        ")
+        SELECT
+            rp.request_index,
+            cpr.child_path,
+            cpr.child_label,
+            cpr.child_kind,
+            COALESCE(SUM(cpr.input_tokens), 0.0),
+            COALESCE(SUM(cpr.cache_creation_input_tokens), 0.0),
+            COALESCE(SUM(cpr.cache_read_input_tokens), 0.0),
+            COALESCE(SUM(cpr.output_tokens), 0.0),
+            COUNT(DISTINCT cpr.leaf_file_path)
+        FROM requested_parent rp
+        JOIN chunk_path_rollup cpr
+        JOIN import_chunk ic ON ic.id = cpr.import_chunk_id
+        JOIN project p ON p.id = ic.project_id
+        WHERE ic.state = 'complete'
+          AND ic.publish_seq IS NOT NULL
+          AND ic.publish_seq <= ?
+          AND p.id = rp.project_id
+          AND cpr.display_category = rp.category
+          AND cpr.classification_state = rp.classification_state
+          AND cpr.normalized_action IS rp.normalized_action
+          AND cpr.command_family IS rp.command_family
+          AND cpr.base_command IS rp.base_command
+          AND (
+              (rp.parent_path IS NULL AND cpr.parent_path IS NULL)
+              OR cpr.parent_path = rp.parent_path
+          )
+        ",
+    );
+    query_params.push(Value::Integer(max_publish_seq));
+
+    if let Some(project_id) = first.filters.project_id {
+        append_project_match(&mut sql, &mut query_params, project_id);
+    }
+    if let Some(category) = first.filters.action_category.as_deref() {
+        sql.push_str(" AND cpr.display_category = ?");
+        query_params.push(Value::Text(category.to_string()));
+    }
+    if let Some(action) = first.filters.action.as_ref() {
+        append_path_rollup_action_match(&mut sql, &mut query_params, action);
+    }
+
+    sql.push_str(
+        "
+        GROUP BY rp.request_index, cpr.child_path, cpr.child_label, cpr.child_kind
+        ",
+    );
+
+    Ok((sql, query_params))
+}
+
 fn append_project_match(sql: &mut String, query_params: &mut Vec<Value>, project_id: i64) {
     sql.push_str(" AND p.id = ?");
     query_params.push(Value::Integer(project_id));
@@ -3439,6 +3842,52 @@ fn append_action_key_match(sql: &mut String, query_params: &mut Vec<Value>, acti
         query_params.push(Value::Text(base_command.to_string()));
     } else {
         sql.push_str(" AND a.base_command IS NULL");
+    }
+}
+
+fn append_path_rollup_action_match(
+    sql: &mut String,
+    query_params: &mut Vec<Value>,
+    action: &ActionKey,
+) {
+    sql.push_str(" AND cpr.classification_state = ?");
+    query_params.push(Value::Text(
+        action.classification_state.as_str().to_string(),
+    ));
+
+    if let Some(normalized_action) = action.normalized_action.as_deref() {
+        sql.push_str(" AND cpr.normalized_action = ?");
+        query_params.push(Value::Text(normalized_action.to_string()));
+    } else {
+        sql.push_str(" AND cpr.normalized_action IS NULL");
+    }
+
+    if let Some(command_family) = action.command_family.as_deref() {
+        sql.push_str(" AND cpr.command_family = ?");
+        query_params.push(Value::Text(command_family.to_string()));
+    } else {
+        sql.push_str(" AND cpr.command_family IS NULL");
+    }
+
+    if let Some(base_command) = action.base_command.as_deref() {
+        sql.push_str(" AND cpr.base_command = ?");
+        query_params.push(Value::Text(base_command.to_string()));
+    } else {
+        sql.push_str(" AND cpr.base_command IS NULL");
+    }
+}
+
+fn append_path_rollup_parent_match(
+    sql: &mut String,
+    query_params: &mut Vec<Value>,
+    parent_path: Option<&str>,
+) {
+    match parent_path {
+        Some(parent_path) => {
+            sql.push_str(" AND cpr.parent_path = ?");
+            query_params.push(Value::Text(parent_path.to_string()));
+        }
+        None => sql.push_str(" AND cpr.parent_path IS NULL"),
     }
 }
 
@@ -5135,6 +5584,7 @@ mod tests {
             [import_chunk_id],
         )?;
         crate::rollup::rebuild_chunk_action_rollups(conn, import_chunk_id)?;
+        crate::rollup::rebuild_chunk_path_rollups(conn, import_chunk_id)?;
         Ok(())
     }
 

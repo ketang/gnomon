@@ -32,7 +32,7 @@ pub const IMPORT_CHUNK_UNIT: &str = "project x day";
 /// - `tool_name` — identifies which tool was invoked
 /// - `tool_call_id` — joins `tool_use` with its `tool_result`
 /// - `metadata_json` — only the `input` key, only for `tool_use` parts
-pub const IMPORT_SCHEMA_VERSION: i64 = 1;
+pub const IMPORT_SCHEMA_VERSION: i64 = 2;
 
 /// Stable normalized payload contract for persisted `tool_use` message parts.
 ///
