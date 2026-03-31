@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use jiff::Timestamp;
@@ -195,6 +195,7 @@ pub struct PerfScope {
     started_at: Instant,
     operation: String,
     level: PerfLogLevel,
+    minimum_duration: Option<Duration>,
     fields: Map<String, Value>,
     finished: bool,
 }
@@ -218,9 +219,15 @@ impl PerfScope {
             started_at: Instant::now(),
             operation: operation.into(),
             level,
+            minimum_duration: None,
             fields: Map::new(),
             finished: false,
         }
+    }
+
+    pub fn with_min_duration(mut self, minimum_duration: Duration) -> Self {
+        self.minimum_duration = Some(minimum_duration);
+        self
     }
 
     pub fn field<T>(&mut self, key: &str, value: T)
@@ -262,11 +269,20 @@ impl PerfScope {
             return;
         };
 
+        let duration = self.started_at.elapsed();
+        if matches!(self.level, PerfLogLevel::Normal)
+            && self
+                .minimum_duration
+                .is_some_and(|minimum| duration < minimum)
+        {
+            return;
+        }
+
         logger.write_event(&PerfEvent {
             timestamp_utc: Timestamp::now(),
             operation: &self.operation,
             status,
-            duration_ms: self.started_at.elapsed().as_secs_f64() * 1000.0,
+            duration_ms: duration.as_secs_f64() * 1000.0,
             error: error.as_deref(),
             fields: &self.fields,
             level: self.level,
@@ -466,6 +482,7 @@ fn format_human_scalar(value: &str) -> String {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
     use anyhow::{Context, Result};
     use serde_json::Value;
@@ -526,6 +543,43 @@ mod tests {
         assert!(line.contains("ok"));
         assert!(line.contains("row_count=42"));
         assert!(line.contains("root=ProjectHierarchy"));
+        Ok(())
+    }
+
+    #[test]
+    fn normal_scope_with_min_duration_suppresses_fast_events() -> Result<()> {
+        let temp = tempdir()?;
+        let log_path = temp.path().join("perf.log");
+        let logger = PerfLogger::open_jsonl(log_path.clone())?;
+
+        let mut scope = PerfScope::new(Some(logger), "query.browse")
+            .with_min_duration(Duration::from_millis(10));
+        scope.started_at = Instant::now();
+        scope.finish_ok();
+
+        let contents = fs::read_to_string(log_path)?;
+        assert!(contents.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn normal_scope_with_min_duration_logs_slow_events() -> Result<()> {
+        let temp = tempdir()?;
+        let log_path = temp.path().join("perf.log");
+        let logger = PerfLogger::open_jsonl(log_path.clone())?;
+
+        let mut scope = PerfScope::new(Some(logger), "query.browse")
+            .with_min_duration(Duration::from_millis(10));
+        scope.started_at = Instant::now() - Duration::from_millis(20);
+        scope.field("row_count", 42usize);
+        scope.finish_ok();
+
+        let contents = fs::read_to_string(log_path)?;
+        let line = contents.lines().next().context("missing perf log line")?;
+        let payload: Value = serde_json::from_str(line)?;
+        assert_eq!(payload["operation"], "query.browse");
+        assert_eq!(payload["row_count"], 42);
+        assert!(payload["duration_ms"].as_f64().unwrap_or(0.0) >= 10.0);
         Ok(())
     }
 
