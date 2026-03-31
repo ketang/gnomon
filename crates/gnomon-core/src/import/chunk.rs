@@ -7,7 +7,10 @@ use std::time::Duration;
 use crate::classify::{BuildActionsParams, build_actions};
 use crate::db::Database;
 use crate::query::SnapshotBounds;
-use crate::rollup::{clear_chunk_action_rollups, rebuild_chunk_action_rollups};
+use crate::rollup::{
+    clear_chunk_action_rollups, clear_chunk_path_rollups, rebuild_chunk_action_rollups,
+    rebuild_chunk_path_rollups,
+};
 use anyhow::{Context, Result, anyhow};
 use jiff::{Timestamp, ToSpan, tz::TimeZone};
 use rusqlite::{Connection, Transaction, params};
@@ -806,6 +809,7 @@ fn purge_chunk_data(tx: &Transaction<'_>, import_chunk_id: i64) -> Result<()> {
     )
     .context("unable to clear prior chunk warnings")?;
     clear_chunk_action_rollups(tx, import_chunk_id)?;
+    clear_chunk_path_rollups(tx, import_chunk_id)?;
 
     tx.execute(
         "
@@ -885,6 +889,7 @@ fn finalize_chunk_import(conn: &mut Connection, chunk: &PreparedChunk) -> Result
     }
 
     rebuild_chunk_action_rollups(&tx, chunk.import_chunk_id)?;
+    rebuild_chunk_path_rollups(&tx, chunk.import_chunk_id)?;
 
     let next_publish_seq: i64 = tx
         .query_row(
