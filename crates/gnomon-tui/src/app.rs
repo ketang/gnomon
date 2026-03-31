@@ -924,7 +924,7 @@ impl App {
         config: RuntimeConfig,
         snapshot: SnapshotBounds,
         startup_open_reason: StartupOpenReason,
-        startup_status_message: Option<String>,
+        _startup_status_message: Option<String>,
         startup_progress_update: Option<StartupProgressUpdate>,
         startup_browse_state: Option<StartupBrowseState>,
         status_updates: Option<Receiver<StartupWorkerEvent>>,
@@ -932,7 +932,7 @@ impl App {
         perf_logger: Option<PerfLogger>,
     ) -> Result<Self> {
         let ui_state_path = config.state_dir.join(UI_STATE_FILENAME);
-        let (ui_state, mut status_message) = match PersistedUiState::load(&ui_state_path) {
+        let (ui_state, status_message) = match PersistedUiState::load(&ui_state_path) {
             Ok(Some(state)) => (state, None),
             Ok(None) => (PersistedUiState::default(), None),
             Err(error) => (
@@ -942,16 +942,6 @@ impl App {
                 )))),
             ),
         };
-        if let Some(startup_status_message) = startup_status_message {
-            status_message = Some(match status_message {
-                Some(existing) => StatusMessage::error(format!(
-                    "{} | {}",
-                    compact_status_text(&startup_status_message),
-                    compact_status_text(&existing.text)
-                )),
-                None => StatusMessage::error(compact_status_text(&startup_status_message)),
-            });
-        }
         let mut ui_state = ui_state;
         ui_state.apply_startup_browse_state(startup_browse_state);
         let focused_pane = PaneFocus::from_pane_mode(ui_state.pane_mode);
@@ -1116,34 +1106,15 @@ impl App {
                 self.startup_activity = Some(StartupActivity::from_progress(update));
             }
             StartupWorkerEvent::StartupSettled {
-                startup_status_message,
-            } => {
-                if let Some(message) = startup_status_message {
-                    self.push_status_message(message);
-                }
-            }
+                startup_status_message: _,
+            } => {}
             StartupWorkerEvent::DeferredFailures {
-                deferred_status_message,
-            } => {
-                if let Some(message) = deferred_status_message {
-                    self.push_status_message(message);
-                }
-            }
+                deferred_status_message: _,
+            } => {}
             StartupWorkerEvent::Finished => {
                 self.startup_activity = None;
             }
         }
-    }
-
-    fn push_status_message(&mut self, message: impl Into<String>) {
-        let message = compact_status_text(message.into());
-        self.status_message = Some(match self.status_message.take() {
-            Some(existing) => StatusMessage::error(format!(
-                "{message} | {}",
-                compact_status_text(&existing.text)
-            )),
-            None => StatusMessage::error(message),
-        });
     }
 
     fn render(&mut self, frame: &mut Frame<'_>) {
@@ -9110,6 +9081,45 @@ mod tests {
             "status pane header not rendered"
         );
         assert!(content.contains("Keys"), "keys pane header not rendered");
+        Ok(())
+    }
+
+    #[test]
+    fn startup_import_failures_do_not_set_tui_status_message() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            Some("startup import failed for 1 chunk".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        assert!(
+            app.status_message.is_none(),
+            "startup import failures should not be rendered in the TUI"
+        );
+
+        app.apply_status_update(StartupWorkerEvent::DeferredFailures {
+            deferred_status_message: Some("deferred import failed for 2 chunks".to_string()),
+        });
+        assert!(
+            app.status_message.is_none(),
+            "deferred import failures should not be rendered in the TUI"
+        );
+
+        app.apply_status_update(StartupWorkerEvent::StartupSettled {
+            startup_status_message: Some("startup import failed for 1 chunk".to_string()),
+        });
+        assert!(
+            app.status_message.is_none(),
+            "settled startup failures should not be rendered in the TUI"
+        );
+
         Ok(())
     }
 

@@ -162,8 +162,8 @@ Shell commands do not create path attribution.
 - Open the TUI when:
   - last 24 hours are ready, or
   - 10 seconds have elapsed
-- Failed startup chunks do not block the TUI; mark them failed and surface the
-  first actionable error in the UI status area
+- Failed startup chunks do not block the TUI; mark them failed and print the
+  first actionable error on stderr outside the TUI lifecycle
 - Continue importing in one background worker after the UI opens
 - Do not auto-apply new data to the visible UI
 - Instead, show `new data available`

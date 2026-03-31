@@ -1,5 +1,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -7,8 +9,8 @@ use gnomon_core::benchmark::{QueryBenchmarkOptions, QueryBenchmarkReport, run_qu
 use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
 use gnomon_core::db::{Database, ResetReport, reset_sqlite_database};
 use gnomon_core::import::{
-    StartupProgressUpdate, import_all, scan_source_manifest, start_startup_import,
-    start_startup_import_with_progress,
+    StartupProgressUpdate, StartupWorkerEvent, import_all, scan_source_manifest,
+    start_startup_import, start_startup_import_with_progress,
 };
 use gnomon_core::opportunity::{OpportunityCategory, OpportunityConfidence, OpportunitySummary};
 use gnomon_core::perf::PerfLogger;
@@ -352,22 +354,25 @@ fn run_app(config: &RuntimeConfig, startup_args: StartupArgs) -> Result<()> {
     )?;
     let snapshot = startup_import.snapshot.clone();
     let open_reason = startup_import.open_reason;
-    let startup_status_message = startup_import.startup_status_message.clone();
     let startup_progress_update = startup_import.startup_progress_update.clone();
     let startup_browse_state = startup_args.build_startup_browse_state()?;
-    let status_updates = startup_import.take_status_updates();
+    print_import_problem(startup_import.startup_status_message.as_deref());
+    let mut forwarded_updates =
+        ForwardedStartupUpdates::spawn(startup_import.take_status_updates());
+    let ui_updates = forwarded_updates.take_ui_updates();
 
-    gnomon_tui::run_with_progress(
+    let run_result = gnomon_tui::run_with_progress(
         config,
         snapshot,
         open_reason,
-        startup_status_message,
         startup_progress_update,
         startup_browse_state,
-        status_updates,
+        ui_updates,
         |update| startup_progress.query_progress(update),
         perf_logger,
-    )
+    );
+    print_import_problems(forwarded_updates.finish());
+    run_result
 }
 
 fn run_db_command(config: &RuntimeConfig, command: DbSubcommand) -> Result<()> {
@@ -406,17 +411,16 @@ fn run_snapshot_command(config: &RuntimeConfig, args: &SnapshotArgs) -> Result<(
         start_startup_import(database.connection(), &config.db_path, &config.source_root)?;
     let snapshot = startup_import.snapshot.clone();
     let open_reason = startup_import.open_reason;
-    let startup_status_message = startup_import.startup_status_message.clone();
     let startup_progress_update = startup_import.startup_progress_update.clone();
     let startup_browse_state = args.startup.build_startup_browse_state()?;
     // Drain the import worker so it doesn't outlive the render.
     drop(startup_import.take_status_updates());
+    print_import_problem(startup_import.startup_status_message.as_deref());
 
     let output = gnomon_tui::render_snapshot(
         config,
         snapshot,
         open_reason,
-        startup_status_message,
         startup_progress_update,
         startup_browse_state,
         args.width,
@@ -545,6 +549,92 @@ struct StartupConsoleProgress {
     rendered_width: usize,
 }
 
+struct ForwardedStartupUpdates {
+    ui_updates: Option<mpsc::Receiver<StartupWorkerEvent>>,
+    captured_messages: Arc<Mutex<Vec<String>>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl ForwardedStartupUpdates {
+    fn spawn(status_updates: Option<mpsc::Receiver<StartupWorkerEvent>>) -> Self {
+        let Some(status_updates) = status_updates else {
+            return Self {
+                ui_updates: None,
+                captured_messages: Arc::new(Mutex::new(Vec::new())),
+                worker: None,
+            };
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        let captured_messages = Arc::new(Mutex::new(Vec::new()));
+        let worker_messages = Arc::clone(&captured_messages);
+        let worker = thread::spawn(move || {
+            while let Ok(update) = status_updates.recv() {
+                match update {
+                    StartupWorkerEvent::Progress { .. } | StartupWorkerEvent::Finished => {
+                        if sender.send(update).is_err() {
+                            break;
+                        }
+                    }
+                    StartupWorkerEvent::StartupSettled {
+                        startup_status_message,
+                    } => push_import_problem(&worker_messages, startup_status_message),
+                    StartupWorkerEvent::DeferredFailures {
+                        deferred_status_message,
+                    } => push_import_problem(&worker_messages, deferred_status_message),
+                }
+            }
+        });
+
+        Self {
+            ui_updates: Some(receiver),
+            captured_messages,
+            worker: Some(worker),
+        }
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        take_import_problems(&self.captured_messages)
+    }
+
+    fn take_ui_updates(&mut self) -> Option<mpsc::Receiver<StartupWorkerEvent>> {
+        self.ui_updates.take()
+    }
+}
+
+fn push_import_problem(target: &Arc<Mutex<Vec<String>>>, message: Option<String>) {
+    let Some(message) = message else {
+        return;
+    };
+    if let Ok(mut problems) = target.lock() {
+        problems.push(message);
+    }
+}
+
+fn take_import_problems(source: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    source
+        .lock()
+        .map(|mut problems| std::mem::take(&mut *problems))
+        .unwrap_or_default()
+}
+
+fn print_import_problem(message: Option<&str>) {
+    let Some(message) = message else {
+        return;
+    };
+    StartupConsoleProgress::clear_stderr_line();
+    eprintln!("{message}");
+}
+
+fn print_import_problems(messages: Vec<String>) {
+    for message in messages {
+        print_import_problem(Some(&message));
+    }
+}
+
 impl StartupConsoleProgress {
     fn stderr() -> Self {
         Self {
@@ -580,6 +670,14 @@ impl StartupConsoleProgress {
         eprint!("\r{line}{}", " ".repeat(padding));
         let _ = io::stderr().flush();
         self.rendered_width = line.len();
+    }
+
+    fn clear_stderr_line() {
+        if !io::stderr().is_terminal() {
+            return;
+        }
+        eprint!("\r\x1b[2K");
+        let _ = io::stderr().flush();
     }
 }
 
@@ -850,6 +948,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command as ProcessCommand;
+    use std::sync::mpsc;
 
     use anyhow::{Context, Result, anyhow};
     use clap::{CommandFactory, Parser};
@@ -866,6 +965,7 @@ mod tests {
     };
     use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
     use gnomon_core::db::Database;
+    use gnomon_core::import::StartupWorkerEvent;
     use gnomon_core::query::{
         BrowsePath, MetricIndicators, MetricTotals, RollupRow, RollupRowKind,
     };
@@ -1502,6 +1602,52 @@ mod tests {
                 .scenarios
                 .iter()
                 .any(|scenario| scenario.name == "project_root_refresh")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn forwarded_startup_updates_capture_failures_outside_the_tui() -> Result<()> {
+        let (sender, mut forwarded) = {
+            let (sender, receiver) = mpsc::channel();
+            let forwarded = super::ForwardedStartupUpdates::spawn(Some(receiver));
+            (sender, forwarded)
+        };
+
+        sender.send(StartupWorkerEvent::StartupSettled {
+            startup_status_message: Some("startup import failed for 1 chunk".to_string()),
+        })?;
+        sender.send(StartupWorkerEvent::DeferredFailures {
+            deferred_status_message: Some("deferred import failed for 2 chunks".to_string()),
+        })?;
+        sender.send(StartupWorkerEvent::Progress {
+            update: gnomon_core::import::StartupProgressUpdate {
+                label: "startup import",
+                current: 1,
+                total: 2,
+                detail: "chunk 1 of 2".to_string(),
+            },
+        })?;
+        sender.send(StartupWorkerEvent::Finished)?;
+        drop(sender);
+
+        let receiver = forwarded
+            .take_ui_updates()
+            .context("missing forwarded ui receiver")?;
+        assert!(matches!(
+            receiver.recv()?,
+            StartupWorkerEvent::Progress { .. }
+        ));
+        assert!(matches!(receiver.recv()?, StartupWorkerEvent::Finished));
+
+        let captured = forwarded.finish();
+        assert_eq!(
+            captured,
+            vec![
+                "startup import failed for 1 chunk".to_string(),
+                "deferred import failed for 2 chunks".to_string()
+            ]
         );
 
         Ok(())
