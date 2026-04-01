@@ -21,8 +21,11 @@ repository.
 - Use a feature branch or the existing task branch for every implementation
   task.
 - If the current branch is `main`, stop and ask before editing files.
-- Use a dedicated worktree for implementation work whenever practical, and for
-  all parallel work. Repo-local worktrees live under `.worktrees/`.
+- Always use a dedicated worktree for implementation work. Repo-local worktrees
+  live under `.worktrees/`. Creating a feature branch in the repo root is not a
+  substitute — create both the branch and the worktree before touching any
+  files, regardless of which branch you are on.
+- All parallel work must use separate worktrees.
 - `.worktrees/` is local orchestration state, not product source. Do not commit
   or clean it up unless the user explicitly asks.
 
