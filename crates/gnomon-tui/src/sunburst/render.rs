@@ -25,7 +25,7 @@ impl Widget for &SunburstPane<'_> {
             return;
         }
 
-        rasterize_sunburst(buf, inner, self.model, self.focused, self.config);
+        rasterize_sunburst(buf, inner, self.model, self.config);
 
         let center_area = sunburst_center_label_area(inner, self.config);
         let center_lines =
