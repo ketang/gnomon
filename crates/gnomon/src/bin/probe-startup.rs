@@ -70,7 +70,6 @@ fn main() -> Result<()> {
         snapshot.clone(),
         StartupOpenReason::Last24hReady,
         None,
-        None,
         Some(StartupBrowseState {
             root: cli.root.root_view(),
             path: BrowsePath::Root,
