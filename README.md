@@ -152,8 +152,10 @@ cargo run -p gnomon -- db rebuild
 ```
 
 Both commands honor the existing `--db` and `--source-root` overrides.
-`reset` is destructive and requires `--force`. `rebuild` recreates the cache
-from the source manifest and session history without opening the TUI.
+`reset` is destructive and requires `--force`; it removes both the derived
+usage database and the persisted browse-cache sidecar.
+`rebuild` clears those persisted cache artifacts and recreates the usage
+database from the source manifest and session history without opening the TUI.
 If you pull a version that renames derived taxonomy labels, such as `Editing`
 to `editing` or bracketed special-state labels like `[mixed]`, run `db rebuild`
 to refresh existing cached aggregates and filters.
@@ -193,6 +195,8 @@ The TUI now persists warmed browse results in a separate SQLite sidecar at
 `<state_dir>/browse-cache.sqlite3`. The browse cache is scoped to the published
 snapshot generation, reused across launches, pruned automatically when newer
 snapshots appear, and bounded by a default `64 MiB` payload budget.
+Database reset and rebuild clear the persisted sidecar before the next import so
+old browse rows cannot survive a publish-sequence restart.
 
 Implementation notes and retention details live in `docs/browse-cache.md`.
 
