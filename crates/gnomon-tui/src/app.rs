@@ -5983,14 +5983,6 @@ fn radial_center_label_style(focused: bool) -> Style {
     sunburst_center_label_style(focused)
 }
 
-pub(crate) fn cached_ratio(row: &RollupRow) -> f64 {
-    if row.metrics.gross_input <= 0.0 {
-        0.0
-    } else {
-        (row.metrics.cached_input / row.metrics.gross_input).clamp(0.0, 1.0)
-    }
-}
-
 fn project_row_key(project_id: i64) -> String {
     format!("project:{project_id}")
 }
@@ -7827,13 +7819,11 @@ mod tests {
                 segments: vec![
                     RadialSegment {
                         value: 8.0,
-                        cached_ratio: 0.0,
                         bucket: RadialBucket::Project,
                         is_selected: true,
                     },
                     RadialSegment {
                         value: 4.0,
-                        cached_ratio: 0.0,
                         bucket: RadialBucket::Category,
                         is_selected: false,
                     },
@@ -7893,13 +7883,11 @@ mod tests {
                 segments: vec![
                     RadialSegment {
                         value: 8.0,
-                        cached_ratio: 0.0,
                         bucket: RadialBucket::Project,
                         is_selected: true,
                     },
                     RadialSegment {
                         value: 4.0,
-                        cached_ratio: 0.6,
                         bucket: RadialBucket::Category,
                         is_selected: false,
                     },
@@ -7947,13 +7935,11 @@ mod tests {
                 segments: vec![
                     RadialSegment {
                         value: 3.0,
-                        cached_ratio: 0.0,
                         bucket: RadialBucket::Project,
                         is_selected: true,
                     },
                     RadialSegment {
                         value: 1.0,
-                        cached_ratio: 0.0,
                         bucket: RadialBucket::Category,
                         is_selected: false,
                     },
@@ -7999,7 +7985,6 @@ mod tests {
                 span: RadialSpan::full(),
                 segments: vec![RadialSegment {
                     value: 1.0,
-                    cached_ratio: 0.8,
                     bucket: RadialBucket::Category,
                     is_selected: false,
                 }],

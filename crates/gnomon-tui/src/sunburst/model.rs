@@ -64,7 +64,6 @@ impl SunburstSpan {
 #[derive(Debug, Clone)]
 pub(crate) struct SunburstSegment {
     pub(crate) value: f64,
-    pub(crate) cached_ratio: f64,
     pub(crate) bucket: SunburstBucket,
     pub(crate) is_selected: bool,
 }
