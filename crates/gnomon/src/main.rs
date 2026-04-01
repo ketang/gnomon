@@ -1312,7 +1312,7 @@ mod tests {
     fn reset_deletes_browse_cache_file_when_forced() -> Result<()> {
         let temp = tempdir()?;
         let db_path = temp.path().join("usage.sqlite3");
-        let config = load_test_config(temp.path(), db_path, temp.path().join("source"))?;
+        let config = test_runtime_config(temp.path(), db_path, temp.path().join("source"));
         config.ensure_dirs()?;
         let browse_cache_path =
             gnomon_core::browse_cache::default_browse_cache_path(&config.state_dir);
@@ -1363,7 +1363,7 @@ mod tests {
         init_git_repo(&project_root)?;
         write_jsonl(&source_root.join("project/session.jsonl"), &project_root)?;
 
-        let config = load_test_config(temp.path(), db_path.clone(), source_root)?;
+        let config = test_runtime_config(temp.path(), db_path.clone(), source_root);
         config.ensure_dirs()?;
         let browse_cache_path =
             gnomon_core::browse_cache::default_browse_cache_path(&config.state_dir);
@@ -1752,6 +1752,15 @@ mod tests {
             ));
         }
         Ok(())
+    }
+
+    fn test_runtime_config(root: &Path, db_path: PathBuf, source_root: PathBuf) -> RuntimeConfig {
+        RuntimeConfig {
+            app_name: "gnomon",
+            state_dir: root.join("state"),
+            db_path,
+            source_root,
+        }
     }
 
     fn run_git<const N: usize>(repo_root: &Path, args: [&str; N]) -> Result<()> {
