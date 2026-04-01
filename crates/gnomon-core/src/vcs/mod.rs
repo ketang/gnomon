@@ -58,9 +58,10 @@ pub struct ResolvedProject {
 /// Resolves a project identity from a cwd using Git as the authoritative source when available.
 /// Git-backed projects collapse to a canonical root path; non-Git paths retain the normalized cwd.
 ///
-/// If Git discovery fails because a recorded Claude worktree path no longer exists, we apply a
-/// narrow recovery heuristic for paths under `.../.claude/worktrees/...` by probing the candidate
-/// repo roots above that worktree segment. We do not attempt broader path-prefix inference.
+/// If Git discovery fails because a recorded worktree path no longer exists, we apply a narrow
+/// recovery heuristic for paths under `.../.claude/worktrees/...` and repo-local
+/// `.../.worktrees/...` layouts by probing the candidate repo roots above the recognized worktree
+/// segment. We do not attempt broader path-prefix inference.
 pub fn resolve_project_from_cwd(cwd: &Path) -> ResolvedProject {
     resolve_project_from_cwd_with_policy(cwd, &ProjectIdentityPolicy::default())
 }
@@ -126,30 +127,20 @@ fn resolve_git_project(repo: &gix::Repository) -> Option<ResolvedProject> {
     })
 }
 
-/// Recover a canonical repo identity from a deleted Claude worktree path.
+/// Recover a canonical repo identity from a deleted worktree path.
 ///
-/// We only consider missing paths under a recognized `.../.claude/worktrees/...` segment. For each
-/// matching ancestor, we probe the path above `/.claude/worktrees/` and accept it only if Git can
-/// still resolve a canonical root from that recovered candidate. This keeps the recovery specific
-/// to known Claude worktree layouts and avoids broad longest-prefix guesses across the filesystem.
+/// We only consider missing paths under recognized `.../.claude/worktrees/...` and
+/// `.../.worktrees/...` segments. For each matching ancestor, we probe the path above the
+/// recognized worktree segment and accept it only if Git can still resolve a canonical root from
+/// that recovered candidate. This keeps the recovery specific to known worktree layouts and avoids
+/// broad longest-prefix guesses across the filesystem.
 fn recover_project_from_stale_worktree_path(cwd: &Path) -> Option<ResolvedProject> {
     if cwd.exists() {
         return None;
     }
 
     for ancestor in cwd.ancestors() {
-        if ancestor.file_name().and_then(|name| name.to_str()) != Some("worktrees") {
-            continue;
-        }
-
-        let Some(claude_dir) = ancestor.parent() else {
-            continue;
-        };
-        if claude_dir.file_name().and_then(|name| name.to_str()) != Some(".claude") {
-            continue;
-        }
-
-        let Some(candidate_root) = claude_dir.parent() else {
+        let Some(candidate_root) = recover_candidate_root_from_worktree_ancestor(ancestor) else {
             continue;
         };
         if let Ok(repo) = gix::discover(candidate_root)
@@ -160,6 +151,19 @@ fn recover_project_from_stale_worktree_path(cwd: &Path) -> Option<ResolvedProjec
     }
 
     None
+}
+
+fn recover_candidate_root_from_worktree_ancestor(ancestor: &Path) -> Option<&Path> {
+    match ancestor.file_name().and_then(|name| name.to_str()) {
+        Some("worktrees") => {
+            let claude_dir = ancestor.parent()?;
+            (claude_dir.file_name().and_then(|name| name.to_str()) == Some(".claude"))
+                .then(|| claude_dir.parent())
+                .flatten()
+        }
+        Some(".worktrees") => ancestor.parent(),
+        _ => None,
+    }
 }
 
 fn canonical_git_root(repo: &gix::Repository) -> Option<PathBuf> {
@@ -471,6 +475,42 @@ mod tests {
     }
 
     #[test]
+    fn deleted_repo_local_worktree_path_recovers_to_main_repo() -> Result<()> {
+        let temp = tempdir()?;
+        let repo_root = temp.path().join("main-repo");
+        let worktree_root = repo_root.join(".worktrees").join("feature-wt");
+
+        make_git_repo(&repo_root)?;
+        run_git(&repo_root, ["branch", "-m", "main"])?;
+        run_git(&repo_root, ["branch", "feature"])?;
+        run_git_freeform(&[
+            "-C",
+            repo_root.to_str().context("non-utf8 path")?,
+            "worktree",
+            "add",
+            worktree_root.to_str().context("non-utf8 path")?,
+            "feature",
+        ])?;
+        run_git_freeform(&[
+            "-C",
+            repo_root.to_str().context("non-utf8 path")?,
+            "worktree",
+            "remove",
+            "--force",
+            worktree_root.to_str().context("non-utf8 path")?,
+        ])?;
+
+        let canonical_main = fs::canonicalize(&repo_root)?;
+        let project = resolve_project_from_cwd(&worktree_root);
+
+        assert_eq!(project.identity_kind, ProjectIdentityKind::Git);
+        assert_eq!(project.root_path, canonical_main);
+        assert_eq!(project.git_root_path, Some(canonical_main));
+        assert!(project.identity_reason.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn missing_worktree_pattern_without_git_repo_stays_path() -> Result<()> {
         let temp = tempdir()?;
         let repo_root = temp.path().join("plain-dir");
@@ -479,6 +519,24 @@ mod tests {
             .join(".claude")
             .join("worktrees")
             .join("feature-wt");
+
+        let project = resolve_project_from_cwd(&missing_worktree);
+
+        assert_eq!(project.identity_kind, ProjectIdentityKind::Path);
+        assert_eq!(project.root_path, missing_worktree);
+        assert_eq!(
+            project.identity_reason.as_deref(),
+            Some(PATH_REASON_GIT_ROOT_NOT_FOUND),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_repo_local_worktree_pattern_without_git_repo_stays_path() -> Result<()> {
+        let temp = tempdir()?;
+        let repo_root = temp.path().join("plain-dir");
+        fs::create_dir_all(&repo_root)?;
+        let missing_worktree = repo_root.join(".worktrees").join("feature-wt");
 
         let project = resolve_project_from_cwd(&missing_worktree);
 
