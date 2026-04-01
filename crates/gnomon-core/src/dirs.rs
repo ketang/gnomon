@@ -15,6 +15,10 @@ pub fn default_state_dir() -> Result<PathBuf> {
         .context("unable to resolve a writable state directory for gnomon")
 }
 
+pub fn default_config_dir() -> Result<PathBuf> {
+    Ok(project_dirs()?.config_dir().to_path_buf())
+}
+
 pub fn default_source_root() -> Result<PathBuf> {
     let base_dirs = BaseDirs::new().context("unable to resolve the current home directory")?;
     Ok(base_dirs.home_dir().join(".claude").join("projects"))

@@ -217,8 +217,11 @@ mod tests {
         RuntimeConfig {
             app_name: "gnomon",
             state_dir: root.to_path_buf(),
+            config_path: root.join("config.toml"),
             db_path: root.join("usage.sqlite3"),
             source_root: root.join("source"),
+            project_identity: Default::default(),
+            project_filters: Vec::new(),
         }
     }
 }

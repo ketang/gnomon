@@ -52,8 +52,11 @@ fn main() -> Result<()> {
     let config = RuntimeConfig {
         app_name: "gnomon",
         state_dir,
+        config_path: default_state_dir(&cli.db).join("config.toml"),
         db_path: cli.db,
         source_root,
+        project_identity: Default::default(),
+        project_filters: Vec::new(),
     };
     config.ensure_dirs()?;
 
