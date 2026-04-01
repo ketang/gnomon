@@ -6,8 +6,11 @@ use std::thread::{self, JoinHandle};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use gnomon_core::benchmark::{QueryBenchmarkOptions, QueryBenchmarkReport, run_query_benchmark};
+use gnomon_core::browse_cache::{
+    DerivedCacheResetReport, default_browse_cache_path, reset_derived_cache_artifacts,
+};
 use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
-use gnomon_core::db::{Database, ResetReport, reset_sqlite_database};
+use gnomon_core::db::{Database, ResetReport};
 use gnomon_core::import::{
     StartupProgressUpdate, StartupWorkerEvent, import_all, scan_source_manifest_with_policy,
     start_startup_import, start_startup_import_with_progress,
@@ -73,9 +76,9 @@ struct DbCommand {
 
 #[derive(Debug, Subcommand)]
 enum DbSubcommand {
-    /// Remove the derived SQLite cache file and its WAL sidecars.
+    /// Remove the derived usage database and persisted browse-cache artifacts.
     Reset(ResetArgs),
-    /// Recreate the derived SQLite cache from the source manifest and session history.
+    /// Recreate the derived usage database after clearing persisted cache artifacts.
     Rebuild,
 }
 
@@ -393,8 +396,8 @@ fn run_db_command(config: &RuntimeConfig, command: DbSubcommand) -> Result<()> {
                 );
             }
 
-            let report = reset_sqlite_database(&config.db_path)?;
-            print_reset_report(&config.db_path, &report);
+            let report = reset_derived_cache_artifacts(&config.db_path, &config.state_dir)?;
+            print_derived_reset_report(&config.state_dir, &config.db_path, &report);
             Ok(())
         }
         DbSubcommand::Rebuild => rebuild_database(config),
@@ -533,7 +536,7 @@ fn build_query_benchmark_report(
 }
 
 fn rebuild_database(config: &RuntimeConfig) -> Result<()> {
-    let reset_report = reset_sqlite_database(&config.db_path)?;
+    let reset_report = reset_derived_cache_artifacts(&config.db_path, &config.state_dir)?;
     let mut database = Database::open(&config.db_path)?;
     let scan_report = scan_source_manifest_with_policy(
         &mut database,
@@ -544,7 +547,7 @@ fn rebuild_database(config: &RuntimeConfig) -> Result<()> {
     let import_report = import_all(database.connection(), &config.db_path, &config.source_root)?;
     let completed_chunks = count_completed_chunks(&config.db_path)?;
 
-    print_reset_report(&config.db_path, &reset_report);
+    print_derived_reset_report(&config.state_dir, &config.db_path, &reset_report);
     println!(
         "Rebuilt {} from {} discovered source files across {} completed chunks ({} startup, {} deferred).",
         config.db_path.display(),
@@ -713,6 +716,12 @@ fn print_reset_report(db_path: &Path, report: &ResetReport) {
             println!("  deleted {}", path.display());
         }
     }
+}
+
+fn print_derived_reset_report(state_dir: &Path, db_path: &Path, report: &DerivedCacheResetReport) {
+    print_reset_report(db_path, &report.database);
+    let browse_cache_path = default_browse_cache_path(state_dir);
+    print_reset_report(&browse_cache_path, &report.browse_cache);
 }
 
 fn count_completed_chunks(db_path: &Path) -> Result<i64> {
@@ -1300,6 +1309,22 @@ mod tests {
     }
 
     #[test]
+    fn reset_deletes_browse_cache_file_when_forced() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let config = load_test_config(temp.path(), db_path, temp.path().join("source"))?;
+        config.ensure_dirs()?;
+        let browse_cache_path =
+            gnomon_core::browse_cache::default_browse_cache_path(&config.state_dir);
+        fs::write(&browse_cache_path, "seed")?;
+
+        run_db_command(&config, DbSubcommand::Reset(ResetArgs { force: true }))?;
+
+        assert!(!browse_cache_path.exists());
+        Ok(())
+    }
+
+    #[test]
     fn rebuild_recreates_database_from_source_history() -> Result<()> {
         let temp = tempdir()?;
         let db_path = temp.path().join("usage.sqlite3");
@@ -1326,6 +1351,28 @@ mod tests {
         assert_eq!(conversation_count, 1);
         assert_eq!(count_completed_chunks(&db_path)?, 1);
 
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_deletes_browse_cache_before_reimport() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let project_root = temp.path().join("project");
+        init_git_repo(&project_root)?;
+        write_jsonl(&source_root.join("project/session.jsonl"), &project_root)?;
+
+        let config = load_test_config(temp.path(), db_path.clone(), source_root)?;
+        config.ensure_dirs()?;
+        let browse_cache_path =
+            gnomon_core::browse_cache::default_browse_cache_path(&config.state_dir);
+        fs::write(&browse_cache_path, "seed")?;
+
+        run_db_command(&config, DbSubcommand::Rebuild)?;
+
+        assert!(!browse_cache_path.exists());
+        assert!(db_path.exists());
         Ok(())
     }
 

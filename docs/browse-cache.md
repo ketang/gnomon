@@ -52,3 +52,7 @@ The lookup order is:
 
 When a persisted entry is used, it is hydrated back into the in-memory cache so
 subsequent requests in the same session reuse the normal fast path.
+
+CLI `db reset --force` removes the sidecar entirely. Database rebuild clears
+persisted browse-cache artifacts before reimport so stale entries cannot remain
+keyed to recycled publish-sequence values.

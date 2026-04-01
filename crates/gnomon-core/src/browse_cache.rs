@@ -301,6 +301,32 @@ pub fn default_browse_cache_path(state_dir: &Path) -> PathBuf {
     state_dir.join(DEFAULT_BROWSE_CACHE_FILENAME)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedCacheResetReport {
+    pub database: ResetReport,
+    pub browse_cache: ResetReport,
+}
+
+impl DerivedCacheResetReport {
+    pub fn removed_path_count(&self) -> usize {
+        self.database.removed_paths.len() + self.browse_cache.removed_paths.len()
+    }
+}
+
+pub fn reset_derived_cache_artifacts(
+    db_path: impl AsRef<Path>,
+    state_dir: impl AsRef<Path>,
+) -> Result<DerivedCacheResetReport> {
+    let browse_cache_path = default_browse_cache_path(state_dir.as_ref());
+
+    Ok(DerivedCacheResetReport {
+        // Clear the sidecar first so a later database-reset failure does not
+        // leave stale persisted browse rows attached to an unchanged database.
+        browse_cache: reset_browse_cache(&browse_cache_path)?,
+        database: reset_sqlite_database(db_path)?,
+    })
+}
+
 pub fn reset_browse_cache(path: impl AsRef<Path>) -> Result<ResetReport> {
     reset_sqlite_database(path)
 }
@@ -339,7 +365,10 @@ mod tests {
     use anyhow::Result;
     use tempfile::tempdir;
 
-    use super::{BrowseCacheStats, BrowseCacheStore};
+    use super::{
+        BrowseCacheStats, BrowseCacheStore, default_browse_cache_path,
+        reset_derived_cache_artifacts,
+    };
     use crate::query::{
         ActionKey, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState, MetricIndicators,
         MetricLens, MetricTotals, RollupRow, RollupRowKind, RootView, SnapshotBounds,
@@ -407,6 +436,22 @@ mod tests {
         assert!(loaded_a.is_none() || loaded_b.is_none());
         assert!(loaded_a.is_some() || loaded_b.is_some());
         assert!(store.stats()?.total_payload_bytes <= budget);
+        Ok(())
+    }
+
+    #[test]
+    fn reset_derived_cache_artifacts_removes_database_and_browse_cache() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let browse_cache_path = default_browse_cache_path(temp.path());
+        std::fs::write(&db_path, "db")?;
+        std::fs::write(&browse_cache_path, "browse-cache")?;
+
+        let report = reset_derived_cache_artifacts(&db_path, temp.path())?;
+
+        assert_eq!(report.removed_path_count(), 2);
+        assert!(!db_path.exists());
+        assert!(!browse_cache_path.exists());
         Ok(())
     }
 
