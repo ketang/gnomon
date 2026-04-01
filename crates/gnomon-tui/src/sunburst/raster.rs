@@ -18,13 +18,12 @@ pub(crate) fn rasterize_sunburst(
     buf: &mut Buffer,
     inner: ratatui::layout::Rect,
     model: &SunburstModel,
-    focused: bool,
     config: SunburstRenderConfig,
 ) {
     debug_assert!(SUPPORTED_RENDER_MODES.contains(&config.mode));
     match config.mode {
-        SunburstRenderMode::Coarse => rasterize_coarse(buf, inner, model, focused, config),
-        SunburstRenderMode::Braille => rasterize_braille(buf, inner, model, focused, config),
+        SunburstRenderMode::Coarse => rasterize_coarse(buf, inner, model, config),
+        SunburstRenderMode::Braille => rasterize_braille(buf, inner, model, config),
     }
 }
 
@@ -32,7 +31,6 @@ fn rasterize_coarse(
     buf: &mut Buffer,
     inner: ratatui::layout::Rect,
     model: &SunburstModel,
-    focused: bool,
     config: SunburstRenderConfig,
 ) {
     let layer_count = model.layers.len();
@@ -71,7 +69,7 @@ fn rasterize_coarse(
             };
 
             if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_style(sunburst_segment_style(segment, focused));
+                cell.set_style(sunburst_segment_style(segment));
                 cell.set_char(COARSE_FILL);
             }
         }
@@ -82,7 +80,6 @@ fn rasterize_braille(
     buf: &mut Buffer,
     inner: ratatui::layout::Rect,
     model: &SunburstModel,
-    focused: bool,
     config: SunburstRenderConfig,
 ) {
     const DOT_SAMPLES: [(f64, f64, u32); 8] = [
@@ -155,25 +152,17 @@ fn rasterize_braille(
             };
 
             if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_style(sunburst_braille_style(segment, focused));
+                cell.set_style(sunburst_braille_style(segment));
                 cell.set_char(symbol);
             }
         }
     }
 }
 
-/// Color used to de-emphasize cached or unfocused segments instead of the
-/// terminal-dependent `DIM` modifier, which can make braille dots invisible.
-const CACHE_DEEMPH_COLOR: Color = Color::Indexed(239);
-
-fn sunburst_segment_style(segment: &SunburstSegment, focused: bool) -> Style {
+fn sunburst_segment_style(segment: &SunburstSegment) -> Style {
     let mut style = Style::default()
         .bg(sunburst_bucket_color(segment.bucket))
         .fg(Color::Black);
-
-    if !focused {
-        style = style.bg(CACHE_DEEMPH_COLOR);
-    }
 
     if segment.is_selected {
         style = style.fg(Color::White).add_modifier(Modifier::BOLD);
@@ -182,12 +171,8 @@ fn sunburst_segment_style(segment: &SunburstSegment, focused: bool) -> Style {
     style
 }
 
-fn sunburst_braille_style(segment: &SunburstSegment, focused: bool) -> Style {
+fn sunburst_braille_style(segment: &SunburstSegment) -> Style {
     let mut style = Style::default().fg(sunburst_bucket_color(segment.bucket));
-
-    if !focused {
-        style = style.fg(CACHE_DEEMPH_COLOR);
-    }
 
     if segment.is_selected {
         style = style.fg(Color::White).add_modifier(Modifier::BOLD);
@@ -252,7 +237,7 @@ mod tests {
     #[test]
     fn segment_style_no_underline_when_selected() {
         let seg = make_segment(SunburstBucket::Project, true);
-        let style = sunburst_segment_style(&seg, true);
+        let style = sunburst_segment_style(&seg);
         assert!(style.add_modifier.contains(Modifier::BOLD));
         assert!(!style.add_modifier.contains(Modifier::UNDERLINED));
     }
@@ -260,7 +245,7 @@ mod tests {
     #[test]
     fn braille_style_no_underline_when_selected() {
         let seg = make_segment(SunburstBucket::Project, true);
-        let style = sunburst_braille_style(&seg, true);
+        let style = sunburst_braille_style(&seg);
         assert!(style.add_modifier.contains(Modifier::BOLD));
         assert!(!style.add_modifier.contains(Modifier::UNDERLINED));
     }
@@ -269,7 +254,7 @@ mod tests {
     fn segment_style_bucket_color_when_focused_and_high_cached_ratio() {
         // cached_ratio no longer affects color — bucket color always shows when focused
         let seg = make_segment(SunburstBucket::Classified, false);
-        let style = sunburst_segment_style(&seg, true);
+        let style = sunburst_segment_style(&seg);
         assert_eq!(
             style.bg,
             Some(sunburst_bucket_color(SunburstBucket::Classified))
@@ -277,16 +262,19 @@ mod tests {
     }
 
     #[test]
-    fn segment_style_deemphasized_when_unfocused() {
+    fn segment_style_preserves_bucket_color_when_unfocused() {
         let seg = make_segment(SunburstBucket::Classified, false);
-        let style = sunburst_segment_style(&seg, false);
-        assert_eq!(style.bg, Some(CACHE_DEEMPH_COLOR));
+        let style = sunburst_segment_style(&seg);
+        assert_eq!(
+            style.bg,
+            Some(sunburst_bucket_color(SunburstBucket::Classified))
+        );
     }
 
     #[test]
     fn segment_style_bucket_color_when_focused_and_uncached() {
         let seg = make_segment(SunburstBucket::Classified, false);
-        let style = sunburst_segment_style(&seg, true);
+        let style = sunburst_segment_style(&seg);
         assert_eq!(
             style.bg,
             Some(sunburst_bucket_color(SunburstBucket::Classified))
@@ -297,7 +285,7 @@ mod tests {
     fn braille_style_bucket_color_when_focused_and_high_cached_ratio() {
         // cached_ratio no longer affects color — bucket color always shows when focused
         let seg = make_segment(SunburstBucket::Category, false);
-        let style = sunburst_braille_style(&seg, true);
+        let style = sunburst_braille_style(&seg);
         assert_eq!(
             style.fg,
             Some(sunburst_bucket_color(SunburstBucket::Category))
@@ -305,23 +293,26 @@ mod tests {
     }
 
     #[test]
-    fn braille_style_deemphasized_when_unfocused() {
+    fn braille_style_preserves_bucket_color_when_unfocused() {
         let seg = make_segment(SunburstBucket::Category, false);
-        let style = sunburst_braille_style(&seg, false);
-        assert_eq!(style.fg, Some(CACHE_DEEMPH_COLOR));
+        let style = sunburst_braille_style(&seg);
+        assert_eq!(
+            style.fg,
+            Some(sunburst_bucket_color(SunburstBucket::Category))
+        );
     }
 
     #[test]
     fn braille_style_selected_overrides_fg_to_white() {
         let seg = make_segment(SunburstBucket::Mixed, true);
-        let style = sunburst_braille_style(&seg, true);
+        let style = sunburst_braille_style(&seg);
         assert_eq!(style.fg, Some(Color::White));
     }
 
     #[test]
     fn segment_style_selected_overrides_fg_to_white() {
         let seg = make_segment(SunburstBucket::Mixed, true);
-        let style = sunburst_segment_style(&seg, true);
+        let style = sunburst_segment_style(&seg);
         assert_eq!(style.fg, Some(Color::White));
         assert_eq!(style.bg, Some(Color::Indexed(179)));
     }
