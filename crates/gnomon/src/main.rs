@@ -292,6 +292,7 @@ enum RootViewArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum MetricLensArg {
     UncachedInput,
+    #[value(name = "all-input", alias = "gross-input")]
     GrossInput,
     Output,
     Total,
@@ -988,6 +989,7 @@ mod tests {
         ResetArgs, RootViewArg, StartupArgs, build_browse_report, build_query_benchmark_report,
         count_completed_chunks, filter_opportunities, rebuild_database, run_db_command,
     };
+    use clap::ValueEnum;
     use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
     use gnomon_core::db::Database;
     use gnomon_core::import::StartupWorkerEvent;
@@ -1084,6 +1086,50 @@ mod tests {
             Some(Command::Opportunities(_)) => panic!("expected db command"),
             Some(Command::Snapshot(_)) => panic!("expected db command"),
             None => panic!("expected db command"),
+        }
+    }
+
+    #[test]
+    fn metric_lens_value_enum_uses_all_input_name() {
+        let gross_input = MetricLensArg::value_variants()
+            .iter()
+            .find(|variant| matches!(variant, MetricLensArg::GrossInput))
+            .expect("gross input variant");
+
+        assert_eq!(
+            gross_input
+                .to_possible_value()
+                .expect("possible value")
+                .get_name(),
+            "all-input"
+        );
+    }
+
+    #[test]
+    fn parse_accepts_all_input_metric_lens() {
+        let cli = Cli::parse_from(["gnomon", "report", "--lens", "all-input"]);
+
+        match cli.command {
+            Some(Command::Report(args)) => assert_eq!(args.lens, MetricLensArg::GrossInput),
+            Some(Command::Db(_)) => panic!("expected report command"),
+            Some(Command::Benchmark(_)) => panic!("expected report command"),
+            Some(Command::Opportunities(_)) => panic!("expected report command"),
+            Some(Command::Snapshot(_)) => panic!("expected report command"),
+            None => panic!("expected report command"),
+        }
+    }
+
+    #[test]
+    fn parse_accepts_legacy_gross_input_metric_lens_alias() {
+        let cli = Cli::parse_from(["gnomon", "report", "--lens", "gross-input"]);
+
+        match cli.command {
+            Some(Command::Report(args)) => assert_eq!(args.lens, MetricLensArg::GrossInput),
+            Some(Command::Db(_)) => panic!("expected report command"),
+            Some(Command::Benchmark(_)) => panic!("expected report command"),
+            Some(Command::Opportunities(_)) => panic!("expected report command"),
+            Some(Command::Snapshot(_)) => panic!("expected report command"),
+            None => panic!("expected report command"),
         }
     }
 

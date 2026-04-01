@@ -1660,7 +1660,7 @@ impl App {
         let lines = vec![
             Line::from("Toggle optional columns:"),
             Line::from(format!(
-                "k kind [{}]   g gross [{}]   o output [{}]   t total [{}]",
+                "k kind [{}]   g all input [{}]   o output [{}]   t total [{}]",
                 toggle_mark(cols, OptionalColumn::Kind),
                 toggle_mark(cols, OptionalColumn::GrossInput),
                 toggle_mark(cols, OptionalColumn::Output),
@@ -5374,7 +5374,7 @@ impl OptionalColumn {
     fn short_label(self) -> &'static str {
         match self {
             Self::Kind => "kind",
-            Self::GrossInput => "gross",
+            Self::GrossInput => "all input",
             Self::Output => "output",
             Self::Total => "total",
             Self::Last5Hours => "5h",
@@ -5574,7 +5574,7 @@ fn optional_column_spec(column: &OptionalColumn) -> ColumnSpec {
         },
         OptionalColumn::GrossInput => ColumnSpec {
             key: ColumnKey::Optional(OptionalColumn::GrossInput),
-            title: "gross".to_string(),
+            title: "all input".to_string(),
             constraint: Constraint::Length(10),
         },
         OptionalColumn::Output => ColumnSpec {
@@ -5769,7 +5769,7 @@ fn drillability_glyph(root: &RootView, current_path: &BrowsePath, row: &RollupRo
 pub(crate) fn metric_lens_label(lens: MetricLens) -> &'static str {
     match lens {
         MetricLens::UncachedInput => "uncached",
-        MetricLens::GrossInput => "gross",
+        MetricLens::GrossInput => "all input",
         MetricLens::Output => "output",
         MetricLens::Total => "total",
     }
@@ -7272,6 +7272,16 @@ mod tests {
         assert!(columns.len() < default_enabled_columns().len() + 2);
         assert_eq!(columns[0].key, ColumnKey::Label);
         assert_eq!(columns[1].key, ColumnKey::SelectedLens);
+    }
+
+    #[test]
+    fn gross_metric_labels_use_all_input_wording() {
+        assert_eq!(metric_lens_label(MetricLens::GrossInput), "all input");
+        assert_eq!(OptionalColumn::GrossInput.short_label(), "all input");
+        assert_eq!(
+            optional_column_spec(&OptionalColumn::GrossInput).title,
+            "all input"
+        );
     }
 
     #[test]
