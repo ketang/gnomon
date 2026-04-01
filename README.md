@@ -167,10 +167,11 @@ to refresh existing cached aggregates and filters.
 Run `db rebuild` after pulling a version that changes project identity
 resolution as well. Identity fixes only affect newly imported manifest rows, so
 an existing cache can keep stale project records until it is rebuilt.
-This includes stale Claude worktree recovery: when a transcript `cwd` points at
-`.../.claude/worktrees/...` and that worktree no longer exists, `gnomon` now
-probes the repo root above the recognized worktree segment and re-attributes
-the session to the canonical Git project when possible.
+This includes stale worktree recovery: when a transcript `cwd` points at
+`.../.claude/worktrees/...` or repo-local `.../.worktrees/...` and that
+worktree no longer exists, `gnomon` probes the repo root above the recognized
+worktree segment and re-attributes the session to the canonical Git project
+when possible.
 Project-filter changes also require a rebuild before the existing cache will
 reflect the new include/exclude policy.
 Apply the same rebuild step after pulling a version that bumps the importer
@@ -183,7 +184,8 @@ Common stale-identity symptoms include:
 - duplicate top-level project rows for what should be one repo
 - ephemeral labels derived from worktree or agent directory names
 - project metadata that still points at an old root path or fallback identity
-- rows rooted under deleted Claude worktrees such as `.../.claude/worktrees/...`
+- rows rooted under deleted worktrees such as `.../.claude/worktrees/...` or
+  `.../.worktrees/...`
 
 Recovery path:
 

@@ -115,8 +115,8 @@ Working top-level action taxonomy:
   before they enter the derived cache
 - The identity policy surface should own narrow recovery heuristics such as
   stale Claude worktree re-attribution
-- Missing Claude worktree paths under a recognized `.../.claude/worktrees/...`
-  layout are a narrow exception:
+- Missing worktree paths under recognized `.../.claude/worktrees/...` or
+  repo-local `.../.worktrees/...` layouts are a narrow exception:
   `v1` recovers the candidate repo root above that worktree segment and uses it
   only when Git can still resolve a canonical root from that recovered path
 - `v1` does not perform broad longest-prefix or cross-session project inference
