@@ -3,6 +3,7 @@ members = [
   "crates/gnomon",
   "crates/gnomon-core",
   "crates/gnomon-tui",
+  "crates/gnomon-web",
 ]
 default-members = ["crates/gnomon"]
 resolver = "2"
@@ -14,6 +15,7 @@ rust-version = "1.93"
 
 [workspace.dependencies]
 anyhow = "1.0"
+axum = "0.8.8"
 clap = { version = "4.6.0", features = ["derive", "env"] }
 crossterm = "0.29.0"
 directories = "6.0.0"
@@ -32,6 +34,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 walkdir = "2.5.0"
 tempfile = "3.10.1"
+tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread"] }
+tower = { version = "0.5.2", features = ["util"] }
 
 [workspace.lints.clippy]
 dbg_macro = "deny"
