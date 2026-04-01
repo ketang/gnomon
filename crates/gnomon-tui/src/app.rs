@@ -912,6 +912,7 @@ pub struct App {
     query_cache: QueryResultCache,
     selection_context_cache: SelectionContextCache,
     row_cache: Vec<CachedRows>,
+    remembered_selections: Vec<RememberedSelection>,
     expanded_paths: Vec<BrowsePath>,
     selected_project_identity: Option<SelectedProjectIdentity>,
     show_inspect_pane: bool,
@@ -996,6 +997,7 @@ impl App {
             query_cache: QueryResultCache::default(),
             selection_context_cache: SelectionContextCache::default(),
             row_cache: Vec::new(),
+            remembered_selections: Vec::new(),
             expanded_paths: Vec::new(),
             selected_project_identity: None,
             show_inspect_pane: false,
@@ -2481,23 +2483,34 @@ impl App {
             return Ok(());
         }
 
-        if let Some(preferred_key) = preferred_key
-            && let Some(index) = self
-                .visible_rows
-                .iter()
-                .position(|row| row.key() == preferred_key)
+        if let Some(index) = preferred_key
+            .as_ref()
+            .filter(|preferred_key| preferred_key.parent_path == self.ui_state.path)
+            .and_then(|preferred_key| {
+                self.visible_rows
+                    .iter()
+                    .position(|row| row.key() == *preferred_key)
+            })
         {
             self.table_state.select(Some(index));
             self.rebuild_radial_model();
             return Ok(());
         }
 
-        let selected = self
-            .table_state
-            .selected()
-            .unwrap_or(0)
-            .min(self.visible_rows.len().saturating_sub(1));
-        self.table_state.select(Some(selected));
+        if let Some(index) = self
+            .remembered_selection_for_current_path()
+            .and_then(|selected_key| {
+                self.visible_rows
+                    .iter()
+                    .position(|row| row.key() == selected_key)
+            })
+        {
+            self.table_state.select(Some(index));
+            self.rebuild_radial_model();
+            return Ok(());
+        }
+
+        self.table_state.select(Some(0));
         self.rebuild_radial_model();
         Ok(())
     }
@@ -3278,6 +3291,7 @@ impl App {
     }
 
     fn refresh_active_context_for_selection(&mut self) {
+        self.remember_selection_for_current_path();
         let selected_row = self.selected_tree_row().cloned();
         let active_path = self.active_path();
         let selected_row_key = selected_row.as_ref().map(TreeRow::key);
@@ -3333,6 +3347,34 @@ impl App {
         self.selected_tree_row()
             .and_then(|row| row.node_path.clone())
             .unwrap_or_else(|| self.ui_state.path.clone())
+    }
+
+    fn remember_selection_for_current_path(&mut self) {
+        let Some(selected_key) = self.selected_tree_row_key() else {
+            return;
+        };
+
+        if let Some(existing) = self.remembered_selections.iter_mut().find(|existing| {
+            existing.root == self.ui_state.root && existing.path == self.ui_state.path
+        }) {
+            existing.selected_key = selected_key;
+            return;
+        }
+
+        self.remembered_selections.push(RememberedSelection {
+            root: self.ui_state.root,
+            path: self.ui_state.path.clone(),
+            selected_key,
+        });
+    }
+
+    fn remembered_selection_for_current_path(&self) -> Option<TreeRowKey> {
+        self.remembered_selections
+            .iter()
+            .find(|existing| {
+                existing.root == self.ui_state.root && existing.path == self.ui_state.path
+            })
+            .map(|existing| existing.selected_key.clone())
     }
 
     fn active_radial_state(&self) -> (BrowsePath, Vec<RollupRow>, Option<RollupRow>) {
@@ -3420,6 +3462,13 @@ impl App {
 struct CachedRows {
     path: BrowsePath,
     rows: Vec<RollupRow>,
+}
+
+#[derive(Debug, Clone)]
+struct RememberedSelection {
+    root: RootView,
+    path: BrowsePath,
+    selected_key: TreeRowKey,
 }
 
 #[derive(Debug, Clone)]
@@ -8536,6 +8585,155 @@ mod tests {
     }
 
     #[test]
+    fn drilldown_selection_defaults_to_first_on_first_visit_and_restores_on_revisit() -> Result<()>
+    {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        let root_ui_state = PersistedUiState {
+            root: RootView::ProjectHierarchy,
+            path: BrowsePath::Root,
+            ..PersistedUiState::default()
+        };
+        let child_path = BrowsePath::Project { project_id: 4 };
+        let child_ui_state = PersistedUiState {
+            root: RootView::ProjectHierarchy,
+            path: child_path.clone(),
+            ..PersistedUiState::default()
+        };
+        let root_rows = vec![
+            radial_row(RadialRowSpec {
+                key: "project:1",
+                label: "project-1",
+                kind: RollupRowKind::Project,
+                value: 1.0,
+                project_id: Some(1),
+                category: None,
+                action: None,
+                full_path: Some("/tmp/project-1"),
+            }),
+            radial_row(RadialRowSpec {
+                key: "project:2",
+                label: "project-2",
+                kind: RollupRowKind::Project,
+                value: 2.0,
+                project_id: Some(2),
+                category: None,
+                action: None,
+                full_path: Some("/tmp/project-2"),
+            }),
+            radial_row(RadialRowSpec {
+                key: "project:3",
+                label: "project-3",
+                kind: RollupRowKind::Project,
+                value: 3.0,
+                project_id: Some(3),
+                category: None,
+                action: None,
+                full_path: Some("/tmp/project-3"),
+            }),
+            radial_row(RadialRowSpec {
+                key: "project:4",
+                label: "project-4",
+                kind: RollupRowKind::Project,
+                value: 4.0,
+                project_id: Some(4),
+                category: None,
+                action: None,
+                full_path: Some("/tmp/project-4"),
+            }),
+        ];
+        let child_rows = vec![
+            radial_row(RadialRowSpec {
+                key: "category:editing",
+                label: "editing",
+                kind: RollupRowKind::ActionCategory,
+                value: 1.0,
+                project_id: Some(4),
+                category: Some("editing"),
+                action: None,
+                full_path: Some("/tmp/project-4"),
+            }),
+            radial_row(RadialRowSpec {
+                key: "category:debugging",
+                label: "debugging",
+                kind: RollupRowKind::ActionCategory,
+                value: 1.0,
+                project_id: Some(4),
+                category: Some("debugging"),
+                action: None,
+                full_path: Some("/tmp/project-4"),
+            }),
+            radial_row(RadialRowSpec {
+                key: "category:tests",
+                label: "tests",
+                kind: RollupRowKind::ActionCategory,
+                value: 1.0,
+                project_id: Some(4),
+                category: Some("tests"),
+                action: None,
+                full_path: Some("/tmp/project-4"),
+            }),
+            radial_row(RadialRowSpec {
+                key: "category:docs",
+                label: "docs",
+                kind: RollupRowKind::ActionCategory,
+                value: 1.0,
+                project_id: Some(4),
+                category: Some("docs"),
+                action: None,
+                full_path: Some("/tmp/project-4"),
+            }),
+        ];
+
+        app.apply_loaded_view(loaded_view_for_test(
+            root_ui_state.clone(),
+            root_rows.clone(),
+            None,
+        ))?;
+        assert_eq!(app.table_state.selected(), Some(0));
+
+        app.table_state.select(Some(3));
+        app.refresh_active_context_for_selection();
+        let parent_selected_key = app.selected_tree_row_key();
+
+        app.apply_loaded_view(loaded_view_for_test(
+            child_ui_state.clone(),
+            child_rows.clone(),
+            parent_selected_key.clone(),
+        ))?;
+        assert_eq!(app.table_state.selected(), Some(0));
+
+        app.table_state.select(Some(3));
+        app.refresh_active_context_for_selection();
+        let child_selected_key = app.selected_tree_row_key();
+
+        app.apply_loaded_view(loaded_view_for_test(
+            root_ui_state,
+            root_rows,
+            child_selected_key,
+        ))?;
+        assert_eq!(app.table_state.selected(), Some(3));
+
+        app.apply_loaded_view(loaded_view_for_test(
+            child_ui_state,
+            child_rows,
+            parent_selected_key,
+        ))?;
+        assert_eq!(app.table_state.selected(), Some(3));
+        Ok(())
+    }
+
+    #[test]
     fn prefetch_batch_logs_source_counts() -> Result<()> {
         let temp = tempdir()?;
         let log_path = temp.path().join("perf.jsonl");
@@ -8691,6 +8889,24 @@ mod tests {
             models: Vec::new(),
             categories: Vec::new(),
             actions: Vec::new(),
+        }
+    }
+
+    fn loaded_view_for_test(
+        ui_state: PersistedUiState,
+        raw_rows: Vec<RollupRow>,
+        selected_key: Option<TreeRowKey>,
+    ) -> LoadedView {
+        LoadedView {
+            snapshot: SnapshotBounds::bootstrap(),
+            snapshot_coverage: SnapshotCoverageSummary::default(),
+            ui_state,
+            filter_options: sample_filter_options(),
+            raw_rows,
+            breadcrumb_targets: Vec::new(),
+            radial_context: RadialContext::default(),
+            current_project_root: None,
+            selected_key,
         }
     }
 
