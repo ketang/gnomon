@@ -2,9 +2,7 @@ use gnomon_core::query::{
     ClassificationState, FilterOptions, MetricLens, RollupRow, RollupRowKind,
 };
 
-use crate::app::{
-    cached_ratio, describe_browse_path, format_metric, metric_lens_label, row_kind_label,
-};
+use crate::app::{describe_browse_path, format_metric, metric_lens_label, row_kind_label};
 use crate::sunburst::{
     SunburstBucket, SunburstCenter, SunburstLayer, SunburstModel, SunburstSegment, SunburstSpan,
 };
@@ -69,7 +67,6 @@ pub(crate) fn build_sunburst_layer(
         .iter()
         .map(|row| SunburstSegment {
             value: row.metrics.lens_value(lens),
-            cached_ratio: cached_ratio(row),
             bucket: sunburst_bucket(row),
             is_selected: selected_key.is_some_and(|key| key == row.key),
         })

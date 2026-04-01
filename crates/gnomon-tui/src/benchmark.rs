@@ -189,7 +189,6 @@ fn synthetic_model(fixture: FixtureSpec) -> SunburstModel {
                     } else {
                         (segment_count - segment_index) as f64 + 1.0
                     },
-                    cached_ratio: if segment_index % 3 == 0 { 0.75 } else { 0.1 },
                     bucket: synthetic_bucket(layer_index, segment_index),
                     is_selected,
                 }
