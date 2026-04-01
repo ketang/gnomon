@@ -23,7 +23,9 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use gnomon_core::browse_cache::{BrowseCacheStore, default_browse_cache_path};
+use gnomon_core::browse_cache::{
+    BrowseCacheStore, default_browse_cache_path, reset_derived_cache_artifacts,
+};
 use gnomon_core::config::RuntimeConfig;
 use gnomon_core::db::{Database, reset_sqlite_database, sqlite_artifact_size_bytes};
 use gnomon_core::import::{
@@ -1571,7 +1573,7 @@ impl App {
                     badge("warning", BadgeTone::Warning),
                     separator_span(),
                     Span::raw(
-                        "Database rebuild is separate from browse-cache maintenance and reimports the full derived cache.",
+                        "Database rebuild clears persisted browse-cache artifacts before reimporting the full derived cache.",
                     ),
                 ]),
             ],
@@ -1784,7 +1786,7 @@ impl App {
                 vec![
                     Line::from("Rebuild the derived usage database?"),
                     Line::from(
-                        "This is separate from browse-cache maintenance and reruns source scan plus full import.",
+                        "This clears persisted browse-cache artifacts, reruns source scan, and performs a full import.",
                     ),
                     Line::from(""),
                     Line::from("Enter confirms. Esc cancels."),
@@ -2352,19 +2354,27 @@ impl App {
             .config
             .state_dir
             .join("db-maintenance-placeholder.sqlite3");
+        let placeholder_browse_cache_path = self
+            .config
+            .state_dir
+            .join("browse-cache-maintenance-placeholder.sqlite3");
         let placeholder_database = Database::open(&placeholder_db_path)?;
+        let placeholder_browse_cache = BrowseCacheStore::open(&placeholder_browse_cache_path)?;
         let placeholder_worker = QueryWorker::spawn(
             placeholder_db_path.clone(),
-            browse_cache_path.clone(),
+            placeholder_browse_cache_path.clone(),
             self.perf_logger.clone(),
         );
 
         let old_database = std::mem::replace(&mut self.database, placeholder_database);
+        let old_browse_cache = std::mem::replace(&mut self.browse_cache, placeholder_browse_cache);
         let old_worker = std::mem::replace(&mut self.worker, placeholder_worker);
         drop(old_worker);
+        drop(old_browse_cache);
         drop(old_database);
 
-        let reset_report = reset_sqlite_database(&self.config.db_path)?;
+        let reset_report =
+            reset_derived_cache_artifacts(&self.config.db_path, &self.config.state_dir)?;
         let mut database = Database::open(&self.config.db_path)?;
         let scan_report = scan_source_manifest_with_policy(
             &mut database,
@@ -2383,16 +2393,20 @@ impl App {
             |row| row.get(0),
         )?;
 
+        let browse_cache = BrowseCacheStore::open(&browse_cache_path)?;
         let worker = QueryWorker::spawn(
             self.config.db_path.clone(),
-            browse_cache_path,
+            browse_cache_path.clone(),
             self.perf_logger.clone(),
         );
         let placeholder_database = std::mem::replace(&mut self.database, database);
+        let placeholder_browse_cache = std::mem::replace(&mut self.browse_cache, browse_cache);
         let placeholder_worker = std::mem::replace(&mut self.worker, worker);
         drop(placeholder_worker);
+        drop(placeholder_browse_cache);
         drop(placeholder_database);
         let _ = reset_sqlite_database(&placeholder_db_path);
+        let _ = reset_sqlite_database(&placeholder_browse_cache_path);
 
         self.query_cache = QueryResultCache::default();
         self.row_cache.clear();
@@ -2421,7 +2435,7 @@ impl App {
         self.has_newer_snapshot = false;
         self.status_message = Some(StatusMessage::info(format!(
             "Rebuilt database: removed {} artifact(s), discovered {} source files, imported {} completed chunks ({} startup, {} deferred).",
-            reset_report.removed_paths.len(),
+            reset_report.removed_path_count(),
             scan_report.discovered_source_files,
             completed_chunks,
             import_report.startup_chunk_count,
