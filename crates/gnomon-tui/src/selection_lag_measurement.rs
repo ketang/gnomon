@@ -88,8 +88,11 @@ fn selection_move_measurement_trace_is_reproducible() -> Result<()> {
         RuntimeConfig {
             app_name: "gnomon",
             state_dir: temp.path().to_path_buf(),
+            config_path: temp.path().join("config.toml"),
             db_path: validation.db_path.clone(),
             source_root: validation.source_root.clone(),
+            project_identity: Default::default(),
+            project_filters: Vec::new(),
         },
         validation.final_snapshot.clone(),
         StartupOpenReason::Last24hReady,

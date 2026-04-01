@@ -3,7 +3,7 @@ use serde_json::Value;
 
 mod source;
 
-pub use source::{ScanReport, ScanWarning, scan_source_manifest};
+pub use source::{ScanReport, ScanWarning, scan_source_manifest, scan_source_manifest_with_policy};
 
 pub const STARTUP_IMPORT_WINDOW_HOURS: i64 = 24;
 pub const STARTUP_OPEN_DEADLINE_SECS: u64 = 10;

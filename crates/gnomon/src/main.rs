@@ -9,7 +9,7 @@ use gnomon_core::benchmark::{QueryBenchmarkOptions, QueryBenchmarkReport, run_qu
 use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
 use gnomon_core::db::{Database, ResetReport, reset_sqlite_database};
 use gnomon_core::import::{
-    StartupProgressUpdate, StartupWorkerEvent, import_all, scan_source_manifest,
+    StartupProgressUpdate, StartupWorkerEvent, import_all, scan_source_manifest_with_policy,
     start_startup_import, start_startup_import_with_progress,
 };
 use gnomon_core::opportunity::{OpportunityCategory, OpportunityConfidence, OpportunitySummary};
@@ -328,6 +328,7 @@ fn run(cli: Cli) -> Result<()> {
     let config = RuntimeConfig::load(ConfigOverrides {
         db_path: global.db,
         source_root: global.source_root,
+        ..Default::default()
     })?;
 
     match command {
@@ -345,7 +346,12 @@ fn run_app(config: &RuntimeConfig, startup_args: StartupArgs) -> Result<()> {
     let perf_logger = PerfLogger::from_env(&config.state_dir)?;
     let mut startup_progress = StartupConsoleProgress::stderr();
     let mut database = Database::open(&config.db_path)?;
-    let _scan_report = scan_source_manifest(&mut database, &config.source_root)?;
+    let _scan_report = scan_source_manifest_with_policy(
+        &mut database,
+        &config.source_root,
+        &config.project_identity,
+        &config.project_filters,
+    )?;
     let mut startup_import = start_startup_import_with_progress(
         database.connection(),
         &config.db_path,
@@ -406,7 +412,12 @@ fn run_report_command(config: &RuntimeConfig, args: &ReportArgs) -> Result<()> {
 fn run_snapshot_command(config: &RuntimeConfig, args: &SnapshotArgs) -> Result<()> {
     config.ensure_dirs()?;
     let mut database = Database::open(&config.db_path)?;
-    let _scan_report = scan_source_manifest(&mut database, &config.source_root)?;
+    let _scan_report = scan_source_manifest_with_policy(
+        &mut database,
+        &config.source_root,
+        &config.project_identity,
+        &config.project_filters,
+    )?;
     let mut startup_import =
         start_startup_import(database.connection(), &config.db_path, &config.source_root)?;
     let snapshot = startup_import.snapshot.clone();
@@ -524,7 +535,12 @@ fn build_query_benchmark_report(
 fn rebuild_database(config: &RuntimeConfig) -> Result<()> {
     let reset_report = reset_sqlite_database(&config.db_path)?;
     let mut database = Database::open(&config.db_path)?;
-    let scan_report = scan_source_manifest(&mut database, &config.source_root)?;
+    let scan_report = scan_source_manifest_with_policy(
+        &mut database,
+        &config.source_root,
+        &config.project_identity,
+        &config.project_filters,
+    )?;
     let import_report = import_all(database.connection(), &config.db_path, &config.source_root)?;
     let completed_chunks = count_completed_chunks(&config.db_path)?;
 
@@ -1256,10 +1272,11 @@ mod tests {
     #[test]
     fn reset_requires_force() -> Result<()> {
         let temp = tempdir()?;
-        let config = RuntimeConfig::load(ConfigOverrides {
-            db_path: Some(temp.path().join("usage.sqlite3")),
-            source_root: Some(temp.path().join("source")),
-        })?;
+        let config = load_test_config(
+            temp.path(),
+            temp.path().join("usage.sqlite3"),
+            temp.path().join("source"),
+        )?;
 
         let err = run_db_command(&config, DbSubcommand::Reset(ResetArgs::default()))
             .expect_err("reset should require force");
@@ -1272,10 +1289,7 @@ mod tests {
     fn reset_deletes_database_file_when_forced() -> Result<()> {
         let temp = tempdir()?;
         let db_path = temp.path().join("usage.sqlite3");
-        let config = RuntimeConfig::load(ConfigOverrides {
-            db_path: Some(db_path.clone()),
-            source_root: Some(temp.path().join("source")),
-        })?;
+        let config = load_test_config(temp.path(), db_path.clone(), temp.path().join("source"))?;
         config.ensure_dirs()?;
         fs::write(&db_path, "seed")?;
 
@@ -1294,10 +1308,7 @@ mod tests {
         init_git_repo(&project_root)?;
         write_jsonl(&source_root.join("project/session.jsonl"), &project_root)?;
 
-        let config = RuntimeConfig::load(ConfigOverrides {
-            db_path: Some(db_path.clone()),
-            source_root: Some(source_root),
-        })?;
+        let config = load_test_config(temp.path(), db_path.clone(), source_root)?;
 
         run_db_command(&config, DbSubcommand::Rebuild)?;
 
@@ -1335,10 +1346,7 @@ mod tests {
             )?;
         }
 
-        let config = RuntimeConfig::load(ConfigOverrides {
-            db_path: Some(db_path.clone()),
-            source_root: Some(source_root),
-        })?;
+        let config = load_test_config(temp.path(), db_path.clone(), source_root)?;
 
         run_db_command(&config, DbSubcommand::Rebuild)?;
 
@@ -1376,10 +1384,7 @@ mod tests {
         std::fs::write(&bad_path, malformed_bytes)?;
         set_file_modified_days_ago(&bad_path, 5)?;
 
-        let config = RuntimeConfig::load(ConfigOverrides {
-            db_path: Some(db_path.clone()),
-            source_root: Some(source_root),
-        })?;
+        let config = load_test_config(temp.path(), db_path.clone(), source_root)?;
 
         rebuild_database(&config)?;
 
@@ -1417,10 +1422,7 @@ mod tests {
         init_git_repo(&project_root)?;
         write_jsonl(&source_root.join("project/session.jsonl"), &project_root)?;
 
-        let config = RuntimeConfig::load(ConfigOverrides {
-            db_path: Some(db_path),
-            source_root: Some(source_root),
-        })?;
+        let config = load_test_config(temp.path(), db_path, source_root)?;
         run_db_command(&config, DbSubcommand::Rebuild)?;
 
         let report = build_browse_report(
@@ -1512,10 +1514,7 @@ mod tests {
         init_git_repo(&project_root)?;
         write_jsonl(&source_root.join("project/session.jsonl"), &project_root)?;
 
-        let config = RuntimeConfig::load(ConfigOverrides {
-            db_path: Some(db_path.clone()),
-            source_root: Some(source_root),
-        })?;
+        let config = load_test_config(temp.path(), db_path.clone(), source_root)?;
         run_db_command(&config, DbSubcommand::Rebuild)?;
 
         let project_id: i64 = Database::open(&db_path)?.connection().query_row(
@@ -1589,10 +1588,7 @@ mod tests {
             },
         )?;
 
-        let config = RuntimeConfig::load(ConfigOverrides {
-            db_path: Some(validation.db_path),
-            source_root: Some(validation.source_root),
-        })?;
+        let config = load_test_config(temp.path(), validation.db_path, validation.source_root)?;
 
         let report = build_query_benchmark_report(&config, &BenchmarkArgs { iterations: 2 })?;
 
@@ -1726,5 +1722,20 @@ mod tests {
             ));
         }
         Ok(())
+    }
+
+    fn load_test_config(
+        root: &Path,
+        db_path: PathBuf,
+        source_root: PathBuf,
+    ) -> Result<RuntimeConfig> {
+        let config_path = root.join("config.toml");
+        fs::write(&config_path, "")?;
+        RuntimeConfig::load(ConfigOverrides {
+            db_path: Some(db_path),
+            source_root: Some(source_root),
+            state_dir: Some(root.join("state")),
+            config_path: Some(config_path),
+        })
     }
 }

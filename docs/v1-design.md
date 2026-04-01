@@ -111,6 +111,10 @@ Working top-level action taxonomy:
 - Authoritative project identity is discovered from Git
 - `v1` supports `git` only
 - If a path cannot be resolved to a Git root, it becomes its own path-based project with a warning/reason
+- A user config file can apply include/exclude policy to discovered projects
+  before they enter the derived cache
+- The identity policy surface should own narrow recovery heuristics such as
+  stale Claude worktree re-attribution
 - Missing Claude worktree paths under a recognized `.../.claude/worktrees/...`
   layout are a narrow exception:
   `v1` recovers the candidate repo root above that worktree segment and uses it

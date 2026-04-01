@@ -76,6 +76,48 @@ Fresh launches open at the top level by default. Use `--startup-*` flags to
 open directly into a narrower drill-down view when you want to skip the root
 landing state.
 
+## Configuration
+
+`gnomon` now boots a user config file automatically on first run.
+
+- Linux config path: `~/.config/gnomon/config.toml`
+- Default source root: `~/.claude/projects`
+- Default filter: exclude resolved project roots under `/tmp/`
+
+The generated file starts with sensible defaults and comments. The default
+filter keeps transient scratch directories such as smoke-test roots out of the
+derived dataset unless you opt back in.
+
+Example:
+
+```toml
+[source]
+root = "~/.claude/projects"
+
+[project_identity]
+stale_claude_worktree_recovery = true
+fallback_path_projects = true
+
+[[project_filters]]
+action = "exclude"
+match_on = "resolved_root"
+path_prefix = "/tmp/"
+```
+
+Supported project-filter matchers in `[[project_filters]]`:
+
+- `path_prefix`
+- `glob`
+- `equals`
+
+Supported `match_on` targets:
+
+- `raw_cwd`
+- `resolved_root`
+- `identity_reason`
+
+Rules are evaluated in order. The first matching rule wins.
+
 ## Performance Logs
 
 Performance logging is enabled by default.
@@ -122,6 +164,8 @@ This includes stale Claude worktree recovery: when a transcript `cwd` points at
 `.../.claude/worktrees/...` and that worktree no longer exists, `gnomon` now
 probes the repo root above the recognized worktree segment and re-attributes
 the session to the canonical Git project when possible.
+Project-filter changes also require a rebuild before the existing cache will
+reflect the new include/exclude policy.
 Apply the same rebuild step after pulling a version that bumps the importer
 schema version. Import-schema bumps mean `gnomon` now consumes a different
 normalized source-field set, so existing cached rows need reimport to match the

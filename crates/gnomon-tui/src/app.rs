@@ -27,7 +27,8 @@ use gnomon_core::browse_cache::{BrowseCacheStore, default_browse_cache_path};
 use gnomon_core::config::RuntimeConfig;
 use gnomon_core::db::{Database, reset_sqlite_database, sqlite_artifact_size_bytes};
 use gnomon_core::import::{
-    StartupOpenReason, StartupProgressUpdate, StartupWorkerEvent, import_all, scan_source_manifest,
+    StartupOpenReason, StartupProgressUpdate, StartupWorkerEvent, import_all,
+    scan_source_manifest_with_policy,
 };
 use gnomon_core::opportunity::{OpportunityCategory, OpportunityConfidence};
 use gnomon_core::perf::{PerfLogger, PerfScope};
@@ -2365,7 +2366,12 @@ impl App {
 
         let reset_report = reset_sqlite_database(&self.config.db_path)?;
         let mut database = Database::open(&self.config.db_path)?;
-        let scan_report = scan_source_manifest(&mut database, &self.config.source_root)?;
+        let scan_report = scan_source_manifest_with_policy(
+            &mut database,
+            &self.config.source_root,
+            &self.config.project_identity,
+            &self.config.project_filters,
+        )?;
         let import_report = import_all(
             database.connection(),
             &self.config.db_path,
@@ -8141,8 +8147,11 @@ mod tests {
             RuntimeConfig {
                 app_name: "gnomon",
                 state_dir: temp.path().to_path_buf(),
+                config_path: temp.path().join("config.toml"),
                 db_path: validation.db_path.clone(),
                 source_root: validation.source_root.clone(),
+                project_identity: Default::default(),
+                project_filters: Vec::new(),
             },
             validation.final_snapshot.clone(),
             StartupOpenReason::Last24hReady,
@@ -8259,8 +8268,11 @@ mod tests {
             RuntimeConfig {
                 app_name: "gnomon",
                 state_dir: temp.path().to_path_buf(),
+                config_path: temp.path().join("config.toml"),
                 db_path: validation.db_path.clone(),
                 source_root: validation.source_root.clone(),
+                project_identity: Default::default(),
+                project_filters: Vec::new(),
             },
             validation.final_snapshot.clone(),
             StartupOpenReason::Last24hReady,
@@ -8696,8 +8708,11 @@ mod tests {
         RuntimeConfig {
             app_name: "gnomon",
             state_dir: dir.to_path_buf(),
+            config_path: dir.join("config.toml"),
             db_path: dir.join("test.sqlite3"),
             source_root: dir.join("source"),
+            project_identity: Default::default(),
+            project_filters: Vec::new(),
         }
     }
 

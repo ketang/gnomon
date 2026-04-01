@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::config::ProjectIdentityPolicy;
+
 pub const AUTHORITATIVE_VCS: &str = "git";
 pub const PATH_REASON_GIT_ROOT_NOT_FOUND: &str = "git root could not be resolved from cwd";
 pub const PATH_REASON_GIT_ROOT_UNAVAILABLE: &str =
@@ -60,13 +62,27 @@ pub struct ResolvedProject {
 /// narrow recovery heuristic for paths under `.../.claude/worktrees/...` by probing the candidate
 /// repo roots above that worktree segment. We do not attempt broader path-prefix inference.
 pub fn resolve_project_from_cwd(cwd: &Path) -> ResolvedProject {
+    resolve_project_from_cwd_with_policy(cwd, &ProjectIdentityPolicy::default())
+}
+
+pub fn resolve_project_from_cwd_with_policy(
+    cwd: &Path,
+    policy: &ProjectIdentityPolicy,
+) -> ResolvedProject {
     let normalized_cwd = normalize_path(cwd);
 
     match gix::discover(&normalized_cwd) {
         Ok(repo) => resolve_git_project(&repo)
             .unwrap_or_else(|| path_project(&normalized_cwd, PATH_REASON_GIT_ROOT_UNAVAILABLE)),
-        Err(_) => recover_project_from_stale_worktree_path(&normalized_cwd)
-            .unwrap_or_else(|| path_project(&normalized_cwd, PATH_REASON_GIT_ROOT_NOT_FOUND)),
+        Err(_) => {
+            if policy.stale_claude_worktree_recovery {
+                recover_project_from_stale_worktree_path(&normalized_cwd).unwrap_or_else(|| {
+                    path_project(&normalized_cwd, PATH_REASON_GIT_ROOT_NOT_FOUND)
+                })
+            } else {
+                path_project(&normalized_cwd, PATH_REASON_GIT_ROOT_NOT_FOUND)
+            }
+        }
     }
 }
 

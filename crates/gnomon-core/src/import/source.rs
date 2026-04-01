@@ -9,6 +9,9 @@ use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
+use crate::config::{
+    ProjectFilterAction, ProjectFilterContext, ProjectFilterRule, ProjectIdentityPolicy,
+};
 use crate::db::Database;
 use crate::vcs::{self, ProjectIdentityKind, ResolvedProject};
 
@@ -19,6 +22,7 @@ const WARNING_PATH_PROJECT: &str = "path_project";
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ScanReport {
     pub discovered_source_files: usize,
+    pub excluded_source_files: usize,
     pub inserted_projects: usize,
     pub updated_projects: usize,
     pub inserted_source_files: usize,
@@ -81,6 +85,20 @@ struct StoredSourceFile {
 }
 
 pub fn scan_source_manifest(database: &mut Database, source_root: &Path) -> Result<ScanReport> {
+    scan_source_manifest_with_policy(
+        database,
+        source_root,
+        &ProjectIdentityPolicy::default(),
+        &[],
+    )
+}
+
+pub fn scan_source_manifest_with_policy(
+    database: &mut Database,
+    source_root: &Path,
+    identity_policy: &ProjectIdentityPolicy,
+    project_filters: &[ProjectFilterRule],
+) -> Result<ScanReport> {
     if !source_root.exists() {
         return Ok(ScanReport::default());
     }
@@ -88,19 +106,20 @@ pub fn scan_source_manifest(database: &mut Database, source_root: &Path) -> Resu
         bail!("source root {} is not a directory", source_root.display());
     }
 
-    let discovered_files = discover_source_files(source_root)?;
+    let discovery = discover_source_files(source_root, identity_policy, project_filters)?;
     let mut report = ScanReport {
-        discovered_source_files: discovered_files.len(),
+        discovered_source_files: discovery.discovered_source_files,
+        excluded_source_files: discovery.excluded_source_files,
         ..ScanReport::default()
     };
-    let mut seen_files = HashSet::with_capacity(discovered_files.len());
+    let mut seen_files = HashSet::with_capacity(discovery.files.len());
 
     let tx = database
         .connection_mut()
         .transaction()
         .context("unable to begin a source manifest scan transaction")?;
 
-    for file in &discovered_files {
+    for file in &discovery.files {
         let project_id = upsert_project(&tx, &file.project, &mut report)?;
         upsert_source_file(&tx, project_id, file, &mut report)?;
         seen_files.insert((project_id, file.relative_path.clone()));
@@ -114,8 +133,21 @@ pub fn scan_source_manifest(database: &mut Database, source_root: &Path) -> Resu
     Ok(report)
 }
 
-fn discover_source_files(source_root: &Path) -> Result<Vec<DiscoveredSourceFile>> {
+#[derive(Debug)]
+struct DiscoveryResult {
+    files: Vec<DiscoveredSourceFile>,
+    discovered_source_files: usize,
+    excluded_source_files: usize,
+}
+
+fn discover_source_files(
+    source_root: &Path,
+    identity_policy: &ProjectIdentityPolicy,
+    project_filters: &[ProjectFilterRule],
+) -> Result<DiscoveryResult> {
     let mut discovered_files = Vec::new();
+    let mut discovered_source_files = 0usize;
+    let mut excluded_source_files = 0usize;
 
     for entry in WalkDir::new(source_root) {
         let entry = entry
@@ -127,17 +159,30 @@ fn discover_source_files(source_root: &Path) -> Result<Vec<DiscoveredSourceFile>
             continue;
         }
 
-        discovered_files.push(discover_source_file(source_root, entry.path())?);
+        discovered_source_files += 1;
+        if let Some(file) =
+            discover_source_file(source_root, entry.path(), identity_policy, project_filters)?
+        {
+            discovered_files.push(file);
+        } else {
+            excluded_source_files += 1;
+        }
     }
 
     discovered_files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(discovered_files)
+    Ok(DiscoveryResult {
+        files: discovered_files,
+        discovered_source_files,
+        excluded_source_files,
+    })
 }
 
 fn discover_source_file(
     source_root: &Path,
     source_file_path: &Path,
-) -> Result<DiscoveredSourceFile> {
+    identity_policy: &ProjectIdentityPolicy,
+    project_filters: &[ProjectFilterRule],
+) -> Result<Option<DiscoveredSourceFile>> {
     let metadata = fs::metadata(source_file_path)
         .with_context(|| format!("unable to read metadata for {}", source_file_path.display()))?;
     let relative_path = source_file_path
@@ -161,10 +206,20 @@ fn discover_source_file(
     })?;
 
     let ExtractedCwd { cwd, mut warnings } = extract_cwd(source_file_path)?;
+    let raw_cwd = cwd.clone();
     let project = match cwd {
-        Some(cwd) => vcs::resolve_project_from_cwd(&cwd),
+        Some(cwd) => vcs::resolve_project_from_cwd_with_policy(&cwd, identity_policy),
         None => vcs::path_project(source_file_path, vcs::PATH_REASON_MISSING_CWD),
     };
+
+    if !identity_policy.fallback_path_projects && project.identity_kind == ProjectIdentityKind::Path
+    {
+        return Ok(None);
+    }
+
+    if should_exclude_project(raw_cwd.as_deref(), &project, project_filters)? {
+        return Ok(None);
+    }
 
     if project.identity_kind == ProjectIdentityKind::Path
         && let Some(reason) = &project.identity_reason
@@ -179,13 +234,33 @@ fn discover_source_file(
         )
     })?;
 
-    Ok(DiscoveredSourceFile {
+    Ok(Some(DiscoveredSourceFile {
         project,
         relative_path,
         modified_at_utc,
         size_bytes,
         scan_warnings_json,
-    })
+    }))
+}
+
+fn should_exclude_project(
+    raw_cwd: Option<&Path>,
+    project: &ResolvedProject,
+    project_filters: &[ProjectFilterRule],
+) -> Result<bool> {
+    let context = ProjectFilterContext {
+        raw_cwd,
+        resolved_root: &project.root_path,
+        identity_reason: project.identity_reason.as_deref(),
+    };
+
+    for rule in project_filters {
+        if rule.matches(&context)? {
+            return Ok(matches!(rule.action, ProjectFilterAction::Exclude));
+        }
+    }
+
+    Ok(false)
 }
 
 fn extract_cwd(source_file_path: &Path) -> Result<ExtractedCwd> {
@@ -534,7 +609,13 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{ScanReport, ScanWarning, WARNING_INVALID_JSON, scan_source_manifest};
+    use super::{
+        ScanReport, ScanWarning, WARNING_INVALID_JSON, scan_source_manifest,
+        scan_source_manifest_with_policy,
+    };
+    use crate::config::{
+        ProjectFilterAction, ProjectFilterMatchOn, ProjectFilterRule, ProjectIdentityPolicy,
+    };
     use crate::db::Database;
     use crate::vcs::{PATH_REASON_GIT_ROOT_NOT_FOUND, resolve_project_from_cwd};
 
@@ -560,6 +641,7 @@ mod tests {
             report,
             ScanReport {
                 discovered_source_files: 2,
+                excluded_source_files: 0,
                 inserted_projects: 2,
                 updated_projects: 0,
                 inserted_source_files: 2,
@@ -679,6 +761,7 @@ mod tests {
             second_scan,
             ScanReport {
                 discovered_source_files: 1,
+                excluded_source_files: 0,
                 inserted_projects: 0,
                 updated_projects: 0,
                 inserted_source_files: 0,
@@ -1197,6 +1280,51 @@ mod tests {
             warnings.iter().any(|w| w.code == WARNING_INVALID_JSON),
             "expected an invalid_json warning; got: {warnings:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn project_filters_exclude_tmp_roots_before_manifest_upsert() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        let tmp_project = temp.path().join("tmp-root").join("sea-smoke-123");
+        let repo_root = temp.path().join("repo");
+        let repo_cwd = repo_root.join("work");
+
+        fs::create_dir_all(&tmp_project)?;
+        init_git_repo(&repo_root)?;
+        fs::create_dir_all(&repo_cwd)?;
+
+        write_jsonl(&source_root.join("tmp/session.jsonl"), &tmp_project)?;
+        write_jsonl(&source_root.join("repo/session.jsonl"), &repo_cwd)?;
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let report = scan_source_manifest_with_policy(
+            &mut db,
+            &source_root,
+            &ProjectIdentityPolicy::default(),
+            &[ProjectFilterRule {
+                action: ProjectFilterAction::Exclude,
+                match_on: ProjectFilterMatchOn::ResolvedRoot,
+                path_prefix: Some(temp.path().join("tmp-root").to_string_lossy().into_owned()),
+                glob: None,
+                equals: None,
+            }],
+        )?;
+
+        assert_eq!(report.discovered_source_files, 2);
+        assert_eq!(report.excluded_source_files, 1);
+
+        let projects: Vec<(String, String)> = db
+            .connection()
+            .prepare("SELECT identity_kind, root_path FROM project ORDER BY root_path")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            projects,
+            vec![("git".to_string(), repo_root.display().to_string())]
+        );
+
         Ok(())
     }
 
