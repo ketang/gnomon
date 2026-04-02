@@ -149,15 +149,10 @@ fn rasterize_braille(
         for x in inner.x..inner.x + inner.width {
             let hits = braille_cell_hits(x, y, &raster_context);
 
-            let Some(owner) = winning_braille_segment(&hits, &model.layers) else {
+            let Some(owner) = dominant_braille_segment(&hits, &model.layers) else {
                 continue;
             };
-            let dots = hits
-                .iter()
-                .filter(|hit| {
-                    hit.layer_index == owner.layer_index && hit.segment_index == owner.segment_index
-                })
-                .fold(0_u32, |bits, hit| bits | hit.dot_bit);
+            let dots = hits.iter().fold(0_u32, |bits, hit| bits | hit.dot_bit);
             if dots == 0 {
                 continue;
             }
@@ -500,7 +495,7 @@ fn quantized_segment_index(
         .flatten()
 }
 
-fn winning_braille_segment(hits: &[SampleHit], layers: &[SunburstLayer]) -> Option<SampleHit> {
+fn dominant_braille_segment(hits: &[SampleHit], layers: &[SunburstLayer]) -> Option<SampleHit> {
     if hits.is_empty() {
         return None;
     }
@@ -751,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn braille_winner_prefers_selected_segment_when_cell_contains_multiple_segments() {
+    fn dominant_braille_segment_prefers_selected_segment_when_cell_contains_multiple_segments() {
         let layers = vec![make_layer(
             &[
                 (50.0, SunburstBucket::Project, false),
@@ -778,13 +773,13 @@ mod tests {
             },
         ];
 
-        let owner = winning_braille_segment(&hits, &layers).expect("winner");
+        let owner = dominant_braille_segment(&hits, &layers).expect("winner");
         assert_eq!(owner.layer_index, 0);
         assert_eq!(owner.segment_index, 1);
     }
 
     #[test]
-    fn rendered_braille_cell_uses_only_winning_segments_dots_in_narrow_selected_child_span() {
+    fn rendered_braille_cell_preserves_all_sampled_dots_in_narrow_selected_child_span() {
         let root_layer = make_layer(
             &[
                 (90.0, SunburstBucket::Project, false),
@@ -844,21 +839,19 @@ mod tests {
             })
             .expect("expected at least one braille cell to sample multiple slice owners");
 
-        let owner = winning_braille_segment(&mixed_cell.2, &model.layers).expect("winner");
-        let expected_dots = mixed_cell
-            .2
-            .iter()
-            .filter(|hit| {
-                hit.layer_index == owner.layer_index && hit.segment_index == owner.segment_index
-            })
-            .fold(0_u32, |bits, hit| bits | hit.dot_bit);
         let all_dots = mixed_cell
             .2
             .iter()
             .fold(0_u32, |bits, hit| bits | hit.dot_bit);
-        assert_ne!(
-            expected_dots, all_dots,
-            "the mixed cell must include losing-owner dots for this regression to matter"
+        let dominant_owner =
+            dominant_braille_segment(&mixed_cell.2, &model.layers).expect("dominant owner");
+        assert!(
+            mixed_cell.2.iter().any(|hit| {
+                (hit.layer_index != dominant_owner.layer_index
+                    || hit.segment_index != dominant_owner.segment_index)
+                    && (hit.dot_bit & all_dots) != 0
+            }),
+            "the mixed cell must include non-dominant dots for this regression to matter"
         );
 
         let mut buf = Buffer::empty(inner);
@@ -873,8 +866,8 @@ mod tests {
         let actual_dots = u32::from(symbol).saturating_sub(0x2800);
 
         assert_eq!(
-            actual_dots, expected_dots,
-            "the rendered cell should keep only the winning segment's dots"
+            actual_dots, all_dots,
+            "the rendered cell should preserve all per-dot ownership, not drop non-dominant dots"
         );
     }
 }
