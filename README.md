@@ -81,6 +81,30 @@ Fresh launches open at the top level by default. Use `--startup-*` flags to
 open directly into a narrower drill-down view when you want to skip the root
 landing state.
 
+## TUI Screenshot Harness
+
+A portable screenshot harness lives under `tools/tui-shot/`.
+
+It runs `gnomon` in a PTY, renders the terminal via `xterm.js` inside headless
+Chromium, and captures PNG screenshots after scripted navigation steps.
+
+Bootstrap:
+
+```bash
+cd tools/tui-shot
+npm install
+npx playwright install chromium
+```
+
+Run the default drill-down scenario:
+
+```bash
+cd tools/tui-shot
+node src/cli.mjs
+```
+
+Artifacts are written under `tools/tui-shot/artifacts/`.
+
 ## Configuration
 
 `gnomon` now boots a user config file automatically on first run.
