@@ -96,7 +96,11 @@ const TERMINAL_SIZES: [BenchmarkTerminalSize; 3] = [
     },
 ];
 
-const MODES: [SunburstRenderMode; 2] = [SunburstRenderMode::Coarse, SunburstRenderMode::Braille];
+const MODES: [SunburstRenderMode; 3] = [
+    SunburstRenderMode::Coarse,
+    SunburstRenderMode::Quadrant,
+    SunburstRenderMode::Braille,
+];
 
 pub fn run_sunburst_benchmark(
     options: SunburstBenchmarkOptions,
@@ -158,6 +162,7 @@ pub fn run_sunburst_benchmark(
 fn render_mode_label(mode: SunburstRenderMode) -> &'static str {
     match mode {
         SunburstRenderMode::Coarse => "coarse",
+        SunburstRenderMode::Quadrant => "quadrant",
         SunburstRenderMode::Braille => "braille",
     }
 }
@@ -249,6 +254,12 @@ mod tests {
                 .scenarios
                 .iter()
                 .any(|scenario| scenario.mode == "coarse")
+        );
+        assert!(
+            report
+                .scenarios
+                .iter()
+                .any(|scenario| scenario.mode == "quadrant")
         );
         assert!(
             report

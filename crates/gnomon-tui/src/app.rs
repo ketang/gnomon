@@ -8047,6 +8047,72 @@ mod tests {
     }
 
     #[test]
+    fn radial_pane_emits_quadrant_glyphs_when_quadrant_mode_is_selected() -> Result<()> {
+        let model = RadialModel {
+            center: RadialCenter::default(),
+            layers: vec![RadialLayer {
+                span: RadialSpan::full(),
+                segments: vec![
+                    RadialSegment {
+                        value: 3.0,
+                        bucket: RadialBucket::Project,
+                        is_selected: true,
+                    },
+                    RadialSegment {
+                        value: 1.0,
+                        bucket: RadialBucket::Category,
+                        is_selected: false,
+                    },
+                ],
+                total_value: 4.0,
+            }],
+        };
+
+        let backend = TestBackend::new(24, 12);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|frame| {
+            frame.render_widget(
+                &SunburstPane {
+                    model: &model,
+                    focused: true,
+                    config: SunburstRenderConfig {
+                        mode: SunburstRenderMode::Quadrant,
+                        ..SunburstRenderConfig::default()
+                    },
+                },
+                frame.area(),
+            );
+        })?;
+
+        let has_quadrant = terminal.backend().buffer().content.iter().any(|cell| {
+            matches!(
+                cell.symbol().chars().next(),
+                Some(
+                    '▘' | '▝'
+                        | '▖'
+                        | '▗'
+                        | '▀'
+                        | '▄'
+                        | '▌'
+                        | '▐'
+                        | '▚'
+                        | '▞'
+                        | '▛'
+                        | '▜'
+                        | '▙'
+                        | '▟'
+                        | '█'
+                )
+            )
+        });
+        assert!(
+            has_quadrant,
+            "expected quadrant render mode to emit quadrant or half-block glyphs"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn coarse_cached_indicator_uses_a_single_subtle_glyph() -> Result<()> {
         let model = RadialModel {
             center: RadialCenter::default(),
