@@ -4,3 +4,6 @@
 .DS_Store
 
 crates/gnomon-web/ui/node_modules/
+tools/tui-shot/node_modules/
+tools/tui-shot/artifacts/
+tools/tui-shot/.tmp/

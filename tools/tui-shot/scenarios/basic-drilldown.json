@@ -1,0 +1,81 @@
+{
+  "name": "basic-drilldown",
+  "viewport": {
+    "cols": 120,
+    "rows": 40,
+    "deviceScaleFactor": 1
+  },
+  "render": {
+    "fontFamily": "Monaco, Menlo, Consolas, 'Liberation Mono', monospace",
+    "fontSize": 14,
+    "lineHeight": 1,
+    "theme": {
+      "background": "#121212",
+      "foreground": "#f5f5f5",
+      "cursor": "#f97316",
+      "selectionBackground": "#3f3f46"
+    }
+  },
+  "fixture": {
+    "profile": "quick"
+  },
+  "launch": {
+    "program": "cargo",
+    "args": [
+      "run",
+      "-p",
+      "gnomon",
+      "--"
+    ]
+  },
+  "steps": [
+    {
+      "action": "wait_for_idle",
+      "timeout_ms": 10000,
+      "quiet_ms": 300
+    },
+    {
+      "action": "screenshot",
+      "name": "00-root"
+    },
+    {
+      "action": "key",
+      "key": "ArrowDown"
+    },
+    {
+      "action": "wait_for_idle",
+      "timeout_ms": 3000,
+      "quiet_ms": 250
+    },
+    {
+      "action": "screenshot",
+      "name": "01-select-next-row"
+    },
+    {
+      "action": "key",
+      "key": "Enter"
+    },
+    {
+      "action": "wait_for_idle",
+      "timeout_ms": 5000,
+      "quiet_ms": 250
+    },
+    {
+      "action": "screenshot",
+      "name": "02-drill-down"
+    },
+    {
+      "action": "key",
+      "key": "Backspace"
+    },
+    {
+      "action": "wait_for_idle",
+      "timeout_ms": 3000,
+      "quiet_ms": 250
+    },
+    {
+      "action": "screenshot",
+      "name": "03-navigate-up"
+    }
+  ]
+}
