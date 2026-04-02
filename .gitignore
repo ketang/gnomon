@@ -3,3 +3,4 @@
 /.vscode
 .DS_Store
 
+crates/gnomon-web/ui/node_modules/
