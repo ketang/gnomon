@@ -9,13 +9,16 @@ use super::model::{
     SunburstSegment,
 };
 
-const SUPPORTED_RENDER_MODES: [SunburstRenderMode; 2] =
-    [SunburstRenderMode::Coarse, SunburstRenderMode::Braille];
+const SUPPORTED_RENDER_MODES: [SunburstRenderMode; 3] = [
+    SunburstRenderMode::Coarse,
+    SunburstRenderMode::Quadrant,
+    SunburstRenderMode::Braille,
+];
 
 /// Uniform fill glyph for coarse mode — geometry carries the signal, not texture.
 const COARSE_FILL: char = '█';
 
-const BRAILLE_DOT_SAMPLES: [(f64, f64, u32); 8] = [
+const BRAILLE_DOT_SAMPLES: [(f64, f64, u8); 8] = [
     (0.25, 0.125, 0x01),
     (0.25, 0.375, 0x02),
     (0.25, 0.625, 0x04),
@@ -24,6 +27,13 @@ const BRAILLE_DOT_SAMPLES: [(f64, f64, u32); 8] = [
     (0.75, 0.625, 0x20),
     (0.25, 0.875, 0x40),
     (0.75, 0.875, 0x80),
+];
+
+const QUADRANT_SAMPLES: [(f64, f64, u8); 4] = [
+    (0.25, 0.25, 0x1),
+    (0.75, 0.25, 0x2),
+    (0.25, 0.75, 0x4),
+    (0.75, 0.75, 0x8),
 ];
 
 #[derive(Debug, Clone)]
@@ -35,10 +45,10 @@ struct QuantizedLayer {
 struct SampleHit {
     layer_index: usize,
     segment_index: usize,
-    dot_bit: u32,
+    sample_bit: u8,
 }
 
-struct BrailleRasterContext<'a> {
+struct RasterContext<'a> {
     center_x: f64,
     center_y: f64,
     radius_x: f64,
@@ -58,7 +68,70 @@ pub(crate) fn rasterize_sunburst(
     debug_assert!(SUPPORTED_RENDER_MODES.contains(&config.mode));
     match config.mode {
         SunburstRenderMode::Coarse => rasterize_coarse(buf, inner, model, config),
+        SunburstRenderMode::Quadrant => rasterize_quadrant(buf, inner, model, config),
         SunburstRenderMode::Braille => rasterize_braille(buf, inner, model, config),
+    }
+}
+
+fn rasterize_quadrant(
+    buf: &mut Buffer,
+    inner: ratatui::layout::Rect,
+    model: &SunburstModel,
+    config: SunburstRenderConfig,
+) {
+    let layer_count = model.layers.len();
+    if layer_count == 0 {
+        return;
+    }
+    let quantized_layers = quantize_layers(inner, model, config);
+
+    let center_x = f64::from(inner.x) + f64::from(inner.width) / 2.0;
+    let center_y = f64::from(inner.y) + f64::from(inner.height) / 2.0;
+    let radius_x = (f64::from(inner.width) / 2.0).max(1.0);
+    let radius_y = (f64::from(inner.height) / 2.0).max(1.0);
+    let ring_band = (config.outer_radius - config.center_radius) / layer_count as f64;
+    let raster_context = RasterContext {
+        center_x,
+        center_y,
+        radius_x,
+        radius_y,
+        ring_band,
+        model,
+        quantized_layers: &quantized_layers,
+        config,
+    };
+
+    for y in inner.y..inner.y + inner.height {
+        for x in inner.x..inner.x + inner.width {
+            let hits = quadrant_cell_hits(x, y, &raster_context);
+
+            let Some(owner) = dominant_segment(&hits, &model.layers) else {
+                continue;
+            };
+            let mask = hits.iter().fold(0_u8, |bits, hit| {
+                if hit.layer_index == owner.layer_index && hit.segment_index == owner.segment_index
+                {
+                    bits | hit.sample_bit
+                } else {
+                    bits
+                }
+            });
+            let Some(symbol) = quadrant_glyph(mask) else {
+                continue;
+            };
+            let Some(segment) = model
+                .layers
+                .get(owner.layer_index)
+                .and_then(|layer| layer.segments.get(owner.segment_index))
+            else {
+                continue;
+            };
+
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_style(sunburst_quadrant_style(segment));
+                cell.set_char(symbol);
+            }
+        }
     }
 }
 
@@ -134,7 +207,7 @@ fn rasterize_braille(
     let radius_x = (f64::from(inner.width) / 2.0).max(1.0);
     let radius_y = (f64::from(inner.height) / 2.0).max(1.0);
     let ring_band = (config.outer_radius - config.center_radius) / layer_count as f64;
-    let raster_context = BrailleRasterContext {
+    let raster_context = RasterContext {
         center_x,
         center_y,
         radius_x,
@@ -149,10 +222,12 @@ fn rasterize_braille(
         for x in inner.x..inner.x + inner.width {
             let hits = braille_cell_hits(x, y, &raster_context);
 
-            let Some(owner) = dominant_braille_segment(&hits, &model.layers) else {
+            let Some(owner) = dominant_segment(&hits, &model.layers) else {
                 continue;
             };
-            let dots = hits.iter().fold(0_u32, |bits, hit| bits | hit.dot_bit);
+            let dots = hits
+                .iter()
+                .fold(0_u32, |bits, hit| bits | u32::from(hit.sample_bit));
             if dots == 0 {
                 continue;
             }
@@ -187,11 +262,24 @@ fn sunburst_segment_style(segment: &SunburstSegment) -> Style {
     style
 }
 
-fn braille_cell_hits(x: u16, y: u16, context: &BrailleRasterContext<'_>) -> Vec<SampleHit> {
-    let layer_count = context.model.layers.len();
-    let mut hits = Vec::with_capacity(BRAILLE_DOT_SAMPLES.len());
+fn quadrant_cell_hits(x: u16, y: u16, context: &RasterContext<'_>) -> Vec<SampleHit> {
+    cell_sample_hits(x, y, context, &QUADRANT_SAMPLES)
+}
 
-    for (sample_x, sample_y, bit) in BRAILLE_DOT_SAMPLES {
+fn braille_cell_hits(x: u16, y: u16, context: &RasterContext<'_>) -> Vec<SampleHit> {
+    cell_sample_hits(x, y, context, &BRAILLE_DOT_SAMPLES)
+}
+
+fn cell_sample_hits<const N: usize>(
+    x: u16,
+    y: u16,
+    context: &RasterContext<'_>,
+    samples: &[(f64, f64, u8); N],
+) -> Vec<SampleHit> {
+    let layer_count = context.model.layers.len();
+    let mut hits = Vec::with_capacity(samples.len());
+
+    for (sample_x, sample_y, bit) in *samples {
         let normalized_x = (f64::from(x) + sample_x - context.center_x) / context.radius_x;
         let normalized_y = (f64::from(y) + sample_y - context.center_y) / context.radius_y;
         let radius = (normalized_x.powi(2) + normalized_y.powi(2)).sqrt();
@@ -219,7 +307,7 @@ fn braille_cell_hits(x: u16, y: u16, context: &BrailleRasterContext<'_>) -> Vec<
         hits.push(SampleHit {
             layer_index,
             segment_index,
-            dot_bit: bit,
+            sample_bit: bit,
         });
     }
 
@@ -261,6 +349,7 @@ fn angular_slot_count(
     let circumference = (TAU * terminal_radius * layer_midpoint).max(1.0);
     let density = match config.mode {
         SunburstRenderMode::Coarse => 1.0,
+        SunburstRenderMode::Quadrant => 1.5,
         SunburstRenderMode::Braille => 2.0,
     };
 
@@ -495,7 +584,7 @@ fn quantized_segment_index(
         .flatten()
 }
 
-fn dominant_braille_segment(hits: &[SampleHit], layers: &[SunburstLayer]) -> Option<SampleHit> {
+fn dominant_segment(hits: &[SampleHit], layers: &[SunburstLayer]) -> Option<SampleHit> {
     if hits.is_empty() {
         return None;
     }
@@ -530,8 +619,18 @@ fn dominant_braille_segment(hits: &[SampleHit], layers: &[SunburstLayer]) -> Opt
         .map(|((layer_index, segment_index), _)| SampleHit {
             layer_index,
             segment_index,
-            dot_bit: 0,
+            sample_bit: 0,
         })
+}
+
+fn sunburst_quadrant_style(segment: &SunburstSegment) -> Style {
+    let mut style = Style::default().fg(sunburst_bucket_color(segment.bucket));
+
+    if segment.is_selected {
+        style = style.fg(Color::White).add_modifier(Modifier::BOLD);
+    }
+
+    style
 }
 
 fn sunburst_braille_style(segment: &SunburstSegment) -> Style {
@@ -542,6 +641,28 @@ fn sunburst_braille_style(segment: &SunburstSegment) -> Style {
     }
 
     style
+}
+
+fn quadrant_glyph(mask: u8) -> Option<char> {
+    match mask {
+        0x0 => None,
+        0x1 => Some('▘'),
+        0x2 => Some('▝'),
+        0x3 => Some('▀'),
+        0x4 => Some('▖'),
+        0x5 => Some('▌'),
+        0x6 => Some('▞'),
+        0x7 => Some('▛'),
+        0x8 => Some('▗'),
+        0x9 => Some('▚'),
+        0xA => Some('▐'),
+        0xB => Some('▜'),
+        0xC => Some('▄'),
+        0xD => Some('▙'),
+        0xE => Some('▟'),
+        0xF => Some('█'),
+        _ => None,
+    }
 }
 
 /// Muted ANSI-256 palette — geometry carries the primary signal, color stays
@@ -634,6 +755,14 @@ mod tests {
     }
 
     #[test]
+    fn quadrant_style_no_underline_when_selected() {
+        let seg = make_segment(SunburstBucket::Project, true);
+        let style = sunburst_quadrant_style(&seg);
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+        assert!(!style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
     fn segment_style_bucket_color_when_focused_and_high_cached_ratio() {
         // cached_ratio no longer affects color — bucket color always shows when focused
         let seg = make_segment(SunburstBucket::Classified, false);
@@ -701,10 +830,105 @@ mod tests {
     }
 
     #[test]
-    fn default_render_mode_is_braille() {
+    fn default_render_mode_is_quadrant() {
         assert_eq!(
             SunburstRenderConfig::default().mode,
-            SunburstRenderMode::Braille
+            SunburstRenderMode::Quadrant
+        );
+    }
+
+    #[test]
+    fn rendered_quadrant_cell_does_not_bridge_non_owner_subcells_in_narrow_selected_child_span() {
+        let root_layer = make_layer(
+            &[
+                (90.0, SunburstBucket::Project, false),
+                (10.0, SunburstBucket::Category, true),
+            ],
+            SunburstSpan::full(),
+            100.0,
+        );
+        let child_layer = make_layer(
+            &[
+                (1.0, SunburstBucket::Project, true),
+                (1.0, SunburstBucket::Category, false),
+                (1.0, SunburstBucket::Classified, false),
+                (1.0, SunburstBucket::Mixed, false),
+            ],
+            SunburstSpan {
+                start: 0.0,
+                sweep: TAU / 12.0,
+            },
+            4.0,
+        );
+        let model = SunburstModel {
+            center: Default::default(),
+            layers: vec![root_layer, child_layer],
+        };
+        let config = SunburstRenderConfig {
+            mode: SunburstRenderMode::Quadrant,
+            ..SunburstRenderConfig::default()
+        };
+        let inner = ratatui::layout::Rect::new(0, 0, 28, 14);
+        let quantized_layers = quantize_layers(inner, &model, config);
+        let center_x = f64::from(inner.x) + f64::from(inner.width) / 2.0;
+        let center_y = f64::from(inner.y) + f64::from(inner.height) / 2.0;
+        let radius_x = (f64::from(inner.width) / 2.0).max(1.0);
+        let radius_y = (f64::from(inner.height) / 2.0).max(1.0);
+        let ring_band = (config.outer_radius - config.center_radius) / model.layers.len() as f64;
+        let raster_context = RasterContext {
+            center_x,
+            center_y,
+            radius_x,
+            radius_y,
+            ring_band,
+            model: &model,
+            quantized_layers: &quantized_layers,
+            config,
+        };
+
+        let mixed_cell = (inner.y..inner.y + inner.height)
+            .flat_map(|y| (inner.x..inner.x + inner.width).map(move |x| (x, y)))
+            .find_map(|(x, y)| {
+                let hits = quadrant_cell_hits(x, y, &raster_context);
+                let owners = hits
+                    .iter()
+                    .map(|hit| (hit.layer_index, hit.segment_index))
+                    .collect::<std::collections::BTreeSet<_>>();
+                (owners.len() > 1).then_some((x, y, hits))
+            })
+            .expect("expected at least one quadrant cell to sample multiple slice owners");
+
+        let owner = dominant_segment(&mixed_cell.2, &model.layers).expect("dominant owner");
+        let owner_mask = mixed_cell.2.iter().fold(0_u8, |bits, hit| {
+            if hit.layer_index == owner.layer_index && hit.segment_index == owner.segment_index {
+                bits | hit.sample_bit
+            } else {
+                bits
+            }
+        });
+        let all_mask = mixed_cell
+            .2
+            .iter()
+            .fold(0_u8, |bits, hit| bits | hit.sample_bit);
+        assert_ne!(
+            owner_mask, all_mask,
+            "the mixed cell must include non-owner quadrants for this regression to matter"
+        );
+
+        let mut buf = Buffer::empty(inner);
+        rasterize_sunburst(&mut buf, inner, &model, config);
+        let symbol = buf
+            .cell((mixed_cell.0, mixed_cell.1))
+            .expect("rendered cell")
+            .symbol()
+            .chars()
+            .next()
+            .expect("quadrant symbol");
+        let actual_mask = quadrant_mask(symbol).expect("quadrant mask");
+
+        assert_eq!(
+            actual_mask, owner_mask,
+            "the quadrant renderer should render only the dominant owner's owned subcells"
         );
     }
 
@@ -746,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn dominant_braille_segment_prefers_selected_segment_when_cell_contains_multiple_segments() {
+    fn dominant_segment_prefers_selected_segment_when_cell_contains_multiple_segments() {
         let layers = vec![make_layer(
             &[
                 (50.0, SunburstBucket::Project, false),
@@ -759,21 +983,21 @@ mod tests {
             SampleHit {
                 layer_index: 0,
                 segment_index: 0,
-                dot_bit: 0x01,
+                sample_bit: 0x01,
             },
             SampleHit {
                 layer_index: 0,
                 segment_index: 0,
-                dot_bit: 0x02,
+                sample_bit: 0x02,
             },
             SampleHit {
                 layer_index: 0,
                 segment_index: 1,
-                dot_bit: 0x04,
+                sample_bit: 0x04,
             },
         ];
 
-        let owner = dominant_braille_segment(&hits, &layers).expect("winner");
+        let owner = dominant_segment(&hits, &layers).expect("winner");
         assert_eq!(owner.layer_index, 0);
         assert_eq!(owner.segment_index, 1);
     }
@@ -816,7 +1040,7 @@ mod tests {
         let radius_x = (f64::from(inner.width) / 2.0).max(1.0);
         let radius_y = (f64::from(inner.height) / 2.0).max(1.0);
         let ring_band = (config.outer_radius - config.center_radius) / model.layers.len() as f64;
-        let raster_context = BrailleRasterContext {
+        let raster_context = RasterContext {
             center_x,
             center_y,
             radius_x,
@@ -842,14 +1066,14 @@ mod tests {
         let all_dots = mixed_cell
             .2
             .iter()
-            .fold(0_u32, |bits, hit| bits | hit.dot_bit);
+            .fold(0_u32, |bits, hit| bits | u32::from(hit.sample_bit));
         let dominant_owner =
-            dominant_braille_segment(&mixed_cell.2, &model.layers).expect("dominant owner");
+            dominant_segment(&mixed_cell.2, &model.layers).expect("dominant owner");
         assert!(
             mixed_cell.2.iter().any(|hit| {
                 (hit.layer_index != dominant_owner.layer_index
                     || hit.segment_index != dominant_owner.segment_index)
-                    && (hit.dot_bit & all_dots) != 0
+                    && (u32::from(hit.sample_bit) & all_dots) != 0
             }),
             "the mixed cell must include non-dominant dots for this regression to matter"
         );
@@ -869,5 +1093,26 @@ mod tests {
             actual_dots, all_dots,
             "the rendered cell should preserve all per-dot ownership, not drop non-dominant dots"
         );
+    }
+
+    fn quadrant_mask(symbol: char) -> Option<u8> {
+        match symbol {
+            '▘' => Some(0x1),
+            '▝' => Some(0x2),
+            '▀' => Some(0x3),
+            '▖' => Some(0x4),
+            '▌' => Some(0x5),
+            '▞' => Some(0x6),
+            '▛' => Some(0x7),
+            '▗' => Some(0x8),
+            '▚' => Some(0x9),
+            '▐' => Some(0xA),
+            '▜' => Some(0xB),
+            '▄' => Some(0xC),
+            '▙' => Some(0xD),
+            '▟' => Some(0xE),
+            '█' => Some(0xF),
+            _ => None,
+        }
     }
 }

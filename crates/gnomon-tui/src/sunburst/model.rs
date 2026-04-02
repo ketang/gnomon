@@ -90,7 +90,7 @@ impl Default for SunburstRenderConfig {
         Self {
             center_radius: 0.24,
             outer_radius: 0.96,
-            mode: SunburstRenderMode::Braille,
+            mode: SunburstRenderMode::Quadrant,
             distortion_policy: SunburstDistortionPolicy::default(),
         }
     }
@@ -99,6 +99,7 @@ impl Default for SunburstRenderConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum SunburstRenderMode {
     #[default]
+    Quadrant,
     Coarse,
     Braille,
 }

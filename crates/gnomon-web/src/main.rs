@@ -703,14 +703,19 @@ mod tests {
     async fn serves_index_html() {
         let app = build_router(test_app_state());
         let response = app
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("index request"),
+            )
             .await
-            .unwrap();
+            .expect("index response");
         assert_eq!(response.status(), StatusCode::OK);
         let body = body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .unwrap();
-        let text = String::from_utf8(body.to_vec()).unwrap();
+            .expect("index body");
+        let text = String::from_utf8(body.to_vec()).expect("index body utf-8");
         assert!(text.contains("<!doctype html>"));
     }
 
@@ -722,15 +727,15 @@ mod tests {
                 Request::builder()
                     .uri("/api/status")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("status request"),
             )
             .await
-            .unwrap();
+            .expect("status response");
         assert_eq!(response.status(), StatusCode::OK);
         let body = body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
+            .expect("status body");
+        let json: Value = serde_json::from_slice(&body).expect("status body json");
         assert_eq!(json["pinned_snapshot"]["max_publish_seq"], 0);
     }
 
@@ -742,10 +747,10 @@ mod tests {
                 Request::builder()
                     .uri("/api/detail")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("detail request"),
             )
             .await
-            .unwrap();
+            .expect("detail response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -772,10 +777,10 @@ mod tests {
         }
     }
     fn test_router_with_temp_db() -> (Router, TempDir) {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().expect("temporary directory");
         let root = temp.path().to_path_buf();
         let db_path = root.join("usage.sqlite3");
-        Database::open(&db_path).unwrap();
+        Database::open(&db_path).expect("temporary database");
         let app_state = AppState {
             config: RuntimeConfig {
                 app_name: "gnomon",
