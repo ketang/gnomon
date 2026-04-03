@@ -22,7 +22,7 @@ Definitions:
 
 - `uncached input = input_tokens + cache_creation_input_tokens`
 - `cached input = cache_read_input_tokens`
-- `gross input = uncached input + cached input`
+- `all input = uncached input + cached input`
 - `output = output_tokens`
 
 ## Opportunity Annotations
