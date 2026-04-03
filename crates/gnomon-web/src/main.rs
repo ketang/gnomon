@@ -707,15 +707,15 @@ mod tests {
                 Request::builder()
                     .uri("/")
                     .body(Body::empty())
-                    .expect("index request"),
+                    .expect("building index request should succeed"),
             )
             .await
-            .expect("index response");
+            .expect("index request should succeed");
         assert_eq!(response.status(), StatusCode::OK);
         let body = body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .expect("index body");
-        let text = String::from_utf8(body.to_vec()).expect("index body utf-8");
+            .expect("reading index response body should succeed");
+        let text = String::from_utf8(body.to_vec()).expect("index response should be valid utf-8");
         assert!(text.contains("<!doctype html>"));
     }
 
@@ -727,15 +727,15 @@ mod tests {
                 Request::builder()
                     .uri("/api/status")
                     .body(Body::empty())
-                    .expect("status request"),
+                    .expect("building status request should succeed"),
             )
             .await
-            .expect("status response");
+            .expect("status request should succeed");
         assert_eq!(response.status(), StatusCode::OK);
         let body = body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .expect("status body");
-        let json: Value = serde_json::from_slice(&body).expect("status body json");
+            .expect("reading status response body should succeed");
+        let json: Value = serde_json::from_slice(&body).expect("status response should be valid json");
         assert_eq!(json["pinned_snapshot"]["max_publish_seq"], 0);
     }
 
@@ -747,10 +747,10 @@ mod tests {
                 Request::builder()
                     .uri("/api/detail")
                     .body(Body::empty())
-                    .expect("detail request"),
+                    .expect("building detail request should succeed"),
             )
             .await
-            .expect("detail response");
+            .expect("detail request should succeed");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -777,10 +777,10 @@ mod tests {
         }
     }
     fn test_router_with_temp_db() -> (Router, TempDir) {
-        let temp = tempfile::tempdir().expect("temporary directory");
+        let temp = tempfile::tempdir().expect("creating temp dir for test db should succeed");
         let root = temp.path().to_path_buf();
         let db_path = root.join("usage.sqlite3");
-        Database::open(&db_path).expect("temporary database");
+        Database::open(&db_path).expect("opening test database should succeed");
         let app_state = AppState {
             config: RuntimeConfig {
                 app_name: "gnomon",

@@ -1,5 +1,6 @@
 <script>
   import { onMount } from "svelte";
+  import SunburstChart from "./components/SunburstChart.svelte";
 
   const ROOT_OPTIONS = ["project", "category"];
   const LENS_OPTIONS = ["uncached_input", "gross_input", "output", "total"];
@@ -62,6 +63,9 @@
   let jumpInput;
   let opportunityOnly = false;
   let compactRows = false;
+  let childRowsByParent = {};
+  let sunburstLoading = false;
+  let prefetchEpoch = 0;
 
   $: projectFilterValue = currentContext.filter_project_id == null ? "" : String(currentContext.filter_project_id);
   $: categoryFilterValue = currentContext.filter_category ?? "";
@@ -125,6 +129,16 @@
     return params;
   }
 
+
+  async function fetchBrowseRows(context) {
+    const response = await fetch(`/api/browse?${buildBrowseParams(context).toString()}`);
+    if (!response.ok) {
+      throw new Error(`browse request failed with ${response.status}`);
+    }
+    const report = await response.json();
+    return report.rows ?? [];
+  }
+
   async function loadStatus() {
     const response = await fetch("/api/status");
     if (!response.ok) {
@@ -149,6 +163,7 @@
 
     browseReport = await response.json();
     const nextRows = browseReport.rows ?? [];
+    childRowsByParent = {};
 
     if (nextRows.length === 0) {
       selectedRow = null;
@@ -160,6 +175,47 @@
       ? nextRows.find((row) => row.key === preserveSelectionKey)
       : null;
     await selectRow(preservedRow ?? nextRows[0]);
+    await prefetchSunburstChildren(nextRows);
+  }
+
+  async function prefetchSunburstChildren(rows) {
+    const candidates = rows
+      .filter((row) => nextContextForRow(row))
+      .slice(0, 10);
+
+    if (candidates.length === 0) {
+      childRowsByParent = {};
+      return;
+    }
+
+    const epoch = ++prefetchEpoch;
+    sunburstLoading = true;
+    try {
+      const loaded = await Promise.all(
+        candidates.map(async (row) => {
+          const nextContext = nextContextForRow(row);
+          if (!nextContext) {
+            return [row.key, []];
+          }
+          const childRows = await fetchBrowseRows(nextContext);
+          return [row.key, childRows.slice(0, 8)];
+        }),
+      );
+
+      if (epoch !== prefetchEpoch) {
+        return;
+      }
+
+      childRowsByParent = Object.fromEntries(loaded);
+    } catch (err) {
+      if (epoch === prefetchEpoch) {
+        childRowsByParent = {};
+      }
+    } finally {
+      if (epoch === prefetchEpoch) {
+        sunburstLoading = false;
+      }
+    }
   }
 
   async function selectRow(row) {
@@ -225,6 +281,21 @@
     return (row.opportunities?.annotations?.length ?? 0) > 0;
   }
 
+  function selectedRowMetric() {
+    if (!selectedRow) {
+      return null;
+    }
+    return selectedRow.metrics?.[currentContext.lens] ?? null;
+  }
+
+  function selectedRowOpportunityCount() {
+    return selectedRow?.opportunities?.annotations?.length ?? 0;
+  }
+
+  function selectedRowCanDrill() {
+    return Boolean(nextContextForRow(selectedRow));
+  }
+
   function currentRows() {
     let rows = browseReport?.rows ?? [];
     if (opportunityOnly) {
@@ -251,6 +322,10 @@
     }));
     items.push({ label: breadcrumbLabel(currentContext), index: contextHistory.length });
     return items;
+  }
+
+  function chartScopeLabel() {
+    return breadcrumbLabel(currentContext);
   }
 
   function breadcrumbLabel(context) {
@@ -485,18 +560,23 @@
     return null;
   }
 
-  async function drillIntoSelected() {
-    const nextContext = nextContextForRow(selectedRow);
+  async function drillIntoRow(row) {
+    const nextContext = nextContextForRow(row);
     if (!nextContext) {
       shortcutMessage = "Selected row has no deeper browse level.";
       return;
     }
 
+    selectedRow = row;
     contextHistory = [...contextHistory, copyContext(currentContext)];
     currentContext = nextContext;
     focusedPane = "browse";
     await loadBrowse();
-    shortcutMessage = `Drilled into ${selectedRow?.label ?? "selection"}.`;
+    shortcutMessage = `Drilled into ${row.label}.`;
+  }
+
+  async function drillIntoSelected() {
+    await drillIntoRow(selectedRow);
   }
 
   async function navigateUp() {
@@ -841,7 +921,7 @@
         <h1>Browser shell bootstrap</h1>
         <p class="lede">
           The browser shell now talks to the local <code>gnomon-web</code> backend and renders
-          status, browse, detail, and filter surfaces in the DOM.
+          status, sunburst, browse, detail, and filter surfaces in the DOM.
         </p>
       </div>
       <div class="hero-actions">
@@ -1036,41 +1116,101 @@
 
     <section class="workspace">
       <section class:focused-pane={focusedPane === "browse"} class="panel browse-panel">
-        <header class="panel-header">
+        <header class="panel-header browse-header">
           <div>
-            <p class="eyebrow">Browse</p>
+            <p class="eyebrow">Map</p>
             <h2>{ROOT_LABELS[currentContext.root]}</h2>
+            <p class="chart-caption">{chartScopeLabel()} · {LENS_LABELS[currentContext.lens]}</p>
           </div>
-          <span>{currentRows().length} rows</span>
+          <span>{currentRows().length} rows{#if sunburstLoading} · mapping deeper rings{/if}</span>
         </header>
 
-        {#if currentRows().length}
-          <ul class:compact={compactRows} class="row-list">
-            {#each currentRows() as row}
-              <li>
-                <button
-                  class:selected={selectedRow?.key === row.key}
-                  on:click={() => selectRow(row)}
-                  type="button"
-                >
-                  <span class="row-title">{row.label}</span>
-                  <span class="row-meta">
-                    {formatMetric(row.metrics[currentContext.lens])} {LENS_LABELS[currentContext.lens].toLowerCase()}
-                  </span>
-                  <span class="row-tags">{row.kind}{#if row.category} · {row.category}{/if}</span>
-                  {#if rowHasOpportunities(row)}
-                    <span class="row-badge">{row.opportunities.annotations.length} opportunity{row.opportunities.annotations.length === 1 ? "" : "ies"}</span>
-                  {/if}
-                  {#if !compactRows && row.full_path}
-                    <span class="row-path">{row.full_path}</span>
-                  {/if}
-                </button>
-              </li>
-            {/each}
-          </ul>
-        {:else}
-          <p class="empty-state">No visible rows yet for the pinned snapshot, current filters, and opportunity mode.</p>
-        {/if}
+        <div class="browse-chart-wrap">
+          <SunburstChart
+            rows={currentRows()}
+            lens={currentContext.lens}
+            lensLabel={LENS_LABELS[currentContext.lens]}
+            rootLabel={chartScopeLabel()}
+            selectedKey={selectedRow?.key ?? null}
+            selectedRow={selectedRow}
+            childRowsByParent={childRowsByParent}
+            loading={sunburstLoading}
+            on:select={(event) => selectRow(event.detail.row)}
+            on:drill={(event) => drillIntoRow(event.detail.row)}
+          />
+
+          <div class="chart-summary" aria-live="polite">
+            <div>
+              <strong>Chart selection</strong>
+              {#if selectedRow}
+                <p>
+                  {selectedRow.label} · {selectedRow.kind} · {formatMetric(selectedRowMetric())}
+                  {LENS_LABELS[currentContext.lens].toLowerCase()}
+                </p>
+                <p>
+                  {selectedRowOpportunityCount()} opportunity annotation{selectedRowOpportunityCount() === 1 ? "" : "s"}
+                  {#if selectedRowCanDrill()} · deeper scope available{/if}
+                </p>
+              {:else}
+                <p>No row selected. Use the keyboard or chart to choose a segment.</p>
+              {/if}
+            </div>
+
+            <div class="chart-summary-actions">
+              <button
+                type="button"
+                on:click={() => drillIntoSelected()}
+                disabled={!selectedRowCanDrill()}
+              >
+                Drill into selection
+              </button>
+              <button
+                type="button"
+                on:click={() => navigateUp()}
+                disabled={contextHistory.length === 0}
+              >
+                Move to parent scope
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="browse-list-block">
+          <div class="subpanel-header">
+            <div>
+              <p class="eyebrow">Rows</p>
+              <p class="subpanel-note">List view mirrors the current chart scope and selection.</p>
+            </div>
+            <span>{compactRows ? "compact" : "expanded"}{#if sunburstLoading} · loading child rings{/if}</span>
+          </div>
+          {#if currentRows().length}
+            <ul class:compact={compactRows} class="row-list">
+              {#each currentRows() as row}
+                <li>
+                  <button
+                    class:selected={selectedRow?.key === row.key}
+                    on:click={() => selectRow(row)}
+                    type="button"
+                  >
+                    <span class="row-title">{row.label}</span>
+                    <span class="row-meta">
+                      {formatMetric(row.metrics[currentContext.lens])} {LENS_LABELS[currentContext.lens].toLowerCase()}
+                    </span>
+                    <span class="row-tags">{row.kind}{#if row.category} · {row.category}{/if}</span>
+                    {#if rowHasOpportunities(row)}
+                      <span class="row-badge">{row.opportunities.annotations.length} opportunity{row.opportunities.annotations.length === 1 ? "" : "ies"}</span>
+                    {/if}
+                    {#if !compactRows && row.full_path}
+                      <span class="row-path">{row.full_path}</span>
+                    {/if}
+                  </button>
+                </li>
+              {/each}
+            </ul>
+          {:else}
+            <p class="empty-state">No visible rows yet for the pinned snapshot, current filters, and opportunity mode.</p>
+          {/if}
+        </div>
       </section>
 
       {#if detailVisible}
