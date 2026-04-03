@@ -317,6 +317,36 @@
     return Boolean(nextContextForRow(selectedRow));
   }
 
+  function canMoveSelection(direction) {
+    const rows = currentRows();
+    if (rows.length === 0) {
+      return false;
+    }
+
+    const index = selectedIndex();
+    const baseIndex = index >= 0 ? index : 0;
+    const nextIndex = Math.min(Math.max(baseIndex + direction, 0), rows.length - 1);
+    return nextIndex !== index;
+  }
+
+  function chartAccessibleSummary() {
+    const rows = currentRows();
+    if (rows.length === 0) {
+      return "No chart segments are visible for the current scope and filters.";
+    }
+
+    const summary = rows
+      .slice(0, 5)
+      .map((row) => {
+        const metric = formatMetric(row.metrics[currentContext.lens]);
+        const drill = nextContextForRow(row) ? "drill available" : "leaf";
+        return `${row.label}, ${row.kind}, ${metric} ${LENS_LABELS[currentContext.lens].toLowerCase()}, ${drill}`;
+      })
+      .join("; ");
+
+    return `${rows.length} visible chart segments. ${summary}`;
+  }
+
   function currentRows() {
     let rows = browseReport?.rows ?? [];
     if (opportunityOnly) {
@@ -1204,6 +1234,8 @@
             selectedRow={selectedRow}
             childRowsByParent={childRowsByParent}
             loading={sunburstLoading}
+            accessibleLabel={`${ROOT_LABELS[currentContext.root]} sunburst for ${chartScopeLabel()}`}
+            accessibleDescriptionId="chart-accessibility-summary"
             on:select={(event) => selectRow(event.detail.row)}
             on:drill={(event) => drillIntoRow(event.detail.row)}
           />
@@ -1211,6 +1243,10 @@
           <div class="chart-summary" aria-live="polite">
             <div>
               <strong>Chart selection</strong>
+              <p id="chart-accessibility-summary" class="chart-instructions">
+                {chartAccessibleSummary()} Use previous and next segment controls, the browse list,
+                or keyboard shortcuts to move selection without the pointer.
+              </p>
               {#if selectedRow}
                 <p>
                   {selectedRow.label} · {selectedRow.kind} · {formatMetric(selectedRowMetric())}
@@ -1228,6 +1264,20 @@
             <div class="chart-summary-actions">
               <button
                 type="button"
+                on:click={() => moveSelection(-1)}
+                disabled={!canMoveSelection(-1)}
+              >
+                Previous segment
+              </button>
+              <button
+                type="button"
+                on:click={() => moveSelection(1)}
+                disabled={!canMoveSelection(1)}
+              >
+                Next segment
+              </button>
+              <button
+                type="button"
                 on:click={() => drillIntoSelected()}
                 disabled={!selectedRowCanDrill()}
               >
@@ -1239,6 +1289,9 @@
                 disabled={contextHistory.length === 0}
               >
                 Move to parent scope
+              </button>
+              <button type="button" on:click={focusBrowsePanel}>
+                Focus browse pane
               </button>
             </div>
           </div>

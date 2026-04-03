@@ -417,6 +417,12 @@ h1 {
   color: var(--ink);
 }
 
+.chart-instructions {
+  max-width: 40rem;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
 .chart-summary-actions {
   display: flex;
   flex-wrap: wrap;
