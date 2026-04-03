@@ -33,6 +33,18 @@ textarea {
   min-height: 100vh;
 }
 
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .loading {
   min-height: 100vh;
   display: grid;
@@ -405,6 +417,12 @@ h1 {
   color: var(--ink);
 }
 
+.chart-instructions {
+  max-width: 40rem;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
 .chart-summary-actions {
   display: flex;
   flex-wrap: wrap;
@@ -481,6 +499,20 @@ h1 {
     0 0 0 3px rgba(192, 86, 33, 0.1);
 }
 
+.focused-pane .panel-header::after {
+  content: "Focused";
+  display: inline-block;
+  margin-left: auto;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  background: rgba(192, 86, 33, 0.12);
+  color: var(--accent);
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
 .panel-header {
   display: flex;
   align-items: start;
@@ -510,6 +542,21 @@ h1 {
 .row-list button.selected {
   border-color: rgba(192, 86, 33, 0.4);
   background: var(--accent-soft);
+  position: relative;
+}
+
+.row-list button.selected::before {
+  content: "Selected";
+  display: inline-block;
+  margin-bottom: 0.5rem;
+  padding: 0.15rem 0.45rem;
+  border-radius: 999px;
+  background: rgba(167, 57, 25, 0.12);
+  color: #8a1d0f;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .row-title,

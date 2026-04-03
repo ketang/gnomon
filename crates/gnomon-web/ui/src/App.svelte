@@ -49,6 +49,7 @@
   let error = "";
   let detailError = "";
   let shortcutMessage = "";
+  let liveMessage = "";
   let filters = null;
   let currentContext = createRootContext();
   let contextHistory = [];
@@ -61,6 +62,8 @@
   let categoryFilterValue = "";
   let rowFilterInput;
   let jumpInput;
+  let browsePanel;
+  let detailPanel;
   let opportunityOnly = false;
   let compactRows = false;
   let childRowsByParent = {};
@@ -72,6 +75,18 @@
 
   function copyContext(context) {
     return structuredClone(context);
+  }
+
+  function announce(message) {
+    liveMessage = message;
+  }
+
+  function focusBrowsePanel() {
+    browsePanel?.focus();
+  }
+
+  function focusDetailPanel() {
+    detailPanel?.focus();
   }
 
   function timeWindowBounds(key) {
@@ -228,6 +243,7 @@
     selectedRow = row;
     detailError = "";
     if (!detailVisible) {
+      focusBrowsePanel();
       return;
     }
 
@@ -246,12 +262,17 @@
     } finally {
       loadingDetail = false;
     }
+
+    if (focusedPane === "detail") {
+      focusDetailPanel();
+    }
   }
 
   async function refreshSnapshot() {
     refreshing = true;
     error = "";
     shortcutMessage = "Refreshing pinned snapshot.";
+    announce("Refreshing pinned snapshot.");
     try {
       const response = await fetch("/api/refresh", { method: "POST" });
       if (!response.ok) {
@@ -294,6 +315,36 @@
 
   function selectedRowCanDrill() {
     return Boolean(nextContextForRow(selectedRow));
+  }
+
+  function canMoveSelection(direction) {
+    const rows = currentRows();
+    if (rows.length === 0) {
+      return false;
+    }
+
+    const index = selectedIndex();
+    const baseIndex = index >= 0 ? index : 0;
+    const nextIndex = Math.min(Math.max(baseIndex + direction, 0), rows.length - 1);
+    return nextIndex !== index;
+  }
+
+  function chartAccessibleSummary() {
+    const rows = currentRows();
+    if (rows.length === 0) {
+      return "No chart segments are visible for the current scope and filters.";
+    }
+
+    const summary = rows
+      .slice(0, 5)
+      .map((row) => {
+        const metric = formatMetric(row.metrics[currentContext.lens]);
+        const drill = nextContextForRow(row) ? "drill available" : "leaf";
+        return `${row.label}, ${row.kind}, ${metric} ${LENS_LABELS[currentContext.lens].toLowerCase()}, ${drill}`;
+      })
+      .join("; ");
+
+    return `${rows.length} visible chart segments. ${summary}`;
   }
 
   function currentRows() {
@@ -343,6 +394,7 @@
     const query = jumpQuery.trim().toLowerCase();
     if (!query) {
       shortcutMessage = "Jump query is empty.";
+      announce(shortcutMessage);
       return;
     }
 
@@ -355,29 +407,34 @@
 
     if (!match) {
       shortcutMessage = `No visible row matches "${jumpQuery}".`;
+      announce(shortcutMessage);
       return;
     }
 
     await selectRow(match);
     focusedPane = "browse";
     shortcutMessage = `Jumped to ${match.label}.`;
+    announce(shortcutMessage);
   }
 
   function toggleBreadcrumbs() {
     showBreadcrumbs = !showBreadcrumbs;
     shortcutMessage = showBreadcrumbs ? "Breadcrumbs shown." : "Breadcrumbs hidden.";
+    announce(shortcutMessage);
   }
 
   function focusRowFilter() {
     rowFilterInput?.focus();
     rowFilterInput?.select();
     shortcutMessage = "Row filter focused.";
+    announce(shortcutMessage);
   }
 
   function focusJumpField() {
     jumpInput?.focus();
     jumpInput?.select();
     shortcutMessage = "Jump field focused.";
+    announce(shortcutMessage);
   }
 
   function toggleOpportunityOnly() {
@@ -385,11 +442,13 @@
     shortcutMessage = opportunityOnly
       ? "Showing only rows with opportunity annotations."
       : "Showing all rows again.";
+    announce(shortcutMessage);
   }
 
   function toggleRowDensity() {
     compactRows = !compactRows;
     shortcutMessage = compactRows ? "Compact row layout enabled." : "Expanded row layout enabled.";
+    announce(shortcutMessage);
   }
 
   function selectedIndex() {
@@ -400,6 +459,7 @@
     const rows = currentRows();
     if (rows.length === 0) {
       shortcutMessage = "No rows available in this browse view.";
+      announce(shortcutMessage);
       return;
     }
 
@@ -412,6 +472,7 @@
 
     await selectRow(rows[nextIndex]);
     shortcutMessage = `Selected ${rows[nextIndex].label}.`;
+    announce(shortcutMessage);
   }
 
   function cycleList(values, current, direction = 1) {
@@ -435,6 +496,7 @@
     detailError = "";
     await loadBrowse();
     shortcutMessage = `Switched to ${ROOT_LABELS[root]}.`;
+    announce(shortcutMessage);
   }
 
   async function cycleLens() {
@@ -444,6 +506,7 @@
     };
     await loadBrowse({ preserveSelectionKey: selectedRow?.key ?? null });
     shortcutMessage = `Lens: ${LENS_LABELS[currentContext.lens]}.`;
+    announce(shortcutMessage);
   }
 
   function nextContextForRow(row) {
@@ -564,6 +627,7 @@
     const nextContext = nextContextForRow(row);
     if (!nextContext) {
       shortcutMessage = "Selected row has no deeper browse level.";
+      announce(shortcutMessage);
       return;
     }
 
@@ -573,6 +637,7 @@
     focusedPane = "browse";
     await loadBrowse();
     shortcutMessage = `Drilled into ${row.label}.`;
+    announce(shortcutMessage);
   }
 
   async function drillIntoSelected() {
@@ -582,6 +647,7 @@
   async function navigateUp() {
     if (contextHistory.length === 0) {
       shortcutMessage = "Already at the root browse view.";
+      announce(shortcutMessage);
       return;
     }
 
@@ -591,11 +657,13 @@
     focusedPane = "browse";
     await loadBrowse();
     shortcutMessage = "Moved to parent scope.";
+    announce(shortcutMessage);
   }
 
   async function clearScope() {
     if (currentContext.path === "root" && contextHistory.length === 0) {
       shortcutMessage = "Already at the unscoped root view.";
+      announce(shortcutMessage);
       return;
     }
 
@@ -610,6 +678,7 @@
     focusedPane = "browse";
     await loadBrowse();
     shortcutMessage = "Cleared scope back to the root view.";
+    announce(shortcutMessage);
   }
 
   async function clearFilters() {
@@ -622,11 +691,18 @@
     };
     await loadBrowse({ preserveSelectionKey: selectedRow?.key ?? null });
     shortcutMessage = "Cleared active filters.";
+    announce(shortcutMessage);
   }
 
   function togglePaneFocus() {
     focusedPane = focusedPane === "browse" ? "detail" : "browse";
     shortcutMessage = focusedPane === "browse" ? "Browse pane focused." : "Detail pane focused.";
+    announce(shortcutMessage);
+    if (focusedPane === "browse") {
+      focusBrowsePanel();
+    } else if (detailVisible) {
+      focusDetailPanel();
+    }
   }
 
   async function toggleDetailPane() {
@@ -638,6 +714,12 @@
       focusedPane = "browse";
     }
     shortcutMessage = detailVisible ? "Detail pane opened." : "Detail pane hidden.";
+    announce(shortcutMessage);
+    if (detailVisible) {
+      focusDetailPanel();
+    } else {
+      focusBrowsePanel();
+    }
   }
 
   async function cycleTimeWindow() {
@@ -650,12 +732,14 @@
     };
     await loadBrowse({ preserveSelectionKey: selectedRow?.key ?? null });
     shortcutMessage = `Time window: ${timeWindowLabel(currentContext.time_window)}.`;
+    announce(shortcutMessage);
   }
 
   async function cycleModel() {
     const values = [null, ...(filters?.models ?? [])];
     if (values.length <= 1) {
       shortcutMessage = "No model filters available yet.";
+      announce(shortcutMessage);
       return;
     }
 
@@ -665,17 +749,20 @@
     };
     await loadBrowse({ preserveSelectionKey: selectedRow?.key ?? null });
     shortcutMessage = `Model filter: ${currentContext.model ?? "all models"}.`;
+    announce(shortcutMessage);
   }
 
   async function cycleProjectFilter() {
     if (currentContext.path !== "root") {
       shortcutMessage = "Project filter is only available from the root view right now.";
+      announce(shortcutMessage);
       return;
     }
 
     const values = [null, ...(filters?.projects?.map((project) => project.id) ?? [])];
     if (values.length <= 1) {
       shortcutMessage = "No project filters available yet.";
+      announce(shortcutMessage);
       return;
     }
 
@@ -685,12 +772,14 @@
     };
     await loadBrowse();
     shortcutMessage = `Project filter: ${projectFilterLabel(currentContext.filter_project_id)}.`;
+    announce(shortcutMessage);
   }
 
   async function cycleCategoryFilter() {
     const values = [null, ...(filters?.categories ?? [])];
     if (values.length <= 1) {
       shortcutMessage = "No category filters available yet.";
+      announce(shortcutMessage);
       return;
     }
 
@@ -700,6 +789,7 @@
     };
     await loadBrowse({ preserveSelectionKey: selectedRow?.key ?? null });
     shortcutMessage = `Category filter: ${currentContext.filter_category ?? "all categories"}.`;
+    announce(shortcutMessage);
   }
 
   function cycleNullableList(values, current) {
@@ -912,13 +1002,15 @@
 <svelte:window on:keydown={handleKeydown} />
 
 {#if loading}
-  <main class="loading">Loading gnomon-web...</main>
+  <main class="loading" aria-busy="true">Loading gnomon-web...</main>
 {:else}
   <main class="app-shell">
-    <section class="hero">
+    <div class="sr-only" aria-live="polite" aria-atomic="true">{liveMessage}</div>
+
+    <header class="hero" aria-labelledby="app-title">
       <div>
         <p class="eyebrow">gnomon-web</p>
-        <h1>Browser shell bootstrap</h1>
+        <h1 id="app-title">Browser shell bootstrap</h1>
         <p class="lede">
           The browser shell now talks to the local <code>gnomon-web</code> backend and renders
           status, sunburst, browse, detail, and filter surfaces in the DOM.
@@ -929,13 +1021,13 @@
           {#if refreshing}Refreshing...{:else}Refresh snapshot{/if}
         </button>
       </div>
-    </section>
+    </header>
 
     {#if error}
-      <section class="banner error">{error}</section>
+      <section class="banner error" role="alert">{error}</section>
     {/if}
 
-    <section class="status-grid">
+    <section class="status-grid" aria-label="Snapshot status overview">
       <article class="status-card">
         <p class="label">Pinned snapshot</p>
         <strong>{formatSnapshot(status?.pinned_snapshot)}</strong>
@@ -956,8 +1048,8 @@
       </article>
     </section>
 
-    <section class="toolbar">
-      <div class="toolbar-group" aria-label="Root hierarchy">
+    <nav class="toolbar" aria-label="Primary browser controls">
+      <div class="toolbar-group" role="group" aria-label="Root hierarchy">
         {#each ROOT_OPTIONS as root}
           <button
             class:active={currentContext.root === root}
@@ -968,7 +1060,7 @@
           </button>
         {/each}
       </div>
-      <div class="toolbar-group" aria-label="Metric lens and shell controls">
+      <div class="toolbar-group" role="group" aria-label="Metric lens and shell controls">
         <button type="button" class="pill" on:click={cycleLens}>
           L Lens: {LENS_LABELS[currentContext.lens]}
         </button>
@@ -988,9 +1080,9 @@
           O {compactRows ? "Expanded" : "Compact"} rows
         </button>
       </div>
-    </section>
+    </nav>
 
-    <section class="filter-bar">
+    <section class="filter-bar" aria-label="Filters">
       <label>
         <span>T time</span>
         <select on:change={updateTimeWindow} bind:value={currentContext.time_window}>
@@ -1033,7 +1125,7 @@
     </section>
 
 
-    <section class="aux-bar">
+    <section class="aux-bar" aria-label="Search and jump controls">
       <label>
         <span>/ row filter</span>
         <input bind:this={rowFilterInput} bind:value={rowFilter} type="search" placeholder="Filter visible rows" />
@@ -1047,7 +1139,7 @@
       </label>
     </section>
 
-    <section class="status-strip">
+    <section class="status-strip" aria-label="Current browser state">
       <p>
         <strong>Scope</strong>
         <span>{ROOT_LABELS[currentContext.root]}</span>
@@ -1070,7 +1162,7 @@
     </section>
 
     {#if showBreadcrumbs}
-      <section class="banner breadcrumb-banner">
+      <nav class="banner breadcrumb-banner" aria-label="Breadcrumbs">
         <strong>Breadcrumbs</strong>
         {#each breadcrumbItems() as crumb, index}
           <button
@@ -1083,15 +1175,16 @@
               focusedPane = "browse";
               await loadBrowse();
               shortcutMessage = `Jumped to ${crumb.label}.`;
+              announce(shortcutMessage);
             }}
           >
             {crumb.label}
           </button>
         {/each}
-      </section>
+      </nav>
     {/if}
 
-    <section class="banner shortcut-banner">
+    <section class="banner shortcut-banner" aria-label="Keyboard shortcuts">
       <strong>Keyboard</strong>
       <span>1/2 root</span>
       <span>l lens</span>
@@ -1115,11 +1208,17 @@
     </section>
 
     <section class="workspace">
-      <section class:focused-pane={focusedPane === "browse"} class="panel browse-panel">
+      <section
+        class:focused-pane={focusedPane === "browse"}
+        class="panel browse-panel"
+        aria-labelledby="browse-heading"
+        tabindex="-1"
+        bind:this={browsePanel}
+      >
         <header class="panel-header browse-header">
           <div>
             <p class="eyebrow">Map</p>
-            <h2>{ROOT_LABELS[currentContext.root]}</h2>
+            <h2 id="browse-heading">{ROOT_LABELS[currentContext.root]}</h2>
             <p class="chart-caption">{chartScopeLabel()} · {LENS_LABELS[currentContext.lens]}</p>
           </div>
           <span>{currentRows().length} rows{#if sunburstLoading} · mapping deeper rings{/if}</span>
@@ -1135,6 +1234,8 @@
             selectedRow={selectedRow}
             childRowsByParent={childRowsByParent}
             loading={sunburstLoading}
+            accessibleLabel={`${ROOT_LABELS[currentContext.root]} sunburst for ${chartScopeLabel()}`}
+            accessibleDescriptionId="chart-accessibility-summary"
             on:select={(event) => selectRow(event.detail.row)}
             on:drill={(event) => drillIntoRow(event.detail.row)}
           />
@@ -1142,6 +1243,10 @@
           <div class="chart-summary" aria-live="polite">
             <div>
               <strong>Chart selection</strong>
+              <p id="chart-accessibility-summary" class="chart-instructions">
+                {chartAccessibleSummary()} Use previous and next segment controls, the browse list,
+                or keyboard shortcuts to move selection without the pointer.
+              </p>
               {#if selectedRow}
                 <p>
                   {selectedRow.label} · {selectedRow.kind} · {formatMetric(selectedRowMetric())}
@@ -1159,6 +1264,20 @@
             <div class="chart-summary-actions">
               <button
                 type="button"
+                on:click={() => moveSelection(-1)}
+                disabled={!canMoveSelection(-1)}
+              >
+                Previous segment
+              </button>
+              <button
+                type="button"
+                on:click={() => moveSelection(1)}
+                disabled={!canMoveSelection(1)}
+              >
+                Next segment
+              </button>
+              <button
+                type="button"
                 on:click={() => drillIntoSelected()}
                 disabled={!selectedRowCanDrill()}
               >
@@ -1170,6 +1289,9 @@
                 disabled={contextHistory.length === 0}
               >
                 Move to parent scope
+              </button>
+              <button type="button" on:click={focusBrowsePanel}>
+                Focus browse pane
               </button>
             </div>
           </div>
@@ -1184,13 +1306,15 @@
             <span>{compactRows ? "compact" : "expanded"}{#if sunburstLoading} · loading child rings{/if}</span>
           </div>
           {#if currentRows().length}
-            <ul class:compact={compactRows} class="row-list">
+            <ul class:compact={compactRows} class="row-list" role="listbox" aria-label="Browse rows">
               {#each currentRows() as row}
                 <li>
                   <button
                     class:selected={selectedRow?.key === row.key}
                     on:click={() => selectRow(row)}
                     type="button"
+                    aria-pressed={selectedRow?.key === row.key}
+                    aria-current={selectedRow?.key === row.key ? "true" : undefined}
                   >
                     <span class="row-title">{row.label}</span>
                     <span class="row-meta">
@@ -1214,11 +1338,17 @@
       </section>
 
       {#if detailVisible}
-        <section class:focused-pane={focusedPane === "detail"} class="panel detail-panel">
+        <section
+          class:focused-pane={focusedPane === "detail"}
+          class="panel detail-panel"
+          aria-labelledby="detail-heading"
+          tabindex="-1"
+          bind:this={detailPanel}
+        >
           <header class="panel-header">
             <div>
               <p class="eyebrow">Detail</p>
-              <h2>{selectedRow?.label ?? "Select a row"}</h2>
+              <h2 id="detail-heading">{selectedRow?.label ?? "Select a row"}</h2>
             </div>
           </header>
 

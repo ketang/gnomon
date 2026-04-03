@@ -15,6 +15,8 @@
   export let selectedRow = null;
   export let childRowsByParent = {};
   export let loading = false;
+  export let accessibleLabel = "Sunburst chart";
+  export let accessibleDescriptionId = null;
 
   const dispatch = createEventDispatcher();
   const palette = {
@@ -342,7 +344,13 @@
 
 {#if rows.length}
   <div class:loading class="sunburst-shell">
-    <div bind:this={container} class="sunburst-chart" aria-label="Sunburst chart"></div>
+    <div
+      bind:this={container}
+      class="sunburst-chart"
+      role="img"
+      aria-label={accessibleLabel}
+      aria-describedby={accessibleDescriptionId ?? undefined}
+    ></div>
     {#if loading}
       <div class="sunburst-loading">Mapping deeper rings for the current view.</div>
     {/if}
