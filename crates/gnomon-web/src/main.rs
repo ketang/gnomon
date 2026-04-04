@@ -735,7 +735,8 @@ mod tests {
         let body = body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("reading status response body should succeed");
-        let json: Value = serde_json::from_slice(&body).expect("status response should be valid json");
+        let json: Value =
+            serde_json::from_slice(&body).expect("status response should be valid json");
         assert_eq!(json["pinned_snapshot"]["max_publish_seq"], 0);
     }
 
