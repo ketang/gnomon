@@ -96,9 +96,8 @@ impl Default for SunburstRenderConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SunburstRenderMode {
-    #[default]
     Quadrant,
     Coarse,
     Braille,
