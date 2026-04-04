@@ -303,18 +303,6 @@ without renaming the underlying category labels.
 
 ## Agent Instructions
 
-Shared agent standards are vendored via the `.agents/` git submodule:
-
-```bash
-git submodule update --init --recursive
-```
-
-- `CLAUDE.md` imports the project-appropriate shared rules from `.agents/rules/`
-- `AGENTS.md` provides Codex-friendly project instructions and references the
-  same shared standards directly
-
-To refresh the shared standards later:
-
-```bash
-git submodule update --remote --merge .agents
-```
+- `AGENTS.md` is the canonical project instruction entry point for Codex and
+  other file-scoped agents
+- `CLAUDE.md` contains the repo-local instructions for Claude

@@ -3,11 +3,6 @@
 `gnomon` is a Rust workspace for analyzing Claude session history and surfacing
 the usage patterns that drive the highest token consumption.
 
-@.agents/rules/workflow.md
-@.agents/rules/testing.md
-@.agents/rules/code-quality.md
-@.agents/rules/learning.md
-
 ---
 
 ## Local Overrides
@@ -29,9 +24,6 @@ repository.
 - `.worktrees/` is local orchestration state, not product source. Do not commit
   or clean it up unless the user explicitly asks.
 
-The imported workflow rule contains a direct-to-`main` policy for repos that
-use that model. `gnomon` does not. The local branch policy above overrides it.
-
 ### Issue tracking
 
 - GitHub Issues is the canonical issue tracker workflow for this repo.
@@ -40,8 +32,7 @@ use that model. `gnomon` does not. The local branch policy above overrides it.
   that context.
 - Do not create, edit, or close GitHub issues unless the user explicitly asks.
 
-GitHub Issues is the tracker for `gnomon`, so this repo does not import
-`.agents/rules/beads.md`.
+GitHub Issues is the tracker for `gnomon`; do not assume `beads`.
 
 ## Read First
 

@@ -12,16 +12,9 @@ project instruction entry point.
 
 ## Shared Standards
 
-Shared standards live under `.agents/rules/`. Open the relevant files when the
-task touches these areas:
-
-- `.agents/rules/workflow.md`
-- `.agents/rules/testing.md`
-- `.agents/rules/code-quality.md`
-- `.agents/rules/learning.md`
-
-Do not rely on Claude-style `@...` import behavior here. Treat these as files
-to read when needed.
+This repository no longer vendors shared agent rules through a separate
+submodule. Use the instructions in this file, `README.md`, and the design and
+workspace files listed above as the canonical project guidance.
 
 ## Repo Facts
 
