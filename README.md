@@ -4,10 +4,11 @@
 
 ## Current Status
 
-This repository is bootstrapped as a Rust workspace with three crates:
+This repository is bootstrapped as a Rust workspace with four crates:
 
 - `gnomon-core`: configuration, source discovery, import, storage, classification, and query logic.
 - `gnomon-tui`: the interactive terminal interface.
+- `gnomon-web`: the local browser UI and embedded asset server.
 - `gnomon`: the executable entry point.
 
 The current binary resolves runtime paths, scans the source manifest, schedules
@@ -24,6 +25,12 @@ not abort launch; failed chunks remain excluded from the pinned snapshot until
 a later successful re-import. The checked-in design document captures the
 agreed `v1` architecture and backlog.
 
+`gnomon-web` serves the same backend data locally over HTTP and embeds built
+frontend assets into the Rust binary. The browser build lives under
+`crates/gnomon-web/ui/`, while `crates/gnomon-web/build.rs` copies the built
+`dist/` assets into the binary when they exist and falls back to the checked-in
+placeholder assets when they do not.
+
 ## Workspace Layout
 
 ```text
@@ -31,6 +38,7 @@ crates/
   gnomon/
   gnomon-core/
   gnomon-tui/
+  gnomon-web/
 docs/
   opportunity-stability.md
   v1-design.md
@@ -122,6 +130,40 @@ node src/cli.mjs
 ```
 
 Artifacts are written under `tools/tui-shot/artifacts/`.
+
+## Web UI
+
+`gnomon-web` is the local browser UI for the same derived data model used by the
+terminal app. End users do not need Node.js at runtime because the Rust binary
+serves embedded assets.
+
+Frontend prerequisites and build loop:
+
+```bash
+cd crates/gnomon-web/ui
+npm install
+npm run build
+```
+
+The build writes `ui/dist/`, which `crates/gnomon-web/build.rs` embeds into the
+binary at compile time. If `ui/dist/` is absent, the build script falls back to
+the checked-in placeholder assets so the binary still runs.
+
+Developer workflow:
+
+```bash
+cargo run -p gnomon-web -- --help
+cargo run -p gnomon-web
+```
+
+For frontend-only iteration, keep the Rust server running and rebuild the UI
+bundle in `crates/gnomon-web/ui/` as needed. The browser UI listens on loopback
+by default, on port `4680` unless overridden with `--port` or `GNOMON_WEB_PORT`.
+
+```bash
+cd crates/gnomon-web/ui
+npm run build
+```
 
 ## Configuration
 
