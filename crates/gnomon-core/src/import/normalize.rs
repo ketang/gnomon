@@ -204,6 +204,14 @@ enum HistoryInputKind {
     Other,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillInvocationDraft {
+    session_id: String,
+    recorded_at_utc: Option<String>,
+    raw_project: Option<String>,
+    skill_name: String,
+}
+
 impl HistoryInputKind {
     const fn as_str(self) -> &'static str {
         match self {
@@ -306,8 +314,9 @@ fn insert_history_event(
         )
     })?;
 
-    tx.execute(
-        "
+    let history_event_id = tx
+        .query_row(
+            "
         INSERT INTO history_event (
             import_chunk_id,
             source_file_id,
@@ -322,27 +331,33 @@ fn insert_history_event(
             raw_json
         )
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        RETURNING id
         ",
-        params![
-            params.import_chunk_id,
-            params.source_file_id,
-            source_line_no,
-            optional_string(record.get("sessionId")),
-            optional_string(record.get("timestamp")),
-            optional_string(record.get("project")),
-            display_text,
-            pasted_contents_json,
-            input_kind.as_str(),
-            slash_command_name,
-            raw_json,
-        ],
-    )
-    .with_context(|| {
-        format!(
-            "unable to insert normalized history event on line {source_line_no} from {}",
-            params.path.display()
+            params![
+                params.import_chunk_id,
+                params.source_file_id,
+                source_line_no,
+                optional_string(record.get("sessionId")),
+                optional_string(record.get("timestamp")),
+                optional_string(record.get("project")),
+                display_text,
+                pasted_contents_json,
+                input_kind.as_str(),
+                slash_command_name,
+                raw_json,
+            ],
+            |row| row.get::<_, i64>(0),
         )
-    })?;
+        .with_context(|| {
+            format!(
+                "unable to insert normalized history event on line {source_line_no} from {}",
+                params.path.display()
+            )
+        })?;
+
+    if let Some(invocation) = extract_skill_invocation(record) {
+        insert_skill_invocation(tx, params, history_event_id, &invocation)?;
+    }
 
     Ok(())
 }
@@ -363,6 +378,58 @@ fn classify_history_input(display_text: Option<&str>) -> (HistoryInputKind, Opti
         return (HistoryInputKind::SlashCommand, command_name);
     }
     (HistoryInputKind::PlainPrompt, None)
+}
+
+fn extract_skill_invocation(record: &Value) -> Option<SkillInvocationDraft> {
+    let session_id = optional_string(record.get("sessionId"))?;
+    let display_text = optional_string(record.get("display"))?;
+    let stripped = display_text.trim().strip_prefix("/skill")?;
+    let skill_name = stripped
+        .split_whitespace()
+        .next()
+        .filter(|name| !name.is_empty())?
+        .to_string();
+
+    Some(SkillInvocationDraft {
+        session_id,
+        recorded_at_utc: optional_string(record.get("timestamp")),
+        raw_project: optional_string(record.get("project")),
+        skill_name,
+    })
+}
+
+fn insert_skill_invocation(
+    tx: &Transaction<'_>,
+    params: &NormalizeJsonlFileParams,
+    history_event_id: i64,
+    invocation: &SkillInvocationDraft,
+) -> Result<()> {
+    tx.execute(
+        "
+        INSERT INTO skill_invocation (
+            import_chunk_id,
+            history_event_id,
+            source_file_id,
+            session_id,
+            recorded_at_utc,
+            raw_project,
+            skill_name,
+            invocation_kind
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'explicit_history')
+        ",
+        params![
+            params.import_chunk_id,
+            history_event_id,
+            params.source_file_id,
+            invocation.session_id,
+            invocation.recorded_at_utc,
+            invocation.raw_project,
+            invocation.skill_name,
+        ],
+    )
+    .context("unable to insert explicit skill invocation")?;
+    Ok(())
 }
 
 fn purge_existing_import(
@@ -388,6 +455,12 @@ fn purge_existing_import(
         [params.source_file_id],
     )
     .context("unable to purge existing normalized history event state")?;
+
+    tx.execute(
+        "DELETE FROM skill_invocation WHERE source_file_id = ?1",
+        [params.source_file_id],
+    )
+    .context("unable to purge existing normalized skill invocation state")?;
 
     tx.execute(
         "
@@ -1790,6 +1863,11 @@ mod tests {
                 id INTEGER PRIMARY KEY,
                 source_file_id INTEGER NOT NULL
             );
+
+            CREATE TABLE skill_invocation (
+                id INTEGER PRIMARY KEY,
+                source_file_id INTEGER NOT NULL
+            );
             ",
         )?;
         conn.execute(
@@ -2053,6 +2131,27 @@ mod tests {
             |row| row.get(0),
         )?;
         assert!(pasted_contents_json.is_some());
+
+        let invocations: Vec<(String, String, Option<String>)> = {
+            let mut stmt = db.connection().prepare(
+                "
+                SELECT session_id, skill_name, raw_project
+                FROM skill_invocation
+                ORDER BY recorded_at_utc
+                ",
+            )?;
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(
+            invocations[0],
+            (
+                "session-history-1".to_string(),
+                "planner".to_string(),
+                Some("/tmp/project-a".to_string()),
+            )
+        );
 
         Ok(())
     }

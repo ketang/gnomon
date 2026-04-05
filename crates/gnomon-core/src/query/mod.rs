@@ -466,6 +466,24 @@ pub struct HistoryEventRow {
     pub slash_command_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkillInvocationFilters {
+    pub skill_name: Option<String>,
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillInvocationRow {
+    pub skill_name: String,
+    pub session_id: String,
+    pub recorded_at_utc: Option<String>,
+    pub raw_project: Option<String>,
+    pub conversation_id: Option<i64>,
+    pub project_id: Option<i64>,
+    pub project_name: Option<String>,
+    pub conversation_title: Option<String>,
+}
+
 pub struct QueryEngine<'conn> {
     conn: &'conn Connection,
     perf_logger: Option<PerfLogger>,
@@ -1113,6 +1131,96 @@ impl<'conn> QueryEngine<'conn> {
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("unable to read history event rows")
+    }
+
+    pub fn skill_invocations(
+        &self,
+        snapshot: &SnapshotBounds,
+        filters: &SkillInvocationFilters,
+    ) -> Result<Vec<SkillInvocationRow>> {
+        if snapshot.max_publish_seq == 0 {
+            return Ok(Vec::new());
+        }
+
+        let max_publish_seq = i64::try_from(snapshot.max_publish_seq)
+            .context("snapshot publish_seq overflowed i64")?;
+        let mut sql = "
+            SELECT
+                si.skill_name,
+                si.session_id,
+                si.recorded_at_utc,
+                si.raw_project,
+                c.id,
+                c.project_id,
+                c.display_name,
+                c.title
+            FROM skill_invocation si
+            JOIN import_chunk sic ON sic.id = si.import_chunk_id
+            LEFT JOIN (
+                SELECT DISTINCT
+                    c.id,
+                    c.title,
+                    c.project_id,
+                    p.display_name,
+                    substr(c.external_id, instr(c.external_id, ':session:') + 9) AS session_id
+                FROM conversation c
+                JOIN source_file sf
+                    ON sf.id = c.source_file_id
+                   AND sf.source_kind = 'transcript'
+                JOIN stream s
+                    ON s.conversation_id = c.id
+                JOIN import_chunk cic
+                    ON cic.id = s.import_chunk_id
+                JOIN project p
+                    ON p.id = c.project_id
+                WHERE cic.state = 'complete'
+                  AND cic.publish_seq IS NOT NULL
+                  AND cic.publish_seq <= ?1
+            ) c
+                ON c.session_id = si.session_id
+            WHERE sic.state = 'complete'
+              AND sic.publish_seq IS NOT NULL
+              AND sic.publish_seq <= ?1
+        "
+        .to_string();
+        let mut params = vec![Value::Integer(max_publish_seq)];
+
+        if let Some(skill_name) = &filters.skill_name {
+            sql.push_str(&format!(" AND si.skill_name = ?{}", params.len() + 1));
+            params.push(Value::Text(skill_name.clone()));
+        }
+        if let Some(session_id) = &filters.session_id {
+            sql.push_str(&format!(" AND si.session_id = ?{}", params.len() + 1));
+            params.push(Value::Text(session_id.clone()));
+        }
+
+        sql.push_str(
+            "
+            ORDER BY si.skill_name, si.session_id, si.recorded_at_utc, c.id
+            ",
+        );
+
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .context("unable to prepare skill invocation query")?;
+        let rows = stmt
+            .query_map(params_from_iter(params.iter()), |row| {
+                Ok(SkillInvocationRow {
+                    skill_name: row.get(0)?,
+                    session_id: row.get(1)?,
+                    recorded_at_utc: row.get(2)?,
+                    raw_project: row.get(3)?,
+                    conversation_id: row.get(4)?,
+                    project_id: row.get(5)?,
+                    project_name: row.get(6)?,
+                    conversation_title: row.get(7)?,
+                })
+            })
+            .context("unable to execute skill invocation query")?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("unable to read skill invocation rows")
     }
 
     pub fn latest_snapshot_bounds_query_plan(&self) -> Result<Vec<String>> {
@@ -4113,8 +4221,8 @@ mod tests {
     use super::{
         ActionKey, BatchBrowseRequest, BatchBrowseResult, BrowseFilters, BrowsePath, BrowseRequest,
         ClassificationState, ConversationTurnRow, FilterOptions, HistoryEventFilters, MetricLens,
-        QueryEngine, RootView, SnapshotBounds, SnapshotCoverageSummary, TimeWindowFilter,
-        build_grouped_action_rollup_rows_query, build_opportunities_rows,
+        QueryEngine, RootView, SkillInvocationFilters, SnapshotBounds, SnapshotCoverageSummary,
+        TimeWindowFilter, build_grouped_action_rollup_rows_query, build_opportunities_rows,
         build_scoped_action_facts_query, build_scoped_path_facts_query, display_category,
     };
 
@@ -4325,6 +4433,165 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2, 3]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn skill_invocations_join_to_sessions_and_preserve_unmatched_rows() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let conn = db.connection_mut();
+        let fixture = seed_query_fixture(conn, temp.path())?;
+        let (matched_conversation_id, matched_transcript_source_file_id): (i64, i64) = conn
+            .query_row(
+                "
+                SELECT c.id, c.source_file_id
+                FROM conversation c
+                JOIN project p ON p.id = c.project_id
+                WHERE p.id = ?1
+                ORDER BY c.id
+                LIMIT 1
+                ",
+                [fixture.project_a_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+        conn.execute(
+            "
+            UPDATE conversation
+            SET external_id = ?2
+            WHERE id = ?1
+            ",
+            params![
+                matched_conversation_id,
+                format!(
+                    "source-file:{}:session:matched-session",
+                    matched_transcript_source_file_id
+                )
+            ],
+        )?;
+
+        let source_file_id: i64 = conn.query_row(
+            "
+            INSERT INTO source_file (
+                project_id,
+                relative_path,
+                source_kind,
+                modified_at_utc,
+                size_bytes,
+                scan_warnings_json
+            )
+            VALUES (?1, '../history.jsonl', 'claude_history', '2026-03-28T09:00:00Z', 1, '[]')
+            RETURNING id
+            ",
+            [fixture.project_a_id],
+            |row| row.get(0),
+        )?;
+        let import_chunk_id: i64 = conn.query_row(
+            "
+            INSERT INTO import_chunk (
+                project_id,
+                chunk_day_local,
+                state,
+                publish_seq,
+                started_at_utc,
+                completed_at_utc
+            )
+            VALUES (?1, '2026-03-28', 'complete', 3, '2026-03-28T09:00:00Z', '2026-03-28T09:00:01Z')
+            RETURNING id
+            ",
+            [fixture.project_a_id],
+            |row| row.get(0),
+        )?;
+
+        let matched_history_event_id: i64 = conn.query_row(
+            "
+            INSERT INTO history_event (
+                import_chunk_id,
+                source_file_id,
+                source_line_no,
+                session_id,
+                recorded_at_utc,
+                raw_project,
+                display_text,
+                pasted_contents_json,
+                input_kind,
+                slash_command_name,
+                raw_json
+            )
+            VALUES (?1, ?2, 1, 'matched-session', '2026-03-28T08:00:00Z', '/tmp/project-a', '/skill planner', '[]', 'slash_command', 'skill', '{}')
+            RETURNING id
+            ",
+            params![import_chunk_id, source_file_id],
+            |row| row.get(0),
+        )?;
+        let unmatched_history_event_id: i64 = conn.query_row(
+            "
+            INSERT INTO history_event (
+                import_chunk_id,
+                source_file_id,
+                source_line_no,
+                session_id,
+                recorded_at_utc,
+                raw_project,
+                display_text,
+                pasted_contents_json,
+                input_kind,
+                slash_command_name,
+                raw_json
+            )
+            VALUES (?1, ?2, 2, 'missing-session', '2026-03-28T08:05:00Z', '/tmp/project-z', '/skill reviewer', '[]', 'slash_command', 'skill', '{}')
+            RETURNING id
+            ",
+            params![import_chunk_id, source_file_id],
+            |row| row.get(0),
+        )?;
+
+        conn.execute(
+            "
+            INSERT INTO skill_invocation (
+                import_chunk_id,
+                history_event_id,
+                source_file_id,
+                session_id,
+                recorded_at_utc,
+                raw_project,
+                skill_name,
+                invocation_kind
+            )
+            VALUES
+                (?1, ?2, ?4, 'matched-session', '2026-03-28T08:00:00Z', '/tmp/project-a', 'planner', 'explicit_history'),
+                (?1, ?3, ?4, 'missing-session', '2026-03-28T08:05:00Z', '/tmp/project-z', 'reviewer', 'explicit_history')
+            ",
+            params![
+                import_chunk_id,
+                matched_history_event_id,
+                unmatched_history_event_id,
+                source_file_id
+            ],
+        )?;
+
+        let engine = QueryEngine::new(conn);
+        let snapshot = engine.latest_snapshot_bounds()?;
+
+        let rows = engine.skill_invocations(&snapshot, &SkillInvocationFilters::default())?;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].skill_name, "planner");
+        assert!(rows[0].conversation_id.is_some());
+        assert_eq!(rows[0].conversation_id, Some(matched_conversation_id));
+        assert_eq!(rows[0].project_name.as_deref(), Some("project-a"));
+        assert_eq!(rows[1].skill_name, "reviewer");
+        assert_eq!(rows[1].conversation_id, None);
+
+        let filtered = engine.skill_invocations(
+            &snapshot,
+            &SkillInvocationFilters {
+                skill_name: Some("planner".to_string()),
+                ..SkillInvocationFilters::default()
+            },
+        )?;
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].session_id, "matched-session");
 
         Ok(())
     }
