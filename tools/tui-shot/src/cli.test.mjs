@@ -2,9 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  acknowledgeBrowserWrite,
   buildLaunchCommand,
+  createBrowserRenderState,
+  hasRenderableTerminalLines,
   keyToSequence,
   parseFixtureReport,
+  queueBrowserWrite,
   terminalViewportPixels,
 } from "./cli.mjs";
 
@@ -60,4 +64,30 @@ test("buildLaunchCommand injects fixture db and source root", () => {
     "/tmp/source",
   ]);
   assert.equal(launch.cwd, "/repo");
+});
+
+test("browser render state tracks queued and acknowledged writes", () => {
+  const renderState = createBrowserRenderState();
+
+  assert.equal(renderState.nextSequence, 1);
+  assert.equal(renderState.lastQueuedSequence, 0);
+  assert.equal(renderState.lastAckedSequence, 0);
+
+  const first = queueBrowserWrite(renderState);
+  const second = queueBrowserWrite(renderState);
+
+  assert.equal(first, 1);
+  assert.equal(second, 2);
+  assert.equal(renderState.lastQueuedSequence, 2);
+
+  acknowledgeBrowserWrite(renderState, 1);
+  assert.equal(renderState.lastAckedSequence, 1);
+  acknowledgeBrowserWrite(renderState, 2);
+  assert.equal(renderState.lastAckedSequence, 2);
+});
+
+test("hasRenderableTerminalLines rejects blank render output", () => {
+  assert.equal(hasRenderableTerminalLines([]), false);
+  assert.equal(hasRenderableTerminalLines(["", "   ", "\t"]), false);
+  assert.equal(hasRenderableTerminalLines(["", "gnomon"]), true);
 });

@@ -190,6 +190,8 @@ function createSession(pty, launch, viewport, repoRoot) {
     lastOutputAt: Date.now(),
     outputChunks: [],
     exitCode: null,
+    browserRender: createBrowserRenderState(),
+    browserWriteTail: Promise.resolve(),
   };
 }
 
@@ -218,12 +220,37 @@ async function setupTerminalPage(page, scenario) {
 }
 
 function bindPtyToPage(page, session) {
-  session.pty.onData(async (data) => {
+  session.pty.onData((data) => {
     session.lastOutputAt = Date.now();
     session.outputChunks.push(data);
-    await page.evaluate((chunk) => {
-      window.__GNOMON_TUI_SHOT__.terminal.write(chunk);
-    }, data);
+    const sequence = queueBrowserWrite(session.browserRender);
+    const nextTail = session.browserWriteTail.then(async () => {
+      await page.evaluate(
+        ({ chunk }) =>
+          new Promise((resolve, reject) => {
+            const harness = window.__GNOMON_TUI_SHOT__;
+            if (!harness?.terminal) {
+              reject(new Error("terminal harness is not ready"));
+              return;
+            }
+
+            try {
+              harness.terminal.write(chunk, () => {
+                resolve();
+              });
+            } catch (error) {
+              reject(error);
+            }
+          }),
+        { chunk: data },
+      );
+      acknowledgeBrowserWrite(session.browserRender, sequence);
+    });
+
+    nextTail.catch((error) => {
+      session.browserRender.writeError = error;
+    });
+    session.browserWriteTail = nextTail;
   });
 
   session.pty.onExit(({ exitCode }) => {
@@ -269,6 +296,7 @@ async function captureScreenshot({
   const pngPath = path.join(artifactsDir, `${baseName}.png`);
   const jsonPath = path.join(artifactsDir, `${baseName}.json`);
   const terminal = page.locator("#terminal-shell");
+  await waitForBrowserRender(session, page);
   await terminal.screenshot({
     path: pngPath,
     animations: "disabled",
@@ -291,6 +319,23 @@ async function captureScreenshot({
   await fs.writeFile(jsonPath, JSON.stringify(metadata, null, 2));
 }
 
+async function waitForBrowserRender(session, page, timeoutMs = 4000) {
+  await waitForPromise(session.browserWriteTail, timeoutMs, "browser write chain");
+
+  if (session.browserRender.writeError) {
+    throw session.browserRender.writeError;
+  }
+
+  if (!isBrowserRenderSettled(session.browserRender)) {
+    throw new Error(
+      `browser render barrier is not settled: acked ${session.browserRender.lastAckedSequence}, queued ${session.browserRender.lastQueuedSequence}`,
+    );
+  }
+
+  await waitForAnimationFrames(page, 2, timeoutMs);
+  await ensureTerminalRendered(page, timeoutMs);
+}
+
 async function waitForIdle(session, timeoutMs, quietMs) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -303,6 +348,102 @@ async function waitForIdle(session, timeoutMs, quietMs) {
     await sleep(25);
   }
   throw new Error(`timed out waiting for PTY idle after ${timeoutMs}ms`);
+}
+
+async function waitForAnimationFrames(page, frames, timeoutMs) {
+  await waitForPromise(
+    page.evaluate(
+      (frameCount) =>
+        new Promise((resolve) => {
+          let remaining = frameCount;
+
+          const tick = () => {
+            remaining -= 1;
+            if (remaining <= 0) {
+              resolve();
+              return;
+            }
+            requestAnimationFrame(tick);
+          };
+
+          requestAnimationFrame(tick);
+        }),
+      frames,
+    ),
+    timeoutMs,
+    "browser paint settle",
+  );
+}
+
+async function ensureTerminalRendered(page, timeoutMs) {
+  const renderedLines = await waitForPromise(
+    page.evaluate(() => {
+      const terminal = window.__GNOMON_TUI_SHOT__?.terminal;
+      if (!terminal) {
+        return [];
+      }
+
+      const visibleLines = [];
+      const startRow = terminal.buffer.active.viewportY;
+      for (let row = 0; row < terminal.rows; row += 1) {
+        const line = terminal.buffer.active.getLine(startRow + row);
+        visibleLines.push(line ? line.translateToString(true) : "");
+      }
+      return visibleLines;
+    }),
+    timeoutMs,
+    "terminal viewport sanity check",
+  );
+
+  if (!hasRenderableTerminalLines(renderedLines)) {
+    throw new Error("terminal viewport appears blank after render settle");
+  }
+}
+
+async function waitForPromise(promise, timeoutMs, label) {
+  let timeoutId;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new Error(`timed out waiting for ${label} after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+export function createBrowserRenderState() {
+  return {
+    nextSequence: 1,
+    lastQueuedSequence: 0,
+    lastAckedSequence: 0,
+    writeError: null,
+  };
+}
+
+export function queueBrowserWrite(renderState) {
+  const sequence = renderState.nextSequence;
+  renderState.nextSequence += 1;
+  renderState.lastQueuedSequence = sequence;
+  return sequence;
+}
+
+export function acknowledgeBrowserWrite(renderState, sequence) {
+  renderState.lastAckedSequence = sequence;
+}
+
+export function isBrowserRenderSettled(renderState) {
+  return renderState.lastQueuedSequence === renderState.lastAckedSequence;
+}
+
+export function hasRenderableTerminalLines(renderedLines) {
+  return renderedLines.some((line) => line.replace(/\s+/g, "").length > 0);
 }
 
 export function keyToSequence(key) {
