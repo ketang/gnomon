@@ -484,9 +484,61 @@ pub struct SkillInvocationRow {
     pub conversation_title: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SkillsPath {
+    Root,
+    Skill { skill_name: String },
+    SkillProject { skill_name: String, project_id: i64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SkillsRowKind {
+    Skill,
+    Project,
+    Session,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillsReport {
+    pub snapshot: SnapshotBounds,
+    pub path: SkillsPath,
+    pub cost_scope: String,
+    pub unmatched_invocation_count: u64,
+    pub unmatched_session_count: u64,
+    pub rows: Vec<SkillsReportRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillsReportRow {
+    pub kind: SkillsRowKind,
+    pub key: String,
+    pub label: String,
+    pub skill_name: String,
+    pub project_id: Option<i64>,
+    pub project_name: Option<String>,
+    pub session_id: Option<String>,
+    pub conversation_id: Option<i64>,
+    pub conversation_title: Option<String>,
+    pub invocation_count: u64,
+    pub session_count: u64,
+    pub metrics: MetricTotals,
+}
+
 pub struct QueryEngine<'conn> {
     conn: &'conn Connection,
     perf_logger: Option<PerfLogger>,
+}
+
+#[derive(Debug, Clone)]
+struct SkillSessionAssociation {
+    skill_name: String,
+    session_id: String,
+    invocation_count: u64,
+    conversation_id: Option<i64>,
+    project_id: Option<i64>,
+    project_name: Option<String>,
+    conversation_title: Option<String>,
+    metrics: Option<MetricTotals>,
 }
 
 const CONVERSATION_TURNS_SQL: &str = "
@@ -1223,6 +1275,70 @@ impl<'conn> QueryEngine<'conn> {
             .context("unable to read skill invocation rows")
     }
 
+    pub fn skills_report(
+        &self,
+        snapshot: &SnapshotBounds,
+        path: SkillsPath,
+    ) -> Result<SkillsReport> {
+        let mut perf = self.perf_scope("query.skills_report");
+        if snapshot.max_publish_seq == 0 {
+            perf.finish_ok();
+            return Ok(SkillsReport {
+                snapshot: snapshot.clone(),
+                path,
+                cost_scope: "session-associated".to_string(),
+                unmatched_invocation_count: 0,
+                unmatched_session_count: 0,
+                rows: Vec::new(),
+            });
+        }
+
+        let associations = self.load_skill_session_associations(snapshot)?;
+        let unmatched_invocation_count = associations
+            .iter()
+            .filter(|row| row.conversation_id.is_none())
+            .map(|row| row.invocation_count)
+            .sum();
+        let unmatched_session_count = associations
+            .iter()
+            .filter(|row| row.conversation_id.is_none())
+            .count() as u64;
+        let matched = associations
+            .iter()
+            .filter(|row| row.conversation_id.is_some() && row.metrics.is_some())
+            .collect::<Vec<_>>();
+
+        let mut rows = match &path {
+            SkillsPath::Root => build_skill_root_rows(&matched),
+            SkillsPath::Skill { skill_name } => build_skill_project_rows(&matched, skill_name),
+            SkillsPath::SkillProject {
+                skill_name,
+                project_id,
+            } => build_skill_session_rows(&matched, skill_name, *project_id),
+        };
+        rows.sort_by(|left, right| {
+            right
+                .metrics
+                .uncached_input
+                .total_cmp(&left.metrics.uncached_input)
+                .then_with(|| left.label.cmp(&right.label))
+        });
+
+        perf.field("row_count", rows.len());
+        perf.field("unmatched_invocation_count", unmatched_invocation_count);
+        perf.field("unmatched_session_count", unmatched_session_count);
+        perf.finish_ok();
+
+        Ok(SkillsReport {
+            snapshot: snapshot.clone(),
+            path,
+            cost_scope: "session-associated".to_string(),
+            unmatched_invocation_count,
+            unmatched_session_count,
+            rows,
+        })
+    }
+
     pub fn latest_snapshot_bounds_query_plan(&self) -> Result<Vec<String>> {
         self.explain_query_plan(LATEST_SNAPSHOT_BOUNDS_SQL)
     }
@@ -1284,6 +1400,117 @@ impl<'conn> QueryEngine<'conn> {
             build_batched_path_facts_query(requests)?
         };
         self.explain_query_plan_with_params(&sql, query_params)
+    }
+
+    fn load_skill_session_associations(
+        &self,
+        snapshot: &SnapshotBounds,
+    ) -> Result<Vec<SkillSessionAssociation>> {
+        let max_publish_seq = i64::try_from(snapshot.max_publish_seq)
+            .context("snapshot publish_seq overflowed i64")?;
+        let sql = "
+            WITH conversation_sessions AS (
+                SELECT DISTINCT
+                    c.id,
+                    c.project_id,
+                    p.display_name,
+                    c.title,
+                    substr(c.external_id, instr(c.external_id, ':session:') + 9) AS session_id
+                FROM conversation c
+                JOIN source_file sf
+                    ON sf.id = c.source_file_id
+                   AND sf.source_kind = 'transcript'
+                JOIN stream s
+                    ON s.conversation_id = c.id
+                JOIN import_chunk cic
+                    ON cic.id = s.import_chunk_id
+                JOIN project p
+                    ON p.id = c.project_id
+                WHERE cic.state = 'complete'
+                  AND cic.publish_seq IS NOT NULL
+                  AND cic.publish_seq <= ?1
+                  AND instr(c.external_id, ':session:') > 0
+            ),
+            conversation_metrics AS (
+                SELECT
+                    t.conversation_id,
+                    SUM(COALESCE(t.input_tokens, 0) + COALESCE(t.cache_creation_input_tokens, 0)) AS uncached_input,
+                    SUM(COALESCE(t.cache_read_input_tokens, 0)) AS cached_input,
+                    SUM(COALESCE(t.output_tokens, 0)) AS output_tokens
+                FROM turn t
+                JOIN import_chunk tic
+                    ON tic.id = t.import_chunk_id
+                WHERE tic.state = 'complete'
+                  AND tic.publish_seq IS NOT NULL
+                  AND tic.publish_seq <= ?1
+                GROUP BY t.conversation_id
+            ),
+            skill_sessions AS (
+                SELECT
+                    si.skill_name,
+                    si.session_id,
+                    COUNT(*) AS invocation_count
+                FROM skill_invocation si
+                JOIN import_chunk sic
+                    ON sic.id = si.import_chunk_id
+                WHERE sic.state = 'complete'
+                  AND sic.publish_seq IS NOT NULL
+                  AND sic.publish_seq <= ?1
+                GROUP BY si.skill_name, si.session_id
+            )
+            SELECT
+                ss.skill_name,
+                ss.session_id,
+                ss.invocation_count,
+                cs.id,
+                cs.project_id,
+                cs.display_name,
+                cs.title,
+                cm.uncached_input,
+                cm.cached_input,
+                cm.output_tokens
+            FROM skill_sessions ss
+            LEFT JOIN conversation_sessions cs
+                ON cs.session_id = ss.session_id
+            LEFT JOIN conversation_metrics cm
+                ON cm.conversation_id = cs.id
+            ORDER BY ss.skill_name, cs.project_id, ss.session_id
+        ";
+
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .context("unable to prepare skills report query")?;
+        let rows = stmt
+            .query_map([max_publish_seq], |row| {
+                let uncached_input = row.get::<_, Option<f64>>(7)?;
+                let cached_input = row.get::<_, Option<f64>>(8)?;
+                let output = row.get::<_, Option<f64>>(9)?;
+                Ok(SkillSessionAssociation {
+                    skill_name: row.get(0)?,
+                    session_id: row.get(1)?,
+                    invocation_count: row.get::<_, i64>(2)? as u64,
+                    conversation_id: row.get(3)?,
+                    project_id: row.get(4)?,
+                    project_name: row.get(5)?,
+                    conversation_title: row.get(6)?,
+                    metrics: uncached_input.map(|uncached_input| {
+                        let cached_input = cached_input.unwrap_or_default();
+                        let output = output.unwrap_or_default();
+                        MetricTotals {
+                            uncached_input,
+                            cached_input,
+                            gross_input: uncached_input + cached_input,
+                            output,
+                            total: uncached_input + cached_input + output,
+                        }
+                    }),
+                })
+            })
+            .context("unable to execute skills report query")?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("unable to read skills report rows")
     }
 
     fn load_action_facts(&self, request: &BrowseRequest) -> Result<Vec<ActionFact>> {
@@ -2291,6 +2518,109 @@ impl RollupBuilder {
             full_path: self.full_path,
         }
     }
+}
+
+fn build_skill_root_rows(associations: &[&SkillSessionAssociation]) -> Vec<SkillsReportRow> {
+    let mut rows = BTreeMap::<String, SkillsReportRow>::new();
+
+    for association in associations {
+        let Some(metrics) = association.metrics.as_ref() else {
+            continue;
+        };
+        let row = rows
+            .entry(association.skill_name.clone())
+            .or_insert_with(|| SkillsReportRow {
+                kind: SkillsRowKind::Skill,
+                key: format!("skill:{}", association.skill_name),
+                label: association.skill_name.clone(),
+                skill_name: association.skill_name.clone(),
+                project_id: None,
+                project_name: None,
+                session_id: None,
+                conversation_id: None,
+                conversation_title: None,
+                invocation_count: 0,
+                session_count: 0,
+                metrics: MetricTotals::zero(),
+            });
+        row.invocation_count += association.invocation_count;
+        row.session_count += 1;
+        row.metrics.add_assign(metrics);
+    }
+
+    rows.into_values().collect()
+}
+
+fn build_skill_project_rows(
+    associations: &[&SkillSessionAssociation],
+    skill_name: &str,
+) -> Vec<SkillsReportRow> {
+    let mut rows = BTreeMap::<i64, SkillsReportRow>::new();
+
+    for association in associations
+        .iter()
+        .copied()
+        .filter(|row| row.skill_name == skill_name)
+    {
+        let (Some(project_id), Some(project_name), Some(metrics)) = (
+            association.project_id,
+            association.project_name.as_ref(),
+            association.metrics.as_ref(),
+        ) else {
+            continue;
+        };
+        let row = rows.entry(project_id).or_insert_with(|| SkillsReportRow {
+            kind: SkillsRowKind::Project,
+            key: format!("skill:{skill_name}:project:{project_id}"),
+            label: project_name.clone(),
+            skill_name: skill_name.to_string(),
+            project_id: Some(project_id),
+            project_name: Some(project_name.clone()),
+            session_id: None,
+            conversation_id: None,
+            conversation_title: None,
+            invocation_count: 0,
+            session_count: 0,
+            metrics: MetricTotals::zero(),
+        });
+        row.invocation_count += association.invocation_count;
+        row.session_count += 1;
+        row.metrics.add_assign(metrics);
+    }
+
+    rows.into_values().collect()
+}
+
+fn build_skill_session_rows(
+    associations: &[&SkillSessionAssociation],
+    skill_name: &str,
+    project_id: i64,
+) -> Vec<SkillsReportRow> {
+    associations
+        .iter()
+        .copied()
+        .filter(|row| row.skill_name == skill_name && row.project_id == Some(project_id))
+        .filter_map(|association| {
+            let metrics = association.metrics.clone()?;
+            Some(SkillsReportRow {
+                kind: SkillsRowKind::Session,
+                key: format!("skill:{skill_name}:session:{}", association.session_id),
+                label: association
+                    .conversation_title
+                    .clone()
+                    .unwrap_or_else(|| association.session_id.clone()),
+                skill_name: skill_name.to_string(),
+                project_id: association.project_id,
+                project_name: association.project_name.clone(),
+                session_id: Some(association.session_id.clone()),
+                conversation_id: association.conversation_id,
+                conversation_title: association.conversation_title.clone(),
+                invocation_count: association.invocation_count,
+                session_count: 1,
+                metrics,
+            })
+        })
+        .collect()
 }
 
 fn aggregate_projects(
@@ -4221,9 +4551,10 @@ mod tests {
     use super::{
         ActionKey, BatchBrowseRequest, BatchBrowseResult, BrowseFilters, BrowsePath, BrowseRequest,
         ClassificationState, ConversationTurnRow, FilterOptions, HistoryEventFilters, MetricLens,
-        QueryEngine, RootView, SkillInvocationFilters, SnapshotBounds, SnapshotCoverageSummary,
-        TimeWindowFilter, build_grouped_action_rollup_rows_query, build_opportunities_rows,
-        build_scoped_action_facts_query, build_scoped_path_facts_query, display_category,
+        QueryEngine, RootView, SkillInvocationFilters, SkillsPath, SnapshotBounds,
+        SnapshotCoverageSummary, TimeWindowFilter, build_grouped_action_rollup_rows_query,
+        build_opportunities_rows, build_scoped_action_facts_query, build_scoped_path_facts_query,
+        display_category,
     };
 
     #[test]
@@ -4592,6 +4923,244 @@ mod tests {
         )?;
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].session_id, "matched-session");
+
+        Ok(())
+    }
+
+    #[test]
+    fn skills_report_aggregates_session_associated_metrics_by_skill_project_and_session()
+    -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let conn = db.connection_mut();
+        let fixture = seed_query_fixture(conn, temp.path())?;
+
+        let project_a_sessions = {
+            let mut stmt = conn.prepare(
+                "
+                SELECT c.id, c.source_file_id
+                FROM conversation c
+                WHERE c.project_id = ?1
+                ORDER BY c.started_at_utc
+                ",
+            )?;
+            stmt.query_map([fixture.project_a_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        let project_b_rows = {
+            let mut stmt = conn.prepare(
+                "
+                SELECT c.id, c.source_file_id, c.project_id
+                FROM conversation c
+                WHERE c.project_id != ?1
+                ORDER BY c.started_at_utc
+                LIMIT 1
+                ",
+            )?;
+            stmt.query_map([fixture.project_a_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        let [
+            (project_a_session_1, source_file_a_1),
+            (project_a_session_2, source_file_a_2),
+        ] = project_a_sessions
+            .as_slice()
+            .try_into()
+            .context("expected two project-a conversations")?;
+        let [(project_b_session_1, source_file_b_1, project_b_id)] = project_b_rows
+            .as_slice()
+            .try_into()
+            .context("expected one project-b conversation")?;
+
+        conn.execute(
+            "
+            UPDATE conversation
+            SET external_id = ?2
+            WHERE id = ?1
+            ",
+            params![
+                project_a_session_1,
+                format!("source-file:{source_file_a_1}:session:planner-a1")
+            ],
+        )?;
+        conn.execute(
+            "
+            UPDATE conversation
+            SET external_id = ?2
+            WHERE id = ?1
+            ",
+            params![
+                project_a_session_2,
+                format!("source-file:{source_file_a_2}:session:shared-a2")
+            ],
+        )?;
+        conn.execute(
+            "
+            UPDATE conversation
+            SET external_id = ?2
+            WHERE id = ?1
+            ",
+            params![
+                project_b_session_1,
+                format!("source-file:{source_file_b_1}:session:reviewer-b1")
+            ],
+        )?;
+
+        let source_file_id: i64 = conn.query_row(
+            "
+            INSERT INTO source_file (
+                project_id,
+                relative_path,
+                source_kind,
+                modified_at_utc,
+                size_bytes,
+                scan_warnings_json
+            )
+            VALUES (?1, '../history.jsonl', 'claude_history', '2026-03-28T09:00:00Z', 1, '[]')
+            RETURNING id
+            ",
+            [fixture.project_a_id],
+            |row| row.get(0),
+        )?;
+        let import_chunk_id: i64 = conn.query_row(
+            "
+            INSERT INTO import_chunk (
+                project_id,
+                chunk_day_local,
+                state,
+                publish_seq,
+                started_at_utc,
+                completed_at_utc
+            )
+            VALUES (?1, '2026-03-28', 'complete', 3, '2026-03-28T09:00:00Z', '2026-03-28T09:00:01Z')
+            RETURNING id
+            ",
+            [fixture.project_a_id],
+            |row| row.get(0),
+        )?;
+
+        let history_event_ids = [
+            ("planner-a1", "planner", "2026-03-28T08:00:00Z"),
+            ("planner-a1", "planner", "2026-03-28T08:01:00Z"),
+            ("shared-a2", "planner", "2026-03-28T08:02:00Z"),
+            ("shared-a2", "reviewer", "2026-03-28T08:03:00Z"),
+            ("reviewer-b1", "reviewer", "2026-03-28T08:04:00Z"),
+            ("missing-session", "ghost", "2026-03-28T08:05:00Z"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (session_id, skill_name, recorded_at_utc))| {
+            let history_event_id: i64 = conn.query_row(
+                "
+                INSERT INTO history_event (
+                    import_chunk_id,
+                    source_file_id,
+                    source_line_no,
+                    session_id,
+                    recorded_at_utc,
+                    raw_project,
+                    display_text,
+                    pasted_contents_json,
+                    input_kind,
+                    slash_command_name,
+                    raw_json
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, '/tmp/project', ?6, '[]', 'slash_command', 'skill', '{}')
+                RETURNING id
+                ",
+                params![
+                    import_chunk_id,
+                    source_file_id,
+                    idx as i64 + 1,
+                    session_id,
+                    recorded_at_utc,
+                    format!("/skill {skill_name}")
+                ],
+                |row| row.get(0),
+            )?;
+            conn.execute(
+                "
+                INSERT INTO skill_invocation (
+                    import_chunk_id,
+                    history_event_id,
+                    source_file_id,
+                    session_id,
+                    recorded_at_utc,
+                    raw_project,
+                    skill_name,
+                    invocation_kind
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, '/tmp/project', ?6, 'explicit_history')
+                ",
+                params![
+                    import_chunk_id,
+                    history_event_id,
+                    source_file_id,
+                    session_id,
+                    recorded_at_utc,
+                    skill_name
+                ],
+            )?;
+            Ok::<_, anyhow::Error>(history_event_id)
+        })
+        .collect::<Result<Vec<_>>>()?;
+        assert_eq!(history_event_ids.len(), 6);
+
+        let engine = QueryEngine::new(conn);
+        let snapshot = engine.latest_snapshot_bounds()?;
+
+        let root_report = engine.skills_report(&snapshot, SkillsPath::Root)?;
+        assert_eq!(root_report.cost_scope, "session-associated");
+        assert_eq!(root_report.unmatched_invocation_count, 1);
+        assert_eq!(root_report.unmatched_session_count, 1);
+        assert_eq!(root_report.rows.len(), 2);
+        assert_eq!(root_report.rows[0].skill_name, "planner");
+        assert_eq!(root_report.rows[0].invocation_count, 3);
+        assert_eq!(root_report.rows[0].session_count, 2);
+        assert_eq!(root_report.rows[0].metrics.uncached_input, 10.0);
+        assert_eq!(root_report.rows[1].skill_name, "reviewer");
+        assert_eq!(root_report.rows[1].invocation_count, 2);
+        assert_eq!(root_report.rows[1].session_count, 2);
+        assert_eq!(root_report.rows[1].metrics.uncached_input, 9.0);
+
+        let planner_projects = engine.skills_report(
+            &snapshot,
+            SkillsPath::Skill {
+                skill_name: "planner".to_string(),
+            },
+        )?;
+        assert_eq!(planner_projects.rows.len(), 1);
+        assert_eq!(
+            planner_projects.rows[0].project_id,
+            Some(fixture.project_a_id)
+        );
+        assert_eq!(planner_projects.rows[0].invocation_count, 3);
+        assert_eq!(planner_projects.rows[0].session_count, 2);
+        assert_eq!(planner_projects.rows[0].metrics.uncached_input, 10.0);
+
+        let reviewer_sessions = engine.skills_report(
+            &snapshot,
+            SkillsPath::SkillProject {
+                skill_name: "reviewer".to_string(),
+                project_id: project_b_id,
+            },
+        )?;
+        assert_eq!(reviewer_sessions.rows.len(), 1);
+        assert_eq!(
+            reviewer_sessions.rows[0].session_id.as_deref(),
+            Some("reviewer-b1")
+        );
+        assert_eq!(reviewer_sessions.rows[0].invocation_count, 1);
+        assert_eq!(reviewer_sessions.rows[0].session_count, 1);
+        assert_eq!(reviewer_sessions.rows[0].metrics.uncached_input, 4.0);
 
         Ok(())
     }

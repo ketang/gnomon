@@ -83,6 +83,21 @@ Fresh launches open at the top level by default. Use `--startup-*` flags to
 open directly into a narrower drill-down view when you want to skip the root
 landing state.
 
+## Skills Analytics
+
+`gnomon` also exposes a non-interactive skills lens for explicit `/skill`
+invocations imported from Claude history.
+
+```bash
+cargo run -p gnomon -- skills
+cargo run -p gnomon -- skills --path skill --skill planner
+cargo run -p gnomon -- skills --path skill-project --skill planner --project-id 1
+```
+
+The reported token totals are session-associated, not action-attributed. The
+JSON output also includes unmatched invocation counts so you can see when an
+explicit skill invocation did not join to a transcript-backed session.
+
 ## TUI Screenshot Harness
 
 A portable screenshot harness lives under `tools/tui-shot/`.
