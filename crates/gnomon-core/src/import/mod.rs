@@ -9,10 +9,10 @@ pub const STARTUP_IMPORT_WINDOW_HOURS: i64 = 24;
 pub const STARTUP_OPEN_DEADLINE_SECS: u64 = 10;
 pub const IMPORT_CHUNK_UNIT: &str = "project x day";
 
-/// Import schema version: controls what normalized fields are persisted.
+/// Import schema version: controls when derived import data must be rebuilt.
 ///
 /// Bumping this version triggers reimport of all previously imported source
-/// files, since the stored data shape has changed.
+/// files, since the stored normalized or action-derived data shape has changed.
 ///
 /// ## v1 consumed fields (`message_part`)
 ///
@@ -32,7 +32,7 @@ pub const IMPORT_CHUNK_UNIT: &str = "project x day";
 /// - `tool_name` — identifies which tool was invoked
 /// - `tool_call_id` — joins `tool_use` with its `tool_result`
 /// - `metadata_json` — only the `input` key, only for `tool_use` parts
-pub const IMPORT_SCHEMA_VERSION: i64 = 3;
+pub const IMPORT_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceFileKind {

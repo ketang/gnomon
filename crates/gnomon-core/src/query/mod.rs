@@ -498,11 +498,26 @@ pub enum SkillsRowKind {
     Session,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SkillAttributionConfidence {
+    High,
+}
+
+impl SkillAttributionConfidence {
+    fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkillsReport {
     pub snapshot: SnapshotBounds,
     pub path: SkillsPath,
     pub cost_scope: String,
+    pub attributed_cost_scope: String,
     pub unmatched_invocation_count: u64,
     pub unmatched_session_count: u64,
     pub rows: Vec<SkillsReportRow>,
@@ -522,6 +537,9 @@ pub struct SkillsReportRow {
     pub invocation_count: u64,
     pub session_count: u64,
     pub metrics: MetricTotals,
+    pub attributed_action_count: u64,
+    pub attributed_metrics: MetricTotals,
+    pub top_attribution_confidence: Option<SkillAttributionConfidence>,
 }
 
 pub struct QueryEngine<'conn> {
@@ -539,6 +557,9 @@ struct SkillSessionAssociation {
     project_name: Option<String>,
     conversation_title: Option<String>,
     metrics: Option<MetricTotals>,
+    attributed_action_count: u64,
+    attributed_metrics: MetricTotals,
+    top_attribution_confidence: Option<SkillAttributionConfidence>,
 }
 
 const CONVERSATION_TURNS_SQL: &str = "
@@ -1287,6 +1308,7 @@ impl<'conn> QueryEngine<'conn> {
                 snapshot: snapshot.clone(),
                 path,
                 cost_scope: "session-associated".to_string(),
+                attributed_cost_scope: "action-attributed".to_string(),
                 unmatched_invocation_count: 0,
                 unmatched_session_count: 0,
                 rows: Vec::new(),
@@ -1333,6 +1355,7 @@ impl<'conn> QueryEngine<'conn> {
             snapshot: snapshot.clone(),
             path,
             cost_scope: "session-associated".to_string(),
+            attributed_cost_scope: "action-attributed".to_string(),
             unmatched_invocation_count,
             unmatched_session_count,
             rows,
@@ -1445,6 +1468,29 @@ impl<'conn> QueryEngine<'conn> {
                   AND tic.publish_seq <= ?1
                 GROUP BY t.conversation_id
             ),
+            attributed_actions AS (
+                SELECT
+                    cs.session_id,
+                    asa.skill_name,
+                    COUNT(*) AS action_count,
+                    SUM(COALESCE(a.input_tokens, 0) + COALESCE(a.cache_creation_input_tokens, 0)) AS uncached_input,
+                    SUM(COALESCE(a.cache_read_input_tokens, 0)) AS cached_input,
+                    SUM(COALESCE(a.output_tokens, 0)) AS output_tokens,
+                    MAX(asa.confidence) AS top_confidence
+                FROM action_skill_attribution asa
+                JOIN action a
+                    ON a.id = asa.action_id
+                JOIN import_chunk aic
+                    ON aic.id = a.import_chunk_id
+                JOIN turn t
+                    ON t.id = a.turn_id
+                JOIN conversation_sessions cs
+                    ON cs.id = t.conversation_id
+                WHERE aic.state = 'complete'
+                  AND aic.publish_seq IS NOT NULL
+                  AND aic.publish_seq <= ?1
+                GROUP BY cs.session_id, asa.skill_name
+            ),
             skill_sessions AS (
                 SELECT
                     si.skill_name,
@@ -1468,12 +1514,20 @@ impl<'conn> QueryEngine<'conn> {
                 cs.title,
                 cm.uncached_input,
                 cm.cached_input,
-                cm.output_tokens
+                cm.output_tokens,
+                COALESCE(aa.action_count, 0),
+                COALESCE(aa.uncached_input, 0),
+                COALESCE(aa.cached_input, 0),
+                COALESCE(aa.output_tokens, 0),
+                aa.top_confidence
             FROM skill_sessions ss
             LEFT JOIN conversation_sessions cs
                 ON cs.session_id = ss.session_id
             LEFT JOIN conversation_metrics cm
                 ON cm.conversation_id = cs.id
+            LEFT JOIN attributed_actions aa
+                ON aa.session_id = ss.session_id
+               AND aa.skill_name = ss.skill_name
             ORDER BY ss.skill_name, cs.project_id, ss.session_id
         ";
 
@@ -1486,6 +1540,9 @@ impl<'conn> QueryEngine<'conn> {
                 let uncached_input = row.get::<_, Option<f64>>(7)?;
                 let cached_input = row.get::<_, Option<f64>>(8)?;
                 let output = row.get::<_, Option<f64>>(9)?;
+                let attributed_uncached_input = row.get::<_, f64>(11)?;
+                let attributed_cached_input = row.get::<_, f64>(12)?;
+                let attributed_output = row.get::<_, f64>(13)?;
                 Ok(SkillSessionAssociation {
                     skill_name: row.get(0)?,
                     session_id: row.get(1)?,
@@ -1505,6 +1562,20 @@ impl<'conn> QueryEngine<'conn> {
                             total: uncached_input + cached_input + output,
                         }
                     }),
+                    attributed_action_count: row.get::<_, i64>(10)? as u64,
+                    attributed_metrics: MetricTotals {
+                        uncached_input: attributed_uncached_input,
+                        cached_input: attributed_cached_input,
+                        gross_input: attributed_uncached_input + attributed_cached_input,
+                        output: attributed_output,
+                        total: attributed_uncached_input
+                            + attributed_cached_input
+                            + attributed_output,
+                    },
+                    top_attribution_confidence: row
+                        .get::<_, Option<String>>(14)?
+                        .as_deref()
+                        .and_then(SkillAttributionConfidence::from_db_value),
                 })
             })
             .context("unable to execute skills report query")?;
@@ -2542,10 +2613,19 @@ fn build_skill_root_rows(associations: &[&SkillSessionAssociation]) -> Vec<Skill
                 invocation_count: 0,
                 session_count: 0,
                 metrics: MetricTotals::zero(),
+                attributed_action_count: 0,
+                attributed_metrics: MetricTotals::zero(),
+                top_attribution_confidence: None,
             });
         row.invocation_count += association.invocation_count;
         row.session_count += 1;
         row.metrics.add_assign(metrics);
+        row.attributed_action_count += association.attributed_action_count;
+        row.attributed_metrics
+            .add_assign(&association.attributed_metrics);
+        row.top_attribution_confidence = row
+            .top_attribution_confidence
+            .or(association.top_attribution_confidence);
     }
 
     rows.into_values().collect()
@@ -2582,10 +2662,19 @@ fn build_skill_project_rows(
             invocation_count: 0,
             session_count: 0,
             metrics: MetricTotals::zero(),
+            attributed_action_count: 0,
+            attributed_metrics: MetricTotals::zero(),
+            top_attribution_confidence: None,
         });
         row.invocation_count += association.invocation_count;
         row.session_count += 1;
         row.metrics.add_assign(metrics);
+        row.attributed_action_count += association.attributed_action_count;
+        row.attributed_metrics
+            .add_assign(&association.attributed_metrics);
+        row.top_attribution_confidence = row
+            .top_attribution_confidence
+            .or(association.top_attribution_confidence);
     }
 
     rows.into_values().collect()
@@ -2618,6 +2707,9 @@ fn build_skill_session_rows(
                 invocation_count: association.invocation_count,
                 session_count: 1,
                 metrics,
+                attributed_action_count: association.attributed_action_count,
+                attributed_metrics: association.attributed_metrics.clone(),
+                top_attribution_confidence: association.top_attribution_confidence,
             })
         })
         .collect()
@@ -4551,10 +4643,10 @@ mod tests {
     use super::{
         ActionKey, BatchBrowseRequest, BatchBrowseResult, BrowseFilters, BrowsePath, BrowseRequest,
         ClassificationState, ConversationTurnRow, FilterOptions, HistoryEventFilters, MetricLens,
-        QueryEngine, RootView, SkillInvocationFilters, SkillsPath, SnapshotBounds,
-        SnapshotCoverageSummary, TimeWindowFilter, build_grouped_action_rollup_rows_query,
-        build_opportunities_rows, build_scoped_action_facts_query, build_scoped_path_facts_query,
-        display_category,
+        QueryEngine, RootView, SkillAttributionConfidence, SkillInvocationFilters, SkillsPath,
+        SnapshotBounds, SnapshotCoverageSummary, TimeWindowFilter,
+        build_grouped_action_rollup_rows_query, build_opportunities_rows,
+        build_scoped_action_facts_query, build_scoped_path_facts_query, display_category,
     };
 
     #[test]
@@ -5114,11 +5206,40 @@ mod tests {
         .collect::<Result<Vec<_>>>()?;
         assert_eq!(history_event_ids.len(), 6);
 
+        let planner_action_id: i64 = conn.query_row(
+            "
+            SELECT a.id
+            FROM action a
+            JOIN turn t ON t.id = a.turn_id
+            WHERE t.conversation_id = ?1
+            ",
+            [project_a_session_1],
+            |row| row.get(0),
+        )?;
+        let reviewer_action_id: i64 = conn.query_row(
+            "
+            SELECT a.id
+            FROM action a
+            JOIN turn t ON t.id = a.turn_id
+            WHERE t.conversation_id = ?1
+            ",
+            [project_b_session_1],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "
+            INSERT INTO action_skill_attribution (action_id, skill_name, confidence)
+            VALUES (?1, 'planner', 'high'), (?2, 'reviewer', 'high')
+            ",
+            params![planner_action_id, reviewer_action_id],
+        )?;
+
         let engine = QueryEngine::new(conn);
         let snapshot = engine.latest_snapshot_bounds()?;
 
         let root_report = engine.skills_report(&snapshot, SkillsPath::Root)?;
         assert_eq!(root_report.cost_scope, "session-associated");
+        assert_eq!(root_report.attributed_cost_scope, "action-attributed");
         assert_eq!(root_report.unmatched_invocation_count, 1);
         assert_eq!(root_report.unmatched_session_count, 1);
         assert_eq!(root_report.rows.len(), 2);
@@ -5126,10 +5247,22 @@ mod tests {
         assert_eq!(root_report.rows[0].invocation_count, 3);
         assert_eq!(root_report.rows[0].session_count, 2);
         assert_eq!(root_report.rows[0].metrics.uncached_input, 10.0);
+        assert_eq!(root_report.rows[0].attributed_action_count, 1);
+        assert_eq!(root_report.rows[0].attributed_metrics.uncached_input, 5.0);
+        assert_eq!(
+            root_report.rows[0].top_attribution_confidence,
+            Some(SkillAttributionConfidence::High)
+        );
         assert_eq!(root_report.rows[1].skill_name, "reviewer");
         assert_eq!(root_report.rows[1].invocation_count, 2);
         assert_eq!(root_report.rows[1].session_count, 2);
         assert_eq!(root_report.rows[1].metrics.uncached_input, 9.0);
+        assert_eq!(root_report.rows[1].attributed_action_count, 1);
+        assert_eq!(root_report.rows[1].attributed_metrics.uncached_input, 4.0);
+        assert_eq!(
+            root_report.rows[1].top_attribution_confidence,
+            Some(SkillAttributionConfidence::High)
+        );
 
         let planner_projects = engine.skills_report(
             &snapshot,
@@ -5145,6 +5278,11 @@ mod tests {
         assert_eq!(planner_projects.rows[0].invocation_count, 3);
         assert_eq!(planner_projects.rows[0].session_count, 2);
         assert_eq!(planner_projects.rows[0].metrics.uncached_input, 10.0);
+        assert_eq!(planner_projects.rows[0].attributed_action_count, 1);
+        assert_eq!(
+            planner_projects.rows[0].attributed_metrics.uncached_input,
+            5.0
+        );
 
         let reviewer_sessions = engine.skills_report(
             &snapshot,
@@ -5161,6 +5299,15 @@ mod tests {
         assert_eq!(reviewer_sessions.rows[0].invocation_count, 1);
         assert_eq!(reviewer_sessions.rows[0].session_count, 1);
         assert_eq!(reviewer_sessions.rows[0].metrics.uncached_input, 4.0);
+        assert_eq!(reviewer_sessions.rows[0].attributed_action_count, 1);
+        assert_eq!(
+            reviewer_sessions.rows[0].attributed_metrics.uncached_input,
+            4.0
+        );
+        assert_eq!(
+            reviewer_sessions.rows[0].top_attribution_confidence,
+            Some(SkillAttributionConfidence::High)
+        );
 
         Ok(())
     }
