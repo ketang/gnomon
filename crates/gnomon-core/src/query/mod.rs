@@ -446,6 +446,26 @@ pub struct OpportunitiesFilters {
     pub include_empty: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistoryEventFilters {
+    pub session_id: Option<String>,
+    pub start_at_utc: Option<String>,
+    pub end_at_utc: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryEventRow {
+    pub source_file_id: i64,
+    pub source_line_no: i64,
+    pub session_id: Option<String>,
+    pub recorded_at_utc: Option<String>,
+    pub raw_project: Option<String>,
+    pub display_text: Option<String>,
+    pub pasted_contents_json: Option<String>,
+    pub input_kind: String,
+    pub slash_command_name: Option<String>,
+}
+
 pub struct QueryEngine<'conn> {
     conn: &'conn Connection,
     perf_logger: Option<PerfLogger>,
@@ -1018,6 +1038,81 @@ impl<'conn> QueryEngine<'conn> {
             snapshot: snapshot.clone(),
             rows,
         })
+    }
+
+    pub fn history_events(
+        &self,
+        snapshot: &SnapshotBounds,
+        filters: &HistoryEventFilters,
+    ) -> Result<Vec<HistoryEventRow>> {
+        if snapshot.max_publish_seq == 0 {
+            return Ok(Vec::new());
+        }
+
+        let max_publish_seq = i64::try_from(snapshot.max_publish_seq)
+            .context("snapshot publish_seq overflowed i64")?;
+        let mut sql = "
+            SELECT
+                he.source_file_id,
+                he.source_line_no,
+                he.session_id,
+                he.recorded_at_utc,
+                he.raw_project,
+                he.display_text,
+                he.pasted_contents_json,
+                he.input_kind,
+                he.slash_command_name
+            FROM history_event he
+            JOIN import_chunk ic ON ic.id = he.import_chunk_id
+            WHERE ic.state = 'complete'
+              AND ic.publish_seq IS NOT NULL
+              AND ic.publish_seq <= ?1
+        "
+        .to_string();
+        let mut params = vec![Value::Integer(max_publish_seq)];
+
+        if let Some(session_id) = &filters.session_id {
+            sql.push_str(&format!(" AND he.session_id = ?{}", params.len() + 1));
+            params.push(Value::Text(session_id.clone()));
+        }
+        if let Some(start_at_utc) = &filters.start_at_utc {
+            sql.push_str(&format!(
+                " AND datetime(he.recorded_at_utc) >= datetime(?{})",
+                params.len() + 1
+            ));
+            params.push(Value::Text(start_at_utc.clone()));
+        }
+        if let Some(end_at_utc) = &filters.end_at_utc {
+            sql.push_str(&format!(
+                " AND datetime(he.recorded_at_utc) <= datetime(?{})",
+                params.len() + 1
+            ));
+            params.push(Value::Text(end_at_utc.clone()));
+        }
+
+        sql.push_str(" ORDER BY he.recorded_at_utc, he.source_file_id, he.source_line_no");
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .context("unable to prepare history event query")?;
+        let rows = stmt
+            .query_map(params_from_iter(params.iter()), |row| {
+                Ok(HistoryEventRow {
+                    source_file_id: row.get(0)?,
+                    source_line_no: row.get(1)?,
+                    session_id: row.get(2)?,
+                    recorded_at_utc: row.get(3)?,
+                    raw_project: row.get(4)?,
+                    display_text: row.get(5)?,
+                    pasted_contents_json: row.get(6)?,
+                    input_kind: row.get(7)?,
+                    slash_command_name: row.get(8)?,
+                })
+            })
+            .context("unable to execute history event query")?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("unable to read history event rows")
     }
 
     pub fn latest_snapshot_bounds_query_plan(&self) -> Result<Vec<String>> {
@@ -4017,8 +4112,8 @@ mod tests {
 
     use super::{
         ActionKey, BatchBrowseRequest, BatchBrowseResult, BrowseFilters, BrowsePath, BrowseRequest,
-        ClassificationState, ConversationTurnRow, FilterOptions, MetricLens, QueryEngine, RootView,
-        SnapshotBounds, SnapshotCoverageSummary, TimeWindowFilter,
+        ClassificationState, ConversationTurnRow, FilterOptions, HistoryEventFilters, MetricLens,
+        QueryEngine, RootView, SnapshotBounds, SnapshotCoverageSummary, TimeWindowFilter,
         build_grouped_action_rollup_rows_query, build_opportunities_rows,
         build_scoped_action_facts_query, build_scoped_path_facts_query, display_category,
     };
@@ -4132,6 +4227,103 @@ mod tests {
         assert_eq!(
             engine.snapshot_coverage_summary(&SnapshotBounds::bootstrap())?,
             SnapshotCoverageSummary::default()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn history_events_are_queryable_by_session_id_and_timestamp() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let conn = db.connection_mut();
+        let fixture = seed_query_fixture(conn, temp.path())?;
+
+        let source_file_id: i64 = conn.query_row(
+            "
+            INSERT INTO source_file (
+                project_id,
+                relative_path,
+                source_kind,
+                modified_at_utc,
+                size_bytes,
+                scan_warnings_json
+            )
+            VALUES (?1, '../history.jsonl', 'claude_history', '2026-03-26T09:00:00Z', 1, '[]')
+            RETURNING id
+            ",
+            [fixture.project_a_id],
+            |row| row.get(0),
+        )?;
+        let import_chunk_id: i64 = conn.query_row(
+            "
+            INSERT INTO import_chunk (
+                project_id,
+                chunk_day_local,
+                state,
+                publish_seq,
+                started_at_utc,
+                completed_at_utc
+            )
+            VALUES (?1, '2026-03-28', 'complete', 3, '2026-03-28T09:00:00Z', '2026-03-28T09:00:01Z')
+            RETURNING id
+            ",
+            [fixture.project_a_id],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "
+            INSERT INTO history_event (
+                import_chunk_id,
+                source_file_id,
+                source_line_no,
+                session_id,
+                recorded_at_utc,
+                raw_project,
+                display_text,
+                pasted_contents_json,
+                input_kind,
+                slash_command_name,
+                raw_json
+            )
+            VALUES
+                (?1, ?2, 1, 'session-history-1', '2026-03-26T08:00:00Z', '/tmp/project-a', 'Investigate parser', '[{\"type\":\"text\",\"text\":\"trace\"}]', 'plain_prompt', NULL, '{}'),
+                (?1, ?2, 2, 'session-history-1', '2026-03-26T08:01:00Z', '/tmp/project-a', '/skill planner --fast', '[]', 'slash_command', 'skill', '{}'),
+                (?1, ?2, 3, 'session-history-2', '2026-03-26T08:02:00Z', '/tmp/project-b', NULL, NULL, 'other', NULL, '{}')
+            ",
+            params![import_chunk_id, source_file_id],
+        )?;
+
+        let engine = QueryEngine::new(conn);
+        let snapshot = engine.latest_snapshot_bounds()?;
+
+        let session_rows = engine.history_events(
+            &snapshot,
+            &HistoryEventFilters {
+                session_id: Some("session-history-1".to_string()),
+                ..HistoryEventFilters::default()
+            },
+        )?;
+        assert_eq!(session_rows.len(), 2);
+        assert_eq!(session_rows[0].input_kind, "plain_prompt");
+        assert_eq!(session_rows[1].input_kind, "slash_command");
+        assert_eq!(session_rows[1].slash_command_name.as_deref(), Some("skill"));
+
+        let window_rows = engine.history_events(
+            &snapshot,
+            &HistoryEventFilters {
+                start_at_utc: Some("2026-03-26T08:01:00Z".to_string()),
+                end_at_utc: Some("2026-03-26T08:02:00Z".to_string()),
+                ..HistoryEventFilters::default()
+            },
+        )?;
+        assert_eq!(window_rows.len(), 2);
+        assert_eq!(
+            window_rows
+                .iter()
+                .map(|row| row.source_line_no)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
         );
 
         Ok(())
