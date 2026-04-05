@@ -7,10 +7,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
 
-use super::NormalizedToolUsePartMetadata;
+use super::{NormalizedToolUsePartMetadata, SourceFileKind};
 
 const PRIMARY_STREAM_SEQUENCE_NO: i64 = 0;
 const SOURCE_LINE_PREVIEW_CHAR_LIMIT: usize = 160;
+const WARNING_UNKNOWN_SOURCE_KIND: &str = "unknown_source_kind";
 const WARNING_INVALID_JSON: &str = "invalid_json";
 
 #[derive(Debug, Clone)]
@@ -23,11 +24,12 @@ pub struct NormalizeJsonlFileParams {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizeJsonlFileResult {
-    pub conversation_id: i64,
-    pub stream_id: i64,
+    pub conversation_id: Option<i64>,
+    pub stream_id: Option<i64>,
     pub record_count: usize,
     pub message_count: usize,
     pub turn_count: usize,
+    pub history_event_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +46,36 @@ pub enum NormalizeJsonlFileOutcome {
 }
 
 pub fn normalize_jsonl_file(
+    conn: &mut Connection,
+    params: &NormalizeJsonlFileParams,
+) -> Result<NormalizeJsonlFileOutcome> {
+    match load_source_file_kind(conn, params.source_file_id)? {
+        Some(SourceFileKind::Transcript) => normalize_transcript_jsonl_file(conn, params),
+        Some(SourceFileKind::ClaudeHistory) => normalize_history_jsonl_file(conn, params),
+        None => Ok(NormalizeJsonlFileOutcome::Warning(NormalizeImportWarning {
+            code: WARNING_UNKNOWN_SOURCE_KIND,
+            message: format!(
+                "unable to determine source kind for source file id {}",
+                params.source_file_id
+            ),
+        })),
+    }
+}
+
+fn load_source_file_kind(conn: &Connection, source_file_id: i64) -> Result<Option<SourceFileKind>> {
+    let raw_kind: Option<String> = conn
+        .query_row(
+            "SELECT source_kind FROM source_file WHERE id = ?1",
+            [source_file_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("unable to load source file kind for normalization")?;
+
+    Ok(raw_kind.as_deref().and_then(SourceFileKind::from_db_value))
+}
+
+fn normalize_transcript_jsonl_file(
     conn: &mut Connection,
     params: &NormalizeJsonlFileParams,
 ) -> Result<NormalizeJsonlFileOutcome> {
@@ -121,19 +153,24 @@ pub fn normalize_jsonl_file(
 
     Ok(NormalizeJsonlFileOutcome::Imported(
         NormalizeJsonlFileResult {
-            conversation_id: state
-                .conversation
-                .as_ref()
-                .map(|conversation| conversation.id)
-                .ok_or_else(|| anyhow!("conversation missing after import"))?,
-            stream_id: state
-                .stream
-                .as_ref()
-                .map(|stream| stream.id)
-                .ok_or_else(|| anyhow!("stream missing after import"))?,
+            conversation_id: Some(
+                state
+                    .conversation
+                    .as_ref()
+                    .map(|conversation| conversation.id)
+                    .ok_or_else(|| anyhow!("conversation missing after import"))?,
+            ),
+            stream_id: Some(
+                state
+                    .stream
+                    .as_ref()
+                    .map(|stream| stream.id)
+                    .ok_or_else(|| anyhow!("stream missing after import"))?,
+            ),
             record_count: state.record_count,
             message_count: state.message_states.len(),
             turn_count,
+            history_event_count: 0,
         },
     ))
 }
@@ -160,6 +197,174 @@ fn preview_source_line(line: &str) -> String {
     preview
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryInputKind {
+    PlainPrompt,
+    SlashCommand,
+    Other,
+}
+
+impl HistoryInputKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PlainPrompt => "plain_prompt",
+            Self::SlashCommand => "slash_command",
+            Self::Other => "other",
+        }
+    }
+}
+
+fn normalize_history_jsonl_file(
+    conn: &mut Connection,
+    params: &NormalizeJsonlFileParams,
+) -> Result<NormalizeJsonlFileOutcome> {
+    let mut tx = conn
+        .transaction()
+        .context("unable to start history normalization transaction")?;
+    purge_existing_import(&mut tx, params)?;
+
+    let file = File::open(&params.path)
+        .with_context(|| format!("unable to open jsonl source {}", params.path.display()))?;
+    let reader = BufReader::new(file);
+    let mut history_event_count = 0usize;
+
+    for (zero_based_line_no, line_result) in reader.lines().enumerate() {
+        let line_no = zero_based_line_no + 1;
+        let line = line_result.with_context(|| {
+            format!(
+                "unable to read line {line_no} from {}",
+                params.path.display()
+            )
+        })?;
+
+        let record: Value = match serde_json::from_str(&line) {
+            Ok(record) => record,
+            Err(_) => {
+                tx.rollback()
+                    .context("unable to roll back malformed history import")?;
+                return Ok(NormalizeJsonlFileOutcome::Warning(NormalizeImportWarning {
+                    code: WARNING_INVALID_JSON,
+                    message: format!(
+                        "unable to parse json on line {line_no} from {} (preview: {})",
+                        params.path.display(),
+                        preview_source_line(&line)
+                    ),
+                }));
+            }
+        };
+
+        insert_history_event(&tx, params, &record, line_no as i64)?;
+        history_event_count += 1;
+    }
+
+    tx.execute(
+        "
+        UPDATE import_chunk
+        SET imported_record_count = imported_record_count + ?2
+        WHERE id = ?1
+        ",
+        params![params.import_chunk_id, history_event_count as i64],
+    )
+    .context("unable to update import chunk counters after history normalization")?;
+    tx.commit()
+        .context("unable to commit normalized history import")?;
+
+    Ok(NormalizeJsonlFileOutcome::Imported(
+        NormalizeJsonlFileResult {
+            conversation_id: None,
+            stream_id: None,
+            record_count: history_event_count,
+            message_count: 0,
+            turn_count: 0,
+            history_event_count,
+        },
+    ))
+}
+
+fn insert_history_event(
+    tx: &Transaction<'_>,
+    params: &NormalizeJsonlFileParams,
+    record: &Value,
+    source_line_no: i64,
+) -> Result<()> {
+    let display_text = optional_string(record.get("display"));
+    let (input_kind, slash_command_name) = classify_history_input(display_text.as_deref());
+    let pasted_contents_json = record
+        .get("pastedContents")
+        .map(serde_json::to_string)
+        .transpose()
+        .with_context(|| {
+            format!(
+                "unable to serialize pastedContents on line {source_line_no} from {}",
+                params.path.display()
+            )
+        })?;
+    let raw_json = serde_json::to_string(record).with_context(|| {
+        format!(
+            "unable to serialize raw history event on line {source_line_no} from {}",
+            params.path.display()
+        )
+    })?;
+
+    tx.execute(
+        "
+        INSERT INTO history_event (
+            import_chunk_id,
+            source_file_id,
+            source_line_no,
+            session_id,
+            recorded_at_utc,
+            raw_project,
+            display_text,
+            pasted_contents_json,
+            input_kind,
+            slash_command_name,
+            raw_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        ",
+        params![
+            params.import_chunk_id,
+            params.source_file_id,
+            source_line_no,
+            optional_string(record.get("sessionId")),
+            optional_string(record.get("timestamp")),
+            optional_string(record.get("project")),
+            display_text,
+            pasted_contents_json,
+            input_kind.as_str(),
+            slash_command_name,
+            raw_json,
+        ],
+    )
+    .with_context(|| {
+        format!(
+            "unable to insert normalized history event on line {source_line_no} from {}",
+            params.path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn classify_history_input(display_text: Option<&str>) -> (HistoryInputKind, Option<String>) {
+    let Some(display_text) = display_text.map(str::trim) else {
+        return (HistoryInputKind::Other, None);
+    };
+    if display_text.is_empty() {
+        return (HistoryInputKind::Other, None);
+    }
+    if let Some(rest) = display_text.strip_prefix('/') {
+        let command_name = rest
+            .split_whitespace()
+            .next()
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned);
+        return (HistoryInputKind::SlashCommand, command_name);
+    }
+    (HistoryInputKind::PlainPrompt, None)
+}
+
 fn purge_existing_import(
     tx: &mut Transaction<'_>,
     params: &NormalizeJsonlFileParams,
@@ -177,6 +382,12 @@ fn purge_existing_import(
         tx.execute("DELETE FROM conversation WHERE id = ?1", [conversation_id])
             .context("unable to purge existing normalized conversation state")?;
     }
+
+    tx.execute(
+        "DELETE FROM history_event WHERE source_file_id = ?1",
+        [params.source_file_id],
+    )
+    .context("unable to purge existing normalized history event state")?;
 
     tx.execute(
         "
@@ -1226,7 +1437,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::db::Database;
-    use crate::import::NormalizedToolUsePartMetadata;
+    use crate::import::{NormalizedToolUsePartMetadata, SourceFileKind};
 
     use super::{NormalizeJsonlFileOutcome, NormalizeJsonlFileParams, normalize_jsonl_file};
 
@@ -1248,6 +1459,12 @@ mod tests {
 
     const SNAPSHOT_ONLY_FIXTURE: &str = "{\"type\":\"file-history-snapshot\",\"messageId\":\"snap-only-1\",\"snapshot\":{\"messageId\":\"snap-only-1\",\"trackedFileBackups\":{},\"timestamp\":\"2026-03-26T09:00:00Z\"},\"isSnapshotUpdate\":false}\n";
 
+    const HISTORY_FIXTURE: &str = concat!(
+        "{\"sessionId\":\"session-history-1\",\"timestamp\":\"2026-03-26T08:00:00Z\",\"project\":\"/tmp/project-a\",\"display\":\"Investigate the parser regression\",\"pastedContents\":[{\"type\":\"text\",\"text\":\"stack trace\"}]}\n",
+        "{\"sessionId\":\"session-history-1\",\"timestamp\":\"2026-03-26T08:01:00Z\",\"project\":\"/tmp/project-a\",\"display\":\"/skill planner --fast\",\"pastedContents\":[]}\n",
+        "{\"sessionId\":\"session-history-2\",\"timestamp\":\"2026-03-26T08:02:00Z\",\"project\":\"/tmp/project-b\"}\n"
+    );
+
     type MessagePartRow = (
         String,
         Option<String>,
@@ -1255,6 +1472,13 @@ mod tests {
         Option<String>,
         Option<String>,
         i64,
+    );
+    type HistoryRow = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
     );
 
     #[test]
@@ -1279,9 +1503,12 @@ mod tests {
             panic!("main session fixture should import");
         };
 
+        assert!(result.conversation_id.is_some());
+        assert!(result.stream_id.is_some());
         assert_eq!(result.record_count, 8);
         assert_eq!(result.message_count, 6);
         assert_eq!(result.turn_count, 1);
+        assert_eq!(result.history_event_count, 0);
 
         let conn = db.connection();
 
@@ -1371,9 +1598,12 @@ mod tests {
             panic!("sidechain fixture should import");
         };
 
+        assert!(result.conversation_id.is_some());
+        assert!(result.stream_id.is_some());
         assert_eq!(result.record_count, 2);
         assert_eq!(result.message_count, 2);
         assert_eq!(result.turn_count, 1);
+        assert_eq!(result.history_event_count, 0);
 
         let conn = db.connection();
 
@@ -1485,6 +1715,13 @@ mod tests {
         let mut conn = Connection::open(temp.path().join("legacy.sqlite3"))?;
         conn.execute_batch(
             "
+            CREATE TABLE source_file (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                relative_path TEXT NOT NULL,
+                source_kind TEXT NOT NULL
+            );
+
             CREATE TABLE conversation (
                 id INTEGER PRIMARY KEY,
                 project_id INTEGER NOT NULL,
@@ -1548,7 +1785,19 @@ mod tests {
                 message TEXT NOT NULL,
                 created_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE history_event (
+                id INTEGER PRIMARY KEY,
+                source_file_id INTEGER NOT NULL
+            );
             ",
+        )?;
+        conn.execute(
+            "
+            INSERT INTO source_file (id, project_id, relative_path, source_kind)
+            VALUES (1, 1, 'session.jsonl', 'transcript')
+            ",
+            [],
         )?;
 
         let error = normalize_jsonl_file(
@@ -1721,8 +1970,8 @@ mod tests {
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
 
-        assert_eq!(first_result.conversation_id, conversations[0].0);
-        assert_eq!(second_result.conversation_id, conversations[1].0);
+        assert_eq!(first_result.conversation_id, Some(conversations[0].0));
+        assert_eq!(second_result.conversation_id, Some(conversations[1].0));
         assert_eq!(conversations.len(), 2);
         assert_eq!(
             conversations[0].2,
@@ -1739,6 +1988,75 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn normalizes_history_jsonl_into_history_events() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let fixture_path = temp.path().join("history.jsonl");
+        std::fs::write(&fixture_path, HISTORY_FIXTURE)?;
+
+        let mut db = Database::open(&db_path)?;
+        let ids = seed_import_context_with_kind(
+            db.connection_mut(),
+            "history.jsonl",
+            SourceFileKind::ClaudeHistory,
+        )?;
+        let result = normalize_jsonl_file(
+            db.connection_mut(),
+            &NormalizeJsonlFileParams {
+                project_id: ids.project_id,
+                source_file_id: ids.source_file_id,
+                import_chunk_id: ids.import_chunk_id,
+                path: fixture_path,
+            },
+        )?;
+        let NormalizeJsonlFileOutcome::Imported(result) = result else {
+            panic!("history fixture should import");
+        };
+
+        assert_eq!(result.conversation_id, None);
+        assert_eq!(result.stream_id, None);
+        assert_eq!(result.record_count, 3);
+        assert_eq!(result.message_count, 0);
+        assert_eq!(result.turn_count, 0);
+        assert_eq!(result.history_event_count, 3);
+
+        let rows: Vec<HistoryRow> = {
+            let mut stmt = db.connection().prepare(
+                "
+                SELECT session_id, recorded_at_utc, display_text, input_kind, slash_command_name
+                FROM history_event
+                ORDER BY source_line_no
+                ",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].3, "plain_prompt");
+        assert_eq!(rows[1].3, "slash_command");
+        assert_eq!(rows[1].4.as_deref(), Some("skill"));
+        assert_eq!(rows[2].3, "other");
+
+        let pasted_contents_json: Option<String> = db.connection().query_row(
+            "SELECT pasted_contents_json FROM history_event WHERE source_line_no = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(pasted_contents_json.is_some());
+
+        Ok(())
+    }
+
     struct SeededIds {
         project_id: i64,
         source_file_id: i64,
@@ -1746,6 +2064,14 @@ mod tests {
     }
 
     fn seed_import_context(conn: &mut Connection, relative_path: &str) -> Result<SeededIds> {
+        seed_import_context_with_kind(conn, relative_path, SourceFileKind::Transcript)
+    }
+
+    fn seed_import_context_with_kind(
+        conn: &mut Connection,
+        relative_path: &str,
+        source_kind: SourceFileKind,
+    ) -> Result<SeededIds> {
         let project_id = conn.query_row(
             "
             INSERT INTO project (identity_kind, canonical_key, display_name, root_path)
@@ -1758,11 +2084,11 @@ mod tests {
 
         let source_file_id = conn.query_row(
             "
-            INSERT INTO source_file (project_id, relative_path, size_bytes)
-            VALUES (?1, ?2, 0)
+            INSERT INTO source_file (project_id, relative_path, source_kind, size_bytes)
+            VALUES (?1, ?2, ?3, 0)
             RETURNING id
             ",
-            params![project_id, relative_path],
+            params![project_id, relative_path, source_kind.as_str()],
             |row| row.get(0),
         )?;
 
@@ -1791,8 +2117,8 @@ mod tests {
     ) -> Result<SeededIds> {
         let source_file_id = conn.query_row(
             "
-            INSERT INTO source_file (project_id, relative_path, size_bytes)
-            VALUES (?1, ?2, 0)
+            INSERT INTO source_file (project_id, relative_path, source_kind, size_bytes)
+            VALUES (?1, ?2, 'transcript', 0)
             RETURNING id
             ",
             params![project_id, relative_path],

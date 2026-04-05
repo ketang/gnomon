@@ -34,6 +34,29 @@ pub const IMPORT_CHUNK_UNIT: &str = "project x day";
 /// - `metadata_json` — only the `input` key, only for `tool_use` parts
 pub const IMPORT_SCHEMA_VERSION: i64 = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceFileKind {
+    Transcript,
+    ClaudeHistory,
+}
+
+impl SourceFileKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Transcript => "transcript",
+            Self::ClaudeHistory => "claude_history",
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "transcript" => Some(Self::Transcript),
+            "claude_history" => Some(Self::ClaudeHistory),
+            _ => None,
+        }
+    }
+}
+
 /// Stable normalized payload contract for persisted `tool_use` message parts.
 ///
 /// This is the only structured `message_part.metadata_json` shape consumed by

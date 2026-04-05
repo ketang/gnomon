@@ -18,7 +18,7 @@ use rusqlite::{Connection, Transaction, params};
 use super::{
     IMPORT_SCHEMA_VERSION, NormalizeImportWarning, NormalizeJsonlFileOutcome,
     NormalizeJsonlFileParams, STARTUP_IMPORT_WINDOW_HOURS, STARTUP_OPEN_DEADLINE_SECS,
-    normalize_jsonl_file,
+    SourceFileKind, normalize_jsonl_file,
 };
 
 const IMPORTER_THREAD_NAME: &str = "gnomon-importer";
@@ -134,6 +134,7 @@ struct PreparedChunk {
 struct ChunkSourceFile {
     source_file_id: i64,
     relative_path: String,
+    source_kind: SourceFileKind,
 }
 
 #[derive(Debug)]
@@ -142,6 +143,7 @@ struct SourceFileRow {
     project_id: i64,
     project_key: String,
     relative_path: String,
+    source_kind: String,
     modified_at_utc: Option<String>,
     discovered_at_utc: String,
     size_bytes: i64,
@@ -353,6 +355,8 @@ fn build_import_plan(
             .push(ChunkSourceFile {
                 source_file_id: row.source_file_id,
                 relative_path: row.relative_path.clone(),
+                source_kind: SourceFileKind::from_db_value(&row.source_kind)
+                    .ok_or_else(|| anyhow!("unknown source file kind {}", row.source_kind))?,
             });
 
         if source_file_needs_import(&row) {
@@ -410,6 +414,7 @@ fn load_source_files(conn: &Connection) -> Result<Vec<SourceFileRow>> {
                 source_file.project_id,
                 project.canonical_key,
                 source_file.relative_path,
+                source_file.source_kind,
                 source_file.modified_at_utc,
                 source_file.discovered_at_utc,
                 source_file.size_bytes,
@@ -430,12 +435,13 @@ fn load_source_files(conn: &Connection) -> Result<Vec<SourceFileRow>> {
                 project_id: row.get(1)?,
                 project_key: row.get(2)?,
                 relative_path: row.get(3)?,
-                modified_at_utc: row.get(4)?,
-                discovered_at_utc: row.get(5)?,
-                size_bytes: row.get(6)?,
-                imported_size_bytes: row.get(7)?,
-                imported_modified_at_utc: row.get(8)?,
-                imported_schema_version: row.get(9)?,
+                source_kind: row.get(4)?,
+                modified_at_utc: row.get(5)?,
+                discovered_at_utc: row.get(6)?,
+                size_bytes: row.get(7)?,
+                imported_size_bytes: row.get(8)?,
+                imported_modified_at_utc: row.get(9)?,
+                imported_schema_version: row.get(10)?,
             })
         })
         .context("unable to enumerate source files for import planning")?;
@@ -731,19 +737,19 @@ fn import_chunk(
             })?;
 
             match outcome {
-                NormalizeJsonlFileOutcome::Imported(conversation) => {
-                    let _ = build_actions(
-                        database.connection_mut(),
-                        &BuildActionsParams {
-                            conversation_id: conversation.conversation_id,
-                        },
-                    )
-                    .with_context(|| {
-                        format!(
-                            "unable to build actions for source file {}",
-                            source_root.join(&source_file.relative_path).display()
+                NormalizeJsonlFileOutcome::Imported(result) => {
+                    if let Some(conversation_id) = result.conversation_id {
+                        let _ = build_actions(
+                            database.connection_mut(),
+                            &BuildActionsParams { conversation_id },
                         )
-                    })?;
+                        .with_context(|| {
+                            format!(
+                                "unable to build actions for source file {}",
+                                source_root.join(&source_file.relative_path).display()
+                            )
+                        })?;
+                    }
                 }
                 NormalizeJsonlFileOutcome::Skipped => {}
                 NormalizeJsonlFileOutcome::Warning(warning) => {

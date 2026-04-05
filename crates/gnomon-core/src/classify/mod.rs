@@ -1216,7 +1216,9 @@ mod tests {
         let result = build_actions(
             db.connection_mut(),
             &BuildActionsParams {
-                conversation_id: normalized.conversation_id,
+                conversation_id: normalized
+                    .conversation_id
+                    .expect("transcript normalization should produce a conversation id"),
             },
         )?;
 
@@ -1296,7 +1298,9 @@ mod tests {
         let result = build_actions(
             db.connection_mut(),
             &BuildActionsParams {
-                conversation_id: normalized.conversation_id,
+                conversation_id: normalized
+                    .conversation_id
+                    .expect("transcript normalization should produce a conversation id"),
             },
         )?;
 

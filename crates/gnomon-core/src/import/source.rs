@@ -13,8 +13,11 @@ use crate::config::{
     ProjectFilterAction, ProjectFilterContext, ProjectFilterRule, ProjectIdentityPolicy,
 };
 use crate::db::Database;
+use crate::import::SourceFileKind;
 use crate::vcs::{self, ProjectIdentityKind, ResolvedProject};
 
+const CLAUDE_HISTORY_PROJECT_REASON: &str = "claude history source";
+const CLAUDE_HISTORY_RELATIVE_PATH: &str = "../history.jsonl";
 const WARNING_INVALID_JSON: &str = "invalid_json";
 const WARNING_MISSING_CWD: &str = "missing_cwd";
 const WARNING_PATH_PROJECT: &str = "path_project";
@@ -47,6 +50,7 @@ impl ScanWarning {
 
 #[derive(Debug, Clone)]
 struct DiscoveredSourceFile {
+    source_kind: SourceFileKind,
     project: ResolvedProject,
     relative_path: String,
     modified_at_utc: Option<String>,
@@ -79,6 +83,7 @@ struct StoredProject {
 #[derive(Debug)]
 struct StoredSourceFile {
     id: i64,
+    source_kind: String,
     modified_at_utc: Option<String>,
     size_bytes: i64,
     scan_warnings_json: String,
@@ -99,10 +104,7 @@ pub fn scan_source_manifest_with_policy(
     identity_policy: &ProjectIdentityPolicy,
     project_filters: &[ProjectFilterRule],
 ) -> Result<ScanReport> {
-    if !source_root.exists() {
-        return Ok(ScanReport::default());
-    }
-    if !source_root.is_dir() {
+    if source_root.exists() && !source_root.is_dir() {
         bail!("source root {} is not a directory", source_root.display());
     }
 
@@ -149,19 +151,34 @@ fn discover_source_files(
     let mut discovered_source_files = 0usize;
     let mut excluded_source_files = 0usize;
 
-    for entry in WalkDir::new(source_root) {
-        let entry = entry
-            .with_context(|| format!("unable to walk source root {}", source_root.display()))?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        if entry.path().extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-            continue;
-        }
+    if source_root.exists() {
+        for entry in WalkDir::new(source_root) {
+            let entry = entry
+                .with_context(|| format!("unable to walk source root {}", source_root.display()))?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if entry.path().extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
 
+            discovered_source_files += 1;
+            if let Some(file) =
+                discover_source_file(source_root, entry.path(), identity_policy, project_filters)?
+            {
+                discovered_files.push(file);
+            } else {
+                excluded_source_files += 1;
+            }
+        }
+    }
+
+    if let Some(history_path) = claude_history_path(source_root)
+        && history_path.is_file()
+    {
         discovered_source_files += 1;
         if let Some(file) =
-            discover_source_file(source_root, entry.path(), identity_policy, project_filters)?
+            discover_history_source_file(source_root, &history_path, project_filters)?
         {
             discovered_files.push(file);
         } else {
@@ -235,12 +252,55 @@ fn discover_source_file(
     })?;
 
     Ok(Some(DiscoveredSourceFile {
+        source_kind: SourceFileKind::Transcript,
         project,
         relative_path,
         modified_at_utc,
         size_bytes,
         scan_warnings_json,
     }))
+}
+
+fn discover_history_source_file(
+    source_root: &Path,
+    history_path: &Path,
+    project_filters: &[ProjectFilterRule],
+) -> Result<Option<DiscoveredSourceFile>> {
+    let metadata = fs::metadata(history_path)
+        .with_context(|| format!("unable to read metadata for {}", history_path.display()))?;
+    let size_bytes = i64::try_from(metadata.len())
+        .with_context(|| format!("source file {} is too large", history_path.display()))?;
+    let modified_at_utc = modified_at_utc(&metadata).with_context(|| {
+        format!(
+            "unable to read modified time for {}",
+            history_path.display()
+        )
+    })?;
+    let project_root = source_root.parent().unwrap_or(source_root).to_path_buf();
+    let project = vcs::path_project(&project_root, CLAUDE_HISTORY_PROJECT_REASON);
+
+    if should_exclude_project(None, &project, project_filters)? {
+        return Ok(None);
+    }
+
+    Ok(Some(DiscoveredSourceFile {
+        source_kind: SourceFileKind::ClaudeHistory,
+        project,
+        relative_path: CLAUDE_HISTORY_RELATIVE_PATH.to_string(),
+        modified_at_utc,
+        size_bytes,
+        scan_warnings_json: "[]".to_string(),
+    }))
+}
+
+fn claude_history_path(source_root: &Path) -> Option<PathBuf> {
+    let projects_dir_name = source_root.file_name()?.to_str()?;
+    let claude_dir = source_root.parent()?;
+    let claude_dir_name = claude_dir.file_name()?.to_str()?;
+    if projects_dir_name != "projects" || claude_dir_name != ".claude" {
+        return None;
+    }
+    Some(claude_dir.join("history.jsonl"))
 }
 
 fn should_exclude_project(
@@ -457,6 +517,7 @@ fn upsert_source_file(
             "
             SELECT
                 id,
+                source_kind,
                 modified_at_utc,
                 size_bytes,
                 scan_warnings_json
@@ -467,9 +528,10 @@ fn upsert_source_file(
             |row| {
                 Ok(StoredSourceFile {
                     id: row.get(0)?,
-                    modified_at_utc: row.get(1)?,
-                    size_bytes: row.get(2)?,
-                    scan_warnings_json: row.get(3)?,
+                    source_kind: row.get(1)?,
+                    modified_at_utc: row.get(2)?,
+                    size_bytes: row.get(3)?,
+                    scan_warnings_json: row.get(4)?,
                 })
             },
         )
@@ -483,14 +545,16 @@ fn upsert_source_file(
                 INSERT INTO source_file (
                     project_id,
                     relative_path,
+                    source_kind,
                     modified_at_utc,
                     size_bytes,
                     scan_warnings_json
-                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                 ",
                 params![
                     project_id,
                     file.relative_path,
+                    file.source_kind.as_str(),
                     file.modified_at_utc,
                     file.size_bytes,
                     file.scan_warnings_json,
@@ -500,7 +564,8 @@ fn upsert_source_file(
             report.inserted_source_files += 1;
         }
         Some(existing) => {
-            let needs_update = existing.modified_at_utc != file.modified_at_utc
+            let needs_update = existing.source_kind != file.source_kind.as_str()
+                || existing.modified_at_utc != file.modified_at_utc
                 || existing.size_bytes != file.size_bytes
                 || existing.scan_warnings_json != file.scan_warnings_json;
 
@@ -509,13 +574,15 @@ fn upsert_source_file(
                     "
                     UPDATE source_file
                     SET
-                        modified_at_utc = ?2,
-                        size_bytes = ?3,
-                        scan_warnings_json = ?4
+                        source_kind = ?2,
+                        modified_at_utc = ?3,
+                        size_bytes = ?4,
+                        scan_warnings_json = ?5
                     WHERE id = ?1
                     ",
                     params![
                         existing.id,
+                        file.source_kind.as_str(),
                         file.modified_at_utc,
                         file.size_bytes,
                         file.scan_warnings_json,
@@ -1092,6 +1159,34 @@ mod tests {
         let report = scan_source_manifest(&mut db, &source_root)?;
 
         assert_eq!(report, ScanReport::default());
+        Ok(())
+    }
+
+    #[test]
+    fn scan_discovers_sibling_claude_history_jsonl() -> Result<()> {
+        let temp = tempdir()?;
+        let claude_root = temp.path().join(".claude");
+        let source_root = claude_root.join("projects");
+        fs::create_dir_all(&source_root)?;
+        fs::write(
+            claude_root.join("history.jsonl"),
+            "{\"sessionId\":\"session-1\",\"timestamp\":\"2026-03-26T08:00:00Z\",\"display\":\"hello\"}\n",
+        )?;
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let report = scan_source_manifest(&mut db, &source_root)?;
+
+        assert_eq!(report.discovered_source_files, 1);
+        assert_eq!(report.inserted_source_files, 1);
+
+        let row: (String, String) = db.connection().query_row(
+            "SELECT relative_path, source_kind FROM source_file",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(row.0, "../history.jsonl");
+        assert_eq!(row.1, "claude_history");
+
         Ok(())
     }
 
