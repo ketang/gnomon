@@ -10,7 +10,7 @@
   };
   const LENS_LABELS = {
     uncached_input: "Uncached input",
-    gross_input: "Gross input",
+    gross_input: "All input",
     output: "Output",
     total: "Total",
   };
@@ -1374,7 +1374,7 @@
                 <dd>{formatMetric(detail.row.metrics.uncached_input)}</dd>
               </div>
               <div>
-                <dt>Gross input</dt>
+                <dt>All input</dt>
                 <dd>{formatMetric(detail.row.metrics.gross_input)}</dd>
               </div>
               <div>
