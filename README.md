@@ -94,9 +94,10 @@ cargo run -p gnomon -- skills --path skill --skill planner
 cargo run -p gnomon -- skills --path skill-project --skill planner --project-id 1
 ```
 
-The reported token totals are session-associated, not action-attributed. The
-JSON output also includes unmatched invocation counts so you can see when an
-explicit skill invocation did not join to a transcript-backed session.
+The JSON output now reports both session-associated totals and explicit
+action-attributed totals. Unmatched invocation counts are also included so you
+can see when an explicit skill invocation did not join to a transcript-backed
+session.
 
 ## TUI Screenshot Harness
 
@@ -207,6 +208,9 @@ database from the source manifest and session history without opening the TUI.
 If you pull a version that renames derived taxonomy labels, such as `Editing`
 to `editing` or bracketed special-state labels like `[mixed]`, run `db rebuild`
 to refresh existing cached aggregates and filters.
+Apply the same rebuild step after pulling a version that adds skill
+action-attribution support. Existing caches need a rebuild before the new
+per-action skill totals will appear in the skills report.
 Run `db rebuild` after pulling a version that changes project identity
 resolution as well. Identity fixes only affect newly imported manifest rows, so
 an existing cache can keep stale project records until it is rebuilt.

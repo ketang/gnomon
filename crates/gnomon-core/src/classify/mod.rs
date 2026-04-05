@@ -69,7 +69,7 @@ pub fn build_actions(
 
             if let Some(group) = current_group.as_mut() {
                 if group.descriptor == classification.descriptor {
-                    group.push_message(message);
+                    group.push_message(message, &classification);
                     continue;
                 }
 
@@ -85,11 +85,7 @@ pub fn build_actions(
             }
 
             if let Some(turn_id) = message.turn_id {
-                current_group = Some(ActionGroupDraft::new(
-                    turn_id,
-                    message,
-                    classification.descriptor,
-                ));
+                current_group = Some(ActionGroupDraft::new(turn_id, message, &classification));
             }
         }
 
@@ -414,10 +410,17 @@ struct PathRefSpec {
     ref_kind: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActionSkillAttributionDraft {
+    skill_name: String,
+    confidence: &'static str,
+}
+
 #[derive(Debug)]
 struct MessageClassification {
     descriptor: ActionDescriptor,
     path_refs: Vec<PathRefSpec>,
+    skill_references: Vec<String>,
 }
 
 fn classify_message(
@@ -426,6 +429,7 @@ fn classify_message(
 ) -> MessageClassification {
     let mut descriptors = HashSet::new();
     let mut path_refs = HashSet::new();
+    let mut skill_references = HashSet::new();
 
     for part in &message.parts {
         match part.part_kind.as_str() {
@@ -436,6 +440,7 @@ fn classify_message(
                     {
                         path_refs.insert(path_ref);
                     }
+                    skill_references.extend(explicit_skill_references_from_tool(&tool_invocation));
                 }
             }
             "tool_result" => {
@@ -460,10 +465,13 @@ fn classify_message(
 
     let mut path_refs: Vec<PathRefSpec> = path_refs.into_iter().collect();
     path_refs.sort_by(|left, right| left.full_path.cmp(&right.full_path));
+    let mut skill_references: Vec<String> = skill_references.into_iter().collect();
+    skill_references.sort();
 
     MessageClassification {
         descriptor,
         path_refs,
+        skill_references,
     }
 }
 
@@ -829,6 +837,77 @@ fn explicit_file_path(tool: &ToolInvocation) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn explicit_skill_references_from_tool(tool: &ToolInvocation) -> Vec<String> {
+    let mut skills = HashSet::new();
+
+    if let Some(path) = explicit_file_path(tool)
+        && let Some(skill_name) = skill_name_from_explicit_path(&path)
+    {
+        skills.insert(skill_name);
+    }
+
+    if tool.tool_name == "Bash" {
+        skills.extend(explicit_skill_references_from_shell_command(tool));
+    }
+
+    let mut skills: Vec<String> = skills.into_iter().collect();
+    skills.sort();
+    skills
+}
+
+fn explicit_skill_references_from_shell_command(tool: &ToolInvocation) -> Vec<String> {
+    let Some(command) = tool
+        .input
+        .as_ref()
+        .and_then(|input| input.get("command"))
+        .and_then(Value::as_str)
+    else {
+        return Vec::new();
+    };
+    if contains_shell_separator(command) {
+        return Vec::new();
+    }
+
+    let mut skills = HashSet::new();
+    for token in shell_words(command) {
+        if token.starts_with('-') || !token.contains('/') {
+            continue;
+        }
+        if let Some(skill_name) = skill_name_from_explicit_path(Path::new(&token)) {
+            skills.insert(skill_name);
+        }
+    }
+
+    let mut skills: Vec<String> = skills.into_iter().collect();
+    skills.sort();
+    skills
+}
+
+fn skill_name_from_explicit_path(path: &Path) -> Option<String> {
+    if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+        return path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty() && !name.starts_with('.'))
+            .map(ToOwned::to_owned);
+    }
+
+    let components = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let skills_index = components
+        .iter()
+        .position(|component| component == "skills")?;
+
+    components
+        .iter()
+        .skip(skills_index + 1)
+        .find(|component| !component.is_empty() && !component.starts_with('.'))
+        .cloned()
+}
+
 fn contains_shell_separator(command: &str) -> bool {
     ["&&", "||", ";", "|", "\n"]
         .iter()
@@ -1027,13 +1106,14 @@ struct ActionGroupDraft {
     ended_at_utc: Option<String>,
     usage: Usage,
     message_ids: Vec<i64>,
+    skill_references: HashSet<String>,
 }
 
 impl ActionGroupDraft {
-    fn new(turn_id: i64, message: &LoadedMessage, descriptor: ActionDescriptor) -> Self {
+    fn new(turn_id: i64, message: &LoadedMessage, classification: &MessageClassification) -> Self {
         Self {
             turn_id,
-            descriptor,
+            descriptor: classification.descriptor.clone(),
             started_at_utc: message
                 .created_at_utc
                 .clone()
@@ -1044,10 +1124,11 @@ impl ActionGroupDraft {
                 .or_else(|| message.created_at_utc.clone()),
             usage: message.usage.clone(),
             message_ids: vec![message.id],
+            skill_references: classification.skill_references.iter().cloned().collect(),
         }
     }
 
-    fn push_message(&mut self, message: &LoadedMessage) {
+    fn push_message(&mut self, message: &LoadedMessage, classification: &MessageClassification) {
         if let Some(candidate) = message
             .created_at_utc
             .clone()
@@ -1089,6 +1170,24 @@ impl ActionGroupDraft {
         );
         add_usage(&mut self.usage.output_tokens, message.usage.output_tokens);
         self.message_ids.push(message.id);
+        self.skill_references
+            .extend(classification.skill_references.iter().cloned());
+    }
+
+    fn skill_attribution(&self) -> Option<ActionSkillAttributionDraft> {
+        let skill_names = self
+            .skill_references
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let [skill_name] = skill_names.as_slice() else {
+            return None;
+        };
+
+        Some(ActionSkillAttributionDraft {
+            skill_name: (*skill_name).to_string(),
+            confidence: "high",
+        })
     }
 }
 
@@ -1152,6 +1251,16 @@ fn persist_action(
         )?;
     }
 
+    if let Some(attribution) = group.skill_attribution() {
+        tx.execute(
+            "
+            INSERT INTO action_skill_attribution (action_id, skill_name, confidence)
+            VALUES (?1, ?2, ?3)
+            ",
+            params![action_id, attribution.skill_name, attribution.confidence],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1190,6 +1299,14 @@ mod tests {
         "{\"type\":\"user\",\"uuid\":\"mixed-result-1\",\"timestamp\":\"2026-03-26T13:00:02Z\",\"sessionId\":\"session-4\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu-mixed\",\"content\":\"mixed output\",\"is_error\":false}]},\"toolUseResult\":{\"stdout\":\"mixed output\"}}\n",
         "{\"type\":\"assistant\",\"uuid\":\"doc-1\",\"timestamp\":\"2026-03-26T13:00:03Z\",\"sessionId\":\"session-4\",\"message\":{\"id\":\"msg-doc\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu-doc\",\"name\":\"Write\",\"input\":{\"file_path\":\"/tmp/project/docs/README.md\",\"content\":\"updated docs\"}}],\"usage\":{\"input_tokens\":4,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":0,\"output_tokens\":2},\"model\":\"claude-opus\",\"stop_reason\":\"tool_use\"}}\n",
         "{\"type\":\"user\",\"uuid\":\"doc-result-1\",\"timestamp\":\"2026-03-26T13:00:04Z\",\"sessionId\":\"session-4\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu-doc\",\"content\":\"written\",\"is_error\":false}]},\"toolUseResult\":{\"stdout\":\"written\"}}\n"
+    );
+
+    const SKILL_ATTRIBUTION_FIXTURE: &str = concat!(
+        "{\"type\":\"user\",\"uuid\":\"prompt-3\",\"timestamp\":\"2026-03-26T14:00:00Z\",\"sessionId\":\"session-5\",\"cwd\":\"/tmp/project\",\"message\":{\"role\":\"user\",\"content\":\"Check the planner skill and rerun tests.\"}}\n",
+        "{\"type\":\"assistant\",\"uuid\":\"skill-read-1\",\"timestamp\":\"2026-03-26T14:00:01Z\",\"sessionId\":\"session-5\",\"message\":{\"id\":\"msg-skill-read\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu-skill-read\",\"name\":\"Read\",\"input\":{\"file_path\":\"/home/ketan/.codex/skills/planner/SKILL.md\"}}],\"usage\":{\"input_tokens\":6,\"cache_creation_input_tokens\":1,\"cache_read_input_tokens\":0,\"output_tokens\":2},\"model\":\"claude-opus\",\"stop_reason\":\"tool_use\"}}\n",
+        "{\"type\":\"user\",\"uuid\":\"skill-read-result-1\",\"timestamp\":\"2026-03-26T14:00:02Z\",\"sessionId\":\"session-5\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu-skill-read\",\"content\":\"---\\nname: planner\\n---\",\"is_error\":false}]},\"toolUseResult\":{\"stdout\":\"---\\nname: planner\\n---\"}}\n",
+        "{\"type\":\"assistant\",\"uuid\":\"test-2\",\"timestamp\":\"2026-03-26T14:00:03Z\",\"sessionId\":\"session-5\",\"message\":{\"id\":\"msg-test-2\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu-test-2\",\"name\":\"Bash\",\"input\":{\"command\":\"cargo test\"}}],\"usage\":{\"input_tokens\":4,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":1},\"model\":\"claude-opus\",\"stop_reason\":\"tool_use\"}}\n",
+        "{\"type\":\"user\",\"uuid\":\"test-result-2\",\"timestamp\":\"2026-03-26T14:00:04Z\",\"sessionId\":\"session-5\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu-test-2\",\"content\":\"ok\",\"is_error\":false}]},\"toolUseResult\":{\"stdout\":\"ok\"}}\n"
     );
 
     #[test]
@@ -1344,6 +1461,69 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(doc_path, "/tmp/project/docs/README.md");
+
+        Ok(())
+    }
+
+    #[test]
+    fn attributes_explicit_skill_paths_without_tagging_generic_actions() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let fixture_path = temp.path().join("skill-attribution.jsonl");
+        std::fs::write(&fixture_path, SKILL_ATTRIBUTION_FIXTURE)?;
+
+        let mut db = Database::open(&db_path)?;
+        let ids = seed_import_context(db.connection_mut(), "skill-attribution.jsonl")?;
+        let normalized = normalize_jsonl_file(
+            db.connection_mut(),
+            &NormalizeJsonlFileParams {
+                project_id: ids.project_id,
+                source_file_id: ids.source_file_id,
+                import_chunk_id: ids.import_chunk_id,
+                path: fixture_path,
+            },
+        )?;
+        let NormalizeJsonlFileOutcome::Imported(normalized) = normalized else {
+            panic!("skill attribution fixture should import");
+        };
+        let result = build_actions(
+            db.connection_mut(),
+            &BuildActionsParams {
+                conversation_id: normalized
+                    .conversation_id
+                    .expect("transcript normalization should produce a conversation id"),
+            },
+        )?;
+
+        assert_eq!(result.action_count, 3);
+        assert_eq!(result.path_ref_count, 0);
+
+        let conn = db.connection();
+        let rows: Vec<(i64, String, String)> = {
+            let mut stmt = conn.prepare(
+                "
+                SELECT a.sequence_no, asa.skill_name, asa.confidence
+                FROM action_skill_attribution asa
+                JOIN action a ON a.id = asa.action_id
+                ORDER BY a.sequence_no
+                ",
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        assert_eq!(rows, vec![(1, "planner".to_string(), "high".to_string())]);
+
+        let generic_action_attribution_count: i64 = conn.query_row(
+            "
+            SELECT COUNT(*)
+            FROM action_skill_attribution asa
+            JOIN action a ON a.id = asa.action_id
+            WHERE a.normalized_action = 'test run'
+            ",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(generic_action_attribution_count, 0);
 
         Ok(())
     }
