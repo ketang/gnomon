@@ -19,7 +19,8 @@ use gnomon_core::opportunity::{OpportunityCategory, OpportunityConfidence, Oppor
 use gnomon_core::perf::PerfLogger;
 use gnomon_core::query::{
     ActionKey, BrowseFilters, BrowsePath, BrowseReport, BrowseRequest, ClassificationState,
-    MetricLens, OpportunitiesFilters, QueryEngine, RootView, TimeWindowFilter,
+    MetricLens, OpportunitiesFilters, QueryEngine, RootView, SkillsPath, SkillsReport,
+    TimeWindowFilter,
 };
 
 #[derive(Debug, Parser)]
@@ -58,6 +59,8 @@ enum Command {
     Benchmark(Box<BenchmarkArgs>),
     #[command(about = "Return non-interactive aggregate rollups from the current snapshot.")]
     Report(Box<ReportArgs>),
+    #[command(about = "Return skill-oriented rollups with session-associated token metrics.")]
+    Skills(Box<SkillsArgs>),
     #[command(
         about = "Emit opportunity annotations with supporting evidence for heuristic calibration."
     )]
@@ -153,6 +156,21 @@ struct BenchmarkArgs {
     /// Number of timing samples to collect for each benchmark scenario.
     #[arg(long, default_value_t = QueryBenchmarkOptions::default().iterations)]
     iterations: usize,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+struct SkillsArgs {
+    /// Aggregate path to browse within the skills lens.
+    #[arg(long, value_enum, default_value_t = SkillsPathArg::Root)]
+    path: SkillsPathArg,
+
+    /// Skill name used by non-root paths.
+    #[arg(long)]
+    skill: Option<String>,
+
+    /// Project id used by skill-project paths.
+    #[arg(long)]
+    project_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Args, PartialEq)]
@@ -310,6 +328,13 @@ enum BrowsePathKindArg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SkillsPathArg {
+    Root,
+    Skill,
+    SkillProject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ClassificationStateArg {
     Classified,
     Mixed,
@@ -340,6 +365,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::Db(command)) => run_db_command(&config, command.command),
         Some(Command::Benchmark(args)) => run_benchmark_command(&config, &args),
         Some(Command::Report(args)) => run_report_command(&config, &args),
+        Some(Command::Skills(args)) => run_skills_command(&config, &args),
         Some(Command::Opportunities(args)) => run_opportunities_command(&config, &args),
         Some(Command::Snapshot(args)) => run_snapshot_command(&config, &args),
     }
@@ -445,6 +471,14 @@ fn run_snapshot_command(config: &RuntimeConfig, args: &SnapshotArgs) -> Result<(
     Ok(())
 }
 
+fn run_skills_command(config: &RuntimeConfig, args: &SkillsArgs) -> Result<()> {
+    config.ensure_dirs()?;
+    let perf_logger = PerfLogger::from_env(&config.state_dir)?;
+    let report = build_skills_report(config, args, perf_logger)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
 fn build_browse_report(
     config: &RuntimeConfig,
     args: &ReportArgs,
@@ -461,6 +495,17 @@ fn build_browse_report(
         path: args.build_path()?,
     };
     engine.browse_report(request)
+}
+
+fn build_skills_report(
+    config: &RuntimeConfig,
+    args: &SkillsArgs,
+    perf_logger: Option<PerfLogger>,
+) -> Result<SkillsReport> {
+    let database = Database::open(&config.db_path)?;
+    let engine = QueryEngine::with_perf(database.connection(), perf_logger);
+    let snapshot = engine.latest_snapshot_bounds()?;
+    engine.skills_report(&snapshot, args.build_path()?)
 }
 
 fn run_opportunities_command(config: &RuntimeConfig, args: &OpportunitiesArgs) -> Result<()> {
@@ -819,6 +864,32 @@ impl ReportArgs {
     }
 }
 
+impl SkillsArgs {
+    fn build_path(&self) -> Result<SkillsPath> {
+        match self.path {
+            SkillsPathArg::Root => Ok(SkillsPath::Root),
+            SkillsPathArg::Skill => Ok(SkillsPath::Skill {
+                skill_name: self.required_skill("skill path")?,
+            }),
+            SkillsPathArg::SkillProject => Ok(SkillsPath::SkillProject {
+                skill_name: self.required_skill("skill-project path")?,
+                project_id: self.required_project_id("skill-project path")?,
+            }),
+        }
+    }
+
+    fn required_skill(&self, context: &str) -> Result<String> {
+        self.skill
+            .clone()
+            .with_context(|| format!("{context} requires --skill"))
+    }
+
+    fn required_project_id(&self, context: &str) -> Result<i64> {
+        self.project_id
+            .with_context(|| format!("{context} requires --project-id"))
+    }
+}
+
 impl StartupArgs {
     fn has_explicit_selection(&self) -> bool {
         self.root.is_some()
@@ -986,8 +1057,9 @@ mod tests {
     use super::{
         BenchmarkArgs, BrowsePathKindArg, ClassificationStateArg, Cli, Command, DbSubcommand,
         GlobalArgs, MetricLensArg, OpportunityCategoryArg, OpportunityConfidenceArg, ReportArgs,
-        ResetArgs, RootViewArg, StartupArgs, build_browse_report, build_query_benchmark_report,
-        count_completed_chunks, filter_opportunities, rebuild_database, run_db_command,
+        ResetArgs, RootViewArg, SkillsArgs, SkillsPathArg, StartupArgs, build_browse_report,
+        build_query_benchmark_report, count_completed_chunks, filter_opportunities,
+        rebuild_database, run_db_command,
     };
     use clap::ValueEnum;
     use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
@@ -1051,6 +1123,7 @@ mod tests {
             },
             Some(Command::Benchmark(_)) => panic!("expected db command"),
             Some(Command::Report(_)) => panic!("expected db command"),
+            Some(Command::Skills(_)) => panic!("expected db command"),
             Some(Command::Opportunities(_)) => panic!("expected db command"),
             Some(Command::Snapshot(_)) => panic!("expected db command"),
             None => panic!("expected db command"),
@@ -1083,6 +1156,7 @@ mod tests {
             },
             Some(Command::Benchmark(_)) => panic!("expected db command"),
             Some(Command::Report(_)) => panic!("expected db command"),
+            Some(Command::Skills(_)) => panic!("expected db command"),
             Some(Command::Opportunities(_)) => panic!("expected db command"),
             Some(Command::Snapshot(_)) => panic!("expected db command"),
             None => panic!("expected db command"),
@@ -1113,6 +1187,7 @@ mod tests {
             Some(Command::Report(args)) => assert_eq!(args.lens, MetricLensArg::GrossInput),
             Some(Command::Db(_)) => panic!("expected report command"),
             Some(Command::Benchmark(_)) => panic!("expected report command"),
+            Some(Command::Skills(_)) => panic!("expected report command"),
             Some(Command::Opportunities(_)) => panic!("expected report command"),
             Some(Command::Snapshot(_)) => panic!("expected report command"),
             None => panic!("expected report command"),
@@ -1127,6 +1202,7 @@ mod tests {
             Some(Command::Report(args)) => assert_eq!(args.lens, MetricLensArg::GrossInput),
             Some(Command::Db(_)) => panic!("expected report command"),
             Some(Command::Benchmark(_)) => panic!("expected report command"),
+            Some(Command::Skills(_)) => panic!("expected report command"),
             Some(Command::Opportunities(_)) => panic!("expected report command"),
             Some(Command::Snapshot(_)) => panic!("expected report command"),
             None => panic!("expected report command"),
@@ -1197,6 +1273,34 @@ mod tests {
                 assert_eq!(*args, BenchmarkArgs { iterations: 7 });
             }
             _ => panic!("expected benchmark command"),
+        }
+    }
+
+    #[test]
+    fn parse_accepts_skills_arguments() {
+        let cli = Cli::parse_from([
+            "gnomon",
+            "skills",
+            "--path",
+            "skill-project",
+            "--skill",
+            "planner",
+            "--project-id",
+            "7",
+        ]);
+
+        match cli.command {
+            Some(Command::Skills(args)) => {
+                assert_eq!(
+                    *args,
+                    SkillsArgs {
+                        path: SkillsPathArg::SkillProject,
+                        skill: Some("planner".to_string()),
+                        project_id: Some(7),
+                    }
+                );
+            }
+            _ => panic!("expected skills command"),
         }
     }
 
@@ -1667,6 +1771,21 @@ mod tests {
             .expect_err("action paths should require a classification state");
 
         assert!(err.to_string().contains("--classification-state"));
+    }
+
+    #[test]
+    fn skills_path_requires_skill_name() {
+        let args = SkillsArgs {
+            path: SkillsPathArg::Skill,
+            skill: None,
+            project_id: None,
+        };
+
+        let err = args
+            .build_path()
+            .expect_err("skill path should require a skill name");
+
+        assert!(err.to_string().contains("--skill"));
     }
 
     #[test]
