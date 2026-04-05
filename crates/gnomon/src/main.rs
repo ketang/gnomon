@@ -1679,6 +1679,7 @@ mod tests {
                 },
                 item_count: 0,
                 opportunities: OpportunitySummary::default(),
+                skill_attribution: None,
                 project_id: Some(1),
                 project_identity: None,
                 category: None,

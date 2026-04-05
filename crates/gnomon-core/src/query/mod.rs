@@ -369,6 +369,8 @@ pub struct RollupRow {
     pub item_count: u64,
     #[serde(default)]
     pub opportunities: OpportunitySummary,
+    #[serde(default)]
+    pub skill_attribution: Option<SkillAttributionSummary>,
     pub project_id: Option<i64>,
     pub project_identity: Option<ProjectIdentity>,
     pub category: Option<String>,
@@ -510,6 +512,12 @@ impl SkillAttributionConfidence {
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillAttributionSummary {
+    pub skill_name: String,
+    pub confidence: SkillAttributionConfidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1619,6 +1627,8 @@ impl<'conn> QueryEngine<'conn> {
                 cache_read_input_tokens: row.get(15)?,
                 output_tokens: row.get(16)?,
                 model_names_csv: row.get(17)?,
+                skill_name: row.get(18)?,
+                skill_confidence: row.get(19)?,
             })
         })?;
 
@@ -1648,6 +1658,10 @@ impl<'conn> QueryEngine<'conn> {
                     ),
                     model_names: split_model_names(row.model_names_csv.as_deref()),
                     item_count: 1,
+                    skill_attribution: parse_skill_attribution(
+                        row.skill_name,
+                        row.skill_confidence,
+                    ),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1707,6 +1721,8 @@ impl<'conn> QueryEngine<'conn> {
                 grouped_action_rollup_row_to_rollup_row(request, row)
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut facts = facts;
+        self.apply_action_rollup_skill_attributions(request, &mut facts)?;
         perf.field("row_count", facts.len());
         perf.finish_ok();
         Ok(facts)
@@ -1812,6 +1828,7 @@ impl<'conn> QueryEngine<'conn> {
         }
 
         for (request, rows) in requests.iter().zip(row_sets.iter_mut()) {
+            self.apply_action_rollup_skill_attributions(request, rows)?;
             finalize_browse_rows(request, rows);
         }
 
@@ -1868,6 +1885,7 @@ impl<'conn> QueryEngine<'conn> {
             }
 
             for (request, rows) in requests.iter().zip(row_sets.iter_mut()) {
+                self.apply_path_rollup_skill_attributions(request, rows)?;
                 finalize_browse_rows(request, rows);
             }
 
@@ -1882,21 +1900,24 @@ impl<'conn> QueryEngine<'conn> {
             Ok((
                 row.get::<_, i64>(0)?,
                 LoadedPathFact {
-                    project_id: row.get(1)?,
-                    project_root: row.get(2)?,
-                    category: row.get(3)?,
-                    normalized_action: row.get(4)?,
-                    command_family: row.get(5)?,
-                    base_command: row.get(6)?,
-                    classification_state: row.get(7)?,
-                    timestamp: row.get(8)?,
-                    input_tokens: row.get(9)?,
-                    cache_creation_input_tokens: row.get(10)?,
-                    cache_read_input_tokens: row.get(11)?,
-                    output_tokens: row.get(12)?,
-                    model_name: row.get(13)?,
-                    file_path: row.get(14)?,
-                    ref_count: row.get(15)?,
+                    action_id: row.get(1)?,
+                    project_id: row.get(2)?,
+                    project_root: row.get(3)?,
+                    category: row.get(4)?,
+                    normalized_action: row.get(5)?,
+                    command_family: row.get(6)?,
+                    base_command: row.get(7)?,
+                    classification_state: row.get(8)?,
+                    timestamp: row.get(9)?,
+                    input_tokens: row.get(10)?,
+                    cache_creation_input_tokens: row.get(11)?,
+                    cache_read_input_tokens: row.get(12)?,
+                    output_tokens: row.get(13)?,
+                    model_name: row.get(14)?,
+                    file_path: row.get(15)?,
+                    ref_count: row.get(16)?,
+                    skill_name: row.get(17)?,
+                    skill_confidence: row.get(18)?,
                 },
             ))
         })?;
@@ -1915,6 +1936,7 @@ impl<'conn> QueryEngine<'conn> {
             )
             .divided_by(loaded_row.ref_count as f64);
             facts_by_request[request_index].push(PathFact {
+                action_id: loaded_row.action_id,
                 project_id: loaded_row.project_id,
                 project_root: loaded_row.project_root,
                 category: display_category(
@@ -1933,6 +1955,10 @@ impl<'conn> QueryEngine<'conn> {
                 model_name: loaded_row.model_name,
                 file_path: loaded_row.file_path,
                 metrics,
+                skill_attribution: parse_skill_attribution(
+                    loaded_row.skill_name,
+                    loaded_row.skill_confidence,
+                ),
             });
         }
 
@@ -1990,6 +2016,8 @@ impl<'conn> QueryEngine<'conn> {
                     cache_read_input_tokens: row.get(15)?,
                     output_tokens: row.get(16)?,
                     model_names_csv: None,
+                    skill_name: None,
+                    skill_confidence: None,
                 })
             },
         )?;
@@ -2020,6 +2048,7 @@ impl<'conn> QueryEngine<'conn> {
                     ),
                     model_names: BTreeSet::new(),
                     item_count: 1,
+                    skill_attribution: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2042,21 +2071,24 @@ impl<'conn> QueryEngine<'conn> {
 
         let rows = stmt.query_map(params_from_iter(query_params.iter()), |row| {
             Ok(LoadedPathFact {
-                project_id: row.get(0)?,
-                project_root: row.get(1)?,
-                category: row.get(2)?,
-                normalized_action: row.get(3)?,
-                command_family: row.get(4)?,
-                base_command: row.get(5)?,
-                classification_state: row.get(6)?,
-                timestamp: row.get(7)?,
-                input_tokens: row.get(8)?,
-                cache_creation_input_tokens: row.get(9)?,
-                cache_read_input_tokens: row.get(10)?,
-                output_tokens: row.get(11)?,
-                model_name: row.get(12)?,
-                file_path: row.get(13)?,
-                ref_count: row.get(14)?,
+                action_id: row.get(0)?,
+                project_id: row.get(1)?,
+                project_root: row.get(2)?,
+                category: row.get(3)?,
+                normalized_action: row.get(4)?,
+                command_family: row.get(5)?,
+                base_command: row.get(6)?,
+                classification_state: row.get(7)?,
+                timestamp: row.get(8)?,
+                input_tokens: row.get(9)?,
+                cache_creation_input_tokens: row.get(10)?,
+                cache_read_input_tokens: row.get(11)?,
+                output_tokens: row.get(12)?,
+                model_name: row.get(13)?,
+                file_path: row.get(14)?,
+                ref_count: row.get(15)?,
+                skill_name: row.get(16)?,
+                skill_confidence: row.get(17)?,
             })
         })?;
 
@@ -2072,6 +2104,7 @@ impl<'conn> QueryEngine<'conn> {
                 .divided_by(row.ref_count as f64);
 
                 Ok(PathFact {
+                    action_id: row.action_id,
                     project_id: row.project_id,
                     project_root: row.project_root,
                     category: display_category(row.category.as_deref(), &row.classification_state)?,
@@ -2087,6 +2120,10 @@ impl<'conn> QueryEngine<'conn> {
                     model_name: row.model_name,
                     file_path: row.file_path,
                     metrics,
+                    skill_attribution: parse_skill_attribution(
+                        row.skill_name,
+                        row.skill_confidence,
+                    ),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2125,9 +2162,302 @@ impl<'conn> QueryEngine<'conn> {
                 path_rollup_row_to_rollup_row(request, row)
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut rollup_rows = rollup_rows;
+        self.apply_path_rollup_skill_attributions(request, &mut rollup_rows)?;
         perf.field("row_count", rollup_rows.len());
         perf.finish_ok();
         Ok(rollup_rows)
+    }
+
+    fn apply_action_rollup_skill_attributions(
+        &self,
+        request: &BrowseRequest,
+        rows: &mut [RollupRow],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let category = match (&request.root, &request.path) {
+            (
+                RootView::ProjectHierarchy,
+                BrowsePath::ProjectCategory {
+                    project_id: _,
+                    category,
+                },
+            )
+            | (RootView::CategoryHierarchy, BrowsePath::Category { category }) => category,
+            _ => return Ok(()),
+        };
+
+        let mut sql = String::from(
+            "
+            WITH requested_action(
+                row_key,
+                classification_state,
+                normalized_action,
+                command_family,
+                base_command
+            ) AS (VALUES
+            ",
+        );
+        let mut query_params = Vec::new();
+        let mut has_values = false;
+        for row in rows.iter() {
+            let Some(action) = row.action.as_ref() else {
+                continue;
+            };
+            if has_values {
+                sql.push_str(", ");
+            }
+            sql.push_str("(?, ?, ?, ?, ?)");
+            has_values = true;
+            query_params.push(Value::Text(row.key.clone()));
+            query_params.push(Value::Text(
+                action.classification_state.as_str().to_string(),
+            ));
+            match &action.normalized_action {
+                Some(value) => query_params.push(Value::Text(value.clone())),
+                None => query_params.push(Value::Null),
+            }
+            match &action.command_family {
+                Some(value) => query_params.push(Value::Text(value.clone())),
+                None => query_params.push(Value::Null),
+            }
+            match &action.base_command {
+                Some(value) => query_params.push(Value::Text(value.clone())),
+                None => query_params.push(Value::Null),
+            }
+        }
+        if !has_values {
+            return Ok(());
+        }
+        sql.push_str(
+            ")
+            SELECT
+                ra.row_key,
+                CASE
+                    WHEN COUNT(DISTINCT a.id) > 0
+                     AND COUNT(DISTINCT a.id) = COUNT(DISTINCT asa.action_id)
+                     AND COUNT(DISTINCT asa.skill_name) = 1
+                     AND COUNT(DISTINCT asa.confidence) = 1
+                    THEN MIN(asa.skill_name)
+                    ELSE NULL
+                END AS skill_name,
+                CASE
+                    WHEN COUNT(DISTINCT a.id) > 0
+                     AND COUNT(DISTINCT a.id) = COUNT(DISTINCT asa.action_id)
+                     AND COUNT(DISTINCT asa.skill_name) = 1
+                     AND COUNT(DISTINCT asa.confidence) = 1
+                    THEN MIN(asa.confidence)
+                    ELSE NULL
+                END AS confidence
+            FROM requested_action ra
+            JOIN action a
+            JOIN import_chunk ic ON ic.id = a.import_chunk_id
+            JOIN project p ON p.id = ic.project_id
+            LEFT JOIN action_skill_attribution asa ON asa.action_id = a.id
+            WHERE ic.state = 'complete'
+              AND ic.publish_seq IS NOT NULL
+              AND ic.publish_seq <= ?
+              AND ",
+        );
+        query_params.push(Value::Integer(
+            i64::try_from(request.snapshot.max_publish_seq)
+                .context("snapshot publish_seq overflowed i64")?,
+        ));
+        sql.push_str(DISPLAY_CATEGORY_SQL);
+        sql.push_str(
+            " = ?
+              AND a.classification_state = ra.classification_state
+              AND a.normalized_action IS ra.normalized_action
+              AND a.command_family IS ra.command_family
+              AND a.base_command IS ra.base_command
+            ",
+        );
+        query_params.push(Value::Text(category.clone()));
+        if let BrowsePath::ProjectCategory { project_id, .. } = &request.path {
+            append_project_match(&mut sql, &mut query_params, *project_id);
+        }
+        if let Some(project_id) = request.filters.project_id {
+            append_project_match(&mut sql, &mut query_params, project_id);
+        }
+        sql.push_str(" GROUP BY ra.row_key");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let annotation_rows = stmt
+            .query_map(params_from_iter(query_params.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    parse_skill_attribution(row.get(1)?, row.get(2)?),
+                ))
+            })?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+
+        for row in rows {
+            row.skill_attribution = annotation_rows.get(&row.key).cloned().flatten();
+        }
+
+        Ok(())
+    }
+
+    fn apply_path_rollup_skill_attributions(
+        &self,
+        request: &BrowseRequest,
+        rows: &mut [RollupRow],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let (project_id, category, action, parent_path) = match (&request.root, &request.path) {
+            (
+                RootView::ProjectHierarchy,
+                BrowsePath::ProjectAction {
+                    project_id,
+                    category,
+                    action,
+                    parent_path,
+                },
+            )
+            | (
+                RootView::CategoryHierarchy,
+                BrowsePath::CategoryActionProject {
+                    category,
+                    action,
+                    project_id,
+                    parent_path,
+                },
+            ) => (*project_id, category, action, parent_path.as_deref()),
+            _ => return Ok(()),
+        };
+
+        let mut sql = String::from(
+            "
+            WITH requested_child(row_key, child_path, child_kind) AS (VALUES
+            ",
+        );
+        let mut query_params = Vec::new();
+        let mut has_values = false;
+        for row in rows.iter() {
+            let Some(path) = row.full_path.as_ref() else {
+                continue;
+            };
+            let kind = match row.kind {
+                RollupRowKind::Directory => "directory",
+                RollupRowKind::File => "file",
+                _ => continue,
+            };
+            if has_values {
+                sql.push_str(", ");
+            }
+            sql.push_str("(?, ?, ?)");
+            has_values = true;
+            query_params.push(Value::Text(row.key.clone()));
+            query_params.push(Value::Text(path.clone()));
+            query_params.push(Value::Text(kind.to_string()));
+        }
+        if !has_values {
+            return Ok(());
+        }
+        sql.push_str(
+            ")
+            SELECT
+                rc.row_key,
+                CASE
+                    WHEN COUNT(DISTINCT a.id) > 0
+                     AND COUNT(DISTINCT a.id) = COUNT(DISTINCT asa.action_id)
+                     AND COUNT(DISTINCT asa.skill_name) = 1
+                     AND COUNT(DISTINCT asa.confidence) = 1
+                    THEN MIN(asa.skill_name)
+                    ELSE NULL
+                END AS skill_name,
+                CASE
+                    WHEN COUNT(DISTINCT a.id) > 0
+                     AND COUNT(DISTINCT a.id) = COUNT(DISTINCT asa.action_id)
+                     AND COUNT(DISTINCT asa.skill_name) = 1
+                     AND COUNT(DISTINCT asa.confidence) = 1
+                    THEN MIN(asa.confidence)
+                    ELSE NULL
+                END AS confidence
+            FROM requested_child rc
+            JOIN action a
+            JOIN import_chunk ic ON ic.id = a.import_chunk_id
+            JOIN project p ON p.id = ic.project_id
+            JOIN action_message am ON am.action_id = a.id
+            JOIN message_path_ref mpr ON mpr.message_id = am.message_id
+            JOIN path_node pn ON pn.id = mpr.path_node_id
+            LEFT JOIN action_skill_attribution asa ON asa.action_id = a.id
+            WHERE ic.state = 'complete'
+              AND ic.publish_seq IS NOT NULL
+              AND ic.publish_seq <= ?
+              AND pn.node_kind = 'file'
+              AND p.id = ?
+              AND ",
+        );
+        query_params.push(Value::Integer(
+            i64::try_from(request.snapshot.max_publish_seq)
+                .context("snapshot publish_seq overflowed i64")?,
+        ));
+        query_params.push(Value::Integer(project_id));
+        sql.push_str(DISPLAY_CATEGORY_SQL);
+        sql.push_str(
+            " = ?
+              AND a.classification_state = ?
+            ",
+        );
+        query_params.push(Value::Text(category.clone()));
+        query_params.push(Value::Text(
+            action.classification_state.as_str().to_string(),
+        ));
+        if let Some(normalized_action) = action.normalized_action.as_deref() {
+            sql.push_str(" AND a.normalized_action = ?");
+            query_params.push(Value::Text(normalized_action.to_string()));
+        } else {
+            sql.push_str(" AND a.normalized_action IS NULL");
+        }
+        if let Some(command_family) = action.command_family.as_deref() {
+            sql.push_str(" AND a.command_family = ?");
+            query_params.push(Value::Text(command_family.to_string()));
+        } else {
+            sql.push_str(" AND a.command_family IS NULL");
+        }
+        if let Some(base_command) = action.base_command.as_deref() {
+            sql.push_str(" AND a.base_command = ?");
+            query_params.push(Value::Text(base_command.to_string()));
+        } else {
+            sql.push_str(" AND a.base_command IS NULL");
+        }
+        if let Some(parent_path) = parent_path {
+            sql.push_str(" AND substr(pn.full_path, 1, length(?) + 1) = ? || '/'");
+            query_params.push(Value::Text(parent_path.to_string()));
+            query_params.push(Value::Text(parent_path.to_string()));
+        }
+        sql.push_str(
+            "
+              AND (
+                    (rc.child_kind = 'file' AND pn.full_path = rc.child_path)
+                 OR (rc.child_kind = 'directory' AND substr(pn.full_path, 1, length(rc.child_path) + 1) = rc.child_path || '/')
+              )
+            GROUP BY rc.row_key
+            ",
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let annotation_rows = stmt
+            .query_map(params_from_iter(query_params.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    parse_skill_attribution(row.get(1)?, row.get(2)?),
+                ))
+            })?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+
+        for row in rows {
+            row.skill_attribution = annotation_rows.get(&row.key).cloned().flatten();
+        }
+
+        Ok(())
     }
 
     fn explain_query_plan(&self, sql: &str) -> Result<Vec<String>> {
@@ -2196,6 +2526,8 @@ struct LoadedActionFact {
     cache_read_input_tokens: i64,
     output_tokens: i64,
     model_names_csv: Option<String>,
+    skill_name: Option<String>,
+    skill_confidence: Option<String>,
 }
 
 #[derive(Debug)]
@@ -2285,6 +2617,7 @@ struct ActionFact {
     metrics: MetricTotals,
     model_names: BTreeSet<String>,
     item_count: u64,
+    skill_attribution: Option<SkillAttributionSummary>,
 }
 
 #[derive(Debug)]
@@ -2307,6 +2640,7 @@ struct LoadedGroupedActionRollupRow {
 
 #[derive(Debug)]
 struct LoadedPathFact {
+    action_id: i64,
     project_id: i64,
     project_root: String,
     category: Option<String>,
@@ -2322,6 +2656,8 @@ struct LoadedPathFact {
     model_name: Option<String>,
     file_path: String,
     ref_count: i64,
+    skill_name: Option<String>,
+    skill_confidence: Option<String>,
 }
 
 #[derive(Debug)]
@@ -2338,6 +2674,7 @@ struct LoadedPathRollupRow {
 
 #[derive(Debug)]
 struct PathFact {
+    action_id: i64,
     project_id: i64,
     project_root: String,
     category: String,
@@ -2346,6 +2683,7 @@ struct PathFact {
     model_name: Option<String>,
     file_path: String,
     metrics: MetricTotals,
+    skill_attribution: Option<SkillAttributionSummary>,
 }
 
 #[derive(Debug)]
@@ -2515,6 +2853,7 @@ struct RollupBuilder {
     selected_lens_last_week: f64,
     uncached_input_reference: f64,
     item_count: u64,
+    skill_attribution: Option<SkillAttributionSummary>,
 }
 
 #[derive(Debug)]
@@ -2546,6 +2885,7 @@ impl RollupBuilder {
             selected_lens_last_week: 0.0,
             uncached_input_reference: 0.0,
             item_count: 0,
+            skill_attribution: None,
         }
     }
 
@@ -2582,12 +2922,35 @@ impl RollupBuilder {
             },
             item_count: self.item_count,
             opportunities: OpportunitySummary::default(),
+            skill_attribution: self.skill_attribution,
             project_id: self.project.as_ref().map(|project| project.project_id),
             project_identity: self.project.and_then(|project| project.identity),
             category: self.category,
             action: self.action,
             full_path: self.full_path,
         }
+    }
+}
+
+fn parse_skill_attribution(
+    skill_name: Option<String>,
+    confidence: Option<String>,
+) -> Option<SkillAttributionSummary> {
+    Some(SkillAttributionSummary {
+        skill_name: skill_name?,
+        confidence: SkillAttributionConfidence::from_db_value(confidence.as_deref()?)?,
+    })
+}
+
+fn summarize_skill_attributions<'a>(
+    attributions: impl IntoIterator<Item = &'a Option<SkillAttributionSummary>>,
+) -> Option<SkillAttributionSummary> {
+    let mut iter = attributions.into_iter();
+    let first = iter.next()?.as_ref()?.clone();
+    if iter.all(|candidate| candidate.as_ref() == Some(&first)) {
+        Some(first)
+    } else {
+        None
     }
 }
 
@@ -2807,7 +3170,8 @@ fn aggregate_actions(
     category: Option<&str>,
     action: Option<&ActionKey>,
 ) -> Vec<RollupRow> {
-    let mut builders = BTreeMap::<ActionKey, RollupBuilder>::new();
+    let mut builders =
+        BTreeMap::<ActionKey, (RollupBuilder, Vec<Option<SkillAttributionSummary>>)>::new();
 
     for fact in facts
         .iter()
@@ -2816,19 +3180,23 @@ fn aggregate_actions(
         builders
             .entry(fact.action.clone())
             .or_insert_with(|| {
-                RollupBuilder::new(
-                    RollupRowKind::Action,
-                    format!("action:{}", fact.action.stable_key()),
-                    fact.action.label(),
-                    project_id.map(|project_id| ProjectRollupContext {
-                        project_id,
-                        identity: None,
-                    }),
-                    Some(fact.category.clone()),
-                    Some(fact.action.clone()),
-                    None,
+                (
+                    RollupBuilder::new(
+                        RollupRowKind::Action,
+                        format!("action:{}", fact.action.stable_key()),
+                        fact.action.label(),
+                        project_id.map(|project_id| ProjectRollupContext {
+                            project_id,
+                            identity: None,
+                        }),
+                        Some(fact.category.clone()),
+                        Some(fact.action.clone()),
+                        None,
+                    ),
+                    Vec::new(),
                 )
             })
+            .0
             .add_metrics(
                 &fact.metrics,
                 lens,
@@ -2836,9 +3204,18 @@ fn aggregate_actions(
                 windows,
                 fact.item_count,
             );
+        if let Some((_, skill_attributions)) = builders.get_mut(&fact.action) {
+            skill_attributions.push(fact.skill_attribution.clone());
+        }
     }
 
-    builders.into_values().map(RollupBuilder::build).collect()
+    builders
+        .into_values()
+        .map(|(mut builder, skill_attributions)| {
+            builder.skill_attribution = summarize_skill_attributions(&skill_attributions);
+            builder.build()
+        })
+        .collect()
 }
 
 fn aggregate_paths(
@@ -2858,7 +3235,14 @@ fn aggregate_paths(
 
     let base_path = scope.parent_path.unwrap_or(project_root.as_str());
     let base_path = Path::new(base_path);
-    let mut builders = BTreeMap::<String, (RollupBuilder, BTreeSet<String>)>::new();
+    let mut builders = BTreeMap::<
+        String,
+        (
+            RollupBuilder,
+            BTreeSet<String>,
+            BTreeMap<i64, Option<SkillAttributionSummary>>,
+        ),
+    >::new();
 
     for fact in facts
         .iter()
@@ -2904,6 +3288,7 @@ fn aggregate_paths(
                         Some(child_path_string.clone()),
                     ),
                     BTreeSet::new(),
+                    BTreeMap::new(),
                 )
             });
 
@@ -2911,12 +3296,17 @@ fn aggregate_paths(
             .0
             .add_metrics(&fact.metrics, lens, fact.timestamp, windows, 1);
         entry.1.insert(fact.file_path.clone());
+        entry
+            .2
+            .entry(fact.action_id)
+            .or_insert_with(|| fact.skill_attribution.clone());
     }
 
     builders
         .into_values()
-        .map(|(mut builder, leaf_paths)| {
+        .map(|(mut builder, leaf_paths, action_skills)| {
             builder.item_count = leaf_paths.len() as u64;
+            builder.skill_attribution = summarize_skill_attributions(action_skills.values());
             builder.build()
         })
         .collect()
@@ -3461,6 +3851,7 @@ fn grouped_action_rollup_row_to_rollup_row(
                 },
                 item_count,
                 opportunities: OpportunitySummary::default(),
+                skill_attribution: None,
                 project_id: Some(project_id),
                 project_identity: row.project_identity,
                 category: None,
@@ -3486,6 +3877,7 @@ fn grouped_action_rollup_row_to_rollup_row(
                 },
                 item_count,
                 opportunities: OpportunitySummary::default(),
+                skill_attribution: None,
                 project_id: None,
                 project_identity: None,
                 category: Some(display_category),
@@ -3572,6 +3964,7 @@ fn path_rollup_row_to_rollup_row(
         },
         item_count,
         opportunities: OpportunitySummary::default(),
+        skill_attribution: None,
         project_id: Some(project_id),
         project_identity: None,
         category: Some(category),
@@ -3612,6 +4005,7 @@ fn build_grouped_action_row(
         },
         item_count,
         opportunities: OpportunitySummary::default(),
+        skill_attribution: None,
         project_id,
         project_identity: None,
         category: Some(display_category),
@@ -3826,12 +4220,15 @@ fn build_scoped_action_facts_query(request: &BrowseRequest) -> Result<(String, V
             COALESCE(a.cache_creation_input_tokens, 0),
             COALESCE(a.cache_read_input_tokens, 0),
             COALESCE(a.output_tokens, 0),
-            GROUP_CONCAT(DISTINCT m.model_name)
+            GROUP_CONCAT(DISTINCT m.model_name),
+            asa.skill_name,
+            asa.confidence
         FROM action a
         JOIN import_chunk ic ON ic.id = a.import_chunk_id
         JOIN project p ON p.id = ic.project_id
         LEFT JOIN action_message am ON am.action_id = a.id
         LEFT JOIN message m ON m.id = am.message_id
+        LEFT JOIN action_skill_attribution asa ON asa.action_id = a.id
         WHERE ic.state = 'complete'
           AND ic.publish_seq IS NOT NULL
           AND ic.publish_seq <= ?
@@ -3930,7 +4327,9 @@ fn build_scoped_action_facts_query(request: &BrowseRequest) -> Result<(String, V
             a.input_tokens,
             a.cache_creation_input_tokens,
             a.cache_read_input_tokens,
-            a.output_tokens
+            a.output_tokens,
+            asa.skill_name,
+            asa.confidence
         ",
     );
 
@@ -3981,6 +4380,7 @@ fn build_scoped_path_facts_query(request: &BrowseRequest) -> Result<(String, Vec
 
     let mut sql = "
         SELECT
+            a.id,
             p.id,
             p.root_path,
             a.category,
@@ -4000,6 +4400,9 @@ fn build_scoped_path_facts_query(request: &BrowseRequest) -> Result<(String, Vec
                 FROM message_path_ref ref_count
                 WHERE ref_count.message_id = m.id
             ) AS ref_count
+            ,
+            asa.skill_name,
+            asa.confidence
         FROM action a
         JOIN import_chunk ic ON ic.id = a.import_chunk_id
         JOIN project p ON p.id = ic.project_id
@@ -4007,6 +4410,7 @@ fn build_scoped_path_facts_query(request: &BrowseRequest) -> Result<(String, Vec
         JOIN message m ON m.id = am.message_id
         JOIN message_path_ref mpr ON mpr.message_id = m.id
         JOIN path_node pn ON pn.id = mpr.path_node_id
+        LEFT JOIN action_skill_attribution asa ON asa.action_id = a.id
         WHERE ic.state = 'complete'
           AND ic.publish_seq IS NOT NULL
           AND ic.publish_seq <= ?
@@ -4223,6 +4627,7 @@ fn build_batched_path_facts_query(requests: &[BrowseRequest]) -> Result<(String,
         ")
         SELECT
             rp.request_index,
+            a.id,
             p.id,
             p.root_path,
             a.category,
@@ -4242,6 +4647,9 @@ fn build_batched_path_facts_query(requests: &[BrowseRequest]) -> Result<(String,
                 FROM message_path_ref ref_count
                 WHERE ref_count.message_id = m.id
             ) AS ref_count
+            ,
+            asa.skill_name,
+            asa.confidence
         FROM requested_parent rp
         JOIN action a
         JOIN import_chunk ic ON ic.id = a.import_chunk_id
@@ -4250,6 +4658,7 @@ fn build_batched_path_facts_query(requests: &[BrowseRequest]) -> Result<(String,
         JOIN message m ON m.id = am.message_id
         JOIN message_path_ref mpr ON mpr.message_id = m.id
         JOIN path_node pn ON pn.id = mpr.path_node_id
+        LEFT JOIN action_skill_attribution asa ON asa.action_id = a.id
         WHERE ic.state = 'complete'
           AND ic.publish_seq IS NOT NULL
           AND ic.publish_seq <= ?
@@ -4643,9 +5052,9 @@ mod tests {
     use super::{
         ActionKey, BatchBrowseRequest, BatchBrowseResult, BrowseFilters, BrowsePath, BrowseRequest,
         ClassificationState, ConversationTurnRow, FilterOptions, HistoryEventFilters, MetricLens,
-        QueryEngine, RootView, SkillAttributionConfidence, SkillInvocationFilters, SkillsPath,
-        SnapshotBounds, SnapshotCoverageSummary, TimeWindowFilter,
-        build_grouped_action_rollup_rows_query, build_opportunities_rows,
+        QueryEngine, RootView, SkillAttributionConfidence, SkillAttributionSummary,
+        SkillInvocationFilters, SkillsPath, SnapshotBounds, SnapshotCoverageSummary,
+        TimeWindowFilter, build_grouped_action_rollup_rows_query, build_opportunities_rows,
         build_scoped_action_facts_query, build_scoped_path_facts_query, display_category,
     };
 
@@ -5730,6 +6139,205 @@ mod tests {
             },
         })?;
         assert!(no_path_rows.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn project_category_rows_surface_skill_attribution_only_for_attributed_actions() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let conn = db.connection_mut();
+        let fixture = seed_query_fixture(conn, temp.path())?;
+        let project_a_root = temp.path().join("project-a");
+        let chunk_a_id: i64 = conn.query_row(
+            "
+            SELECT id
+            FROM import_chunk
+            WHERE project_id = ?1 AND state = 'complete'
+            ORDER BY publish_seq
+            LIMIT 1
+            ",
+            [fixture.project_a_id],
+            |row| row.get(0),
+        )?;
+
+        let read_file_action_id: i64 = conn.query_row(
+            "
+            SELECT a.id
+            FROM action a
+            JOIN import_chunk ic ON ic.id = a.import_chunk_id
+            WHERE ic.project_id = ?1
+              AND a.category = 'editing'
+              AND a.normalized_action = 'read file'
+            LIMIT 1
+            ",
+            [fixture.project_a_id],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "
+            INSERT INTO action_skill_attribution (action_id, skill_name, confidence)
+            VALUES (?1, 'planner', 'high')
+            ",
+            [read_file_action_id],
+        )?;
+
+        seed_action(
+            conn,
+            SeedAction {
+                project_id: fixture.project_a_id,
+                project_root: &project_a_root,
+                import_chunk_id: chunk_a_id,
+                category: Some("editing"),
+                normalized_action: Some("write file"),
+                command_family: None,
+                base_command: None,
+                classification_state: "classified",
+                timestamp_utc: "2026-03-26T10:00:00Z",
+                model_name: Some("claude-opus"),
+                input_tokens: 1,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: 1,
+                path_refs: vec![project_a_root.join("src").join("main.rs")],
+            },
+        )?;
+        refresh_chunk_fixture_aggregates(conn, chunk_a_id)?;
+
+        let engine = QueryEngine::new(conn);
+        let snapshot = engine.latest_snapshot_bounds()?;
+        let rows = engine.browse(&BrowseRequest {
+            snapshot,
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            path: BrowsePath::ProjectCategory {
+                project_id: fixture.project_a_id,
+                category: "editing".to_string(),
+            },
+        })?;
+
+        assert_eq!(rows.len(), 2);
+        let read_file_row = rows
+            .iter()
+            .find(|row| row.label == "read file")
+            .context("expected read file row")?;
+        assert_eq!(
+            read_file_row.skill_attribution,
+            Some(SkillAttributionSummary {
+                skill_name: "planner".to_string(),
+                confidence: SkillAttributionConfidence::High,
+            })
+        );
+        let write_file_row = rows
+            .iter()
+            .find(|row| row.label == "write file")
+            .context("expected write file row")?;
+        assert_eq!(write_file_row.skill_attribution, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn project_action_path_rows_surface_skill_attribution_per_attributed_leaf() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let conn = db.connection_mut();
+        let fixture = seed_query_fixture(conn, temp.path())?;
+        let project_a_root = temp.path().join("project-a");
+        let chunk_a_id: i64 = conn.query_row(
+            "
+            SELECT id
+            FROM import_chunk
+            WHERE project_id = ?1 AND state = 'complete'
+            ORDER BY publish_seq
+            LIMIT 1
+            ",
+            [fixture.project_a_id],
+            |row| row.get(0),
+        )?;
+        let read_file_action_id: i64 = conn.query_row(
+            "
+            SELECT a.id
+            FROM action a
+            JOIN import_chunk ic ON ic.id = a.import_chunk_id
+            WHERE ic.project_id = ?1
+              AND a.category = 'editing'
+              AND a.normalized_action = 'read file'
+            LIMIT 1
+            ",
+            [fixture.project_a_id],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "
+            INSERT INTO action_skill_attribution (action_id, skill_name, confidence)
+            VALUES (?1, 'planner', 'high')
+            ",
+            [read_file_action_id],
+        )?;
+
+        seed_action(
+            conn,
+            SeedAction {
+                project_id: fixture.project_a_id,
+                project_root: &project_a_root,
+                import_chunk_id: chunk_a_id,
+                category: Some("editing"),
+                normalized_action: Some("read file"),
+                command_family: None,
+                base_command: None,
+                classification_state: "classified",
+                timestamp_utc: "2026-03-26T09:30:00Z",
+                model_name: Some("claude-opus"),
+                input_tokens: 1,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: 1,
+                path_refs: vec![project_a_root.join("README.md")],
+            },
+        )?;
+        refresh_chunk_fixture_aggregates(conn, chunk_a_id)?;
+
+        let engine = QueryEngine::new(conn);
+        let snapshot = engine.latest_snapshot_bounds()?;
+        let editing_action = ActionKey {
+            classification_state: ClassificationState::Classified,
+            normalized_action: Some("read file".to_string()),
+            command_family: None,
+            base_command: None,
+        };
+        let rows = engine.browse(&BrowseRequest {
+            snapshot,
+            root: RootView::ProjectHierarchy,
+            lens: MetricLens::UncachedInput,
+            filters: BrowseFilters::default(),
+            path: BrowsePath::ProjectAction {
+                project_id: fixture.project_a_id,
+                category: "editing".to_string(),
+                action: editing_action,
+                parent_path: None,
+            },
+        })?;
+
+        assert_eq!(rows.len(), 2);
+        let src_row = rows
+            .iter()
+            .find(|row| row.label == "src")
+            .context("expected src row")?;
+        assert_eq!(
+            src_row.skill_attribution,
+            Some(SkillAttributionSummary {
+                skill_name: "planner".to_string(),
+                confidence: SkillAttributionConfidence::High,
+            })
+        );
+        let readme_row = rows
+            .iter()
+            .find(|row| row.label == "README.md")
+            .context("expected README row")?;
+        assert_eq!(readme_row.skill_attribution, None);
 
         Ok(())
     }

@@ -1321,6 +1321,9 @@
                       {formatMetric(row.metrics[currentContext.lens])} {LENS_LABELS[currentContext.lens].toLowerCase()}
                     </span>
                     <span class="row-tags">{row.kind}{#if row.category} · {row.category}{/if}</span>
+                    {#if row.skill_attribution}
+                      <span class="row-badge">skill {row.skill_attribution.skill_name}</span>
+                    {/if}
                     {#if rowHasOpportunities(row)}
                       <span class="row-badge">{row.opportunities.annotations.length} opportunity{row.opportunities.annotations.length === 1 ? "" : "ies"}</span>
                     {/if}
@@ -1377,6 +1380,10 @@
               <div>
                 <dt>Output</dt>
                 <dd>{formatMetric(detail.row.metrics.output)}</dd>
+              </div>
+              <div>
+                <dt>Skill</dt>
+                <dd>{detail.row.skill_attribution ? `${detail.row.skill_attribution.skill_name} · ${detail.row.skill_attribution.confidence}` : "-"}</dd>
               </div>
               <div>
                 <dt>Path</dt>

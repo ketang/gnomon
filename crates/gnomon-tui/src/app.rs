@@ -36,8 +36,8 @@ use gnomon_core::opportunity::{OpportunityCategory, OpportunityConfidence};
 use gnomon_core::perf::{PerfLogger, PerfScope};
 use gnomon_core::query::{
     ActionKey, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState, FilterOptions,
-    MetricLens, QueryEngine, RollupRow, RollupRowKind, RootView, SnapshotBounds,
-    SnapshotCoverageSummary, TimeWindowFilter,
+    MetricLens, QueryEngine, RollupRow, RollupRowKind, RootView, SkillAttributionConfidence,
+    SnapshotBounds, SnapshotCoverageSummary, TimeWindowFilter,
 };
 use gnomon_core::vcs::ProjectIdentityKind;
 use jiff::ToSpan;
@@ -835,6 +835,12 @@ fn confidence_color(confidence: OpportunityConfidence) -> Color {
     }
 }
 
+fn skill_attribution_confidence_label(confidence: SkillAttributionConfidence) -> &'static str {
+    match confidence {
+        SkillAttributionConfidence::High => "high",
+    }
+}
+
 fn snapshot_state_badge(snapshot: &SnapshotBounds, has_newer_snapshot: bool) -> Span<'static> {
     if snapshot.is_bootstrap() {
         if has_newer_snapshot {
@@ -1334,48 +1340,71 @@ impl App {
                 "No row selected",
                 Style::default().fg(Color::DarkGray),
             )],
-            Some(row) if row.opportunities.is_empty() => vec![Line::styled(
-                "No opportunities detected for this row",
-                Style::default().fg(Color::DarkGray),
-            )],
             Some(row) => {
                 let mut lines = Vec::new();
-                for annotation in &row.opportunities.annotations {
-                    if !lines.is_empty() {
-                        lines.push(Line::raw(""));
-                    }
+                if let Some(skill_attribution) = &row.skill_attribution {
                     lines.push(Line::from(vec![
+                        Span::styled("skill ", Style::default().fg(Color::Green)),
                         Span::styled(
-                            opportunity_category_label(annotation.category),
+                            skill_attribution.skill_name.as_str(),
                             Style::default()
-                                .fg(Color::Cyan)
+                                .fg(Color::Green)
                                 .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw("  score "),
-                        Span::styled(
-                            format!("{:.2}", annotation.score),
-                            Style::default().fg(Color::Yellow),
                         ),
                         Span::raw("  confidence "),
                         Span::styled(
-                            opportunity_confidence_label(annotation.confidence),
-                            Style::default().fg(confidence_color(annotation.confidence)),
+                            skill_attribution_confidence_label(skill_attribution.confidence),
+                            Style::default().fg(Color::Green),
                         ),
                     ]));
-                    for piece in &annotation.evidence {
-                        lines.push(Line::from(vec![
-                            Span::styled("  • ", Style::default().fg(Color::DarkGray)),
-                            Span::raw(piece.as_str()),
-                        ]));
+                }
+
+                if row.opportunities.is_empty() {
+                    if !lines.is_empty() {
+                        lines.push(Line::raw(""));
                     }
-                    if let Some(recommendation) = &annotation.recommendation {
+                    lines.push(Line::styled(
+                        "No opportunities detected for this row",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                } else {
+                    for annotation in &row.opportunities.annotations {
+                        if !lines.is_empty() {
+                            lines.push(Line::raw(""));
+                        }
                         lines.push(Line::from(vec![
-                            Span::styled("  → ", Style::default().fg(Color::Green)),
                             Span::styled(
-                                recommendation.as_str(),
-                                Style::default().fg(Color::Green),
+                                opportunity_category_label(annotation.category),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw("  score "),
+                            Span::styled(
+                                format!("{:.2}", annotation.score),
+                                Style::default().fg(Color::Yellow),
+                            ),
+                            Span::raw("  confidence "),
+                            Span::styled(
+                                opportunity_confidence_label(annotation.confidence),
+                                Style::default().fg(confidence_color(annotation.confidence)),
                             ),
                         ]));
+                        for piece in &annotation.evidence {
+                            lines.push(Line::from(vec![
+                                Span::styled("  • ", Style::default().fg(Color::DarkGray)),
+                                Span::raw(piece.as_str()),
+                            ]));
+                        }
+                        if let Some(recommendation) = &annotation.recommendation {
+                            lines.push(Line::from(vec![
+                                Span::styled("  → ", Style::default().fg(Color::Green)),
+                                Span::styled(
+                                    recommendation.as_str(),
+                                    Style::default().fg(Color::Green),
+                                ),
+                            ]));
+                        }
                     }
                 }
                 lines
@@ -7135,6 +7164,7 @@ mod tests {
                 },
                 item_count: 1,
                 opportunities: OpportunitySummary::default(),
+                skill_attribution: None,
                 project_id: Some(1),
                 project_identity: None,
                 category: Some("editing".to_string()),
@@ -7304,6 +7334,7 @@ mod tests {
             },
             item_count: 1,
             opportunities: OpportunitySummary::default(),
+            skill_attribution: None,
             project_id: Some(1),
             project_identity: None,
             category: None,
@@ -7340,6 +7371,7 @@ mod tests {
             },
             item_count: 1,
             opportunities: OpportunitySummary::default(),
+            skill_attribution: None,
             project_id: Some(1),
             project_identity: None,
             category: Some("editing".to_string()),
@@ -8910,6 +8942,7 @@ mod tests {
             },
             item_count: 1,
             opportunities: OpportunitySummary::default(),
+            skill_attribution: None,
             project_id: Some(1),
             project_identity: None,
             category: Some("editing".to_string()),
@@ -8948,6 +8981,7 @@ mod tests {
             },
             item_count: 1,
             opportunities: OpportunitySummary::default(),
+            skill_attribution: None,
             project_id: spec.project_id,
             project_identity: None,
             category: spec.category.map(str::to_string),
@@ -10226,6 +10260,42 @@ mod tests {
             content.contains("No opportunities detected"),
             "empty opportunity message should appear"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_pane_renders_skill_attribution_for_selected_row() -> Result<()> {
+        let temp = tempdir()?;
+        let mut app = App::new(
+            make_test_config(temp.path()),
+            SnapshotBounds::bootstrap(),
+            StartupOpenReason::Last24hReady,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        app.show_inspect_pane = true;
+        let mut row = sample_row("src", None);
+        row.skill_attribution = Some(gnomon_core::query::SkillAttributionSummary {
+            skill_name: "planner".to_string(),
+            confidence: SkillAttributionConfidence::High,
+        });
+        app.visible_rows = vec![TreeRow {
+            row,
+            parent_path: BrowsePath::Root,
+            node_path: None,
+            depth: 0,
+            is_expanded: false,
+        }];
+        app.table_state.select(Some(0));
+
+        let content = render_app_to_string(&mut app, 120, 40)?;
+
+        assert!(content.contains("skill planner"));
+        assert!(content.contains("confidence high"));
         Ok(())
     }
 
