@@ -33,13 +33,18 @@ asks.
 ## Branch and Issue Workflow
 
 - Do not implement on `main`
-- If the current branch is `main`, stop and ask before editing
+- For any implementation task, automatically create or switch to a dedicated
+  feature branch and linked worktree before making edits
 - Use a feature branch or the existing task branch for every implementation task
 - Use a dedicated worktree for all implementation work. Creating only a feature
   branch in the repo root is not sufficient; create both the branch and the
   worktree before touching files.
+- Treat branch and worktree setup as required preflight, not as a step that
+  needs user approval
 - Exceptions are limited to read-only tasks and explicit branch-management or
   checkout-recovery tasks the user asked for
+- Only pause for user input if branch or worktree setup would be destructive,
+  ambiguous, or likely to interfere with existing uncommitted work
 - All parallel work must use separate worktrees
 - Rebase finished feature branches onto `origin/main` before integration
 - Merge finished feature branches into `main` with `git merge --no-ff`
