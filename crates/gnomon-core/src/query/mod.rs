@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -474,6 +474,28 @@ pub struct SkillInvocationFilters {
     pub session_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillInvocationConfidence {
+    Explicit,
+    Confirmed,
+    Inferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillTranscriptEvidenceKind {
+    PromptText,
+    ToolInputPath,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillConfidenceCounts {
+    pub explicit: u64,
+    pub confirmed: u64,
+    pub inferred: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillInvocationRow {
     pub skill_name: String,
@@ -484,6 +506,9 @@ pub struct SkillInvocationRow {
     pub project_id: Option<i64>,
     pub project_name: Option<String>,
     pub conversation_title: Option<String>,
+    pub confidence: SkillInvocationConfidence,
+    pub transcript_evidence_kinds: Vec<SkillTranscriptEvidenceKind>,
+    pub transcript_evidence_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -544,6 +569,8 @@ pub struct SkillsReportRow {
     pub conversation_title: Option<String>,
     pub invocation_count: u64,
     pub session_count: u64,
+    pub confidence_counts: SkillConfidenceCounts,
+    pub transcript_evidence_count: u64,
     pub metrics: MetricTotals,
     pub attributed_action_count: u64,
     pub attributed_metrics: MetricTotals,
@@ -564,10 +591,47 @@ struct SkillSessionAssociation {
     project_id: Option<i64>,
     project_name: Option<String>,
     conversation_title: Option<String>,
+    confidence_counts: SkillConfidenceCounts,
+    transcript_evidence_count: u64,
     metrics: Option<MetricTotals>,
     attributed_action_count: u64,
     attributed_metrics: MetricTotals,
     top_attribution_confidence: Option<SkillAttributionConfidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadedSkillTranscriptPart {
+    session_id: String,
+    conversation_id: i64,
+    project_id: i64,
+    project_name: String,
+    conversation_title: Option<String>,
+    recorded_at_utc: Option<String>,
+    text_value: Option<String>,
+    metadata_json: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillTranscriptEvidence {
+    session_id: String,
+    skill_name: String,
+    kind: SkillTranscriptEvidenceKind,
+    recorded_at_utc: Option<String>,
+    conversation_id: i64,
+    project_id: i64,
+    project_name: String,
+    conversation_title: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AggregatedSkillInvocation {
+    invocation_count: u64,
+    conversation_id: Option<i64>,
+    project_id: Option<i64>,
+    project_name: Option<String>,
+    conversation_title: Option<String>,
+    confidence_counts: SkillConfidenceCounts,
+    transcript_evidence_count: u64,
 }
 
 const CONVERSATION_TURNS_SQL: &str = "
@@ -1223,85 +1287,57 @@ impl<'conn> QueryEngine<'conn> {
             return Ok(Vec::new());
         }
 
-        let max_publish_seq = i64::try_from(snapshot.max_publish_seq)
-            .context("snapshot publish_seq overflowed i64")?;
-        let mut sql = "
-            SELECT
-                si.skill_name,
-                si.session_id,
-                si.recorded_at_utc,
-                si.raw_project,
-                c.id,
-                c.project_id,
-                c.display_name,
-                c.title
-            FROM skill_invocation si
-            JOIN import_chunk sic ON sic.id = si.import_chunk_id
-            LEFT JOIN (
-                SELECT DISTINCT
-                    c.id,
-                    c.title,
-                    c.project_id,
-                    p.display_name,
-                    substr(c.external_id, instr(c.external_id, ':session:') + 9) AS session_id
-                FROM conversation c
-                JOIN source_file sf
-                    ON sf.id = c.source_file_id
-                   AND sf.source_kind = 'transcript'
-                JOIN stream s
-                    ON s.conversation_id = c.id
-                JOIN import_chunk cic
-                    ON cic.id = s.import_chunk_id
-                JOIN project p
-                    ON p.id = c.project_id
-                WHERE cic.state = 'complete'
-                  AND cic.publish_seq IS NOT NULL
-                  AND cic.publish_seq <= ?1
-            ) c
-                ON c.session_id = si.session_id
-            WHERE sic.state = 'complete'
-              AND sic.publish_seq IS NOT NULL
-              AND sic.publish_seq <= ?1
-        "
-        .to_string();
-        let mut params = vec![Value::Integer(max_publish_seq)];
-
-        if let Some(skill_name) = &filters.skill_name {
-            sql.push_str(&format!(" AND si.skill_name = ?{}", params.len() + 1));
-            params.push(Value::Text(skill_name.clone()));
-        }
-        if let Some(session_id) = &filters.session_id {
-            sql.push_str(&format!(" AND si.session_id = ?{}", params.len() + 1));
-            params.push(Value::Text(session_id.clone()));
+        let explicit_rows = self.load_explicit_skill_invocations(snapshot)?;
+        let transcript_evidence = self.load_skill_transcript_evidence(snapshot)?;
+        let mut evidence_by_skill_session =
+            HashMap::<(String, String), Vec<SkillTranscriptEvidence>>::new();
+        for evidence in transcript_evidence {
+            evidence_by_skill_session
+                .entry((evidence.skill_name.clone(), evidence.session_id.clone()))
+                .or_default()
+                .push(evidence);
         }
 
-        sql.push_str(
-            "
-            ORDER BY si.skill_name, si.session_id, si.recorded_at_utc, c.id
-            ",
-        );
+        let mut rows = Vec::new();
+        let mut seen_pairs = HashSet::<(String, String)>::new();
 
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .context("unable to prepare skill invocation query")?;
-        let rows = stmt
-            .query_map(params_from_iter(params.iter()), |row| {
-                Ok(SkillInvocationRow {
-                    skill_name: row.get(0)?,
-                    session_id: row.get(1)?,
-                    recorded_at_utc: row.get(2)?,
-                    raw_project: row.get(3)?,
-                    conversation_id: row.get(4)?,
-                    project_id: row.get(5)?,
-                    project_name: row.get(6)?,
-                    conversation_title: row.get(7)?,
-                })
-            })
-            .context("unable to execute skill invocation query")?;
+        for explicit in explicit_rows {
+            let evidence = evidence_by_skill_session
+                .get(&(explicit.skill_name.clone(), explicit.session_id.clone()))
+                .cloned()
+                .unwrap_or_default();
+            seen_pairs.insert((explicit.skill_name.clone(), explicit.session_id.clone()));
+            rows.push(skill_invocation_row_from_explicit(explicit, &evidence));
+        }
 
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("unable to read skill invocation rows")
+        for ((skill_name, session_id), evidence) in evidence_by_skill_session {
+            if seen_pairs.contains(&(skill_name.clone(), session_id.clone())) {
+                continue;
+            }
+            rows.push(skill_invocation_row_from_inferred(
+                skill_name, session_id, &evidence,
+            ));
+        }
+
+        rows.retain(|row| {
+            filters
+                .skill_name
+                .as_ref()
+                .is_none_or(|skill_name| &row.skill_name == skill_name)
+                && filters
+                    .session_id
+                    .as_ref()
+                    .is_none_or(|session_id| &row.session_id == session_id)
+        });
+        rows.sort_by(|left, right| {
+            left.skill_name
+                .cmp(&right.skill_name)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+                .then_with(|| left.recorded_at_utc.cmp(&right.recorded_at_utc))
+                .then_with(|| left.confidence.cmp(&right.confidence))
+        });
+
+        Ok(rows)
     }
 
     pub fn skills_report(
@@ -1559,6 +1595,8 @@ impl<'conn> QueryEngine<'conn> {
                     project_id: row.get(4)?,
                     project_name: row.get(5)?,
                     conversation_title: row.get(6)?,
+                    confidence_counts: SkillConfidenceCounts::default(),
+                    transcript_evidence_count: 0,
                     metrics: uncached_input.map(|uncached_input| {
                         let cached_input = cached_input.unwrap_or_default();
                         let output = output.unwrap_or_default();
@@ -1588,8 +1626,275 @@ impl<'conn> QueryEngine<'conn> {
             })
             .context("unable to execute skills report query")?;
 
+        let base_associations = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("unable to read skills report rows")?;
+        let metrics_by_conversation = self.load_conversation_metrics(snapshot)?;
+        let invocation_rows = self.skill_invocations(snapshot, &SkillInvocationFilters::default())?;
+        let mut aggregated = BTreeMap::<(String, String), AggregatedSkillInvocation>::new();
+        for row in invocation_rows {
+            let entry = aggregated
+                .entry((row.skill_name.clone(), row.session_id.clone()))
+                .or_insert_with(|| AggregatedSkillInvocation {
+                    invocation_count: 0,
+                    conversation_id: row.conversation_id,
+                    project_id: row.project_id,
+                    project_name: row.project_name.clone(),
+                    conversation_title: row.conversation_title.clone(),
+                    confidence_counts: SkillConfidenceCounts::default(),
+                    transcript_evidence_count: 0,
+                });
+            entry.invocation_count += 1;
+            entry.conversation_id = entry.conversation_id.or(row.conversation_id);
+            entry.project_id = entry.project_id.or(row.project_id);
+            entry.project_name = entry.project_name.clone().or(row.project_name.clone());
+            entry.conversation_title = entry
+                .conversation_title
+                .clone()
+                .or(row.conversation_title.clone());
+            increment_skill_confidence_count(&mut entry.confidence_counts, row.confidence);
+            entry.transcript_evidence_count += row.transcript_evidence_count;
+        }
+
+        let mut by_pair = base_associations
+            .into_iter()
+            .map(|association| {
+                (
+                    (association.skill_name.clone(), association.session_id.clone()),
+                    association,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        for ((skill_name, session_id), aggregate) in aggregated {
+            let entry = by_pair
+                .entry((skill_name.clone(), session_id.clone()))
+                .or_insert_with(|| SkillSessionAssociation {
+                    skill_name,
+                    session_id,
+                    invocation_count: 0,
+                    conversation_id: aggregate.conversation_id,
+                    project_id: aggregate.project_id,
+                    project_name: aggregate.project_name.clone(),
+                    conversation_title: aggregate.conversation_title.clone(),
+                    confidence_counts: SkillConfidenceCounts::default(),
+                    transcript_evidence_count: 0,
+                    metrics: aggregate
+                        .conversation_id
+                        .and_then(|conversation_id| metrics_by_conversation.get(&conversation_id))
+                        .cloned(),
+                    attributed_action_count: 0,
+                    attributed_metrics: MetricTotals::zero(),
+                    top_attribution_confidence: None,
+                });
+            entry.invocation_count = aggregate.invocation_count;
+            entry.conversation_id = entry.conversation_id.or(aggregate.conversation_id);
+            entry.project_id = entry.project_id.or(aggregate.project_id);
+            entry.project_name = entry
+                .project_name
+                .clone()
+                .or(aggregate.project_name.clone());
+            entry.conversation_title = entry
+                .conversation_title
+                .clone()
+                .or(aggregate.conversation_title.clone());
+            entry.confidence_counts = aggregate.confidence_counts;
+            entry.transcript_evidence_count = aggregate.transcript_evidence_count;
+            if entry.metrics.is_none() {
+                entry.metrics = entry
+                    .conversation_id
+                    .and_then(|conversation_id| metrics_by_conversation.get(&conversation_id))
+                    .cloned();
+            }
+        }
+
+        Ok(by_pair.into_values().collect())
+    }
+
+    fn load_explicit_skill_invocations(
+        &self,
+        snapshot: &SnapshotBounds,
+    ) -> Result<Vec<SkillInvocationRow>> {
+        let max_publish_seq = i64::try_from(snapshot.max_publish_seq)
+            .context("snapshot publish_seq overflowed i64")?;
+        let sql = "
+            SELECT
+                si.skill_name,
+                si.session_id,
+                si.recorded_at_utc,
+                si.raw_project,
+                c.id,
+                c.project_id,
+                c.display_name,
+                c.title
+            FROM skill_invocation si
+            JOIN import_chunk sic ON sic.id = si.import_chunk_id
+            LEFT JOIN (
+                SELECT DISTINCT
+                    c.id,
+                    c.title,
+                    c.project_id,
+                    p.display_name,
+                    substr(c.external_id, instr(c.external_id, ':session:') + 9) AS session_id
+                FROM conversation c
+                JOIN source_file sf
+                    ON sf.id = c.source_file_id
+                   AND sf.source_kind = 'transcript'
+                JOIN stream s
+                    ON s.conversation_id = c.id
+                JOIN import_chunk cic
+                    ON cic.id = s.import_chunk_id
+                JOIN project p
+                    ON p.id = c.project_id
+                WHERE cic.state = 'complete'
+                  AND cic.publish_seq IS NOT NULL
+                  AND cic.publish_seq <= ?1
+                  AND instr(c.external_id, ':session:') > 0
+            ) c
+                ON c.session_id = si.session_id
+            WHERE sic.state = 'complete'
+              AND sic.publish_seq IS NOT NULL
+              AND sic.publish_seq <= ?1
+            ORDER BY si.skill_name, si.session_id, si.recorded_at_utc, c.id
+        ";
+
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .context("unable to prepare explicit skill invocation query")?;
+        let rows = stmt
+            .query_map([max_publish_seq], |row| {
+                Ok(SkillInvocationRow {
+                    skill_name: row.get(0)?,
+                    session_id: row.get(1)?,
+                    recorded_at_utc: row.get(2)?,
+                    raw_project: row.get(3)?,
+                    conversation_id: row.get(4)?,
+                    project_id: row.get(5)?,
+                    project_name: row.get(6)?,
+                    conversation_title: row.get(7)?,
+                    confidence: SkillInvocationConfidence::Explicit,
+                    transcript_evidence_kinds: Vec::new(),
+                    transcript_evidence_count: 0,
+                })
+            })
+            .context("unable to execute explicit skill invocation query")?;
+
         rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("unable to read skills report rows")
+            .context("unable to read explicit skill invocation rows")
+    }
+
+    fn load_skill_transcript_evidence(
+        &self,
+        snapshot: &SnapshotBounds,
+    ) -> Result<Vec<SkillTranscriptEvidence>> {
+        let max_publish_seq = i64::try_from(snapshot.max_publish_seq)
+            .context("snapshot publish_seq overflowed i64")?;
+        let sql = "
+            SELECT
+                substr(c.external_id, instr(c.external_id, ':session:') + 9) AS session_id,
+                c.id,
+                c.project_id,
+                p.display_name,
+                c.title,
+                COALESCE(m.created_at_utc, m.completed_at_utc),
+                mp.text_value,
+                mp.metadata_json
+            FROM conversation c
+            JOIN source_file sf
+                ON sf.id = c.source_file_id
+               AND sf.source_kind = 'transcript'
+            JOIN message m
+                ON m.conversation_id = c.id
+            JOIN import_chunk mic
+                ON mic.id = m.import_chunk_id
+               AND mic.state = 'complete'
+               AND mic.publish_seq IS NOT NULL
+               AND mic.publish_seq <= ?1
+            JOIN message_part mp
+                ON mp.message_id = m.id
+            JOIN project p
+                ON p.id = c.project_id
+            WHERE instr(c.external_id, ':session:') > 0
+              AND (
+                  mp.text_value IS NOT NULL
+                  OR mp.metadata_json IS NOT NULL
+              )
+            ORDER BY c.id, m.sequence_no, mp.ordinal
+        ";
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .context("unable to prepare transcript skill evidence query")?;
+        let rows = stmt
+            .query_map([max_publish_seq], |row| {
+                Ok(LoadedSkillTranscriptPart {
+                    session_id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    project_id: row.get(2)?,
+                    project_name: row.get(3)?,
+                    conversation_title: row.get(4)?,
+                    recorded_at_utc: row.get(5)?,
+                    text_value: row.get(6)?,
+                    metadata_json: row.get(7)?,
+                })
+            })
+            .context("unable to execute transcript skill evidence query")?;
+
+        let mut evidence = Vec::new();
+        for row in rows {
+            let row = row.context("unable to read transcript skill evidence row")?;
+            evidence.extend(skill_transcript_evidence_from_part(&row));
+        }
+
+        Ok(evidence)
+    }
+
+    fn load_conversation_metrics(
+        &self,
+        snapshot: &SnapshotBounds,
+    ) -> Result<HashMap<i64, MetricTotals>> {
+        let max_publish_seq = i64::try_from(snapshot.max_publish_seq)
+            .context("snapshot publish_seq overflowed i64")?;
+        let sql = "
+            SELECT
+                t.conversation_id,
+                SUM(COALESCE(t.input_tokens, 0) + COALESCE(t.cache_creation_input_tokens, 0)),
+                SUM(COALESCE(t.cache_read_input_tokens, 0)),
+                SUM(COALESCE(t.output_tokens, 0))
+            FROM turn t
+            JOIN import_chunk tic
+                ON tic.id = t.import_chunk_id
+            WHERE tic.state = 'complete'
+              AND tic.publish_seq IS NOT NULL
+              AND tic.publish_seq <= ?1
+            GROUP BY t.conversation_id
+        ";
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .context("unable to prepare conversation metrics query")?;
+        let rows = stmt
+            .query_map([max_publish_seq], |row| {
+                let conversation_id = row.get::<_, i64>(0)?;
+                let uncached_input = row.get::<_, f64>(1)?;
+                let cached_input = row.get::<_, f64>(2)?;
+                let output = row.get::<_, f64>(3)?;
+                Ok((
+                    conversation_id,
+                    MetricTotals {
+                        uncached_input,
+                        cached_input,
+                        gross_input: uncached_input + cached_input,
+                        output,
+                        total: uncached_input + cached_input + output,
+                    },
+                ))
+            })
+            .context("unable to execute conversation metrics query")?;
+
+        rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+            .context("unable to read conversation metrics rows")
     }
 
     fn load_action_facts(&self, request: &BrowseRequest) -> Result<Vec<ActionFact>> {
@@ -2975,6 +3280,8 @@ fn build_skill_root_rows(associations: &[&SkillSessionAssociation]) -> Vec<Skill
                 conversation_title: None,
                 invocation_count: 0,
                 session_count: 0,
+                confidence_counts: SkillConfidenceCounts::default(),
+                transcript_evidence_count: 0,
                 metrics: MetricTotals::zero(),
                 attributed_action_count: 0,
                 attributed_metrics: MetricTotals::zero(),
@@ -2982,6 +3289,8 @@ fn build_skill_root_rows(associations: &[&SkillSessionAssociation]) -> Vec<Skill
             });
         row.invocation_count += association.invocation_count;
         row.session_count += 1;
+        row.transcript_evidence_count += association.transcript_evidence_count;
+        add_skill_confidence_counts(&mut row.confidence_counts, &association.confidence_counts);
         row.metrics.add_assign(metrics);
         row.attributed_action_count += association.attributed_action_count;
         row.attributed_metrics
@@ -3024,6 +3333,8 @@ fn build_skill_project_rows(
             conversation_title: None,
             invocation_count: 0,
             session_count: 0,
+            confidence_counts: SkillConfidenceCounts::default(),
+            transcript_evidence_count: 0,
             metrics: MetricTotals::zero(),
             attributed_action_count: 0,
             attributed_metrics: MetricTotals::zero(),
@@ -3031,6 +3342,8 @@ fn build_skill_project_rows(
         });
         row.invocation_count += association.invocation_count;
         row.session_count += 1;
+        row.transcript_evidence_count += association.transcript_evidence_count;
+        add_skill_confidence_counts(&mut row.confidence_counts, &association.confidence_counts);
         row.metrics.add_assign(metrics);
         row.attributed_action_count += association.attributed_action_count;
         row.attributed_metrics
@@ -3069,6 +3382,8 @@ fn build_skill_session_rows(
                 conversation_title: association.conversation_title.clone(),
                 invocation_count: association.invocation_count,
                 session_count: 1,
+                confidence_counts: association.confidence_counts.clone(),
+                transcript_evidence_count: association.transcript_evidence_count,
                 metrics,
                 attributed_action_count: association.attributed_action_count,
                 attributed_metrics: association.attributed_metrics.clone(),
@@ -3076,6 +3391,228 @@ fn build_skill_session_rows(
             })
         })
         .collect()
+}
+
+fn skill_invocation_row_from_explicit(
+    mut row: SkillInvocationRow,
+    evidence: &[SkillTranscriptEvidence],
+) -> SkillInvocationRow {
+    row.confidence = if evidence.is_empty() {
+        SkillInvocationConfidence::Explicit
+    } else {
+        SkillInvocationConfidence::Confirmed
+    };
+    row.transcript_evidence_kinds = transcript_evidence_kinds(evidence);
+    row.transcript_evidence_count = evidence.len() as u64;
+    row
+}
+
+fn skill_invocation_row_from_inferred(
+    skill_name: String,
+    session_id: String,
+    evidence: &[SkillTranscriptEvidence],
+) -> SkillInvocationRow {
+    let first = evidence.first().expect("inferred row requires evidence");
+    SkillInvocationRow {
+        skill_name,
+        session_id,
+        recorded_at_utc: first.recorded_at_utc.clone(),
+        raw_project: None,
+        conversation_id: Some(first.conversation_id),
+        project_id: Some(first.project_id),
+        project_name: Some(first.project_name.clone()),
+        conversation_title: first.conversation_title.clone(),
+        confidence: SkillInvocationConfidence::Inferred,
+        transcript_evidence_kinds: transcript_evidence_kinds(evidence),
+        transcript_evidence_count: evidence.len() as u64,
+    }
+}
+
+fn transcript_evidence_kinds(
+    evidence: &[SkillTranscriptEvidence],
+) -> Vec<SkillTranscriptEvidenceKind> {
+    let mut kinds = evidence.iter().map(|row| row.kind).collect::<Vec<_>>();
+    kinds.sort();
+    kinds.dedup();
+    kinds
+}
+
+fn increment_skill_confidence_count(
+    counts: &mut SkillConfidenceCounts,
+    confidence: SkillInvocationConfidence,
+) {
+    match confidence {
+        SkillInvocationConfidence::Explicit => counts.explicit += 1,
+        SkillInvocationConfidence::Confirmed => counts.confirmed += 1,
+        SkillInvocationConfidence::Inferred => counts.inferred += 1,
+    }
+}
+
+fn add_skill_confidence_counts(target: &mut SkillConfidenceCounts, source: &SkillConfidenceCounts) {
+    target.explicit += source.explicit;
+    target.confirmed += source.confirmed;
+    target.inferred += source.inferred;
+}
+
+fn skill_transcript_evidence_from_part(
+    row: &LoadedSkillTranscriptPart,
+) -> Vec<SkillTranscriptEvidence> {
+    let mut evidence = Vec::new();
+    let mut seen = HashSet::<(String, SkillTranscriptEvidenceKind)>::new();
+
+    if let Some(text_value) = row.text_value.as_deref() {
+        for skill_name in skill_names_from_transcript_text(text_value) {
+            if seen.insert((skill_name.clone(), SkillTranscriptEvidenceKind::PromptText)) {
+                evidence.push(SkillTranscriptEvidence {
+                    session_id: row.session_id.clone(),
+                    skill_name,
+                    kind: SkillTranscriptEvidenceKind::PromptText,
+                    recorded_at_utc: row.recorded_at_utc.clone(),
+                    conversation_id: row.conversation_id,
+                    project_id: row.project_id,
+                    project_name: row.project_name.clone(),
+                    conversation_title: row.conversation_title.clone(),
+                });
+            }
+        }
+    }
+
+    if let Some(metadata_json) = row.metadata_json.as_deref() {
+        for skill_name in skill_names_from_tool_metadata(metadata_json) {
+            if seen.insert((
+                skill_name.clone(),
+                SkillTranscriptEvidenceKind::ToolInputPath,
+            )) {
+                evidence.push(SkillTranscriptEvidence {
+                    session_id: row.session_id.clone(),
+                    skill_name,
+                    kind: SkillTranscriptEvidenceKind::ToolInputPath,
+                    recorded_at_utc: row.recorded_at_utc.clone(),
+                    conversation_id: row.conversation_id,
+                    project_id: row.project_id,
+                    project_name: row.project_name.clone(),
+                    conversation_title: row.conversation_title.clone(),
+                });
+            }
+        }
+    }
+
+    evidence
+}
+
+fn skill_names_from_transcript_text(text: &str) -> Vec<String> {
+    let normalized = text.replace('\r', "");
+    let trimmed = normalized.trim();
+    if !trimmed.starts_with("---\n") {
+        return Vec::new();
+    }
+
+    let mut lines = trimmed.lines();
+    if lines.next() != Some("---") {
+        return Vec::new();
+    }
+
+    let mut frontmatter = Vec::new();
+    for line in lines {
+        if line == "---" {
+            break;
+        }
+        frontmatter.push(line);
+    }
+
+    let has_description = frontmatter
+        .iter()
+        .any(|line| line.starts_with("description:"));
+    if !has_description {
+        return Vec::new();
+    }
+
+    frontmatter
+        .iter()
+        .find_map(|line| line.strip_prefix("name:"))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| vec![name.to_string()])
+        .unwrap_or_default()
+}
+
+fn skill_names_from_tool_metadata(metadata_json: &str) -> Vec<String> {
+    let Ok(metadata) = serde_json::from_str::<serde_json::Value>(metadata_json) else {
+        return Vec::new();
+    };
+    let mut names = BTreeSet::new();
+    collect_skill_names_from_json_value(&metadata, &mut names);
+    names.into_iter().collect()
+}
+
+fn collect_skill_names_from_json_value(value: &serde_json::Value, names: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            for token in text.split_whitespace() {
+                if let Some(skill_name) = skill_name_from_path_like_text(token) {
+                    names.insert(skill_name);
+                }
+            }
+            if let Some(skill_name) = skill_name_from_path_like_text(text) {
+                names.insert(skill_name);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_skill_names_from_json_value(item, names);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values() {
+                collect_skill_names_from_json_value(value, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn skill_name_from_path_like_text(text: &str) -> Option<String> {
+    let trimmed = text.trim_matches(|character: char| {
+        matches!(
+            character,
+            '"' | '\'' | ',' | ')' | '(' | '[' | ']' | '{' | '}' | ';'
+        )
+    });
+    let path = Path::new(trimmed);
+    let components = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+    if let Some(skill_md_index) = components
+        .iter()
+        .position(|component| component == "SKILL.md")
+        && skill_md_index >= 1
+    {
+        let skill_name = components[skill_md_index - 1].trim();
+        if !skill_name.is_empty() {
+            return Some(skill_name.to_string());
+        }
+    }
+
+    let skills_index = components
+        .iter()
+        .position(|component| component == "skills")?;
+    let tail = &components[skills_index + 1..];
+    if tail.is_empty() {
+        return None;
+    }
+    let candidate = if tail[0].starts_with('.') {
+        tail.get(1)?
+    } else {
+        &tail[0]
+    };
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        None
+    } else {
+        Some(candidate.to_string())
+    }
 }
 
 fn aggregate_projects(
@@ -5053,7 +5590,8 @@ mod tests {
         ActionKey, BatchBrowseRequest, BatchBrowseResult, BrowseFilters, BrowsePath, BrowseRequest,
         ClassificationState, ConversationTurnRow, FilterOptions, HistoryEventFilters, MetricLens,
         QueryEngine, RootView, SkillAttributionConfidence, SkillAttributionSummary,
-        SkillInvocationFilters, SkillsPath, SnapshotBounds, SnapshotCoverageSummary,
+        SkillInvocationConfidence, SkillInvocationFilters, SkillTranscriptEvidenceKind,
+        SkillsPath, SnapshotBounds, SnapshotCoverageSummary,
         TimeWindowFilter, build_grouped_action_rollup_rows_query, build_opportunities_rows,
         build_scoped_action_facts_query, build_scoped_path_facts_query, display_category,
     };
@@ -5403,17 +5941,119 @@ mod tests {
             ],
         )?;
 
+        let matched_message_id: i64 = conn.query_row(
+            "
+            SELECT m.id
+            FROM message m
+            WHERE m.conversation_id = ?1
+            ORDER BY m.sequence_no
+            LIMIT 1
+            ",
+            [matched_conversation_id],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "
+            INSERT INTO message_part (
+                message_id,
+                ordinal,
+                part_kind,
+                text_value,
+                is_error
+            )
+            VALUES (?1, 99, 'text', ?2, 0)
+            ",
+            params![
+                matched_message_id,
+                "---\nname: planner\ndescription: confirm planner\n---\nUse the planner skill.\n"
+            ],
+        )?;
+
+        let (inferred_conversation_id, inferred_source_file_id, inferred_message_id): (
+            i64,
+            i64,
+            i64,
+        ) = conn.query_row(
+            "
+            SELECT c.id, c.source_file_id, m.id
+            FROM conversation c
+            JOIN message m ON m.conversation_id = c.id
+            WHERE c.id != ?1
+            ORDER BY m.sequence_no
+            LIMIT 1
+            ",
+            [matched_conversation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        conn.execute(
+            "
+            UPDATE conversation
+            SET external_id = ?2
+            WHERE id = ?1
+            ",
+            params![
+                inferred_conversation_id,
+                format!("source-file:{inferred_source_file_id}:session:reviewer-confirmed")
+            ],
+        )?;
+        conn.execute(
+            "
+            INSERT INTO message_part (
+                message_id,
+                ordinal,
+                part_kind,
+                tool_name,
+                metadata_json,
+                is_error
+            )
+            VALUES (?1, 98, 'tool_use', 'Bash', ?2, 0)
+            ",
+            params![
+                inferred_message_id,
+                "{\"input\":{\"command\":\"python3 /tmp/.codex/plugins/cache/pkg/local/skills/reviewer/scripts/run.py\"}}"
+            ],
+        )?;
+
         let engine = QueryEngine::new(conn);
         let snapshot = engine.latest_snapshot_bounds()?;
 
         let rows = engine.skill_invocations(&snapshot, &SkillInvocationFilters::default())?;
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].skill_name, "planner");
-        assert!(rows[0].conversation_id.is_some());
-        assert_eq!(rows[0].conversation_id, Some(matched_conversation_id));
-        assert_eq!(rows[0].project_name.as_deref(), Some("project-a"));
-        assert_eq!(rows[1].skill_name, "reviewer");
-        assert_eq!(rows[1].conversation_id, None);
+        assert_eq!(rows.len(), 3);
+        let planner_row = rows
+            .iter()
+            .find(|row| row.skill_name == "planner")
+            .context("missing planner row")?;
+        assert!(planner_row.conversation_id.is_some());
+        assert_eq!(planner_row.conversation_id, Some(matched_conversation_id));
+        assert_eq!(planner_row.project_name.as_deref(), Some("project-a"));
+        assert_eq!(planner_row.confidence, SkillInvocationConfidence::Confirmed);
+        assert_eq!(
+            planner_row.transcript_evidence_kinds,
+            vec![SkillTranscriptEvidenceKind::PromptText]
+        );
+        assert_eq!(planner_row.transcript_evidence_count, 1);
+
+        let inferred_row = rows
+            .iter()
+            .find(|row| row.session_id == "reviewer-confirmed")
+            .context("missing inferred reviewer row")?;
+        assert_eq!(inferred_row.skill_name, "reviewer");
+        assert!(inferred_row.conversation_id.is_some());
+        assert_eq!(inferred_row.confidence, SkillInvocationConfidence::Inferred);
+        assert_eq!(
+            inferred_row.transcript_evidence_kinds,
+            vec![SkillTranscriptEvidenceKind::ToolInputPath]
+        );
+        let unmatched_row = rows
+            .iter()
+            .find(|row| row.session_id == "missing-session")
+            .context("missing unmatched reviewer row")?;
+        assert_eq!(unmatched_row.skill_name, "reviewer");
+        assert_eq!(unmatched_row.conversation_id, None);
+        assert_eq!(
+            unmatched_row.confidence,
+            SkillInvocationConfidence::Explicit
+        );
 
         let filtered = engine.skill_invocations(
             &snapshot,
@@ -5512,6 +6152,63 @@ mod tests {
             params![
                 project_b_session_1,
                 format!("source-file:{source_file_b_1}:session:reviewer-b1")
+            ],
+        )?;
+
+        let planner_message_id: i64 = conn.query_row(
+            "
+            SELECT m.id
+            FROM message m
+            WHERE m.conversation_id = ?1
+            ORDER BY m.sequence_no
+            LIMIT 1
+            ",
+            [project_a_session_1],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "
+            INSERT INTO message_part (
+                message_id,
+                ordinal,
+                part_kind,
+                text_value,
+                is_error
+            )
+            VALUES (?1, 98, 'text', ?2, 0)
+            ",
+            params![
+                planner_message_id,
+                "---\nname: planner\ndescription: planner body\n---\nFocus on planning.\n"
+            ],
+        )?;
+
+        let reviewer_message_id: i64 = conn.query_row(
+            "
+            SELECT m.id
+            FROM message m
+            WHERE m.conversation_id = ?1
+            ORDER BY m.sequence_no
+            LIMIT 1
+            ",
+            [project_b_session_1],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "
+            INSERT INTO message_part (
+                message_id,
+                ordinal,
+                part_kind,
+                tool_name,
+                metadata_json,
+                is_error
+            )
+            VALUES (?1, 99, 'tool_use', 'Bash', ?2, 0)
+            ",
+            params![
+                reviewer_message_id,
+                "{\"input\":{\"command\":\"python3 /tmp/.codex/plugins/cache/pkg/local/skills/reviewer/scripts/run.py\"}}"
             ],
         )?;
 
@@ -5655,6 +6352,9 @@ mod tests {
         assert_eq!(root_report.rows[0].skill_name, "planner");
         assert_eq!(root_report.rows[0].invocation_count, 3);
         assert_eq!(root_report.rows[0].session_count, 2);
+        assert_eq!(root_report.rows[0].confidence_counts.confirmed, 2);
+        assert_eq!(root_report.rows[0].confidence_counts.explicit, 1);
+        assert_eq!(root_report.rows[0].transcript_evidence_count, 2);
         assert_eq!(root_report.rows[0].metrics.uncached_input, 10.0);
         assert_eq!(root_report.rows[0].attributed_action_count, 1);
         assert_eq!(root_report.rows[0].attributed_metrics.uncached_input, 5.0);
@@ -5665,6 +6365,9 @@ mod tests {
         assert_eq!(root_report.rows[1].skill_name, "reviewer");
         assert_eq!(root_report.rows[1].invocation_count, 2);
         assert_eq!(root_report.rows[1].session_count, 2);
+        assert_eq!(root_report.rows[1].confidence_counts.confirmed, 1);
+        assert_eq!(root_report.rows[1].confidence_counts.explicit, 1);
+        assert_eq!(root_report.rows[1].transcript_evidence_count, 1);
         assert_eq!(root_report.rows[1].metrics.uncached_input, 9.0);
         assert_eq!(root_report.rows[1].attributed_action_count, 1);
         assert_eq!(root_report.rows[1].attributed_metrics.uncached_input, 4.0);
@@ -5686,6 +6389,7 @@ mod tests {
         );
         assert_eq!(planner_projects.rows[0].invocation_count, 3);
         assert_eq!(planner_projects.rows[0].session_count, 2);
+        assert_eq!(planner_projects.rows[0].confidence_counts.confirmed, 2);
         assert_eq!(planner_projects.rows[0].metrics.uncached_input, 10.0);
         assert_eq!(planner_projects.rows[0].attributed_action_count, 1);
         assert_eq!(
@@ -5707,6 +6411,8 @@ mod tests {
         );
         assert_eq!(reviewer_sessions.rows[0].invocation_count, 1);
         assert_eq!(reviewer_sessions.rows[0].session_count, 1);
+        assert_eq!(reviewer_sessions.rows[0].confidence_counts.confirmed, 1);
+        assert_eq!(reviewer_sessions.rows[0].transcript_evidence_count, 1);
         assert_eq!(reviewer_sessions.rows[0].metrics.uncached_input, 4.0);
         assert_eq!(reviewer_sessions.rows[0].attributed_action_count, 1);
         assert_eq!(

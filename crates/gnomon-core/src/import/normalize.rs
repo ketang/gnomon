@@ -1325,7 +1325,7 @@ fn extract_message_parts(
         Value::String(text) => Ok(vec![ExtractedMessagePart {
             part_kind: "text".to_string(),
             mime_type: None,
-            text_value: None,
+            text_value: Some(text.clone()),
             tool_name: None,
             tool_call_id: None,
             metadata_json: None,
@@ -1344,7 +1344,13 @@ fn extract_message_parts(
                     format!("unable to serialize message part on source line {source_line_no}")
                 })?;
 
-                let text_value = None;
+                let text_value = match part_type.as_str() {
+                    "text" | "thinking" => part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    _ => None,
+                };
 
                 let tool_name = optional_string(part.get("name"));
                 let tool_call_id = optional_string(part.get("id"))
@@ -1744,7 +1750,17 @@ mod tests {
         };
 
         assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0], ("text".to_string(), None, None, None, None, 0));
+        assert_eq!(
+            parts[0],
+            (
+                "text".to_string(),
+                None,
+                Some("I will inspect the files first.".to_string()),
+                None,
+                None,
+                0,
+            )
+        );
 
         let expected_tool_use = serde_json::to_string(&NormalizedToolUsePartMetadata::from_input(
             &serde_json::json!({
