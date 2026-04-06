@@ -22,7 +22,7 @@ pub const IMPORT_CHUNK_UNIT: &str = "project x day";
 /// | `tool_name`    | stored          | —               | —                 |
 /// | `tool_call_id` | stored          | stored          | —                 |
 /// | `metadata_json`| `{"input":…}`   | `NULL`          | `NULL`            |
-/// | `text_value`   | `NULL`          | `NULL`          | `NULL`            |
+/// | `text_value`   | `NULL`          | `NULL`          | stored            |
 /// | `mime_type`    | `NULL`          | `NULL`          | `NULL`            |
 /// | `is_error`     | stored          | stored          | stored            |
 /// | `ordinal`      | stored          | stored          | stored            |
@@ -32,6 +32,7 @@ pub const IMPORT_CHUNK_UNIT: &str = "project x day";
 /// - `tool_name` — identifies which tool was invoked
 /// - `tool_call_id` — joins `tool_use` with its `tool_result`
 /// - `metadata_json` — only the `input` key, only for `tool_use` parts
+/// - `text_value` — transcript text used for skill confirmation heuristics
 pub const IMPORT_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
