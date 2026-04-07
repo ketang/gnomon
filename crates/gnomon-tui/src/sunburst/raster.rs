@@ -7,12 +7,21 @@ use super::geometry::sunburst_segment_at_angle;
 use super::model::{
     SunburstBucket, SunburstModel, SunburstRenderConfig, SunburstRenderMode, SunburstSegment,
 };
+#[cfg(test)]
+use super::model::{SunburstLayer, SunburstSpan};
 
 const SUPPORTED_RENDER_MODES: [SunburstRenderMode; 2] =
     [SunburstRenderMode::Coarse, SunburstRenderMode::Braille];
 
 /// Uniform fill glyph for coarse mode — geometry carries the signal, not texture.
 const COARSE_FILL: char = '█';
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SampleHit {
+    layer_index: usize,
+    segment_index: usize,
+    sample_bit: u32,
+}
 
 pub(crate) fn rasterize_sunburst(
     buf: &mut Buffer,
@@ -109,8 +118,7 @@ fn rasterize_braille(
 
     for y in inner.y..inner.y + inner.height {
         for x in inner.x..inner.x + inner.width {
-            let mut dots = 0_u32;
-            let mut winning_segment: Option<&SunburstSegment> = None;
+            let mut hits = Vec::with_capacity(DOT_SAMPLES.len());
 
             for (sample_x, sample_y, bit) in DOT_SAMPLES {
                 let normalized_x = (f64::from(x) + sample_x - center_x) / radius_x;
@@ -135,14 +143,35 @@ fn rasterize_braille(
                 ) else {
                     continue;
                 };
+                let Some(segment_index) = layer
+                    .segments
+                    .iter()
+                    .position(|candidate| std::ptr::eq(candidate, segment))
+                else {
+                    continue;
+                };
 
-                dots |= bit;
-                if winning_segment.is_none_or(|current| !current.is_selected && segment.is_selected)
-                {
-                    winning_segment = Some(segment);
-                }
+                hits.push(SampleHit {
+                    layer_index,
+                    segment_index,
+                    sample_bit: bit,
+                });
             }
 
+            let Some(dominant_layer_index) = dominant_layer_index(&hits) else {
+                continue;
+            };
+            let layer_hits = hits
+                .iter()
+                .copied()
+                .filter(|hit| hit.layer_index == dominant_layer_index)
+                .collect::<Vec<_>>();
+            let Some(owner) = dominant_segment(&layer_hits, model) else {
+                continue;
+            };
+            let dots = layer_hits
+                .iter()
+                .fold(0_u32, |bits, hit| bits | hit.sample_bit);
             if dots == 0 {
                 continue;
             }
@@ -150,7 +179,11 @@ fn rasterize_braille(
             let Some(symbol) = char::from_u32(0x2800 + dots) else {
                 continue;
             };
-            let Some(segment) = winning_segment else {
+            let Some(segment) = model
+                .layers
+                .get(owner.layer_index)
+                .and_then(|layer| layer.segments.get(owner.segment_index))
+            else {
                 continue;
             };
 
@@ -196,6 +229,67 @@ fn sunburst_braille_style(segment: &SunburstSegment, focused: bool) -> Style {
     style
 }
 
+fn dominant_segment(hits: &[SampleHit], model: &SunburstModel) -> Option<SampleHit> {
+    if hits.is_empty() {
+        return None;
+    }
+
+    let mut counts = std::collections::BTreeMap::<(usize, usize), usize>::new();
+    for hit in hits {
+        *counts
+            .entry((hit.layer_index, hit.segment_index))
+            .or_default() += 1;
+    }
+
+    counts
+        .into_iter()
+        .max_by(
+            |((left_layer, left_segment), left_count),
+             ((right_layer, right_segment), right_count)| {
+                let left_selected = model
+                    .layers
+                    .get(*left_layer)
+                    .and_then(|layer| layer.segments.get(*left_segment))
+                    .is_some_and(|segment| segment.is_selected);
+                let right_selected = model
+                    .layers
+                    .get(*right_layer)
+                    .and_then(|layer| layer.segments.get(*right_segment))
+                    .is_some_and(|segment| segment.is_selected);
+                left_selected
+                    .cmp(&right_selected)
+                    .then_with(|| left_count.cmp(right_count))
+                    .then_with(|| left_layer.cmp(right_layer))
+                    .then_with(|| left_segment.cmp(right_segment))
+            },
+        )
+        .map(|((layer_index, segment_index), _)| SampleHit {
+            layer_index,
+            segment_index,
+            sample_bit: 0,
+        })
+}
+
+fn dominant_layer_index(hits: &[SampleHit]) -> Option<usize> {
+    if hits.is_empty() {
+        return None;
+    }
+
+    let mut counts = std::collections::BTreeMap::<usize, usize>::new();
+    for hit in hits {
+        *counts.entry(hit.layer_index).or_default() += 1;
+    }
+
+    counts
+        .into_iter()
+        .max_by(|(left_layer, left_count), (right_layer, right_count)| {
+            left_count
+                .cmp(right_count)
+                .then_with(|| left_layer.cmp(right_layer))
+        })
+        .map(|(layer_index, _)| layer_index)
+}
+
 /// Muted ANSI-256 palette — geometry carries the primary signal, color stays
 /// secondary.
 fn sunburst_bucket_color(bucket: SunburstBucket) -> Color {
@@ -217,6 +311,25 @@ mod tests {
             value: 100.0,
             bucket,
             is_selected,
+        }
+    }
+
+    fn make_layer(
+        values: &[(f64, SunburstBucket, bool)],
+        span: SunburstSpan,
+        total_value: f64,
+    ) -> SunburstLayer {
+        SunburstLayer {
+            span,
+            segments: values
+                .iter()
+                .map(|(value, bucket, is_selected)| SunburstSegment {
+                    value: *value,
+                    bucket: *bucket,
+                    is_selected: *is_selected,
+                })
+                .collect(),
+            total_value,
         }
     }
 
@@ -332,5 +445,116 @@ mod tests {
             SunburstRenderConfig::default().mode,
             SunburstRenderMode::Braille
         );
+    }
+
+    #[test]
+    fn dominant_layer_prefers_majority_hits_over_inner_selected_layer() {
+        let hits = vec![
+            SampleHit {
+                layer_index: 0,
+                segment_index: 0,
+                sample_bit: 0x01,
+            },
+            SampleHit {
+                layer_index: 1,
+                segment_index: 0,
+                sample_bit: 0x02,
+            },
+            SampleHit {
+                layer_index: 1,
+                segment_index: 1,
+                sample_bit: 0x04,
+            },
+        ];
+
+        assert_eq!(dominant_layer_index(&hits), Some(1));
+    }
+
+    #[test]
+    fn dominant_segment_prefers_selected_segment_when_counts_tie_within_layer() {
+        let model = SunburstModel {
+            center: Default::default(),
+            layers: vec![make_layer(
+                &[
+                    (50.0, SunburstBucket::Project, false),
+                    (50.0, SunburstBucket::Category, true),
+                ],
+                SunburstSpan::full(),
+                100.0,
+            )],
+        };
+        let hits = vec![
+            SampleHit {
+                layer_index: 0,
+                segment_index: 0,
+                sample_bit: 0x01,
+            },
+            SampleHit {
+                layer_index: 0,
+                segment_index: 1,
+                sample_bit: 0x02,
+            },
+        ];
+
+        let owner = dominant_segment(&hits, &model).expect("winner");
+        assert_eq!(owner.layer_index, 0);
+        assert_eq!(owner.segment_index, 1);
+    }
+
+    #[test]
+    fn braille_uses_only_dots_from_the_dominant_ring_layer() {
+        let model = SunburstModel {
+            center: Default::default(),
+            layers: vec![
+                make_layer(
+                    &[(100.0, SunburstBucket::Project, true)],
+                    SunburstSpan::full(),
+                    100.0,
+                ),
+                make_layer(
+                    &[
+                        (50.0, SunburstBucket::Category, false),
+                        (50.0, SunburstBucket::Classified, false),
+                    ],
+                    SunburstSpan {
+                        start: 0.0,
+                        sweep: TAU / 6.0,
+                    },
+                    100.0,
+                ),
+            ],
+        };
+        let hits = vec![
+            SampleHit {
+                layer_index: 0,
+                segment_index: 0,
+                sample_bit: 0x01,
+            },
+            SampleHit {
+                layer_index: 1,
+                segment_index: 0,
+                sample_bit: 0x02,
+            },
+            SampleHit {
+                layer_index: 1,
+                segment_index: 1,
+                sample_bit: 0x04,
+            },
+        ];
+
+        let dominant_layer = dominant_layer_index(&hits).expect("dominant layer");
+        let layer_hits = hits
+            .iter()
+            .copied()
+            .filter(|hit| hit.layer_index == dominant_layer)
+            .collect::<Vec<_>>();
+        let owner = dominant_segment(&layer_hits, &model).expect("dominant owner");
+        let dots = layer_hits
+            .iter()
+            .fold(0_u32, |bits, hit| bits | hit.sample_bit);
+
+        assert_eq!(dominant_layer, 1);
+        assert_eq!(owner.layer_index, 1);
+        assert_eq!(dots, 0x06);
     }
 }
