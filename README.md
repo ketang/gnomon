@@ -48,14 +48,19 @@ docs/
 
 - Do not implement on `main`.
 - Start each task on a feature branch or the existing task branch.
+- For any implementation task, automatically create or switch to a dedicated
+  feature branch and linked worktree before making edits.
 - Use a dedicated worktree for all implementation work. Creating only a feature
   branch in the repo root is not sufficient; create both the branch and the
   worktree before touching files.
+- Treat branch and worktree setup as required preflight, not as a step that
+  needs user approval.
 - Exceptions are limited to read-only tasks and explicit branch-management or
   checkout-recovery tasks the user asked for.
 - All parallel work must use separate worktrees.
-- If you land on `main`, stop and create a feature branch plus worktree before
-  editing.
+- If you land on `main`, create a feature branch plus worktree before editing.
+- Only pause for user input if branch or worktree setup would be destructive,
+  ambiguous, or likely to interfere with existing uncommitted work.
 - Rebase finished feature branches onto `origin/main` before integration.
 - Merge finished feature branches into `main` with `git merge --no-ff`.
 - Do not fast-forward feature branch integrations into `main`.
