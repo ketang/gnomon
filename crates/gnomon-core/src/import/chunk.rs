@@ -138,6 +138,21 @@ struct PreparedChunk {
     source_files: Vec<ChunkSourceFile>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportPhase {
+    Startup,
+    Deferred,
+}
+
+impl ImportPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Deferred => "deferred",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChunkSourceFile {
     source_file_id: i64,
@@ -320,7 +335,9 @@ fn start_startup_import_with_options(
         }) {
         Ok(worker) => worker,
         Err(err) => {
-            mark_chunks_failed(conn, &prepared)?;
+            let error_message =
+                compact_status_text(format!("unable to spawn background importer worker: {err}"));
+            mark_chunks_failed(conn, &prepared, Some(error_message.as_str()))?;
             return Err(anyhow!(err)).context("unable to spawn background importer worker");
         }
     };
@@ -608,17 +625,21 @@ fn prepare_import_plan(conn: &Connection, plan: &ImportPlan) -> Result<PreparedI
         startup_chunks: plan
             .startup_chunks
             .iter()
-            .map(|chunk| prepare_chunk(conn, chunk))
+            .map(|chunk| prepare_chunk(conn, chunk, ImportPhase::Startup))
             .collect::<Result<Vec<_>>>()?,
         deferred_chunks: plan
             .deferred_chunks
             .iter()
-            .map(|chunk| prepare_chunk(conn, chunk))
+            .map(|chunk| prepare_chunk(conn, chunk, ImportPhase::Deferred))
             .collect::<Result<Vec<_>>>()?,
     })
 }
 
-fn prepare_chunk(conn: &Connection, chunk: &ChunkCandidate) -> Result<PreparedChunk> {
+fn prepare_chunk(
+    conn: &Connection,
+    chunk: &ChunkCandidate,
+    phase: ImportPhase,
+) -> Result<PreparedChunk> {
     let import_chunk_id = conn
         .query_row(
             "
@@ -632,9 +653,11 @@ fn prepare_chunk(conn: &Connection, chunk: &ChunkCandidate) -> Result<PreparedCh
                 imported_message_count,
                 imported_action_count,
                 imported_conversation_count,
-                imported_turn_count
+                imported_turn_count,
+                last_attempt_phase,
+                last_error_message
             )
-            VALUES (?1, ?2, 'pending', NULL, NULL, 0, 0, 0, 0, 0)
+            VALUES (?1, ?2, 'pending', NULL, NULL, 0, 0, 0, 0, 0, ?3, NULL)
             ON CONFLICT(project_id, chunk_day_local) DO UPDATE SET
                 state = 'pending',
                 publish_seq = NULL,
@@ -643,10 +666,12 @@ fn prepare_chunk(conn: &Connection, chunk: &ChunkCandidate) -> Result<PreparedCh
                 imported_message_count = 0,
                 imported_action_count = 0,
                 imported_conversation_count = 0,
-                imported_turn_count = 0
+                imported_turn_count = 0,
+                last_attempt_phase = excluded.last_attempt_phase,
+                last_error_message = NULL
             RETURNING id
             ",
-            params![chunk.project_id, chunk.chunk_day_local],
+            params![chunk.project_id, chunk.chunk_day_local, phase.as_str()],
             |row| row.get(0),
         )
         .with_context(|| {
@@ -665,15 +690,23 @@ fn prepare_chunk(conn: &Connection, chunk: &ChunkCandidate) -> Result<PreparedCh
     })
 }
 
-fn mark_chunks_failed(conn: &Connection, plan: &PreparedImportPlan) -> Result<()> {
+fn mark_chunks_failed(
+    conn: &Connection,
+    plan: &PreparedImportPlan,
+    error_message: Option<&str>,
+) -> Result<()> {
     for chunk in plan.all_chunks() {
         conn.execute(
             "
             UPDATE import_chunk
-            SET state = 'failed', publish_seq = NULL, completed_at_utc = CURRENT_TIMESTAMP
+            SET
+                state = 'failed',
+                publish_seq = NULL,
+                completed_at_utc = CURRENT_TIMESTAMP,
+                last_error_message = ?2
             WHERE id = ?1
             ",
-            [chunk.import_chunk_id],
+            params![chunk.import_chunk_id, error_message],
         )
         .with_context(|| {
             format!(
@@ -849,7 +882,12 @@ fn import_chunk(
     })();
 
     if let Err(err) = import_result {
-        let _ = mark_chunk_failed(database.connection_mut(), chunk.import_chunk_id);
+        let error_message = compact_status_text(format!("{err:#}"));
+        let _ = mark_chunk_failed(
+            database.connection_mut(),
+            chunk.import_chunk_id,
+            &error_message,
+        );
         return Err(err);
     }
 
@@ -869,6 +907,7 @@ fn begin_chunk_import(conn: &mut Connection, chunk: &PreparedChunk) -> Result<()
             publish_seq = NULL,
             started_at_utc = CURRENT_TIMESTAMP,
             completed_at_utc = NULL,
+            last_error_message = NULL,
             imported_record_count = 0,
             imported_message_count = 0,
             imported_action_count = 0,
@@ -992,7 +1031,8 @@ fn finalize_chunk_import(conn: &mut Connection, chunk: &PreparedChunk) -> Result
         SET
             state = 'complete',
             publish_seq = ?2,
-            completed_at_utc = CURRENT_TIMESTAMP
+            completed_at_utc = CURRENT_TIMESTAMP,
+            last_error_message = NULL
         WHERE id = ?1
         ",
         params![chunk.import_chunk_id, next_publish_seq],
@@ -1009,17 +1049,22 @@ fn finalize_chunk_import(conn: &mut Connection, chunk: &PreparedChunk) -> Result
     Ok(())
 }
 
-fn mark_chunk_failed(conn: &mut Connection, import_chunk_id: i64) -> Result<()> {
+fn mark_chunk_failed(
+    conn: &mut Connection,
+    import_chunk_id: i64,
+    error_message: &str,
+) -> Result<()> {
     conn.execute(
         "
         UPDATE import_chunk
         SET
             state = 'failed',
             publish_seq = NULL,
-            completed_at_utc = CURRENT_TIMESTAMP
+            completed_at_utc = CURRENT_TIMESTAMP,
+            last_error_message = ?2
         WHERE id = ?1
         ",
-        [import_chunk_id],
+        params![import_chunk_id, error_message],
     )
     .context("unable to mark the import chunk as failed")?;
     Ok(())

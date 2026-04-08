@@ -81,6 +81,23 @@ landing state. `--startup-full-import` keeps the normal TUI launch path but
 waits for the full import to finish before opening, unlike `gnomon db rebuild`
 which is a maintenance command that only rebuilds the cache.
 
+## Database Status Probe
+
+Use the database status probe to verify whether import work is active without
+opening SQLite manually.
+
+```bash
+cargo run -p gnomon -- db status
+```
+
+The probe reports:
+
+- aggregate chunk counts by state (`pending`, `running`, `complete`, `failed`)
+- startup/deferred phase counts when that metadata is available
+- the currently active chunk, if one exists
+- the latest published snapshot
+- recent failed chunks with stored error text
+
 ## Performance Logs
 
 Performance logging is enabled by default.
