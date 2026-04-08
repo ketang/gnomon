@@ -9,8 +9,9 @@ use gnomon_core::benchmark::{QueryBenchmarkOptions, QueryBenchmarkReport, run_qu
 use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
 use gnomon_core::db::{Database, ResetReport, reset_sqlite_database};
 use gnomon_core::import::{
-    StartupProgressUpdate, StartupWorkerEvent, import_all, scan_source_manifest,
-    start_startup_import, start_startup_import_with_progress,
+    StartupImportMode, StartupProgressUpdate, StartupWorkerEvent, import_all,
+    scan_source_manifest, start_startup_import,
+    start_startup_import_with_mode_and_progress,
 };
 use gnomon_core::opportunity::{OpportunityCategory, OpportunityConfidence, OpportunitySummary};
 use gnomon_core::perf::PerfLogger;
@@ -243,6 +244,10 @@ struct SnapshotArgs {
 
 #[derive(Debug, Clone, Args, Default, PartialEq, Eq)]
 struct StartupArgs {
+    /// Finish the full import before opening the TUI.
+    #[arg(long = "startup-full-import")]
+    full_import: bool,
+
     /// Root hierarchy to open on startup when explicitly requested.
     #[arg(long = "startup-root", value_enum)]
     root: Option<RootViewArg>,
@@ -346,10 +351,11 @@ fn run_app(config: &RuntimeConfig, startup_args: StartupArgs) -> Result<()> {
     let mut startup_progress = StartupConsoleProgress::stderr();
     let mut database = Database::open(&config.db_path)?;
     let _scan_report = scan_source_manifest(&mut database, &config.source_root)?;
-    let mut startup_import = start_startup_import_with_progress(
+    let mut startup_import = start_startup_import_with_mode_and_progress(
         database.connection(),
         &config.db_path,
         &config.source_root,
+        startup_args.import_mode(),
         |update| startup_progress.import_progress(update),
     )?;
     let snapshot = startup_import.snapshot.clone();
@@ -357,6 +363,7 @@ fn run_app(config: &RuntimeConfig, startup_args: StartupArgs) -> Result<()> {
     let startup_progress_update = startup_import.startup_progress_update.clone();
     let startup_browse_state = startup_args.build_startup_browse_state()?;
     print_import_problem(startup_import.startup_status_message.as_deref());
+    print_import_problem(startup_import.deferred_status_message.as_deref());
     let mut forwarded_updates =
         ForwardedStartupUpdates::spawn(startup_import.take_status_updates());
     let ui_updates = forwarded_updates.take_ui_updates();
@@ -794,6 +801,14 @@ impl ReportArgs {
 }
 
 impl StartupArgs {
+    fn import_mode(&self) -> StartupImportMode {
+        if self.full_import {
+            StartupImportMode::Full
+        } else {
+            StartupImportMode::RecentFirst
+        }
+    }
+
     fn has_explicit_selection(&self) -> bool {
         self.root.is_some()
             || self.path.is_some()
@@ -1146,10 +1161,33 @@ mod tests {
         assert_eq!(
             cli.startup,
             StartupArgs {
+                full_import: false,
                 root: Some(RootViewArg::Project),
                 path: Some(BrowsePathKindArg::ProjectCategory),
                 project_id: Some(7),
                 category: Some("editing".to_string()),
+                parent_path: None,
+                classification_state: None,
+                normalized_action: None,
+                command_family: None,
+                base_command: None,
+            }
+        );
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parse_accepts_startup_full_import_flag() {
+        let cli = Cli::parse_from(["gnomon", "--startup-full-import"]);
+
+        assert_eq!(
+            cli.startup,
+            StartupArgs {
+                full_import: true,
+                root: None,
+                path: None,
+                project_id: None,
+                category: None,
                 parent_path: None,
                 classification_state: None,
                 normalized_action: None,

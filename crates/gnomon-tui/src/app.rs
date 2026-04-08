@@ -5191,6 +5191,10 @@ fn snapshot_refresh_text(
             "refresh: manual only. Startup opened before the last 24 hours finished importing, so this snapshot may still be partial."
                 .to_string()
         }
+        StartupOpenReason::FullImportReady => {
+            "refresh: manual only. Startup waited for the full import to finish, so this snapshot is already current."
+                .to_string()
+        }
     }
 }
 
@@ -9644,6 +9648,45 @@ mod tests {
                 false,
             ),
             "refresh: manual only. Startup opened before the last 24 hours finished importing, so this snapshot may still be partial."
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn render_shows_full_coverage_when_startup_waits_for_full_import() -> Result<()> {
+        let temp = tempdir()?;
+        let content = render_to_string(
+            make_test_config(temp.path()),
+            SnapshotBounds {
+                max_publish_seq: 4,
+                published_chunk_count: 4,
+                upper_bound_utc: Some("2026-03-27 18:28:38".to_string()),
+            },
+            StartupOpenReason::FullImportReady,
+            None,
+        )?;
+
+        assert!(
+            content.contains("refresh:"),
+            "refresh line not rendered in header"
+        );
+        assert_eq!(
+            snapshot_refresh_text(
+                &SnapshotBounds {
+                    max_publish_seq: 4,
+                    published_chunk_count: 4,
+                    upper_bound_utc: Some("2026-03-27 18:28:38".to_string()),
+                },
+                &SnapshotBounds {
+                    max_publish_seq: 4,
+                    published_chunk_count: 4,
+                    upper_bound_utc: Some("2026-03-27 18:28:38".to_string()),
+                },
+                StartupOpenReason::FullImportReady,
+                false,
+            ),
+            "refresh: manual only. Startup waited for the full import to finish, so this snapshot is already current."
         );
 
         Ok(())
