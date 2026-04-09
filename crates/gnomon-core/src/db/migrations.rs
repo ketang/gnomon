@@ -11,5 +11,8 @@ pub fn all() -> Migrations<'static> {
         M::up(include_str!("migrations/0007_history_sources.sql")),
         M::up(include_str!("migrations/0008_skill_invocations.sql")),
         M::up(include_str!("migrations/0009_action_skill_attribution.sql")),
+        M::up(include_str!(
+            "migrations/0010_import_chunk_status_probe.sql"
+        )),
     ])
 }

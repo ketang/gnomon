@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -12,16 +13,18 @@ use gnomon_core::browse_cache::{
 use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
 use gnomon_core::db::{Database, ResetReport};
 use gnomon_core::import::{
-    StartupProgressUpdate, StartupWorkerEvent, import_all, scan_source_manifest_with_policy,
-    start_startup_import, start_startup_import_with_progress,
+    StartupImportMode, StartupProgressUpdate, StartupWorkerEvent, import_all,
+    scan_source_manifest_with_policy, start_startup_import,
+    start_startup_import_with_mode_and_progress,
 };
 use gnomon_core::opportunity::{OpportunityCategory, OpportunityConfidence, OpportunitySummary};
 use gnomon_core::perf::PerfLogger;
 use gnomon_core::query::{
     ActionKey, BrowseFilters, BrowsePath, BrowseReport, BrowseRequest, ClassificationState,
     MetricLens, OpportunitiesFilters, QueryEngine, RootView, SkillsPath, SkillsReport,
-    TimeWindowFilter,
+    SnapshotBounds, TimeWindowFilter,
 };
+use rusqlite::OptionalExtension;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -83,6 +86,8 @@ enum DbSubcommand {
     Reset(ResetArgs),
     /// Recreate the derived usage database after clearing persisted cache artifacts.
     Rebuild,
+    /// Report current import chunk state, phase, and recent failures.
+    Status,
 }
 
 #[derive(Debug, Clone, Args, Default)]
@@ -90,6 +95,118 @@ struct ResetArgs {
     /// Skip the destructive-operation confirmation check.
     #[arg(long)]
     force: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportChunkState {
+    Pending,
+    Running,
+    Complete,
+    Failed,
+}
+
+impl ImportChunkState {
+    fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "complete" => Some(Self::Complete),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportChunkPhase {
+    Startup,
+    Deferred,
+}
+
+impl ImportChunkPhase {
+    fn from_db_value(value: &str) -> Option<Self> {
+        match value {
+            "startup" => Some(Self::Startup),
+            "deferred" => Some(Self::Deferred),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Deferred => "deferred",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ImportStateCounts {
+    pending: usize,
+    running: usize,
+    complete: usize,
+    failed: usize,
+}
+
+impl ImportStateCounts {
+    fn increment(&mut self, state: ImportChunkState, amount: usize) {
+        match state {
+            ImportChunkState::Pending => self.pending += amount,
+            ImportChunkState::Running => self.running += amount,
+            ImportChunkState::Complete => self.complete += amount,
+            ImportChunkState::Failed => self.failed += amount,
+        }
+    }
+
+    fn active_count(&self) -> usize {
+        self.pending + self.running
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportPhaseCounts {
+    phase: ImportChunkPhase,
+    counts: ImportStateCounts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportChunkStatusRow {
+    id: i64,
+    project_key: String,
+    chunk_day_local: String,
+    state: ImportChunkState,
+    phase: Option<ImportChunkPhase>,
+    publish_seq: Option<i64>,
+    started_at_utc: String,
+    completed_at_utc: Option<String>,
+    last_error_message: Option<String>,
+}
+
+impl ImportChunkStatusRow {
+    fn label(&self) -> String {
+        format!("{}:{}", self.project_key, self.chunk_day_local)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportStatusReport {
+    db_path: PathBuf,
+    db_exists: bool,
+    snapshot: SnapshotBounds,
+    counts: ImportStateCounts,
+    phase_counts: Vec<ImportPhaseCounts>,
+    active_chunk: Option<ImportChunkStatusRow>,
+    latest_completed_chunk: Option<ImportChunkStatusRow>,
+    recent_failures: Vec<ImportChunkStatusRow>,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -264,6 +381,10 @@ struct SnapshotArgs {
 
 #[derive(Debug, Clone, Args, Default, PartialEq, Eq)]
 struct StartupArgs {
+    /// Finish the full import before opening the TUI.
+    #[arg(long = "startup-full-import")]
+    full_import: bool,
+
     /// Root hierarchy to open on startup when explicitly requested.
     #[arg(long = "startup-root", value_enum)]
     root: Option<RootViewArg>,
@@ -382,10 +503,11 @@ fn run_app(config: &RuntimeConfig, startup_args: StartupArgs) -> Result<()> {
         &config.project_identity,
         &config.project_filters,
     )?;
-    let mut startup_import = start_startup_import_with_progress(
+    let mut startup_import = start_startup_import_with_mode_and_progress(
         database.connection(),
         &config.db_path,
         &config.source_root,
+        startup_args.import_mode(),
         |update| startup_progress.import_progress(update),
     )?;
     let snapshot = startup_import.snapshot.clone();
@@ -393,6 +515,7 @@ fn run_app(config: &RuntimeConfig, startup_args: StartupArgs) -> Result<()> {
     let startup_progress_update = startup_import.startup_progress_update.clone();
     let startup_browse_state = startup_args.build_startup_browse_state()?;
     print_import_problem(startup_import.startup_status_message.as_deref());
+    print_import_problem(startup_import.deferred_status_message.as_deref());
     let mut forwarded_updates =
         ForwardedStartupUpdates::spawn(startup_import.take_status_updates());
     let ui_updates = forwarded_updates.take_ui_updates();
@@ -428,6 +551,7 @@ fn run_db_command(config: &RuntimeConfig, command: DbSubcommand) -> Result<()> {
             Ok(())
         }
         DbSubcommand::Rebuild => rebuild_database(config),
+        DbSubcommand::Status => run_db_status_command(config),
     }
 }
 
@@ -607,6 +731,390 @@ fn rebuild_database(config: &RuntimeConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_db_status_command(config: &RuntimeConfig) -> Result<()> {
+    config.ensure_dirs()?;
+    let report = build_import_status_report(config)?;
+    print!("{}", render_import_status_report(&report));
+    Ok(())
+}
+
+fn build_import_status_report(config: &RuntimeConfig) -> Result<ImportStatusReport> {
+    if !config.db_path.exists() {
+        return Ok(ImportStatusReport {
+            db_path: config.db_path.clone(),
+            db_exists: false,
+            snapshot: SnapshotBounds::bootstrap(),
+            counts: ImportStateCounts::default(),
+            phase_counts: Vec::new(),
+            active_chunk: None,
+            latest_completed_chunk: None,
+            recent_failures: Vec::new(),
+        });
+    }
+
+    let database = Database::open(&config.db_path)?;
+    let conn = database.connection();
+    let snapshot = QueryEngine::new(conn).latest_snapshot_bounds()?;
+
+    Ok(ImportStatusReport {
+        db_path: config.db_path.clone(),
+        db_exists: true,
+        snapshot,
+        counts: load_import_state_counts(conn)?,
+        phase_counts: load_phase_counts(conn)?,
+        active_chunk: load_active_import_chunk(conn)?,
+        latest_completed_chunk: load_latest_completed_chunk(conn)?,
+        recent_failures: load_recent_failed_chunks(conn)?,
+    })
+}
+
+fn load_import_state_counts(conn: &rusqlite::Connection) -> Result<ImportStateCounts> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT state, COUNT(*)
+        FROM import_chunk
+        GROUP BY state
+        ",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut counts = ImportStateCounts::default();
+
+    while let Some(row) = rows.next()? {
+        let state_raw = row.get::<_, String>(0)?;
+        let state = ImportChunkState::from_db_value(&state_raw)
+            .ok_or_else(|| anyhow::anyhow!("unknown import chunk state {state_raw}"))?;
+        let count = usize::try_from(row.get::<_, i64>(1)?)
+            .context("import chunk count overflowed usize")?;
+        counts.increment(state, count);
+    }
+
+    Ok(counts)
+}
+
+fn load_phase_counts(conn: &rusqlite::Connection) -> Result<Vec<ImportPhaseCounts>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT last_attempt_phase, state, COUNT(*)
+        FROM import_chunk
+        WHERE last_attempt_phase IS NOT NULL
+        GROUP BY last_attempt_phase, state
+        ORDER BY
+            CASE last_attempt_phase
+                WHEN 'startup' THEN 0
+                WHEN 'deferred' THEN 1
+                ELSE 2
+            END
+        ",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut startup = ImportStateCounts::default();
+    let mut deferred = ImportStateCounts::default();
+    let mut saw_startup = false;
+    let mut saw_deferred = false;
+
+    while let Some(row) = rows.next()? {
+        let phase_raw = row.get::<_, String>(0)?;
+        let state_raw = row.get::<_, String>(1)?;
+        let phase = ImportChunkPhase::from_db_value(&phase_raw)
+            .ok_or_else(|| anyhow::anyhow!("unknown import chunk phase {phase_raw}"))?;
+        let state = ImportChunkState::from_db_value(&state_raw)
+            .ok_or_else(|| anyhow::anyhow!("unknown import chunk state {state_raw}"))?;
+        let count = usize::try_from(row.get::<_, i64>(2)?)
+            .context("phase import chunk count overflowed usize")?;
+        match phase {
+            ImportChunkPhase::Startup => {
+                startup.increment(state, count);
+                saw_startup = true;
+            }
+            ImportChunkPhase::Deferred => {
+                deferred.increment(state, count);
+                saw_deferred = true;
+            }
+        }
+    }
+
+    let mut phase_counts = Vec::new();
+    if saw_startup {
+        phase_counts.push(ImportPhaseCounts {
+            phase: ImportChunkPhase::Startup,
+            counts: startup,
+        });
+    }
+    if saw_deferred {
+        phase_counts.push(ImportPhaseCounts {
+            phase: ImportChunkPhase::Deferred,
+            counts: deferred,
+        });
+    }
+    Ok(phase_counts)
+}
+
+fn load_active_import_chunk(conn: &rusqlite::Connection) -> Result<Option<ImportChunkStatusRow>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT
+            import_chunk.id,
+            project.canonical_key,
+            import_chunk.chunk_day_local,
+            import_chunk.state,
+            import_chunk.last_attempt_phase,
+            import_chunk.publish_seq,
+            import_chunk.started_at_utc,
+            import_chunk.completed_at_utc,
+            import_chunk.last_error_message
+        FROM import_chunk
+        JOIN project ON project.id = import_chunk.project_id
+        WHERE import_chunk.state IN ('running', 'pending')
+        ORDER BY
+            CASE import_chunk.state
+                WHEN 'running' THEN 0
+                WHEN 'pending' THEN 1
+                ELSE 2
+            END,
+            import_chunk.started_at_utc DESC,
+            import_chunk.id DESC
+        LIMIT 1
+        ",
+    )?;
+    Ok(stmt
+        .query_row([], decode_import_chunk_status_row)
+        .optional()?)
+}
+
+fn load_latest_completed_chunk(
+    conn: &rusqlite::Connection,
+) -> Result<Option<ImportChunkStatusRow>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT
+            import_chunk.id,
+            project.canonical_key,
+            import_chunk.chunk_day_local,
+            import_chunk.state,
+            import_chunk.last_attempt_phase,
+            import_chunk.publish_seq,
+            import_chunk.started_at_utc,
+            import_chunk.completed_at_utc,
+            import_chunk.last_error_message
+        FROM import_chunk
+        JOIN project ON project.id = import_chunk.project_id
+        WHERE import_chunk.state = 'complete'
+        ORDER BY import_chunk.publish_seq DESC, import_chunk.id DESC
+        LIMIT 1
+        ",
+    )?;
+    Ok(stmt
+        .query_row([], decode_import_chunk_status_row)
+        .optional()?)
+}
+
+fn load_recent_failed_chunks(conn: &rusqlite::Connection) -> Result<Vec<ImportChunkStatusRow>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT
+            import_chunk.id,
+            project.canonical_key,
+            import_chunk.chunk_day_local,
+            import_chunk.state,
+            import_chunk.last_attempt_phase,
+            import_chunk.publish_seq,
+            import_chunk.started_at_utc,
+            import_chunk.completed_at_utc,
+            import_chunk.last_error_message
+        FROM import_chunk
+        JOIN project ON project.id = import_chunk.project_id
+        WHERE import_chunk.state = 'failed'
+        ORDER BY import_chunk.completed_at_utc DESC, import_chunk.id DESC
+        LIMIT 3
+        ",
+    )?;
+    let rows = stmt.query_map([], decode_import_chunk_status_row)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("unable to decode failed import chunk rows")
+}
+
+fn decode_import_chunk_status_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ImportChunkStatusRow> {
+    let state_raw: String = row.get(3)?;
+    let phase_raw: Option<String> = row.get(4)?;
+    Ok(ImportChunkStatusRow {
+        id: row.get(0)?,
+        project_key: row.get(1)?,
+        chunk_day_local: row.get(2)?,
+        state: ImportChunkState::from_db_value(&state_raw).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown import chunk state {state_raw}"),
+                )),
+            )
+        })?,
+        phase: match phase_raw {
+            Some(phase_raw) => {
+                Some(ImportChunkPhase::from_db_value(&phase_raw).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("unknown import chunk phase {phase_raw}"),
+                        )),
+                    )
+                })?)
+            }
+            None => None,
+        },
+        publish_seq: row.get(5)?,
+        started_at_utc: row.get(6)?,
+        completed_at_utc: row.get(7)?,
+        last_error_message: row.get(8)?,
+    })
+}
+
+fn render_import_status_report(report: &ImportStatusReport) -> String {
+    let mut output = String::new();
+    let _ = writeln!(&mut output, "database: {}", report.db_path.display());
+
+    if !report.db_exists {
+        let _ = writeln!(&mut output, "status: no cache database found");
+        let _ = writeln!(
+            &mut output,
+            "hint: run `cargo run -p gnomon -- db rebuild` or launch `gnomon` to populate the cache"
+        );
+        return output;
+    }
+
+    let _ = writeln!(&mut output, "status: {}", import_status_summary(report));
+    let _ = writeln!(
+        &mut output,
+        "chunks: pending={}, running={}, complete={}, failed={}",
+        report.counts.pending, report.counts.running, report.counts.complete, report.counts.failed
+    );
+
+    if !report.phase_counts.is_empty() {
+        for phase_counts in &report.phase_counts {
+            let _ = writeln!(
+                &mut output,
+                "{} chunks: pending={}, running={}, complete={}, failed={}",
+                phase_counts.phase.as_str(),
+                phase_counts.counts.pending,
+                phase_counts.counts.running,
+                phase_counts.counts.complete,
+                phase_counts.counts.failed,
+            );
+        }
+    }
+
+    let snapshot_description = if report.snapshot.is_bootstrap() {
+        "no published snapshot yet".to_string()
+    } else {
+        match report.snapshot.upper_bound_utc.as_deref() {
+            Some(upper_bound) => format!(
+                "publish_seq <= {} ({} published chunk(s), through {})",
+                report.snapshot.max_publish_seq, report.snapshot.published_chunk_count, upper_bound
+            ),
+            None => format!(
+                "publish_seq <= {} ({} published chunk(s))",
+                report.snapshot.max_publish_seq, report.snapshot.published_chunk_count
+            ),
+        }
+    };
+    let _ = writeln!(&mut output, "latest snapshot: {snapshot_description}");
+
+    if let Some(active_chunk) = &report.active_chunk {
+        let phase = active_chunk
+            .phase
+            .map(ImportChunkPhase::as_str)
+            .unwrap_or("unknown");
+        let _ = writeln!(
+            &mut output,
+            "active chunk: {} [{} phase, state={}]",
+            active_chunk.label(),
+            phase,
+            active_chunk.state.as_str()
+        );
+        let _ = writeln!(
+            &mut output,
+            "active started: {}",
+            active_chunk.started_at_utc
+        );
+    }
+
+    if let Some(latest_completed_chunk) = &report.latest_completed_chunk {
+        let publish_seq = latest_completed_chunk
+            .publish_seq
+            .map(|seq| format!("#{seq}"))
+            .unwrap_or_else(|| "unknown".to_string());
+        let completed_at = latest_completed_chunk
+            .completed_at_utc
+            .as_deref()
+            .unwrap_or("unknown");
+        let _ = writeln!(
+            &mut output,
+            "latest completed chunk: {} (publish_seq {}, completed {})",
+            latest_completed_chunk.label(),
+            publish_seq,
+            completed_at
+        );
+    }
+
+    if report.recent_failures.is_empty() {
+        let _ = writeln!(&mut output, "recent failures: none");
+    } else {
+        let _ = writeln!(&mut output, "recent failures:");
+        for failure in &report.recent_failures {
+            let phase = failure
+                .phase
+                .map(ImportChunkPhase::as_str)
+                .unwrap_or("unknown");
+            let completed_at = failure.completed_at_utc.as_deref().unwrap_or("unknown");
+            let message = failure
+                .last_error_message
+                .as_deref()
+                .unwrap_or("no stored error message");
+            let _ = writeln!(
+                &mut output,
+                "- {} [{} phase, completed {}]: {}",
+                failure.label(),
+                phase,
+                completed_at,
+                message
+            );
+        }
+    }
+
+    output
+}
+
+fn import_status_summary(report: &ImportStatusReport) -> String {
+    if let Some(active_chunk) = &report.active_chunk {
+        let phase = active_chunk
+            .phase
+            .map(ImportChunkPhase::as_str)
+            .unwrap_or("unknown");
+        return match active_chunk.state {
+            ImportChunkState::Running => format!("active ({phase} phase)"),
+            ImportChunkState::Pending => format!("queued ({phase} phase)"),
+            ImportChunkState::Complete | ImportChunkState::Failed => "idle".to_string(),
+        };
+    }
+
+    if report.counts.failed > 0 {
+        return "idle with failures".to_string();
+    }
+    if report.counts.complete > 0 {
+        return "idle".to_string();
+    }
+    if report.counts.active_count() > 0 {
+        return "queued".to_string();
+    }
+
+    "no imported chunks yet".to_string()
 }
 
 struct StartupConsoleProgress {
@@ -891,6 +1399,14 @@ impl SkillsArgs {
 }
 
 impl StartupArgs {
+    fn import_mode(&self) -> StartupImportMode {
+        if self.full_import {
+            StartupImportMode::Full
+        } else {
+            StartupImportMode::RecentFirst
+        }
+    }
+
     fn has_explicit_selection(&self) -> bool {
         self.root.is_some()
             || self.path.is_some()
@@ -1058,8 +1574,8 @@ mod tests {
         BenchmarkArgs, BrowsePathKindArg, ClassificationStateArg, Cli, Command, DbSubcommand,
         GlobalArgs, MetricLensArg, OpportunityCategoryArg, OpportunityConfidenceArg, ReportArgs,
         ResetArgs, RootViewArg, SkillsArgs, SkillsPathArg, StartupArgs, build_browse_report,
-        build_query_benchmark_report, count_completed_chunks, filter_opportunities,
-        rebuild_database, run_db_command,
+        build_import_status_report, build_query_benchmark_report, count_completed_chunks,
+        filter_opportunities, rebuild_database, render_import_status_report, run_db_command,
     };
     use clap::ValueEnum;
     use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
@@ -1094,6 +1610,7 @@ mod tests {
 
         assert!(db_help.contains("reset"));
         assert!(db_help.contains("rebuild"));
+        assert!(db_help.contains("status"));
     }
 
     #[test]
@@ -1120,6 +1637,7 @@ mod tests {
             Some(Command::Db(command)) => match command.command {
                 DbSubcommand::Reset(args) => assert!(args.force),
                 DbSubcommand::Rebuild => panic!("expected reset subcommand"),
+                DbSubcommand::Status => panic!("expected reset subcommand"),
             },
             Some(Command::Benchmark(_)) => panic!("expected db command"),
             Some(Command::Report(_)) => panic!("expected db command"),
@@ -1153,6 +1671,7 @@ mod tests {
             Some(Command::Db(command)) => match command.command {
                 DbSubcommand::Rebuild => {}
                 DbSubcommand::Reset(_) => panic!("expected rebuild subcommand"),
+                DbSubcommand::Status => panic!("expected rebuild subcommand"),
             },
             Some(Command::Benchmark(_)) => panic!("expected db command"),
             Some(Command::Report(_)) => panic!("expected db command"),
@@ -1321,10 +1840,33 @@ mod tests {
         assert_eq!(
             cli.startup,
             StartupArgs {
+                full_import: false,
                 root: Some(RootViewArg::Project),
                 path: Some(BrowsePathKindArg::ProjectCategory),
                 project_id: Some(7),
                 category: Some("editing".to_string()),
+                parent_path: None,
+                classification_state: None,
+                normalized_action: None,
+                command_family: None,
+                base_command: None,
+            }
+        );
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parse_accepts_startup_full_import_flag() {
+        let cli = Cli::parse_from(["gnomon", "--startup-full-import"]);
+
+        assert_eq!(
+            cli.startup,
+            StartupArgs {
+                full_import: true,
+                root: None,
+                path: None,
+                project_id: None,
+                category: None,
                 parent_path: None,
                 classification_state: None,
                 normalized_action: None,
@@ -1607,6 +2149,159 @@ mod tests {
         assert!(warning.1.contains(&bad_path.display().to_string()));
         assert!(warning.1.contains("line 2"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn db_status_reports_missing_cache() -> Result<()> {
+        let temp = tempdir()?;
+        let config = load_test_config(
+            temp.path(),
+            temp.path().join("usage.sqlite3"),
+            temp.path().join("source"),
+        )?;
+
+        let report = build_import_status_report(&config)?;
+        let rendered = render_import_status_report(&report);
+
+        assert!(!report.db_exists);
+        assert_eq!(report.counts, Default::default());
+        assert!(rendered.contains("status: no cache database found"));
+        Ok(())
+    }
+
+    #[test]
+    fn db_status_reports_startup_running_chunk() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let config = load_test_config(temp.path(), db_path.clone(), temp.path().join("source"))?;
+        let database = Database::open(&db_path)?;
+        let project_id = insert_test_project(database.connection(), "git:/tmp/startup")?;
+        insert_test_import_chunk(
+            database.connection(),
+            project_id,
+            "2026-04-07",
+            "running",
+            Some("startup"),
+            None,
+            Some("2026-04-07 12:00:00"),
+            None,
+            None,
+        )?;
+
+        let report = build_import_status_report(&config)?;
+        let rendered = render_import_status_report(&report);
+
+        assert_eq!(report.counts.running, 1);
+        assert_eq!(
+            report
+                .active_chunk
+                .as_ref()
+                .and_then(|chunk| chunk.phase)
+                .expect("active startup phase")
+                .as_str(),
+            "startup"
+        );
+        assert!(rendered.contains("status: active (startup phase)"));
+        Ok(())
+    }
+
+    #[test]
+    fn db_status_reports_deferred_running_chunk() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let config = load_test_config(temp.path(), db_path.clone(), temp.path().join("source"))?;
+        let database = Database::open(&db_path)?;
+        let project_id = insert_test_project(database.connection(), "git:/tmp/deferred")?;
+        insert_test_import_chunk(
+            database.connection(),
+            project_id,
+            "2026-04-01",
+            "running",
+            Some("deferred"),
+            None,
+            Some("2026-04-07 12:00:00"),
+            None,
+            None,
+        )?;
+
+        let report = build_import_status_report(&config)?;
+        let rendered = render_import_status_report(&report);
+
+        assert_eq!(report.counts.running, 1);
+        assert_eq!(
+            report
+                .active_chunk
+                .as_ref()
+                .and_then(|chunk| chunk.phase)
+                .expect("active deferred phase")
+                .as_str(),
+            "deferred"
+        );
+        assert!(rendered.contains("status: active (deferred phase)"));
+        Ok(())
+    }
+
+    #[test]
+    fn db_status_reports_idle_after_completed_chunks() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let config = load_test_config(temp.path(), db_path.clone(), temp.path().join("source"))?;
+        let database = Database::open(&db_path)?;
+        let project_id = insert_test_project(database.connection(), "git:/tmp/completed")?;
+        insert_test_import_chunk(
+            database.connection(),
+            project_id,
+            "2026-04-07",
+            "complete",
+            Some("startup"),
+            Some(7),
+            Some("2026-04-07 12:00:00"),
+            Some("2026-04-07 12:05:00"),
+            None,
+        )?;
+
+        let report = build_import_status_report(&config)?;
+        let rendered = render_import_status_report(&report);
+
+        assert_eq!(report.counts.complete, 1);
+        assert!(report.active_chunk.is_none());
+        assert_eq!(report.snapshot.max_publish_seq, 7);
+        assert!(rendered.contains("status: idle"));
+        assert!(rendered.contains("latest completed chunk: git:/tmp/completed:2026-04-07"));
+        Ok(())
+    }
+
+    #[test]
+    fn db_status_reports_recent_failure_messages() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let config = load_test_config(temp.path(), db_path.clone(), temp.path().join("source"))?;
+        let database = Database::open(&db_path)?;
+        let project_id = insert_test_project(database.connection(), "git:/tmp/failure")?;
+        insert_test_import_chunk(
+            database.connection(),
+            project_id,
+            "2026-04-06",
+            "failed",
+            Some("deferred"),
+            None,
+            Some("2026-04-07 11:00:00"),
+            Some("2026-04-07 11:01:00"),
+            Some("unable to normalize source file /tmp/failure/session.jsonl"),
+        )?;
+
+        let report = build_import_status_report(&config)?;
+        let rendered = render_import_status_report(&report);
+
+        assert_eq!(report.counts.failed, 1);
+        assert_eq!(report.recent_failures.len(), 1);
+        assert_eq!(
+            report.recent_failures[0].last_error_message.as_deref(),
+            Some("unable to normalize source file /tmp/failure/session.jsonl")
+        );
+        assert!(rendered.contains("recent failures:"));
+        assert!(rendered.contains("unable to normalize source file /tmp/failure/session.jsonl"));
         Ok(())
     }
 
@@ -1934,6 +2629,62 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
+        Ok(())
+    }
+    fn insert_test_project(conn: &rusqlite::Connection, canonical_key: &str) -> Result<i64> {
+        conn.execute(
+            "
+            INSERT INTO project (canonical_key, identity_kind, display_name, root_path)
+            VALUES (?1, 'git', ?1, ?2)
+            ",
+            rusqlite::params![
+                canonical_key,
+                format!("/tmp/{}", canonical_key.replace('/', "_"))
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_test_import_chunk(
+        conn: &rusqlite::Connection,
+        project_id: i64,
+        chunk_day_local: &str,
+        state: &str,
+        last_attempt_phase: Option<&str>,
+        publish_seq: Option<i64>,
+        started_at_utc: Option<&str>,
+        completed_at_utc: Option<&str>,
+        last_error_message: Option<&str>,
+    ) -> Result<()> {
+        conn.execute(
+            "
+            INSERT INTO import_chunk (
+                project_id,
+                chunk_day_local,
+                state,
+                publish_seq,
+                started_at_utc,
+                completed_at_utc,
+                imported_record_count,
+                imported_message_count,
+                imported_action_count,
+                last_attempt_phase,
+                last_error_message
+            )
+            VALUES (?1, ?2, ?3, ?4, COALESCE(?5, CURRENT_TIMESTAMP), ?6, 0, 0, 0, ?7, ?8)
+            ",
+            rusqlite::params![
+                project_id,
+                chunk_day_local,
+                state,
+                publish_seq,
+                started_at_utc,
+                completed_at_utc,
+                last_attempt_phase,
+                last_error_message
+            ],
+        )?;
         Ok(())
     }
 

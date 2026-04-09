@@ -361,6 +361,7 @@ async fn status_impl(
         startup: StartupStatusResponse {
             open_reason: match startup.open_reason {
                 StartupOpenReason::Last24hReady => "last_24h_ready",
+                StartupOpenReason::FullImportReady => "full_import_ready",
                 StartupOpenReason::TimedOut => "timed_out",
             },
             startup_status_message: startup.startup_status_message,

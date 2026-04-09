@@ -40,7 +40,6 @@ const QUADRANT_SAMPLES: [(f64, f64, u8); 4] = [
 struct QuantizedLayer {
     slot_owners: Vec<Option<usize>>,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SampleHit {
     layer_index: usize,
@@ -221,11 +220,18 @@ fn rasterize_braille(
     for y in inner.y..inner.y + inner.height {
         for x in inner.x..inner.x + inner.width {
             let hits = braille_cell_hits(x, y, &raster_context);
-
-            let Some(owner) = dominant_segment(&hits, &model.layers) else {
+            let Some(dominant_layer_index) = dominant_layer_index(&hits) else {
                 continue;
             };
-            let dots = hits
+            let layer_hits = hits
+                .iter()
+                .copied()
+                .filter(|hit| hit.layer_index == dominant_layer_index)
+                .collect::<Vec<_>>();
+            let Some(owner) = dominant_segment(&layer_hits, &model.layers) else {
+                continue;
+            };
+            let dots = layer_hits
                 .iter()
                 .fold(0_u32, |bits, hit| bits | u32::from(hit.sample_bit));
             if dots == 0 {
@@ -665,6 +671,26 @@ fn quadrant_glyph(mask: u8) -> Option<char> {
     }
 }
 
+fn dominant_layer_index(hits: &[SampleHit]) -> Option<usize> {
+    if hits.is_empty() {
+        return None;
+    }
+
+    let mut counts = std::collections::BTreeMap::<usize, usize>::new();
+    for hit in hits {
+        *counts.entry(hit.layer_index).or_default() += 1;
+    }
+
+    counts
+        .into_iter()
+        .max_by(|(left_layer, left_count), (right_layer, right_count)| {
+            left_count
+                .cmp(right_count)
+                .then_with(|| left_layer.cmp(right_layer))
+        })
+        .map(|(layer_index, _)| layer_index)
+}
+
 /// Muted ANSI-256 palette — geometry carries the primary signal, color stays
 /// secondary.
 fn sunburst_bucket_color(bucket: SunburstBucket) -> Color {
@@ -1002,99 +1028,6 @@ mod tests {
         assert_eq!(owner.segment_index, 1);
     }
 
-    #[test]
-    fn rendered_braille_cell_preserves_all_sampled_dots_in_narrow_selected_child_span() {
-        let root_layer = make_layer(
-            &[
-                (90.0, SunburstBucket::Project, false),
-                (10.0, SunburstBucket::Category, true),
-            ],
-            SunburstSpan::full(),
-            100.0,
-        );
-        let child_layer = make_layer(
-            &[
-                (1.0, SunburstBucket::Project, true),
-                (1.0, SunburstBucket::Category, false),
-                (1.0, SunburstBucket::Classified, false),
-                (1.0, SunburstBucket::Mixed, false),
-            ],
-            SunburstSpan {
-                start: 0.0,
-                sweep: TAU / 12.0,
-            },
-            4.0,
-        );
-        let model = SunburstModel {
-            center: Default::default(),
-            layers: vec![root_layer, child_layer],
-        };
-        let config = SunburstRenderConfig {
-            mode: SunburstRenderMode::Braille,
-            ..SunburstRenderConfig::default()
-        };
-        let inner = ratatui::layout::Rect::new(0, 0, 28, 14);
-        let quantized_layers = quantize_layers(inner, &model, config);
-        let center_x = f64::from(inner.x) + f64::from(inner.width) / 2.0;
-        let center_y = f64::from(inner.y) + f64::from(inner.height) / 2.0;
-        let radius_x = (f64::from(inner.width) / 2.0).max(1.0);
-        let radius_y = (f64::from(inner.height) / 2.0).max(1.0);
-        let ring_band = (config.outer_radius - config.center_radius) / model.layers.len() as f64;
-        let raster_context = RasterContext {
-            center_x,
-            center_y,
-            radius_x,
-            radius_y,
-            ring_band,
-            model: &model,
-            quantized_layers: &quantized_layers,
-            config,
-        };
-
-        let mixed_cell = (inner.y..inner.y + inner.height)
-            .flat_map(|y| (inner.x..inner.x + inner.width).map(move |x| (x, y)))
-            .find_map(|(x, y)| {
-                let hits = braille_cell_hits(x, y, &raster_context);
-                let owners = hits
-                    .iter()
-                    .map(|hit| (hit.layer_index, hit.segment_index))
-                    .collect::<std::collections::BTreeSet<_>>();
-                (owners.len() > 1).then_some((x, y, hits))
-            })
-            .expect("expected at least one braille cell to sample multiple slice owners");
-
-        let all_dots = mixed_cell
-            .2
-            .iter()
-            .fold(0_u32, |bits, hit| bits | u32::from(hit.sample_bit));
-        let dominant_owner =
-            dominant_segment(&mixed_cell.2, &model.layers).expect("dominant owner");
-        assert!(
-            mixed_cell.2.iter().any(|hit| {
-                (hit.layer_index != dominant_owner.layer_index
-                    || hit.segment_index != dominant_owner.segment_index)
-                    && (u32::from(hit.sample_bit) & all_dots) != 0
-            }),
-            "the mixed cell must include non-dominant dots for this regression to matter"
-        );
-
-        let mut buf = Buffer::empty(inner);
-        rasterize_sunburst(&mut buf, inner, &model, config);
-        let symbol = buf
-            .cell((mixed_cell.0, mixed_cell.1))
-            .expect("rendered cell")
-            .symbol()
-            .chars()
-            .next()
-            .expect("braille symbol");
-        let actual_dots = u32::from(symbol).saturating_sub(0x2800);
-
-        assert_eq!(
-            actual_dots, all_dots,
-            "the rendered cell should preserve all per-dot ownership, not drop non-dominant dots"
-        );
-    }
-
     fn quadrant_mask(symbol: char) -> Option<u8> {
         match symbol {
             '▘' => Some(0x1),
@@ -1114,5 +1047,85 @@ mod tests {
             '█' => Some(0xF),
             _ => None,
         }
+    }
+
+    #[test]
+    fn dominant_layer_prefers_majority_hits_over_inner_selected_layer() {
+        let hits = vec![
+            SampleHit {
+                layer_index: 0,
+                segment_index: 0,
+                sample_bit: 0x01,
+            },
+            SampleHit {
+                layer_index: 1,
+                segment_index: 0,
+                sample_bit: 0x02,
+            },
+            SampleHit {
+                layer_index: 1,
+                segment_index: 1,
+                sample_bit: 0x04,
+            },
+        ];
+
+        assert_eq!(dominant_layer_index(&hits), Some(1));
+    }
+
+    #[test]
+    fn braille_uses_only_dots_from_the_dominant_ring_layer() {
+        let model = SunburstModel {
+            center: Default::default(),
+            layers: vec![
+                make_layer(
+                    &[(100.0, SunburstBucket::Project, true)],
+                    SunburstSpan::full(),
+                    100.0,
+                ),
+                make_layer(
+                    &[
+                        (50.0, SunburstBucket::Category, false),
+                        (50.0, SunburstBucket::Classified, false),
+                    ],
+                    SunburstSpan {
+                        start: 0.0,
+                        sweep: TAU / 6.0,
+                    },
+                    100.0,
+                ),
+            ],
+        };
+        let hits = vec![
+            SampleHit {
+                layer_index: 0,
+                segment_index: 0,
+                sample_bit: 0x01,
+            },
+            SampleHit {
+                layer_index: 1,
+                segment_index: 0,
+                sample_bit: 0x02,
+            },
+            SampleHit {
+                layer_index: 1,
+                segment_index: 1,
+                sample_bit: 0x04,
+            },
+        ];
+
+        let dominant_layer = dominant_layer_index(&hits).expect("dominant layer");
+        let layer_hits = hits
+            .iter()
+            .copied()
+            .filter(|hit| hit.layer_index == dominant_layer)
+            .collect::<Vec<_>>();
+        let owner = dominant_segment(&layer_hits, &model.layers).expect("dominant owner");
+        let dots = layer_hits
+            .iter()
+            .fold(0_u32, |bits, hit| bits | u32::from(hit.sample_bit));
+
+        assert_eq!(dominant_layer, 1);
+        assert_eq!(owner.layer_index, 1);
+        assert_eq!(dots, 0x06);
     }
 }

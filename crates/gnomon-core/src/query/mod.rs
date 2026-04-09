@@ -1630,7 +1630,8 @@ impl<'conn> QueryEngine<'conn> {
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("unable to read skills report rows")?;
         let metrics_by_conversation = self.load_conversation_metrics(snapshot)?;
-        let invocation_rows = self.skill_invocations(snapshot, &SkillInvocationFilters::default())?;
+        let invocation_rows =
+            self.skill_invocations(snapshot, &SkillInvocationFilters::default())?;
         let mut aggregated = BTreeMap::<(String, String), AggregatedSkillInvocation>::new();
         for row in invocation_rows {
             let entry = aggregated
@@ -1660,7 +1661,10 @@ impl<'conn> QueryEngine<'conn> {
             .into_iter()
             .map(|association| {
                 (
-                    (association.skill_name.clone(), association.session_id.clone()),
+                    (
+                        association.skill_name.clone(),
+                        association.session_id.clone(),
+                    ),
                     association,
                 )
             })
@@ -5590,9 +5594,9 @@ mod tests {
         ActionKey, BatchBrowseRequest, BatchBrowseResult, BrowseFilters, BrowsePath, BrowseRequest,
         ClassificationState, ConversationTurnRow, FilterOptions, HistoryEventFilters, MetricLens,
         QueryEngine, RootView, SkillAttributionConfidence, SkillAttributionSummary,
-        SkillInvocationConfidence, SkillInvocationFilters, SkillTranscriptEvidenceKind,
-        SkillsPath, SnapshotBounds, SnapshotCoverageSummary,
-        TimeWindowFilter, build_grouped_action_rollup_rows_query, build_opportunities_rows,
+        SkillInvocationConfidence, SkillInvocationFilters, SkillTranscriptEvidenceKind, SkillsPath,
+        SnapshotBounds, SnapshotCoverageSummary, TimeWindowFilter,
+        build_grouped_action_rollup_rows_query, build_opportunities_rows,
         build_scoped_action_facts_query, build_scoped_path_facts_query, display_category,
     };
 

@@ -162,13 +162,14 @@ Shell commands do not create path attribution.
 ### Visibility and Consistency
 
 - A chunk becomes visible only when fully imported
-- Startup imports the last 24 hours first
+- Default startup imports the last 24 hours first
+- `--startup-full-import` waits for the full import before the UI opens
 - Open the TUI when:
   - last 24 hours are ready, or
   - 10 seconds have elapsed
 - Failed startup chunks do not block the TUI; mark them failed and print the
   first actionable error on stderr outside the TUI lifecycle
-- Continue importing in one background worker after the UI opens
+- Continue importing in one background worker after the UI opens for default startup
 - Do not auto-apply new data to the visible UI
 - Instead, show `new data available`
 - The active UI queries against a pinned set of completed chunks until manual refresh

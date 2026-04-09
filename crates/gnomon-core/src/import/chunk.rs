@@ -27,12 +27,20 @@ const IMPORTER_THREAD_NAME: &str = "gnomon-importer";
 pub enum StartupOpenReason {
     Last24hReady,
     TimedOut,
+    FullImportReady,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupImportMode {
+    RecentFirst,
+    Full,
 }
 
 pub struct StartupImport {
     pub snapshot: SnapshotBounds,
     pub open_reason: StartupOpenReason,
     pub startup_status_message: Option<String>,
+    pub deferred_status_message: Option<String>,
     pub startup_progress_update: Option<StartupProgressUpdate>,
     status_updates: Option<Receiver<StartupWorkerEvent>>,
     worker: Option<JoinHandle<Result<()>>>,
@@ -130,6 +138,21 @@ struct PreparedChunk {
     source_files: Vec<ChunkSourceFile>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportPhase {
+    Startup,
+    Deferred,
+}
+
+impl ImportPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Deferred => "deferred",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChunkSourceFile {
     source_file_id: i64,
@@ -165,13 +188,38 @@ pub fn start_startup_import(
     db_path: &Path,
     source_root: &Path,
 ) -> Result<StartupImport> {
-    start_startup_import_with_progress(conn, db_path, source_root, |_| {})
+    start_startup_import_with_mode_and_progress(
+        conn,
+        db_path,
+        source_root,
+        StartupImportMode::RecentFirst,
+        |_| {},
+    )
 }
 
 pub fn start_startup_import_with_progress<F>(
     conn: &Connection,
     db_path: &Path,
     source_root: &Path,
+    on_progress: F,
+) -> Result<StartupImport>
+where
+    F: FnMut(&StartupProgressUpdate),
+{
+    start_startup_import_with_mode_and_progress(
+        conn,
+        db_path,
+        source_root,
+        StartupImportMode::RecentFirst,
+        on_progress,
+    )
+}
+
+pub fn start_startup_import_with_mode_and_progress<F>(
+    conn: &Connection,
+    db_path: &Path,
+    source_root: &Path,
+    import_mode: StartupImportMode,
     mut on_progress: F,
 ) -> Result<StartupImport>
 where
@@ -182,6 +230,7 @@ where
         db_path,
         source_root,
         Duration::from_secs(STARTUP_OPEN_DEADLINE_SECS),
+        import_mode,
         ImportWorkerOptions::default(),
         Some(&mut on_progress),
     )
@@ -245,6 +294,7 @@ fn start_startup_import_with_options(
     db_path: &Path,
     source_root: &Path,
     wait_timeout: Duration,
+    import_mode: StartupImportMode,
     worker_options: ImportWorkerOptions,
     mut on_progress: Option<&mut dyn FnMut(&StartupProgressUpdate)>,
 ) -> Result<StartupImport> {
@@ -256,8 +306,12 @@ fn start_startup_import_with_options(
     if prepared.is_empty() {
         return Ok(StartupImport {
             snapshot: SnapshotBounds::load(conn)?,
-            open_reason: StartupOpenReason::Last24hReady,
+            open_reason: match import_mode {
+                StartupImportMode::RecentFirst => StartupOpenReason::Last24hReady,
+                StartupImportMode::Full => StartupOpenReason::FullImportReady,
+            },
             startup_status_message: None,
+            deferred_status_message: None,
             startup_progress_update: None,
             status_updates: None,
             worker: None,
@@ -283,7 +337,9 @@ fn start_startup_import_with_options(
         }) {
         Ok(worker) => worker,
         Err(err) => {
-            mark_chunks_failed(conn, &prepared)?;
+            let error_message =
+                compact_status_text(format!("unable to spawn background importer worker: {err}"));
+            mark_chunks_failed(conn, &prepared, Some(error_message.as_str()))?;
             return Err(anyhow!(err)).context("unable to spawn background importer worker");
         }
     };
@@ -297,37 +353,85 @@ fn start_startup_import_with_options(
                 total: plan.startup_chunks.len(),
                 detail: format!("{}:{}", chunk.project_key, chunk.chunk_day_local),
             });
-    let (open_reason, startup_status_message) = loop {
-        match receiver.recv_timeout(wait_timeout) {
-            Ok(StartupWorkerEvent::Progress { update }) => {
-                startup_progress_update = Some(update.clone());
-                if let Some(callback) = on_progress.as_mut() {
-                    callback(&update);
+    match import_mode {
+        StartupImportMode::RecentFirst => {
+            let (open_reason, startup_status_message) = loop {
+                match receiver.recv_timeout(wait_timeout) {
+                    Ok(StartupWorkerEvent::Progress { update }) => {
+                        startup_progress_update = Some(update.clone());
+                        if let Some(callback) = on_progress.as_mut() {
+                            callback(&update);
+                        }
+                    }
+                    Ok(StartupWorkerEvent::StartupSettled {
+                        startup_status_message,
+                    }) => break (StartupOpenReason::Last24hReady, startup_status_message),
+                    Ok(StartupWorkerEvent::DeferredFailures { .. }) => continue,
+                    Ok(StartupWorkerEvent::Finished) => continue,
+                    Err(RecvTimeoutError::Timeout) => break (StartupOpenReason::TimedOut, None),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        let worker_result = join_worker(Some(worker));
+                        return Err(worker_result.err().unwrap_or_else(|| {
+                            anyhow!("background importer exited before signaling startup readiness")
+                        }));
+                    }
+                }
+            };
+
+            Ok(StartupImport {
+                snapshot: SnapshotBounds::load(conn)?,
+                open_reason,
+                startup_status_message,
+                deferred_status_message: None,
+                startup_progress_update,
+                status_updates: Some(receiver),
+                worker: Some(worker),
+            })
+        }
+        StartupImportMode::Full => {
+            let mut startup_status_message = None;
+            let mut deferred_status_message = None;
+
+            loop {
+                match receiver.recv() {
+                    Ok(StartupWorkerEvent::Progress { update }) => {
+                        if let Some(callback) = on_progress.as_mut() {
+                            callback(&update);
+                        }
+                    }
+                    Ok(StartupWorkerEvent::StartupSettled {
+                        startup_status_message: status_message,
+                    }) => {
+                        startup_status_message = status_message;
+                    }
+                    Ok(StartupWorkerEvent::DeferredFailures {
+                        deferred_status_message: status_message,
+                    }) => {
+                        deferred_status_message = status_message;
+                    }
+                    Ok(StartupWorkerEvent::Finished) => break,
+                    Err(_) => {
+                        let worker_result = join_worker(Some(worker));
+                        return Err(worker_result.err().unwrap_or_else(|| {
+                            anyhow!("background importer exited before signaling full completion")
+                        }));
+                    }
                 }
             }
-            Ok(StartupWorkerEvent::StartupSettled {
-                startup_status_message,
-            }) => break (StartupOpenReason::Last24hReady, startup_status_message),
-            Ok(StartupWorkerEvent::DeferredFailures { .. }) => continue,
-            Ok(StartupWorkerEvent::Finished) => continue,
-            Err(RecvTimeoutError::Timeout) => break (StartupOpenReason::TimedOut, None),
-            Err(RecvTimeoutError::Disconnected) => {
-                let worker_result = join_worker(Some(worker));
-                return Err(worker_result.err().unwrap_or_else(|| {
-                    anyhow!("background importer exited before signaling startup readiness")
-                }));
-            }
-        }
-    };
 
-    Ok(StartupImport {
-        snapshot: SnapshotBounds::load(conn)?,
-        open_reason,
-        startup_status_message,
-        startup_progress_update,
-        status_updates: Some(receiver),
-        worker: Some(worker),
-    })
+            join_worker(Some(worker))?;
+
+            Ok(StartupImport {
+                snapshot: SnapshotBounds::load(conn)?,
+                open_reason: StartupOpenReason::FullImportReady,
+                startup_status_message,
+                deferred_status_message,
+                startup_progress_update: None,
+                status_updates: None,
+                worker: None,
+            })
+        }
+    }
 }
 
 fn build_import_plan(
@@ -527,17 +631,21 @@ fn prepare_import_plan(conn: &Connection, plan: &ImportPlan) -> Result<PreparedI
         startup_chunks: plan
             .startup_chunks
             .iter()
-            .map(|chunk| prepare_chunk(conn, chunk))
+            .map(|chunk| prepare_chunk(conn, chunk, ImportPhase::Startup))
             .collect::<Result<Vec<_>>>()?,
         deferred_chunks: plan
             .deferred_chunks
             .iter()
-            .map(|chunk| prepare_chunk(conn, chunk))
+            .map(|chunk| prepare_chunk(conn, chunk, ImportPhase::Deferred))
             .collect::<Result<Vec<_>>>()?,
     })
 }
 
-fn prepare_chunk(conn: &Connection, chunk: &ChunkCandidate) -> Result<PreparedChunk> {
+fn prepare_chunk(
+    conn: &Connection,
+    chunk: &ChunkCandidate,
+    phase: ImportPhase,
+) -> Result<PreparedChunk> {
     let import_chunk_id = conn
         .query_row(
             "
@@ -551,9 +659,11 @@ fn prepare_chunk(conn: &Connection, chunk: &ChunkCandidate) -> Result<PreparedCh
                 imported_message_count,
                 imported_action_count,
                 imported_conversation_count,
-                imported_turn_count
+                imported_turn_count,
+                last_attempt_phase,
+                last_error_message
             )
-            VALUES (?1, ?2, 'pending', NULL, NULL, 0, 0, 0, 0, 0)
+            VALUES (?1, ?2, 'pending', NULL, NULL, 0, 0, 0, 0, 0, ?3, NULL)
             ON CONFLICT(project_id, chunk_day_local) DO UPDATE SET
                 state = 'pending',
                 publish_seq = NULL,
@@ -562,10 +672,12 @@ fn prepare_chunk(conn: &Connection, chunk: &ChunkCandidate) -> Result<PreparedCh
                 imported_message_count = 0,
                 imported_action_count = 0,
                 imported_conversation_count = 0,
-                imported_turn_count = 0
+                imported_turn_count = 0,
+                last_attempt_phase = excluded.last_attempt_phase,
+                last_error_message = NULL
             RETURNING id
             ",
-            params![chunk.project_id, chunk.chunk_day_local],
+            params![chunk.project_id, chunk.chunk_day_local, phase.as_str()],
             |row| row.get(0),
         )
         .with_context(|| {
@@ -584,15 +696,23 @@ fn prepare_chunk(conn: &Connection, chunk: &ChunkCandidate) -> Result<PreparedCh
     })
 }
 
-fn mark_chunks_failed(conn: &Connection, plan: &PreparedImportPlan) -> Result<()> {
+fn mark_chunks_failed(
+    conn: &Connection,
+    plan: &PreparedImportPlan,
+    error_message: Option<&str>,
+) -> Result<()> {
     for chunk in plan.all_chunks() {
         conn.execute(
             "
             UPDATE import_chunk
-            SET state = 'failed', publish_seq = NULL, completed_at_utc = CURRENT_TIMESTAMP
+            SET
+                state = 'failed',
+                publish_seq = NULL,
+                completed_at_utc = CURRENT_TIMESTAMP,
+                last_error_message = ?2
             WHERE id = ?1
             ",
-            [chunk.import_chunk_id],
+            params![chunk.import_chunk_id, error_message],
         )
         .with_context(|| {
             format!(
@@ -768,7 +888,12 @@ fn import_chunk(
     })();
 
     if let Err(err) = import_result {
-        let _ = mark_chunk_failed(database.connection_mut(), chunk.import_chunk_id);
+        let error_message = compact_status_text(format!("{err:#}"));
+        let _ = mark_chunk_failed(
+            database.connection_mut(),
+            chunk.import_chunk_id,
+            &error_message,
+        );
         return Err(err);
     }
 
@@ -788,6 +913,7 @@ fn begin_chunk_import(conn: &mut Connection, chunk: &PreparedChunk) -> Result<()
             publish_seq = NULL,
             started_at_utc = CURRENT_TIMESTAMP,
             completed_at_utc = NULL,
+            last_error_message = NULL,
             imported_record_count = 0,
             imported_message_count = 0,
             imported_action_count = 0,
@@ -911,7 +1037,8 @@ fn finalize_chunk_import(conn: &mut Connection, chunk: &PreparedChunk) -> Result
         SET
             state = 'complete',
             publish_seq = ?2,
-            completed_at_utc = CURRENT_TIMESTAMP
+            completed_at_utc = CURRENT_TIMESTAMP,
+            last_error_message = NULL
         WHERE id = ?1
         ",
         params![chunk.import_chunk_id, next_publish_seq],
@@ -928,17 +1055,22 @@ fn finalize_chunk_import(conn: &mut Connection, chunk: &PreparedChunk) -> Result
     Ok(())
 }
 
-fn mark_chunk_failed(conn: &mut Connection, import_chunk_id: i64) -> Result<()> {
+fn mark_chunk_failed(
+    conn: &mut Connection,
+    import_chunk_id: i64,
+    error_message: &str,
+) -> Result<()> {
     conn.execute(
         "
         UPDATE import_chunk
         SET
             state = 'failed',
             publish_seq = NULL,
-            completed_at_utc = CURRENT_TIMESTAMP
+            completed_at_utc = CURRENT_TIMESTAMP,
+            last_error_message = ?2
         WHERE id = ?1
         ",
-        [import_chunk_id],
+        params![import_chunk_id, error_message],
     )
     .context("unable to mark the import chunk as failed")?;
     Ok(())
@@ -967,8 +1099,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ImportWorkerOptions, StartupOpenReason, StartupWorkerEvent, build_import_plan, import_all,
-        start_startup_import_with_options,
+        ImportWorkerOptions, StartupImportMode, StartupOpenReason, StartupWorkerEvent,
+        build_import_plan, import_all, start_startup_import_with_options,
     };
     use crate::db::Database;
 
@@ -1097,6 +1229,7 @@ mod tests {
             &db_path,
             &source_root,
             Duration::from_secs(2),
+            StartupImportMode::RecentFirst,
             ImportWorkerOptions::default(),
             None,
         )?;
@@ -1172,6 +1305,7 @@ mod tests {
             &db_path,
             &source_root,
             Duration::from_millis(WAIT_TIMEOUT_MS),
+            StartupImportMode::RecentFirst,
             ImportWorkerOptions {
                 per_chunk_delay: Duration::from_millis(WORKER_DELAY_MS),
             },
@@ -1190,6 +1324,86 @@ mod tests {
             Some(("rebuilding database", 1, 1))
         );
         startup.wait_for_completion()?;
+
+        let complete_count: i64 = db.connection().query_row(
+            "SELECT COUNT(*) FROM import_chunk WHERE state = 'complete'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(complete_count, 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn startup_full_import_waits_for_deferred_chunks_before_opening() -> Result<()> {
+        const WORKER_DELAY_MS: u64 = 75;
+
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root)?;
+
+        let recent_relative_path = "recent/session.jsonl";
+        let older_relative_path = "older/session.jsonl";
+        let recent_size = write_session_fixture(
+            &source_root.join(recent_relative_path),
+            "session-full-import-recent",
+        )?;
+        let older_size = write_session_fixture(
+            &source_root.join(older_relative_path),
+            "session-full-import-older",
+        )?;
+
+        let recent = Timestamp::now()
+            .checked_sub(1_i64.hours())
+            .context("unable to construct recent startup test timestamp")?
+            .to_string();
+        let older = Timestamp::now()
+            .checked_sub(72_i64.hours())
+            .context("unable to construct older startup test timestamp")?
+            .to_string();
+
+        let mut db = Database::open(&db_path)?;
+        let project_id = insert_project_with_root(
+            db.connection_mut(),
+            "path:/startup-full-import",
+            "startup-full-import",
+            &project_root,
+        )?;
+        let _ = insert_seeded_source_file(
+            db.connection_mut(),
+            project_id,
+            recent_relative_path,
+            &recent,
+            recent_size,
+        )?;
+        let _ = insert_seeded_source_file(
+            db.connection_mut(),
+            project_id,
+            older_relative_path,
+            &older,
+            older_size,
+        )?;
+
+        let startup = start_startup_import_with_options(
+            db.connection(),
+            &db_path,
+            &source_root,
+            Duration::from_millis(1),
+            StartupImportMode::Full,
+            ImportWorkerOptions {
+                per_chunk_delay: Duration::from_millis(WORKER_DELAY_MS),
+            },
+            None,
+        )?;
+
+        assert_eq!(startup.open_reason, StartupOpenReason::FullImportReady);
+        assert_eq!(startup.snapshot.max_publish_seq, 2);
+        assert!(startup.startup_status_message.is_none());
+        assert!(startup.deferred_status_message.is_none());
+        assert!(startup.startup_progress_update.is_none());
 
         let complete_count: i64 = db.connection().query_row(
             "SELECT COUNT(*) FROM import_chunk WHERE state = 'complete'",
@@ -1257,6 +1471,7 @@ mod tests {
             &db_path,
             &source_root,
             Duration::from_secs(2),
+            StartupImportMode::RecentFirst,
             ImportWorkerOptions::default(),
             None,
         )?;
@@ -1363,6 +1578,7 @@ mod tests {
             &db_path,
             &source_root,
             Duration::from_secs(2),
+            StartupImportMode::RecentFirst,
             ImportWorkerOptions::default(),
             None,
         )?;

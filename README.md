@@ -19,11 +19,13 @@ against the latest published import snapshot. The TUI now includes synchronized
 map and statistics panes, persistent UI state, current-view filtering, global
 jump, and manual snapshot refresh.
 Startup prioritizes the last 24 hours of chunks before the UI opens and
-continues older imports in one background worker after launch. Startup and
-deferred import errors are printed on stderr outside the TUI lifecycle and do
-not abort launch; failed chunks remain excluded from the pinned snapshot until
-a later successful re-import. The checked-in design document captures the
-agreed `v1` architecture and backlog.
+continues older imports in one background worker after launch by default. Use
+`--startup-full-import` when you want the initial TUI snapshot to wait for the
+entire import to finish instead. Startup and deferred import errors are
+printed on stderr outside the TUI lifecycle and do not abort launch; failed
+chunks remain excluded from the pinned snapshot until a later successful
+re-import. The checked-in design document captures the agreed `v1`
+architecture and backlog.
 
 `gnomon-web` serves the same backend data locally over HTTP and embeds built
 frontend assets into the Rust binary. The browser build lives under
@@ -88,13 +90,33 @@ docs/
 ```bash
 cargo run -p gnomon -- --help
 cargo run -p gnomon
+cargo run -p gnomon -- --startup-full-import
 ```
 
 Press `q` or `Esc` to exit the bootstrap TUI.
 
 Fresh launches open at the top level by default. Use `--startup-*` flags to
 open directly into a narrower drill-down view when you want to skip the root
-landing state.
+landing state. `--startup-full-import` keeps the normal TUI launch path but
+waits for the full import to finish before opening, unlike `gnomon db rebuild`
+which is a maintenance command that only rebuilds the cache.
+
+## Database Status Probe
+
+Use the database status probe to verify whether import work is active without
+opening SQLite manually.
+
+```bash
+cargo run -p gnomon -- db status
+```
+
+The probe reports:
+
+- aggregate chunk counts by state (`pending`, `running`, `complete`, `failed`)
+- startup/deferred phase counts when that metadata is available
+- the currently active chunk, if one exists
+- the latest published snapshot
+- recent failed chunks with stored error text
 
 ## Skills Analytics
 
