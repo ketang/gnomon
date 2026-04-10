@@ -134,30 +134,6 @@ action-attributed totals. Unmatched invocation counts are also included so you
 can see when an explicit skill invocation did not join to a transcript-backed
 session.
 
-## TUI Screenshot Harness
-
-A portable screenshot harness lives under `tools/tui-shot/`.
-
-It runs `gnomon` in a PTY, renders the terminal via `xterm.js` inside headless
-Chromium, and captures PNG screenshots after scripted navigation steps.
-
-Bootstrap:
-
-```bash
-cd tools/tui-shot
-npm install
-npx playwright install chromium
-```
-
-Run the default drill-down scenario:
-
-```bash
-cd tools/tui-shot
-node src/cli.mjs
-```
-
-Artifacts are written under `tools/tui-shot/artifacts/`.
-
 ## Web UI
 
 `gnomon-web` is the local browser UI for the same derived data model used by the

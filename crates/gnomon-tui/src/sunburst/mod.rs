@@ -18,6 +18,9 @@ pub(crate) use model::{
 pub(crate) use render::SunburstPane;
 
 #[cfg(test)]
+mod snapshot_tests;
+
+#[cfg(test)]
 pub(crate) use geometry::sunburst_segment_at_angle;
 
 #[cfg(test)]
