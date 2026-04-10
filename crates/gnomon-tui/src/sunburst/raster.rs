@@ -304,6 +304,31 @@ fn cell_sample_hits<const N: usize>(
             continue;
         };
         let angle = (normalized_y.atan2(normalized_x) + FRAC_PI_2).rem_euclid(TAU);
+
+        // For non-root layers (descendants), clip to the parent layer's
+        // rendered selected-segment boundary.  This prevents the descendant
+        // ring from extending past the quantized boundary of the selected
+        // segment in the ancestor, which would otherwise create a visible
+        // overlap with adjacent segments.
+        if layer_index > 0
+            && let (Some(parent_layer), Some(parent_quantized)) = (
+                context.model.layers.get(layer_index - 1),
+                context.quantized_layers.get(layer_index - 1),
+            )
+        {
+            let parent_hit =
+                quantized_segment_index(parent_layer, parent_quantized, angle, context.config);
+            let parent_is_selected = parent_hit.is_some_and(|seg_idx| {
+                parent_layer
+                    .segments
+                    .get(seg_idx)
+                    .is_some_and(|seg| seg.is_selected)
+            });
+            if !parent_is_selected {
+                continue;
+            }
+        }
+
         let Some(segment_index) =
             quantized_segment_index(layer, quantized_layer, angle, context.config)
         else {

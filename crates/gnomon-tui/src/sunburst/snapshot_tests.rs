@@ -387,6 +387,130 @@ use super::geometry::sunburst_selected_child_span;
 use super::model::SunburstDistortionPolicy;
 use super::raster::rasterize_sunburst;
 
+/// Render directly into a buffer (no pane border) and serialize with color tags.
+fn render_direct(model: &SunburstModel, width: u16, height: u16) -> String {
+    let area = Rect::new(0, 0, width, height);
+    let mut buf = Buffer::empty(area);
+    let config = SunburstRenderConfig::default();
+    rasterize_sunburst(&mut buf, area, model, config);
+    buffer_to_color_string(&buf, area)
+}
+
+/// Diagnostic: dump cells near the descendant span boundary to understand
+/// where teal appears relative to the span edge.
+#[test]
+fn diagnose_boundary_cells() {
+    let (model, child_span) = realistic_two_layer_model(1); // gnomon selected
+    let width: u16 = 96;
+    let height: u16 = 44;
+    let area = Rect::new(0, 0, width, height);
+    let mut buf = Buffer::empty(area);
+    let config = SunburstRenderConfig::default();
+    rasterize_sunburst(&mut buf, area, &model, config);
+
+    let center_x = f64::from(width) / 2.0;
+    let center_y = f64::from(height) / 2.0;
+    let radius_x = center_x;
+    let radius_y = center_y;
+    let ring_band = (config.outer_radius - config.center_radius) / model.layers.len() as f64;
+    let span_end = child_span.start + child_span.sweep;
+
+    let descendant_colors = [Color::Indexed(73), Color::Indexed(107)];
+
+    eprintln!(
+        "Descendant span: {:.3}-{:.3} rad ({:.1}°-{:.1}°)",
+        child_span.start,
+        span_end,
+        child_span.start * 180.0 / std::f64::consts::PI,
+        span_end * 180.0 / std::f64::consts::PI,
+    );
+
+    // Find all teal/green cells in the outer ring and report their angles
+    let mut outer_teal_angles: Vec<(u16, u16, f64)> = Vec::new();
+    for y in 0..height {
+        for x in 0..width {
+            let cell = &buf[(x, y)];
+            if !descendant_colors.contains(&cell.fg) {
+                continue;
+            }
+            let nx = (f64::from(x) + 0.5 - center_x) / radius_x;
+            let ny = (f64::from(y) + 0.5 - center_y) / radius_y;
+            let r = (nx * nx + ny * ny).sqrt();
+            if r < config.center_radius + ring_band || r > config.outer_radius {
+                continue;
+            }
+            let angle =
+                (ny.atan2(nx) + std::f64::consts::FRAC_PI_2).rem_euclid(std::f64::consts::TAU);
+            outer_teal_angles.push((x, y, angle));
+        }
+    }
+
+    let min_angle = outer_teal_angles
+        .iter()
+        .map(|t| t.2)
+        .fold(f64::MAX, f64::min);
+    let max_angle = outer_teal_angles
+        .iter()
+        .map(|t| t.2)
+        .fold(f64::MIN, f64::max);
+    let outside_span: Vec<_> = outer_teal_angles
+        .iter()
+        .filter(|t| {
+            let offset = (t.2 - child_span.start).rem_euclid(std::f64::consts::TAU);
+            offset > child_span.sweep
+        })
+        .collect();
+
+    eprintln!(
+        "Teal in outer ring: {} cells, angle range {:.1}°-{:.1}°",
+        outer_teal_angles.len(),
+        min_angle * 180.0 / std::f64::consts::PI,
+        max_angle * 180.0 / std::f64::consts::PI,
+    );
+    eprintln!("Teal OUTSIDE descendant span: {} cells", outside_span.len());
+    for (cx, cy, angle) in outside_span.iter().take(10) {
+        let nx = (f64::from(*cx) + 0.5 - center_x) / radius_x;
+        let ny = (f64::from(*cy) + 0.5 - center_y) / radius_y;
+        let r = (nx * nx + ny * ny).sqrt();
+        let cell = &buf[(*cx, *cy)];
+        eprintln!(
+            "  ({}, {}) angle={:.1}° r={:.3} symbol='{}' fg={:?}",
+            cx,
+            cy,
+            angle * 180.0 / std::f64::consts::PI,
+            r,
+            cell.symbol(),
+            cell.fg,
+        );
+    }
+    // A small number of boundary cells (< 10) are expected from sub-cell
+    // anti-aliasing: the cell center falls outside the span but one of the
+    // 4 quadrant samples lands inside.  A large count indicates a real bug.
+    assert!(
+        outside_span.len() < 10,
+        "{} teal cells outside descendant span (threshold 10)",
+        outside_span.len()
+    );
+}
+
+/// Large-resolution snapshot of the gnomon-selected scenario.
+/// Visually inspect this to see if the descendant ring (teal/73) extends
+/// past the selected segment (white/15) boundary into steel-blue (67) areas.
+#[test]
+fn large_render_gnomon_selected() {
+    let (model, _) = realistic_two_layer_model(1); // gnomon = index 1
+    let rendered = render_direct(&model, 96, 44);
+    insta::assert_snapshot!(rendered);
+}
+
+/// Large-resolution snapshot of the dotfiles-selected scenario.
+#[test]
+fn large_render_dotfiles_selected() {
+    let (model, _) = realistic_two_layer_model(2); // dotfiles = index 2
+    let rendered = render_direct(&model, 96, 44);
+    insta::assert_snapshot!(rendered);
+}
+
 /// Build a realistic 2-layer model matching the screenshot proportions.
 /// Returns (model, ancestor_layer_for_span_check).
 fn realistic_two_layer_model(selected_index: usize) -> (SunburstModel, SunburstSpan) {
