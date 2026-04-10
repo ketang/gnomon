@@ -10193,8 +10193,207 @@ mod tests {
             MetricLens::UncachedInput,
         );
 
-        // 1 ancestor + 1 current + 2 descendant = 4 layers
-        assert_eq!(model.layers.len(), 4);
+        // 1 ancestor + 0 current (skipped, duplicates ancestor) + 2 descendant = 3 layers
+        assert_eq!(model.layers.len(), 3);
+    }
+
+    #[test]
+    fn model_skips_current_layer_when_ancestors_exist_and_selection_present() {
+        // When ancestor layers exist and there's a selection, the current layer
+        // duplicates the last ancestor (same browse-level rows at a narrower
+        // span). Skipping it avoids an extra ring that causes visual overlap.
+        let ancestor_layer = build_radial_layer(
+            &[
+                radial_row(RadialRowSpec {
+                    key: "project:1",
+                    label: "project-a",
+                    kind: RollupRowKind::Project,
+                    value: 70.0,
+                    project_id: Some(1),
+                    category: None,
+                    action: None,
+                    full_path: None,
+                }),
+                radial_row(RadialRowSpec {
+                    key: "project:2",
+                    label: "project-b",
+                    kind: RollupRowKind::Project,
+                    value: 30.0,
+                    project_id: Some(2),
+                    category: None,
+                    action: None,
+                    full_path: None,
+                }),
+            ],
+            MetricLens::UncachedInput,
+            Some("project:1"),
+            RadialSpan::full(),
+        );
+        let descendant_layer = build_radial_layer(
+            &[radial_row(RadialRowSpec {
+                key: "category:editing",
+                label: "editing",
+                kind: RollupRowKind::ActionCategory,
+                value: 70.0,
+                project_id: Some(1),
+                category: Some("editing"),
+                action: None,
+                full_path: None,
+            })],
+            MetricLens::UncachedInput,
+            None,
+            RadialSpan::full(),
+        );
+
+        let context = RadialContext {
+            ancestor_layers: vec![ancestor_layer],
+            current_span: RadialSpan::full(),
+            descendant_layers: vec![descendant_layer],
+        };
+
+        // current_rows duplicate the ancestor (same root-level projects)
+        let current_rows = vec![
+            radial_row(RadialRowSpec {
+                key: "project:1",
+                label: "project-a",
+                kind: RollupRowKind::Project,
+                value: 70.0,
+                project_id: Some(1),
+                category: None,
+                action: None,
+                full_path: None,
+            }),
+            radial_row(RadialRowSpec {
+                key: "project:2",
+                label: "project-b",
+                kind: RollupRowKind::Project,
+                value: 30.0,
+                project_id: Some(2),
+                category: None,
+                action: None,
+                full_path: None,
+            }),
+        ];
+
+        let model = build_radial_model(
+            &context,
+            &current_rows,
+            current_rows.first(), // selected_row present
+            &RootView::ProjectHierarchy,
+            &BrowsePath::Root,
+            &sample_filter_options(),
+            MetricLens::UncachedInput,
+        );
+
+        // 1 ancestor + 0 current (skipped) + 1 descendant = 2 layers
+        assert_eq!(
+            model.layers.len(),
+            2,
+            "current layer should be skipped when it duplicates the last ancestor"
+        );
+    }
+
+    #[test]
+    fn model_keeps_current_layer_when_no_ancestors() {
+        // Without ancestors, the current layer is the only representation
+        // of the browse level — must be included.
+        let context = RadialContext::default();
+        let current_rows = vec![radial_row(RadialRowSpec {
+            key: "project:1",
+            label: "project-a",
+            kind: RollupRowKind::Project,
+            value: 10.0,
+            project_id: Some(1),
+            category: None,
+            action: None,
+            full_path: None,
+        })];
+
+        let model = build_radial_model(
+            &context,
+            &current_rows,
+            current_rows.first(),
+            &RootView::ProjectHierarchy,
+            &BrowsePath::Root,
+            &sample_filter_options(),
+            MetricLens::UncachedInput,
+        );
+
+        assert_eq!(
+            model.layers.len(),
+            1,
+            "current layer should be kept when no ancestors exist"
+        );
+    }
+
+    #[test]
+    fn model_skips_descendants_when_ancestors_exist_but_no_selection() {
+        // When ancestors exist but nothing is selected, the descendant layers
+        // would duplicate the current layer (both query the same browse level).
+        let ancestor_layer = build_radial_layer(
+            &[radial_row(RadialRowSpec {
+                key: "project:1",
+                label: "project-a",
+                kind: RollupRowKind::Project,
+                value: 10.0,
+                project_id: Some(1),
+                category: None,
+                action: None,
+                full_path: None,
+            })],
+            MetricLens::UncachedInput,
+            Some("project:1"),
+            RadialSpan::full(),
+        );
+        let descendant_layer = build_radial_layer(
+            &[radial_row(RadialRowSpec {
+                key: "category:editing",
+                label: "editing",
+                kind: RollupRowKind::ActionCategory,
+                value: 10.0,
+                project_id: Some(1),
+                category: Some("editing"),
+                action: None,
+                full_path: None,
+            })],
+            MetricLens::UncachedInput,
+            None,
+            RadialSpan::full(),
+        );
+
+        let context = RadialContext {
+            ancestor_layers: vec![ancestor_layer],
+            current_span: RadialSpan::full(),
+            descendant_layers: vec![descendant_layer],
+        };
+
+        let current_rows = vec![radial_row(RadialRowSpec {
+            key: "category:editing",
+            label: "editing",
+            kind: RollupRowKind::ActionCategory,
+            value: 10.0,
+            project_id: Some(1),
+            category: Some("editing"),
+            action: None,
+            full_path: None,
+        })];
+
+        let model = build_radial_model(
+            &context,
+            &current_rows,
+            None, // no selection
+            &RootView::ProjectHierarchy,
+            &BrowsePath::Project { project_id: 1 },
+            &sample_filter_options(),
+            MetricLens::UncachedInput,
+        );
+
+        // 1 ancestor + 1 current + 0 descendant (skipped) = 2 layers
+        assert_eq!(
+            model.layers.len(),
+            2,
+            "descendant layers should be skipped when they duplicate the current layer"
+        );
     }
 
     #[test]

@@ -17,7 +17,13 @@ pub(crate) fn build_sunburst_model(
     lens: MetricLens,
 ) -> SunburstModel {
     let mut layers = ancestor_layers;
-    if !visible_rows.is_empty() {
+    let has_ancestors = !layers.is_empty();
+    let has_selection = selected_row.is_some();
+
+    // When ancestors exist and there's a selection, the last ancestor already
+    // represents the same browse level as the current layer (at the parent
+    // span), so skip the current layer to avoid a duplicate ring.
+    if !visible_rows.is_empty() && (!has_ancestors || !has_selection) {
         layers.push(build_sunburst_layer(
             visible_rows,
             lens,
@@ -25,7 +31,12 @@ pub(crate) fn build_sunburst_model(
             current_span,
         ));
     }
-    layers.extend(descendant_layers.iter().cloned());
+
+    // When ancestors exist but nothing is selected, descendant layers would
+    // duplicate the current layer (both query the same browse path).
+    if !has_ancestors || has_selection {
+        layers.extend(descendant_layers.iter().cloned());
+    }
 
     let selection_label = selected_row
         .map(|row| {
