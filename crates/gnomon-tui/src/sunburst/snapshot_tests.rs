@@ -377,3 +377,173 @@ fn overlap_bug_produces_different_snapshot() {
     insta::assert_snapshot!("overlap_buggy", buggy);
     insta::assert_snapshot!("overlap_fixed", fixed);
 }
+
+// ---------------------------------------------------------------------------
+// Angular overlap analysis: verify descendant ring never bleeds past the
+// selected segment's angular boundary in the ancestor ring.
+// ---------------------------------------------------------------------------
+
+use super::geometry::sunburst_selected_child_span;
+use super::model::SunburstDistortionPolicy;
+use super::raster::rasterize_sunburst;
+
+/// Build a realistic 2-layer model matching the screenshot proportions.
+/// Returns (model, ancestor_layer_for_span_check).
+fn realistic_two_layer_model(selected_index: usize) -> (SunburstModel, SunburstSpan) {
+    // Real data proportions: kapow=60M, gnomon=25M, dotfiles=16M
+    let project_values = [60_106_766.0, 24_925_990.0, 16_038_008.0];
+    let total: f64 = project_values.iter().sum();
+
+    let ancestor_segments: Vec<SunburstSegment> = project_values
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| SunburstSegment {
+            value: v,
+            bucket: SunburstBucket::Project,
+            is_selected: i == selected_index,
+        })
+        .collect();
+
+    let ancestor_layer = SunburstLayer {
+        span: SunburstSpan::full(),
+        segments: ancestor_segments,
+        total_value: total,
+    };
+
+    let child_span =
+        sunburst_selected_child_span(&ancestor_layer, SunburstDistortionPolicy::default());
+
+    // Descendant layer: 3 category children within the selected project's span
+    let descendant_segments = vec![
+        make_segment(40.0, SunburstBucket::Category, false),
+        make_segment(30.0, SunburstBucket::Category, false),
+        make_segment(20.0, SunburstBucket::Classified, false),
+    ];
+    let desc_total: f64 = descendant_segments.iter().map(|s| s.value).sum();
+    let descendant_layer = SunburstLayer {
+        span: child_span,
+        segments: descendant_segments,
+        total_value: desc_total,
+    };
+
+    let model = SunburstModel {
+        center: default_center(),
+        layers: vec![ancestor_layer, descendant_layer],
+    };
+
+    (model, child_span)
+}
+
+/// For each cell in the rendered buffer, check that descendant-ring colors
+/// (Category=73, Classified=107) never appear at angles where the ancestor
+/// ring shows a non-selected project (Project=67).
+///
+/// The check works by scanning each row: at a given y, we identify cells
+/// that are in the outer ring radius band and have descendant colors, then
+/// verify that no cell at the SAME y in the inner ring radius band has a
+/// non-selected ancestor color at the same approximate angle.
+#[test]
+fn descendant_ring_does_not_bleed_past_selected_segment() {
+    let test_width: u16 = 80;
+    let test_height: u16 = 40;
+    let config = SunburstRenderConfig::default();
+
+    for selected_index in [1_usize, 2] {
+        let (model, _child_span) = realistic_two_layer_model(selected_index);
+
+        let area = Rect::new(0, 0, test_width, test_height);
+        let mut buf = Buffer::empty(area);
+
+        // Render directly (skip pane_block border to avoid offset issues)
+        rasterize_sunburst(&mut buf, area, &model, config);
+
+        let center_x = f64::from(test_width) / 2.0;
+        let center_y = f64::from(test_height) / 2.0;
+        let radius_x = center_x.max(1.0);
+        let radius_y = center_y.max(1.0);
+        let ring_band = (config.outer_radius - config.center_radius) / model.layers.len() as f64;
+
+        let descendant_colors = [Color::Indexed(73), Color::Indexed(107)];
+        let non_selected_project = Color::Indexed(67);
+
+        let mut violations = Vec::new();
+
+        for y in 0..test_height {
+            for x in 0..test_width {
+                let cell = &buf[(x, y)];
+                let fg = cell.fg;
+
+                // Only look at cells with descendant colors
+                if !descendant_colors.contains(&fg) {
+                    continue;
+                }
+
+                // Compute this cell's normalized position and radius
+                let nx = (f64::from(x) + 0.5 - center_x) / radius_x;
+                let ny = (f64::from(y) + 0.5 - center_y) / radius_y;
+                let r = (nx * nx + ny * ny).sqrt();
+
+                // Must be in the outer ring radius band
+                let outer_start = config.center_radius + ring_band;
+                if r < outer_start || r > config.outer_radius {
+                    continue;
+                }
+
+                // Compute the angle
+                let angle =
+                    (ny.atan2(nx) + std::f64::consts::FRAC_PI_2).rem_euclid(std::f64::consts::TAU);
+
+                // Now check: at this same angle but in the inner ring, is there
+                // a non-selected project color? If so, the descendant ring is
+                // bleeding into a different project's angular range.
+                //
+                // Walk inward at same angle to find an inner-ring cell.
+                // The angle convention: angle = atan2(ny, nx) + π/2,
+                // so nx = sin(angle), ny = -cos(angle).
+                let inner_mid = config.center_radius + ring_band / 2.0;
+                let ix = center_x + angle.sin() * inner_mid * radius_x;
+                let iy = center_y - angle.cos() * inner_mid * radius_y;
+                let ix = (ix.round() as u16).min(test_width - 1);
+                let iy = (iy.round() as u16).min(test_height - 1);
+
+                let inner_cell = &buf[(ix, iy)];
+                if inner_cell.fg == non_selected_project {
+                    violations.push((x, y, ix, iy, angle * 180.0 / std::f64::consts::PI));
+                }
+            }
+        }
+
+        if !violations.is_empty() {
+            // Compute the angular range of violations
+            let min_angle = violations.iter().map(|v| v.4).fold(f64::MAX, f64::min);
+            let max_angle = violations.iter().map(|v| v.4).fold(f64::MIN, f64::max);
+            eprintln!(
+                "selected_index={}: {} violations at angles {:.1}°-{:.1}°",
+                selected_index,
+                violations.len(),
+                min_angle,
+                max_angle,
+            );
+            eprintln!(
+                "  child_span: start={:.3} ({:.1}°) sweep={:.3} ({:.1}°) end={:.1}°",
+                _child_span.start,
+                _child_span.start * 180.0 / std::f64::consts::PI,
+                _child_span.sweep,
+                _child_span.sweep * 180.0 / std::f64::consts::PI,
+                (_child_span.start + _child_span.sweep) * 180.0 / std::f64::consts::PI,
+            );
+        }
+
+        // Allow a small number of boundary violations from quantization
+        // (typically < 30 cells at the span edges). A large count (100+)
+        // indicates a real angular overlap bug.
+        assert!(
+            violations.len() < 30,
+            "selected_index={}: descendant colors appear at {} cells where inner ring shows \
+             non-selected project (threshold 30). First 5: {:?}",
+            selected_index,
+            violations.len(),
+            &violations[..violations.len().min(5)],
+        );
+    }
+}
