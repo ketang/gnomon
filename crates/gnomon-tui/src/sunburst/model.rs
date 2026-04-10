@@ -104,6 +104,7 @@ pub(crate) enum SunburstRenderMode {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub(crate) struct SunburstDistortionPolicy {
     pub(crate) minimum_visible_sweep: f64,
     pub(crate) focus_zoom_threshold_ratio: f64,
