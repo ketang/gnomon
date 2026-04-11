@@ -222,13 +222,37 @@ pub fn start_startup_import_with_mode_and_progress<F>(
     db_path: &Path,
     source_root: &Path,
     import_mode: StartupImportMode,
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<StartupImport>
 where
     F: FnMut(&StartupProgressUpdate),
 {
     let state_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
     let perf_logger = PerfLogger::from_env(state_dir).ok().flatten();
+    start_startup_import_with_perf_logger(
+        conn,
+        db_path,
+        source_root,
+        import_mode,
+        perf_logger,
+        on_progress,
+    )
+}
+
+/// Like [`start_startup_import_with_mode_and_progress`] but accepts an
+/// explicit [`PerfLogger`] instead of reading `GNOMON_PERF_LOG` from the
+/// environment. Used by the `import_bench` example.
+pub fn start_startup_import_with_perf_logger<F>(
+    conn: &Connection,
+    db_path: &Path,
+    source_root: &Path,
+    import_mode: StartupImportMode,
+    perf_logger: Option<PerfLogger>,
+    mut on_progress: F,
+) -> Result<StartupImport>
+where
+    F: FnMut(&StartupProgressUpdate),
+{
     let options = ImportWorkerOptions {
         perf_logger,
         ..ImportWorkerOptions::default()
@@ -249,6 +273,21 @@ pub fn import_all(
     db_path: &Path,
     source_root: &Path,
 ) -> Result<ImportExecutionReport> {
+    let state_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let perf_logger = PerfLogger::from_env(state_dir).ok().flatten();
+    import_all_with_perf_logger(conn, db_path, source_root, perf_logger)
+}
+
+/// Like [`import_all`] but accepts an explicit [`PerfLogger`] instead of
+/// reading `GNOMON_PERF_LOG` from the environment. Used by the
+/// `import_bench` example so it can route per-phase spans to a caller-chosen
+/// path without mutating process env vars.
+pub fn import_all_with_perf_logger(
+    conn: &Connection,
+    db_path: &Path,
+    source_root: &Path,
+    perf_logger: Option<PerfLogger>,
+) -> Result<ImportExecutionReport> {
     let now = Timestamp::now();
     let time_zone = TimeZone::system();
     let plan = build_import_plan(conn, now, &time_zone)?;
@@ -256,8 +295,6 @@ pub fn import_all(
     let mut database =
         Database::open(db_path).with_context(|| format!("unable to open {}", db_path.display()))?;
 
-    let state_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
-    let perf_logger = PerfLogger::from_env(state_dir).ok().flatten();
     let options = ImportWorkerOptions {
         perf_logger,
         ..ImportWorkerOptions::default()
