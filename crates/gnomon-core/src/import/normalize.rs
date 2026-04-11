@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -83,32 +84,41 @@ fn normalize_transcript_jsonl_file(
 ) -> Result<NormalizeJsonlFileOutcome> {
     let mut scope = PerfScope::new(params.perf_logger.clone(), "import.normalize_jsonl");
     scope.field("path", params.path.display().to_string());
-    let result = normalize_transcript_jsonl_file_inner(conn, params);
-    match &result {
-        Ok(NormalizeJsonlFileOutcome::Imported(outcome)) => {
-            scope.field("outcome", "imported");
-            scope.field("record_count", outcome.record_count);
-            scope.field("message_count", outcome.message_count);
-            scope.field("turn_count", outcome.turn_count);
-            scope.finish_ok();
+    let inner = normalize_transcript_jsonl_file_inner(conn, params);
+    match inner {
+        Ok((outcome, parse_total, sql_total)) => {
+            scope.field("parse_ms", parse_total.as_secs_f64() * 1000.0);
+            scope.field("sql_ms", sql_total.as_secs_f64() * 1000.0);
+            match &outcome {
+                NormalizeJsonlFileOutcome::Imported(result) => {
+                    scope.field("outcome", "imported");
+                    scope.field("record_count", result.record_count);
+                    scope.field("message_count", result.message_count);
+                    scope.field("turn_count", result.turn_count);
+                    scope.finish_ok();
+                }
+                NormalizeJsonlFileOutcome::Skipped => {
+                    scope.field("outcome", "skipped");
+                    scope.finish_ok();
+                }
+                NormalizeJsonlFileOutcome::Warning(_) => {
+                    scope.field("outcome", "warning");
+                    scope.finish_ok();
+                }
+            }
+            Ok(outcome)
         }
-        Ok(NormalizeJsonlFileOutcome::Skipped) => {
-            scope.field("outcome", "skipped");
-            scope.finish_ok();
+        Err(err) => {
+            scope.finish_error(&err);
+            Err(err)
         }
-        Ok(NormalizeJsonlFileOutcome::Warning(_)) => {
-            scope.field("outcome", "warning");
-            scope.finish_ok();
-        }
-        Err(err) => scope.finish_error(err),
     }
-    result
 }
 
 fn normalize_transcript_jsonl_file_inner(
     conn: &mut Connection,
     params: &NormalizeJsonlFileParams,
-) -> Result<NormalizeJsonlFileOutcome> {
+) -> Result<(NormalizeJsonlFileOutcome, Duration, Duration)> {
     let mut tx = conn
         .transaction()
         .context("unable to start normalization transaction")?;
@@ -120,6 +130,9 @@ fn normalize_transcript_jsonl_file_inner(
 
     let mut state = ImportState::new(params.clone());
 
+    let mut parse_total: Duration = Duration::ZERO;
+    let mut sql_total: Duration = Duration::ZERO;
+
     for (zero_based_line_no, line_result) in reader.lines().enumerate() {
         let line_no = zero_based_line_no + 1;
         let line = line_result.with_context(|| {
@@ -129,22 +142,30 @@ fn normalize_transcript_jsonl_file_inner(
             )
         })?;
 
+        let parse_start = Instant::now();
         let record: Value = match serde_json::from_str(&line) {
             Ok(record) => record,
             Err(_) => {
+                parse_total += parse_start.elapsed();
                 tx.rollback()
                     .context("unable to roll back malformed jsonl import")?;
-                return Ok(NormalizeJsonlFileOutcome::Warning(NormalizeImportWarning {
-                    code: WARNING_INVALID_JSON,
-                    message: format!(
-                        "unable to parse json on line {line_no} from {} (preview: {})",
-                        params.path.display(),
-                        preview_source_line(&line)
-                    ),
-                }));
+                return Ok((
+                    NormalizeJsonlFileOutcome::Warning(NormalizeImportWarning {
+                        code: WARNING_INVALID_JSON,
+                        message: format!(
+                            "unable to parse json on line {line_no} from {} (preview: {})",
+                            params.path.display(),
+                            preview_source_line(&line)
+                        ),
+                    }),
+                    parse_total,
+                    sql_total,
+                ));
             }
         };
+        parse_total += parse_start.elapsed();
 
+        let sql_start = Instant::now();
         if state.conversation.is_none() {
             if extract_session_id(&record).is_some() {
                 state.initialize_context(&mut tx, &record)?;
@@ -154,18 +175,20 @@ fn normalize_transcript_jsonl_file_inner(
                     source_line_no: line_no as i64,
                     value: record,
                 });
+                sql_total += sql_start.elapsed();
                 continue;
             }
         }
 
         state.process_record(&mut tx, record, line_no as i64)?;
+        sql_total += sql_start.elapsed();
     }
 
     if state.conversation.is_none() {
         if file_contains_only_sessionless_metadata(&state.buffered_records) {
             tx.commit()
                 .context("unable to commit skipped metadata-only import")?;
-            return Ok(NormalizeJsonlFileOutcome::Skipped);
+            return Ok((NormalizeJsonlFileOutcome::Skipped, parse_total, sql_total));
         }
         bail!(
             "no sessionId found in {}; unable to normalize file",
@@ -174,7 +197,9 @@ fn normalize_transcript_jsonl_file_inner(
     }
 
     if !state.buffered_records.is_empty() {
+        let sql_start = Instant::now();
         state.flush_buffered_records(&mut tx)?;
+        sql_total += sql_start.elapsed();
     }
 
     let mut turns_scope = PerfScope::new(params.perf_logger.clone(), "import.build_turns");
@@ -192,8 +217,8 @@ fn normalize_transcript_jsonl_file_inner(
     state.finish_import(&mut tx, turn_count)?;
     tx.commit().context("unable to commit normalized import")?;
 
-    Ok(NormalizeJsonlFileOutcome::Imported(
-        NormalizeJsonlFileResult {
+    Ok((
+        NormalizeJsonlFileOutcome::Imported(NormalizeJsonlFileResult {
             conversation_id: Some(
                 state
                     .conversation
@@ -212,7 +237,9 @@ fn normalize_transcript_jsonl_file_inner(
             message_count: state.message_states.len(),
             turn_count,
             history_event_count: 0,
-        },
+        }),
+        parse_total,
+        sql_total,
     ))
 }
 
