@@ -3,13 +3,13 @@
 > Companion to `docs/specs/2026-04-10-import-perf-design.md`. Append-only phase log plus overwritten Resume Block. First action of any fresh session: read the Resume Block, then the last 2–3 phase entries, then continue.
 
 ## Environment
-- Host: _(to be captured in Phase 1 — Task 10)_
-- CPU: _(to be captured)_
-- RAM: _(to be captured)_
-- WSL filesystem for repo: ext2/ext3 (from capture script stat)
-- WSL filesystem for DB path (`~/.local/share/gnomon/`): _(to be captured in Task 10)_
-- Rust: _(to be captured)_
-- SQLite (bundled): _(to be captured)_
+- Host: `pontoon` — Linux 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun 5 18:30:46 UTC 2025 x86_64 (WSL2 on Windows)
+- CPU: AMD Ryzen 5 5600X 6-Core Processor (1 socket × 6 cores × 2 threads = 12 logical CPUs)
+- RAM: 49,294,516 kB (≈48 GiB) available to the WSL VM
+- Repo filesystem (`/home/ketan/project/gnomon/.worktrees/import-perf`): `ext2/ext3` (this is what `stat --file-system` reports for the WSL ext4 mount)
+- DB filesystem (bench harness): `tmpfs` via `tempfile::TempDir` under `/tmp`. **Not** the production path `~/.local/share/gnomon/` (which doesn't exist on this host yet) — bench numbers reflect tmpfs IO, which is faster than a real disk-backed home dir. Production startup wall on a real disk will likely be slower.
+- Rust: `rustc 1.93.1 (01f6ddf75 2026-02-11)`
+- SQLite (bundled via `libsqlite3-sys 0.37.0`): `3.50.4`
 
 ## Corpus Snapshot
 - Manifest: `tests/fixtures/import-corpus/MANIFEST.md`
