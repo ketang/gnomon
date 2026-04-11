@@ -40,6 +40,10 @@ _(to be agreed with user at end of Phase 1 — Task 14)_
 ### 2026-04-10 — Phase 1 started
 Kicked off Phase 1 (measure). Design doc committed on `import-perf` (sha `dc136b5`). Phase 1 implementation plan committed (sha `cbd3516`). Running log initialized (sha `2c6e57a`). Fixture directory reserved and gitignored (sha `d49560c`). Capture script added (sha `1b1320c`).
 
+### 2026-04-11 — Tasks 5-7 complete: PerfLogger wired into import hot path
+
+Added `Option<PerfLogger>` to `ImportWorkerOptions` and threaded it through `import_chunk` → `normalize_jsonl_file` → `build_turns` → `build_actions` → `finalize_chunk_import` → `rebuild_chunk_{action,path}_rollups` via new `perf_logger` fields on `NormalizeJsonlFileParams` and `BuildActionsParams`. Spans emitted at each phase: `import.chunk`, `import.normalize_jsonl` (+ `import.normalize_history_jsonl`), `import.build_turns`, `import.build_actions`, `import.finalize_chunk`, `import.rebuild_action_rollups`, `import.rebuild_path_rollups`. Opt-in via `GNOMON_PERF_LOG`. Added manual `Debug` impl to `PerfLogger` so it can live inside derived-`Debug` structs. Committed as sha `2a3a47a`. Quality gates: fmt/clippy/tests all clean.
+
 ### 2026-04-11 — Task 4 complete: corpus captured
 
 Ran `tests/fixtures/import-corpus/capture.sh` against the live `~/.claude/projects`. Results recorded in Corpus Snapshot header above. Manifest committed (sha `9b1bd73`). Tarballs are local-only (gitignored).
@@ -64,7 +68,7 @@ Decision: defer to user checkpoint (Task 13) after baselines are in hand. If the
 
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-11 (end of Task 4)
+Last updated: 2026-04-11 (end of Tasks 5-7)
 Current phase: Phase 1 — measure
 Current branch: `import-perf`
 Current worktree: `/home/ketan/project/gnomon/.worktrees/import-perf`
@@ -75,30 +79,16 @@ Primary repo root (do not implement here): `/home/ketan/project/gnomon`
 2. Verify: `git rev-parse --abbrev-ref HEAD` → must print `import-perf`
 3. Read this log's Phase Log (latest entries first) for context.
 4. Read `docs/specs/2026-04-10-import-perf-design.md` if you need the big picture.
-5. Read `docs/specs/2026-04-10-import-perf-phase1-plan.md` for the task list — you are between Task 4 and Task 5.
+5. Read `docs/specs/2026-04-10-import-perf-phase1-plan.md` for the task list — you are between Task 7 and Task 8.
 6. Continue at the "Next action" below.
 
 ### Last completed
-Task 4 — corpus captured, manifest committed (sha `9b1bd73`). Corpus snapshot header populated with SHAs and sizes. Subset-sizing finding logged (see phase entry above).
+Tasks 5-7 — PerfLogger wired into import hot path. Code commit sha `2a3a47a`. Spans emitted at every phase in the import pipeline. All quality gates pass.
 
 ### Next action
-**Task 5 (Phase 1 plan):** Add `perf_logger: Option<PerfLogger>` to `ImportWorkerOptions` in `crates/gnomon-core/src/import/chunk.rs` and thread it through `import_chunk`. Proceed then into Task 6 (normalize.rs spans) and Task 7 (classify + rollup spans) — these three tasks form one atomic change because the field additions break compilation until all three land. Single commit for Tasks 5-7. Task 8 (parse-vs-SQL split) is a separate commit.
+**Task 8 (Phase 1 plan):** Parse-vs-SQL split inside the per-record loop in `crates/gnomon-core/src/import/normalize.rs`. Add two local `Duration` accumulators (parse time vs SQL/process_record time) inside `normalize_transcript_jsonl_file`'s main loop, and emit one summary verbose span at end of loop — **not** per row. Full spec in `docs/specs/2026-04-10-import-perf-phase1-plan.md` starting at line 779. This is a separate commit from Tasks 5-7.
 
-All code for these tasks is fully specified in `docs/specs/2026-04-10-import-perf-phase1-plan.md`. Key integration points:
-- `crates/gnomon-core/src/import/chunk.rs:66-69` — `ImportWorkerOptions` struct.
-- `crates/gnomon-core/src/import/chunk.rs:239` — `import_all` public entry point; construct `PerfLogger::from_env(db_path.parent())` here.
-- `crates/gnomon-core/src/import/chunk.rs:218` — `start_startup_import_with_mode_and_progress`; construct logger here too.
-- `crates/gnomon-core/src/import/chunk.rs:828` — `import_chunk` inner function; wrap body in `PerfScope::new(...)` and pass `options.perf_logger.clone()` into `NormalizeJsonlFileParams` and `BuildActionsParams`.
-- `crates/gnomon-core/src/import/mod.rs` — `NormalizeJsonlFileParams` definition; add `perf_logger: Option<PerfLogger>` field.
-- `crates/gnomon-core/src/import/normalize.rs:78` — `normalize_transcript_jsonl_file`; add `import.normalize_jsonl` span and fields.
-- `crates/gnomon-core/src/classify/mod.rs:21` — `build_actions`; add `perf_logger` to `BuildActionsParams`, wrap in `import.build_actions` span.
-- `crates/gnomon-core/src/rollup.rs` — add `perf_logger` arg to `rebuild_chunk_action_rollups` and `rebuild_chunk_path_rollups`.
-
-`PerfLogger` / `PerfScope` API is in `crates/gnomon-core/src/perf.rs` — `PerfLogger::from_env(state_dir) -> Result<Option<PerfLogger>>`, `PerfScope::new(Option<PerfLogger>, impl Into<String>)`, `.field(k, v)`, `.finish_ok()`, `.finish_error(&err)`.
-
-Quality gates required before the Task 5-7 commit: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo build --workspace`.
-
-After Task 5-7 commits, present the diff for user commit approval per design doc Section 8 (commit-on-approval workflow). The design says code commits need explicit user approval; log-only commits do not.
+After Task 8, Tasks 9-12 are the benchmark harness and baseline captures. Task 13 is the first user checkpoint (review baseline, decide subset sizing).
 
 ### Uncommitted state
 None. Working tree is clean on `import-perf`.
@@ -110,7 +100,7 @@ None. Working tree is clean on `import-perf`.
 - `d49560c` chore: reserve tests/fixtures/import-corpus for perf snapshots
 - `1b1320c` feat: add corpus capture script for import-perf benchmarks
 - `9b1bd73` chore: commit import-corpus manifest for initial snapshot
-- `<next>`  log: record corpus SHAs and subset sizing finding (this commit)
+- `2a3a47a` feat(import): wire PerfLogger into import hot path
 
 ### Target status
 Not set (pending Task 14, which requires Task 10-12 baseline data).
