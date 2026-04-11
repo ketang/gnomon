@@ -1173,7 +1173,7 @@ Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 
 ## Task 10: Capture baseline — subset
 
-- [ ] **Step 1: Record environment fingerprint**
+- [x] **Step 1: Record environment fingerprint**
 
 Run these and paste the outputs into the log's Environment section of the Frozen Header:
 ```bash
@@ -1189,7 +1189,7 @@ Also capture the bundled SQLite version — in the bench tempdir, run `.version`
 
 Commit as `log: record environment fingerprint`.
 
-- [ ] **Step 2: Capture subset, mode=full, 3 runs**
+- [x] **Step 2: Capture subset, mode=full, 3 runs**
 
 Run:
 ```bash
@@ -1202,7 +1202,7 @@ for i in 1 2 3; do
 done
 ```
 
-- [ ] **Step 3: Capture subset, mode=startup, 3 runs**
+- [x] **Step 3: Capture subset, mode=startup, 3 runs**
 
 ```bash
 for i in 1 2 3; do
@@ -1214,7 +1214,7 @@ for i in 1 2 3; do
 done
 ```
 
-- [ ] **Step 4: Summarize into log Phase Log**
+- [x] **Step 4: Summarize into log Phase Log**
 
 Add a Phase Log entry dated today:
 
