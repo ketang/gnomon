@@ -783,7 +783,7 @@ Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 
 The point of this split is to answer "how much of the per-record-loop wall time is `serde_json::from_str` vs the `process_record` SQL work." We do **not** want a span per row — that would flood the log. Instead we maintain two local `Duration` accumulators and emit one summary event at the end of the loop.
 
-- [ ] **Step 1: Add accumulators and emit the summary span**
+- [x] **Step 1: Add accumulators and emit the summary span**
 
 In `normalize_transcript_jsonl_file`, before the `for (zero_based_line_no, line_result) in reader.lines().enumerate() {` loop, add:
 
@@ -823,7 +823,7 @@ After the loop and before `scope.finish_ok()` on the happy path, add:
     scope.field("sql_ms", sql_total.as_secs_f64() * 1000.0);
 ```
 
-- [ ] **Step 2: Quality gates and commit**
+- [x] **Step 2: Quality gates and commit**
 
 Run `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo build --workspace`.
 
@@ -839,7 +839,7 @@ as parse_ms / sql_ms fields on the import.normalize_jsonl span.
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 ```
 
-- [ ] **Step 3: Update Resume Block**
+- [x] **Step 3: Update Resume Block**
 
 `Last completed` → `Task 8: parse-vs-SQL split added.` `Next action` → `Task 9: write bench harness example.` Commit.
 

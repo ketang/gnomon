@@ -40,6 +40,10 @@ _(to be agreed with user at end of Phase 1 — Task 14)_
 ### 2026-04-10 — Phase 1 started
 Kicked off Phase 1 (measure). Design doc committed on `import-perf` (sha `dc136b5`). Phase 1 implementation plan committed (sha `cbd3516`). Running log initialized (sha `2c6e57a`). Fixture directory reserved and gitignored (sha `d49560c`). Capture script added (sha `1b1320c`).
 
+### 2026-04-11 — Task 8 complete: parse vs SQL split inside per-record loop
+
+Refactored `normalize_transcript_jsonl_file_inner` to track two `Duration` accumulators inside the JSONL loop: `parse_total` wraps the `serde_json::from_str` call, `sql_total` wraps the conversation-init / `flush_buffered_records` / `process_record` work (including the post-loop `flush_buffered_records` call). Inner now returns `(NormalizeJsonlFileOutcome, Duration, Duration)`; the outer wrapper attaches `parse_ms` and `sql_ms` as fields on the existing `import.normalize_jsonl` span before `finish_ok()`. No per-row events — one summary per file. Committed as sha `d539ff6`. Quality gates: fmt/clippy/tests/build all clean.
+
 ### 2026-04-11 — Tasks 5-7 complete: PerfLogger wired into import hot path
 
 Added `Option<PerfLogger>` to `ImportWorkerOptions` and threaded it through `import_chunk` → `normalize_jsonl_file` → `build_turns` → `build_actions` → `finalize_chunk_import` → `rebuild_chunk_{action,path}_rollups` via new `perf_logger` fields on `NormalizeJsonlFileParams` and `BuildActionsParams`. Spans emitted at each phase: `import.chunk`, `import.normalize_jsonl` (+ `import.normalize_history_jsonl`), `import.build_turns`, `import.build_actions`, `import.finalize_chunk`, `import.rebuild_action_rollups`, `import.rebuild_path_rollups`. Opt-in via `GNOMON_PERF_LOG`. Added manual `Debug` impl to `PerfLogger` so it can live inside derived-`Debug` structs. Committed as sha `2a3a47a`. Quality gates: fmt/clippy/tests all clean.
@@ -68,7 +72,7 @@ Decision: defer to user checkpoint (Task 13) after baselines are in hand. If the
 
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-11 (end of Tasks 5-7)
+Last updated: 2026-04-11 (end of Task 8)
 Current phase: Phase 1 — measure
 Current branch: `import-perf`
 Current worktree: `/home/ketan/project/gnomon/.worktrees/import-perf`
@@ -79,16 +83,16 @@ Primary repo root (do not implement here): `/home/ketan/project/gnomon`
 2. Verify: `git rev-parse --abbrev-ref HEAD` → must print `import-perf`
 3. Read this log's Phase Log (latest entries first) for context.
 4. Read `docs/specs/2026-04-10-import-perf-design.md` if you need the big picture.
-5. Read `docs/specs/2026-04-10-import-perf-phase1-plan.md` for the task list — you are between Task 7 and Task 8.
+5. Read `docs/specs/2026-04-10-import-perf-phase1-plan.md` for the task list — you are between Task 8 and Task 9.
 6. Continue at the "Next action" below.
 
 ### Last completed
-Tasks 5-7 — PerfLogger wired into import hot path. Code commit sha `2a3a47a`. Spans emitted at every phase in the import pipeline. All quality gates pass.
+Task 8 — parse-vs-SQL split added inside `normalize_transcript_jsonl_file_inner`. Two local `Duration` accumulators wrap `serde_json::from_str` and the per-record SQL work (`initialize_context` / `flush_buffered_records` / `process_record`); the inner function now returns `(outcome, parse_total, sql_total)` and the outer wrapper attaches them as `parse_ms` / `sql_ms` fields on the `import.normalize_jsonl` span. Code commit sha `d539ff6`. All quality gates pass.
 
 ### Next action
-**Task 8 (Phase 1 plan):** Parse-vs-SQL split inside the per-record loop in `crates/gnomon-core/src/import/normalize.rs`. Add two local `Duration` accumulators (parse time vs SQL/process_record time) inside `normalize_transcript_jsonl_file`'s main loop, and emit one summary verbose span at end of loop — **not** per row. Full spec in `docs/specs/2026-04-10-import-perf-phase1-plan.md` starting at line 779. This is a separate commit from Tasks 5-7.
+**Task 9 (Phase 1 plan):** Write the benchmark harness as a `gnomon-core` example at `crates/gnomon-core/examples/import_bench.rs`. Full spec in `docs/specs/2026-04-10-import-perf-phase1-plan.md` starting at line 848.
 
-After Task 8, Tasks 9-12 are the benchmark harness and baseline captures. Task 13 is the first user checkpoint (review baseline, decide subset sizing).
+After Task 9, Tasks 10-12 capture the baseline runs and CPU profiles. Task 13 is the first user checkpoint (review baseline, decide subset sizing).
 
 ### Uncommitted state
 None. Working tree is clean on `import-perf`.
@@ -101,6 +105,7 @@ None. Working tree is clean on `import-perf`.
 - `1b1320c` feat: add corpus capture script for import-perf benchmarks
 - `9b1bd73` chore: commit import-corpus manifest for initial snapshot
 - `2a3a47a` feat(import): wire PerfLogger into import hot path
+- `d539ff6` feat(import): split parse vs SQL time in per-record loop
 
 ### Target status
 Not set (pending Task 14, which requires Task 10-12 baseline data).
