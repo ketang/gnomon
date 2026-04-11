@@ -39,7 +39,7 @@
 
 ## Preflight Checks
 
-- [ ] **PF1: Confirm on the correct branch and worktree**
+- [x] **PF1: Confirm on the correct branch and worktree**
 
 Run:
 ```bash
@@ -48,12 +48,12 @@ pwd
 ```
 Expected: branch is `import-perf`, pwd is `/home/ketan/project/gnomon/.worktrees/import-perf` (or switch to it).
 
-- [ ] **PF2: Confirm design doc exists on this branch**
+- [x] **PF2: Confirm design doc exists on this branch**
 
 Run: `ls docs/specs/2026-04-10-import-perf-design.md`
 Expected: file exists.
 
-- [ ] **PF3: Confirm external tools available**
+- [x] **PF3: Confirm external tools available**
 
 Run: `which tar zstd sha256sum samply`
 Expected: first three present; `samply` may be absent — if so, install with `cargo install samply` before Task 12.
@@ -67,7 +67,7 @@ Expected: first three present; `samply` may be absent — if so, install with `c
 
 The log is initialized with an empty Frozen Header, an empty Phase Log section, and a placeholder Resume Block. It gets populated as Phase 1 progresses.
 
-- [ ] **Step 1: Create the log file**
+- [x] **Step 1: Create the log file**
 
 Write `docs/specs/2026-04-10-import-perf-log.md` with exactly this content:
 
@@ -117,7 +117,7 @@ Target status: not set (pending Task 14)
 Candidate ranking: see design doc Section 4; live re-ranking begins in Phase 2.
 ```
 
-- [ ] **Step 2: Commit the log**
+- [x] **Step 2: Commit the log**
 
 Run:
 ```bash
@@ -131,7 +131,7 @@ Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 ```
 Expected: one commit on `import-perf` adding one file.
 
-- [ ] **Step 3: Update Resume Block to reflect commit**
+- [x] **Step 3: Update Resume Block to reflect commit**
 
 Edit the Resume Block in the file you just committed so `Last completed` reads `Running log committed (sha <new-sha>).` and `Next action` stays on Task 2. Commit with message `log: update resume block after Task 1`.
 
@@ -143,7 +143,7 @@ Edit the Resume Block in the file you just committed so `Last completed` reads `
 - Modify: `.gitignore`
 - Create: `tests/fixtures/import-corpus/.gitkeep`
 
-- [ ] **Step 1: Append to `.gitignore`**
+- [x] **Step 1: Append to `.gitignore`**
 
 Append these lines to the end of `.gitignore` at the repo root:
 
@@ -152,7 +152,7 @@ Append these lines to the end of `.gitignore` at the repo root:
 tests/fixtures/import-corpus/*.tar.zst
 ```
 
-- [ ] **Step 2: Create the fixture directory and keepfile**
+- [x] **Step 2: Create the fixture directory and keepfile**
 
 Run:
 ```bash
@@ -160,7 +160,7 @@ mkdir -p tests/fixtures/import-corpus
 : > tests/fixtures/import-corpus/.gitkeep
 ```
 
-- [ ] **Step 3: Verify gitignore works**
+- [x] **Step 3: Verify gitignore works**
 
 Create a dummy tarball, confirm git ignores it, remove it:
 ```bash
@@ -170,7 +170,7 @@ rm tests/fixtures/import-corpus/sanity.tar.zst
 ```
 Expected: the `.gitkeep` shows as untracked but `sanity.tar.zst` does not appear.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 Run:
 ```bash
@@ -184,7 +184,7 @@ stay local per the design doc privacy note.
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 ```
 
-- [ ] **Step 5: Update Resume Block**
+- [x] **Step 5: Update Resume Block**
 
 Edit the log: `Last completed` → `Task 2: corpus fixture dir reserved and gitignored.` `Next action` → `Task 3: write capture script.` Commit as `log: update resume block after Task 2`.
 
@@ -197,7 +197,7 @@ Edit the log: `Last completed` → `Task 2: corpus fixture dir reserved and giti
 
 This script captures `~/.claude/projects` and `~/.claude/history.jsonl` into `full.tar.zst`, selects a subset by largest projects, captures it into `subset.tar.zst`, computes SHAs, and writes `MANIFEST.md`. Running it is Task 4.
 
-- [ ] **Step 1: Write the script**
+- [x] **Step 1: Write the script**
 
 Create `tests/fixtures/import-corpus/capture.sh` with exactly this content:
 
@@ -308,11 +308,11 @@ echo "  full.tar.zst    $(du -h full.tar.zst | awk '{print $1}')   sha256=${full
 echo "  subset.tar.zst  $(du -h subset.tar.zst | awk '{print $1}') sha256=${subset_sha}"
 ```
 
-- [ ] **Step 2: Make executable**
+- [x] **Step 2: Make executable**
 
 Run: `chmod +x tests/fixtures/import-corpus/capture.sh`
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 Run:
 ```bash
@@ -326,7 +326,7 @@ Largest-first project subsetting preserves chunking skew.
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 ```
 
-- [ ] **Step 4: Update Resume Block**
+- [x] **Step 4: Update Resume Block**
 
 `Last completed` → `Task 3: capture script written.` `Next action` → `Task 4: run capture.sh and write MANIFEST.md.` Commit.
 
@@ -339,22 +339,22 @@ Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 
 **User checkpoint:** This task requires running against the user's real `~/.claude` data, which may take several minutes and consume gigabytes of disk. Pause and confirm before running.
 
-- [ ] **Step 1: Confirm with user**
+- [x] **Step 1: Confirm with user**
 
 Surface: "About to run `tests/fixtures/import-corpus/capture.sh` — this reads your real `~/.claude` data, writes two zstd-compressed tarballs under `tests/fixtures/import-corpus/` (gitignored), and may take several minutes. OK to proceed?"
 Wait for approval.
 
-- [ ] **Step 2: Run capture**
+- [x] **Step 2: Run capture**
 
 Run: `./tests/fixtures/import-corpus/capture.sh`
 Expected: script completes, prints SHAs, creates `full.tar.zst`, `subset.tar.zst`, `MANIFEST.md`.
 
-- [ ] **Step 3: Verify gitignore behavior one more time**
+- [x] **Step 3: Verify gitignore behavior one more time**
 
 Run: `git status --porcelain tests/fixtures/import-corpus/`
 Expected: only `MANIFEST.md` appears as untracked; tarballs do not.
 
-- [ ] **Step 4: Commit MANIFEST**
+- [x] **Step 4: Commit MANIFEST**
 
 Run:
 ```bash
@@ -368,7 +368,7 @@ stay local.
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 ```
 
-- [ ] **Step 5: Update log Corpus Snapshot section and Resume Block**
+- [x] **Step 5: Update log Corpus Snapshot section and Resume Block**
 
 Copy the SHAs from MANIFEST.md into the Frozen Header's Corpus Snapshot section. Update Resume Block: `Last completed` → `Task 4: corpus captured, manifest committed.` `Next action` → `Task 5: wire PerfLogger into ImportWorkerOptions.` Commit as `log: record corpus SHAs`.
 
@@ -381,7 +381,7 @@ Copy the SHAs from MANIFEST.md into the Frozen Header's Corpus Snapshot section.
 
 The existing `ImportWorkerOptions` is private with one field (`per_chunk_delay`). We add an `Option<PerfLogger>` field, construct it from env in the public entry points (`import_all`, `start_startup_import_with_progress`), and use it inside `import_chunk` to emit a span covering the whole chunk.
 
-- [ ] **Step 1: Add the field and import**
+- [x] **Step 1: Add the field and import**
 
 At the top of `crates/gnomon-core/src/import/chunk.rs`, add to existing imports:
 
@@ -399,7 +399,7 @@ struct ImportWorkerOptions {
 }
 ```
 
-- [ ] **Step 2: Update `import_all` to build a logger**
+- [x] **Step 2: Update `import_all` to build a logger**
 
 Replace the body of `import_all` (lines 239-290). Build a logger from env using the db_path's parent as state_dir, then pass it into both loops:
 
@@ -455,7 +455,7 @@ pub fn import_all(
 }
 ```
 
-- [ ] **Step 3: Update `start_startup_import_with_mode_and_progress` to build a logger**
+- [x] **Step 3: Update `start_startup_import_with_mode_and_progress` to build a logger**
 
 At the top of its body (currently creating `ImportWorkerOptions::default()` at line 234), construct the logger from `db_path.parent()` and plumb it through the same way. Replace the call site:
 
@@ -477,7 +477,7 @@ At the top of its body (currently creating `ImportWorkerOptions::default()` at l
     )
 ```
 
-- [ ] **Step 4: Emit a span in `import_chunk`**
+- [x] **Step 4: Emit a span in `import_chunk`**
 
 In `import_chunk` (line 828), immediately after `begin_chunk_import` and the optional delay, wrap the inner `(|| { ... })()` closure in a perf scope. Replace the existing function body with:
 
@@ -571,7 +571,7 @@ fn import_chunk(
 
 Note: this step introduces `perf_logger` fields on `NormalizeJsonlFileParams` (Task 6) and `BuildActionsParams` (Task 7). The code will not compile until those tasks are done. This is intentional — the three tasks form one atomic change. Do not commit or run cargo between Tasks 5, 6, and 7.
 
-- [ ] **Step 5: No commit yet**
+- [x] **Step 5: No commit yet**
 
 Compilation is broken until Tasks 6 and 7 land. Leave the working tree dirty; move to Task 6.
 
@@ -583,7 +583,7 @@ Compilation is broken until Tasks 6 and 7 land. Leave the working tree dirty; mo
 - Modify: `crates/gnomon-core/src/import/mod.rs` — `NormalizeJsonlFileParams` definition.
 - Modify: `crates/gnomon-core/src/import/normalize.rs` — thread logger in, emit spans.
 
-- [ ] **Step 1: Add `perf_logger` to `NormalizeJsonlFileParams`**
+- [x] **Step 1: Add `perf_logger` to `NormalizeJsonlFileParams`**
 
 Find the definition of `NormalizeJsonlFileParams` in `crates/gnomon-core/src/import/mod.rs`. Add the new field:
 
@@ -601,7 +601,7 @@ Keep other fields as they already are. Update the `Clone` derive status to match
 
 If tests in the same file construct `NormalizeJsonlFileParams` by name, add `perf_logger: None` to each. Run `cargo check -p gnomon-core 2>&1 | grep -i 'perf_logger'` after this step to find any missed sites — expected a few compile errors to fix.
 
-- [ ] **Step 2: Add phase spans in `normalize_transcript_jsonl_file`**
+- [x] **Step 2: Add phase spans in `normalize_transcript_jsonl_file`**
 
 In `crates/gnomon-core/src/import/normalize.rs`, add at the top:
 
@@ -627,11 +627,11 @@ On the two early-return paths (`Ok(NormalizeJsonlFileOutcome::Warning(...))` at 
 
 placed after the successful `tx.commit()`.
 
-- [ ] **Step 3: Also wire the history-file path if it exists**
+- [x] **Step 3: Also wire the history-file path if it exists**
 
 If `normalize_history_jsonl_file` (or whatever the sibling function for the `history.jsonl` path is) exists in this file, mirror the same span treatment. If it does not, skip this step.
 
-- [ ] **Step 4: No commit yet**
+- [x] **Step 4: No commit yet**
 
 `build_turns` span still to add in Task 7. Move on.
 
@@ -645,7 +645,7 @@ If `normalize_history_jsonl_file` (or whatever the sibling function for the `his
 - Modify: `crates/gnomon-core/src/rollup.rs` — spans around `rebuild_chunk_action_rollups` and `rebuild_chunk_path_rollups`.
 - Modify: `crates/gnomon-core/src/import/chunk.rs` — span around `finalize_chunk_import` and any rollup call sites.
 
-- [ ] **Step 1: Wrap `build_turns`**
+- [x] **Step 1: Wrap `build_turns`**
 
 Inside `normalize_transcript_jsonl_file` (normalize.rs), replace:
 
@@ -671,7 +671,7 @@ with:
     };
 ```
 
-- [ ] **Step 2: Add `perf_logger` to `BuildActionsParams`**
+- [x] **Step 2: Add `perf_logger` to `BuildActionsParams`**
 
 Open `crates/gnomon-core/src/classify/mod.rs`. Add:
 
@@ -688,7 +688,7 @@ pub struct BuildActionsParams {
 }
 ```
 
-- [ ] **Step 3: Wrap `build_actions` in a span**
+- [x] **Step 3: Wrap `build_actions` in a span**
 
 In the `build_actions` function, at the very top of the body create:
 
@@ -699,7 +699,7 @@ In the `build_actions` function, at the very top of the body create:
 
 At the successful return (just before the final `Ok(...)`), set any counters you can cheaply get (e.g. number of actions inserted) and call `scope.finish_ok()`. On error paths, call `scope.finish_error(&err)`. If `build_actions` is written in `?`-heavy style, wrap the body in an inner closure and match on its result at the outer level, like the `import_chunk` pattern in Task 5.
 
-- [ ] **Step 4: Wrap rollup rebuilds**
+- [x] **Step 4: Wrap rollup rebuilds**
 
 Open `crates/gnomon-core/src/rollup.rs`. Add:
 
@@ -716,7 +716,7 @@ For `rebuild_chunk_action_rollups` and `rebuild_chunk_path_rollups`, change the 
 
 at the top, and `scope.finish_ok()` / `scope.finish_error(&err)` at return paths.
 
-- [ ] **Step 5: Update call sites in `chunk.rs`**
+- [x] **Step 5: Update call sites in `chunk.rs`**
 
 Find `rebuild_chunk_action_rollups` and `rebuild_chunk_path_rollups` call sites in `crates/gnomon-core/src/import/chunk.rs` (around line 1023) and pass `options.perf_logger.clone()` through. Also pass `clear_chunk_action_rollups` / `clear_chunk_path_rollups` an `Option<PerfLogger>` if you want their timings too — skip if the change would be invasive and the rollup clear is trivial.
 
@@ -735,7 +735,7 @@ Wrap `finalize_chunk_import` in its own span inside `import_chunk`:
 
 Replace the existing `finalize_chunk_import(...)?;` call inside the closure with this pattern.
 
-- [ ] **Step 6: Fix compile errors and run quality gates**
+- [x] **Step 6: Fix compile errors and run quality gates**
 
 Run:
 ```bash
@@ -751,7 +751,7 @@ cargo test --workspace
 ```
 Expected: all pass. Fix any failures before moving on.
 
-- [ ] **Step 7: Commit Tasks 5-7 together**
+- [x] **Step 7: Commit Tasks 5-7 together**
 
 Run:
 ```bash
@@ -770,7 +770,7 @@ Opt-in via GNOMON_PERF_LOG env var; off by default.
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 ```
 
-- [ ] **Step 8: Update Resume Block**
+- [x] **Step 8: Update Resume Block**
 
 `Last completed` → `Tasks 5-7: perf spans wired into import path.` `Next action` → `Task 8: parse-vs-SQL split in per-record loop.` Commit as `log: update resume block after Task 7`.
 
