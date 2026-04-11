@@ -93,7 +93,7 @@ Three back-to-back runs each of `import_bench --corpus subset` in `--mode full` 
 6. **Startup mode wall has a non-`import.chunk` floor of ≈940 ms** (scan + DB open + plan build + harness overhead). On a target of "fast TUI gate," this floor is roughly 38% of total wall on the subset. Worth a span around `scan_source_manifest` and `build_import_plan` in Task 11 / Phase 2 instrumentation.
 7. **Subset is unbalanced.** Because the subset is a single huge project, *all* 35 of its chunks land in *one* execution — and 34 of them are "deferred" (older than 24h). That mirrors the full-corpus shape where the bulk of work is also deferred chunks. Subset numbers should track full-corpus numbers proportionally for optimizations that target the per-chunk inner loop, but optimizations targeting the *plan builder* or *project-level overhead* will look near-zero on the subset and only show up on the full corpus.
 
-Committed as sha `<filled in next commit>`. Quality gates: nothing rebuilt, this is data capture only.
+Committed as sha `2b59d25`. Quality gates: nothing rebuilt, this is data capture only.
 
 ### 2026-04-11 — Task 9 complete: import_bench example harness
 
