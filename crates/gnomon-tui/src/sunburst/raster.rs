@@ -304,6 +304,31 @@ fn cell_sample_hits<const N: usize>(
             continue;
         };
         let angle = (normalized_y.atan2(normalized_x) + FRAC_PI_2).rem_euclid(TAU);
+
+        // For non-root layers (descendants), clip to the parent layer's
+        // rendered selected-segment boundary.  This prevents the descendant
+        // ring from extending past the quantized boundary of the selected
+        // segment in the ancestor, which would otherwise create a visible
+        // overlap with adjacent segments.
+        if layer_index > 0
+            && let (Some(parent_layer), Some(parent_quantized)) = (
+                context.model.layers.get(layer_index - 1),
+                context.quantized_layers.get(layer_index - 1),
+            )
+        {
+            let parent_hit =
+                quantized_segment_index(parent_layer, parent_quantized, angle, context.config);
+            let parent_is_selected = parent_hit.is_some_and(|seg_idx| {
+                parent_layer
+                    .segments
+                    .get(seg_idx)
+                    .is_some_and(|seg| seg.is_selected)
+            });
+            if !parent_is_selected {
+                continue;
+            }
+        }
+
         let Some(segment_index) =
             quantized_segment_index(layer, quantized_layer, angle, context.config)
         else {
@@ -380,45 +405,13 @@ fn quantize_layer_owners(
         .collect()
 }
 
-fn display_segment_sweeps(layer: &SunburstLayer, config: SunburstRenderConfig) -> Vec<f64> {
-    let base_sweeps = base_segment_sweeps(layer);
-    let Some(selected_index) = layer
-        .segments
-        .iter()
-        .position(|segment| segment.is_selected)
-    else {
-        return base_sweeps;
-    };
-
-    let policy = config.distortion_policy;
-    let selected_base = base_sweeps[selected_index];
-    let selected_threshold = layer.span.sweep * policy.focus_zoom_threshold_ratio;
-    if selected_base >= selected_threshold && selected_base >= policy.minimum_visible_sweep {
-        return base_sweeps;
-    }
-
-    let selected_target = (selected_base * policy.focus_zoom_multiplier)
-        .max(policy.minimum_visible_sweep)
-        .min(layer.span.sweep * policy.maximum_selected_share)
-        .min(layer.span.sweep);
-    let other_total = layer.span.sweep - selected_base;
-    if other_total <= 0.0 {
-        return vec![layer.span.sweep];
-    }
-
-    let remainder = (layer.span.sweep - selected_target).max(0.0);
-    let scale = remainder / other_total;
-    base_sweeps
-        .into_iter()
-        .enumerate()
-        .map(|(index, sweep)| {
-            if index == selected_index {
-                selected_target
-            } else {
-                sweep * scale
-            }
-        })
-        .collect()
+fn display_segment_sweeps(layer: &SunburstLayer, _config: SunburstRenderConfig) -> Vec<f64> {
+    // Return base (undistorted) sweeps so that segment positions are stable
+    // across selections.  The previous distortion policy expanded the selected
+    // segment and compressed others, causing the angular layout to shift each
+    // time a different project was selected — the descendant ring for project A
+    // would overlap with the descendant ring for project B.
+    base_segment_sweeps(layer)
 }
 
 fn base_segment_sweeps(layer: &SunburstLayer) -> Vec<f64> {

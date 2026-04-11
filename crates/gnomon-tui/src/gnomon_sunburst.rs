@@ -50,6 +50,35 @@ pub(crate) fn build_sunburst_model(
         })
         .unwrap_or_else(|| "selected: none".to_string());
 
+    #[cfg(debug_assertions)]
+    {
+        let ancestor_count = if has_ancestors {
+            layers.len().saturating_sub(descendant_layers.len())
+        } else {
+            0
+        };
+        eprintln!(
+            "[sunburst] layers={} ancestors={} has_ancestors={} has_selection={} visible_rows={} descendants={}",
+            layers.len(),
+            ancestor_count,
+            has_ancestors,
+            has_selection,
+            visible_rows.len(),
+            descendant_layers.len(),
+        );
+        for (i, layer) in layers.iter().enumerate() {
+            let selected_idx = layer.segments.iter().position(|s| s.is_selected);
+            eprintln!(
+                "[sunburst]   layer[{}]: start={:.3} sweep={:.3} segments={} selected_idx={:?}",
+                i,
+                layer.span.start,
+                layer.span.sweep,
+                layer.segments.len(),
+                selected_idx,
+            );
+        }
+    }
+
     SunburstModel {
         center: SunburstCenter {
             scope_label,

@@ -11,16 +11,22 @@ pub(crate) fn sunburst_segment_at_angle(
 
 pub(crate) fn sunburst_selected_child_span(
     layer: &SunburstLayer,
-    policy: SunburstDistortionPolicy,
+    _policy: SunburstDistortionPolicy,
 ) -> SunburstSpan {
     if layer.segments.is_empty() {
         return layer.span;
     }
 
+    // Use base (undistorted) spans so the descendant ring occupies a fixed
+    // angular range that depends only on data proportions, not which segment
+    // is selected.  Distortion is still applied during rendering of the
+    // ancestor ring, but the child span must be stable across selections
+    // to prevent overlapping arcs.
+    let base_sweeps = base_segment_sweeps(layer);
     for (segment, span) in layer
         .segments
         .iter()
-        .zip(display_segment_spans(layer, policy))
+        .zip(segment_spans_from_sweeps(layer.span, &base_sweeps))
     {
         if segment.is_selected {
             return span;
@@ -56,48 +62,9 @@ fn sunburst_segment_at_local_angle(
 
 fn display_segment_spans(
     layer: &SunburstLayer,
-    policy: SunburstDistortionPolicy,
+    _policy: SunburstDistortionPolicy,
 ) -> Vec<SunburstSpan> {
-    let base_sweeps = base_segment_sweeps(layer);
-    let Some(selected_index) = layer
-        .segments
-        .iter()
-        .position(|segment| segment.is_selected)
-    else {
-        return segment_spans_from_sweeps(layer.span, &base_sweeps);
-    };
-
-    let selected_base = base_sweeps[selected_index];
-    let selected_threshold = layer.span.sweep * policy.focus_zoom_threshold_ratio;
-    if selected_base >= selected_threshold && selected_base >= policy.minimum_visible_sweep {
-        return segment_spans_from_sweeps(layer.span, &base_sweeps);
-    }
-
-    let selected_target = (selected_base * policy.focus_zoom_multiplier)
-        .max(policy.minimum_visible_sweep)
-        .min(layer.span.sweep * policy.maximum_selected_share)
-        .min(layer.span.sweep);
-
-    let other_total = layer.span.sweep - selected_base;
-    if other_total <= 0.0 {
-        return vec![layer.span];
-    }
-
-    let remainder = (layer.span.sweep - selected_target).max(0.0);
-    let scale = remainder / other_total;
-    let adjusted = base_sweeps
-        .iter()
-        .enumerate()
-        .map(|(index, sweep)| {
-            if index == selected_index {
-                selected_target
-            } else {
-                sweep * scale
-            }
-        })
-        .collect::<Vec<_>>();
-
-    segment_spans_from_sweeps(layer.span, &adjusted)
+    segment_spans_from_sweeps(layer.span, &base_segment_sweeps(layer))
 }
 
 fn base_segment_sweeps(layer: &SunburstLayer) -> Vec<f64> {

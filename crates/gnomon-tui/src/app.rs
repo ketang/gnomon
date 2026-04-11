@@ -7915,9 +7915,12 @@ mod tests {
         );
 
         let span = radial_selected_child_span(&layer);
+        let expected = TAU * (1.0 / 100.0);
         assert!(
-            span.sweep > TAU / 100.0,
-            "expected the distortion policy to expand tiny selected segments beyond the raw 1% sweep"
+            (span.sweep - expected).abs() < 0.001,
+            "expected undistorted 1% sweep ({:.4}), got {:.4}",
+            expected,
+            span.sweep,
         );
     }
 

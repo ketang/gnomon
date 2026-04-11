@@ -28,10 +28,23 @@ impl Widget for &SunburstPane<'_> {
         rasterize_sunburst(buf, inner, self.model, self.config);
 
         let center_area = sunburst_center_label_area(inner, self.config);
+
+        // Clear the center area so sunburst quadrant glyphs don't bleed
+        // through the centered-text padding.
+        let clear_style = sunburst_center_label_style(self.focused);
+        for y in center_area.y..center_area.y + center_area.height {
+            for x in center_area.x..center_area.x + center_area.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.reset();
+                    cell.set_style(clear_style);
+                }
+            }
+        }
+
         let center_lines =
             sunburst_center_label_lines(&self.model.center, center_area.width, center_area.height);
         Paragraph::new(Text::from(center_lines))
-            .style(sunburst_center_label_style(self.focused))
+            .style(clear_style)
             .alignment(Alignment::Center)
             .render(center_area, buf);
     }
