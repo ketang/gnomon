@@ -61,6 +61,14 @@ pub struct PerfLogger {
     inner: Arc<PerfLoggerInner>,
 }
 
+impl std::fmt::Debug for PerfLogger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PerfLogger")
+            .field("path", &self.inner.path)
+            .finish()
+    }
+}
+
 struct PerfLoggerInner {
     path: PathBuf,
     config: PerfLoggerConfig,

@@ -8,6 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
 
 use super::{NormalizedToolUsePartMetadata, SourceFileKind};
+use crate::perf::{PerfLogger, PerfScope};
 
 const PRIMARY_STREAM_SEQUENCE_NO: i64 = 0;
 const SOURCE_LINE_PREVIEW_CHAR_LIMIT: usize = 160;
@@ -20,6 +21,7 @@ pub struct NormalizeJsonlFileParams {
     pub source_file_id: i64,
     pub import_chunk_id: i64,
     pub path: PathBuf,
+    pub perf_logger: Option<PerfLogger>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +78,34 @@ fn load_source_file_kind(conn: &Connection, source_file_id: i64) -> Result<Optio
 }
 
 fn normalize_transcript_jsonl_file(
+    conn: &mut Connection,
+    params: &NormalizeJsonlFileParams,
+) -> Result<NormalizeJsonlFileOutcome> {
+    let mut scope = PerfScope::new(params.perf_logger.clone(), "import.normalize_jsonl");
+    scope.field("path", params.path.display().to_string());
+    let result = normalize_transcript_jsonl_file_inner(conn, params);
+    match &result {
+        Ok(NormalizeJsonlFileOutcome::Imported(outcome)) => {
+            scope.field("outcome", "imported");
+            scope.field("record_count", outcome.record_count);
+            scope.field("message_count", outcome.message_count);
+            scope.field("turn_count", outcome.turn_count);
+            scope.finish_ok();
+        }
+        Ok(NormalizeJsonlFileOutcome::Skipped) => {
+            scope.field("outcome", "skipped");
+            scope.finish_ok();
+        }
+        Ok(NormalizeJsonlFileOutcome::Warning(_)) => {
+            scope.field("outcome", "warning");
+            scope.finish_ok();
+        }
+        Err(err) => scope.finish_error(err),
+    }
+    result
+}
+
+fn normalize_transcript_jsonl_file_inner(
     conn: &mut Connection,
     params: &NormalizeJsonlFileParams,
 ) -> Result<NormalizeJsonlFileOutcome> {
@@ -147,7 +177,18 @@ fn normalize_transcript_jsonl_file(
         state.flush_buffered_records(&mut tx)?;
     }
 
-    let turn_count = state.build_turns(&mut tx)?;
+    let mut turns_scope = PerfScope::new(params.perf_logger.clone(), "import.build_turns");
+    let turn_count = match state.build_turns(&mut tx) {
+        Ok(count) => {
+            turns_scope.field("turn_count", count);
+            turns_scope.finish_ok();
+            count
+        }
+        Err(err) => {
+            turns_scope.finish_error(&err);
+            return Err(err);
+        }
+    };
     state.finish_import(&mut tx, turn_count)?;
     tx.commit().context("unable to commit normalized import")?;
 
@@ -223,6 +264,32 @@ impl HistoryInputKind {
 }
 
 fn normalize_history_jsonl_file(
+    conn: &mut Connection,
+    params: &NormalizeJsonlFileParams,
+) -> Result<NormalizeJsonlFileOutcome> {
+    let mut scope = PerfScope::new(params.perf_logger.clone(), "import.normalize_history_jsonl");
+    scope.field("path", params.path.display().to_string());
+    let result = normalize_history_jsonl_file_inner(conn, params);
+    match &result {
+        Ok(NormalizeJsonlFileOutcome::Imported(outcome)) => {
+            scope.field("outcome", "imported");
+            scope.field("record_count", outcome.record_count);
+            scope.finish_ok();
+        }
+        Ok(NormalizeJsonlFileOutcome::Skipped) => {
+            scope.field("outcome", "skipped");
+            scope.finish_ok();
+        }
+        Ok(NormalizeJsonlFileOutcome::Warning(_)) => {
+            scope.field("outcome", "warning");
+            scope.finish_ok();
+        }
+        Err(err) => scope.finish_error(err),
+    }
+    result
+}
+
+fn normalize_history_jsonl_file_inner(
     conn: &mut Connection,
     params: &NormalizeJsonlFileParams,
 ) -> Result<NormalizeJsonlFileOutcome> {
@@ -1576,6 +1643,7 @@ mod tests {
                 source_file_id: ids.source_file_id,
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
+                perf_logger: None,
             },
         )?;
         let NormalizeJsonlFileOutcome::Imported(result) = result else {
@@ -1671,6 +1739,7 @@ mod tests {
                 source_file_id: ids.source_file_id,
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
+                perf_logger: None,
             },
         )?;
         let NormalizeJsonlFileOutcome::Imported(result) = result else {
@@ -1723,6 +1792,7 @@ mod tests {
                 source_file_id: ids.source_file_id,
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
+                perf_logger: None,
             },
         )?;
         assert!(matches!(result, NormalizeJsonlFileOutcome::Imported(_)));
@@ -1901,6 +1971,7 @@ mod tests {
                 source_file_id: 1,
                 import_chunk_id: 1,
                 path: fixture_path.clone(),
+                perf_logger: None,
             },
         )
         .expect_err("legacy message schema should fail during insert");
@@ -1939,6 +2010,7 @@ mod tests {
                 source_file_id: ids.source_file_id,
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path.clone(),
+                perf_logger: None,
             },
         )?;
 
@@ -1984,6 +2056,7 @@ mod tests {
                 source_file_id: ids.source_file_id,
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
+                perf_logger: None,
             },
         )?;
 
@@ -2034,6 +2107,7 @@ mod tests {
                 source_file_id: first_ids.source_file_id,
                 import_chunk_id: first_ids.import_chunk_id,
                 path: first_fixture_path,
+                perf_logger: None,
             },
         )?;
         let NormalizeJsonlFileOutcome::Imported(first_result) = first_result else {
@@ -2046,6 +2120,7 @@ mod tests {
                 source_file_id: second_ids.source_file_id,
                 import_chunk_id: second_ids.import_chunk_id,
                 path: second_fixture_path,
+                perf_logger: None,
             },
         )?;
         let NormalizeJsonlFileOutcome::Imported(second_result) = second_result else {
@@ -2102,6 +2177,7 @@ mod tests {
                 source_file_id: ids.source_file_id,
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
+                perf_logger: None,
             },
         )?;
         let NormalizeJsonlFileOutcome::Imported(result) = result else {

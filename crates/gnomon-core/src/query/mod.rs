@@ -8076,8 +8076,8 @@ mod tests {
             ",
             [import_chunk_id],
         )?;
-        crate::rollup::rebuild_chunk_action_rollups(conn, import_chunk_id)?;
-        crate::rollup::rebuild_chunk_path_rollups(conn, import_chunk_id)?;
+        crate::rollup::rebuild_chunk_action_rollups(conn, import_chunk_id, None)?;
+        crate::rollup::rebuild_chunk_path_rollups(conn, import_chunk_id, None)?;
         Ok(())
     }
 

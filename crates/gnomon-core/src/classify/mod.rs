@@ -6,10 +6,12 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
 
 use crate::import::NormalizedToolUsePartMetadata;
+use crate::perf::{PerfLogger, PerfScope};
 
 #[derive(Debug, Clone)]
 pub struct BuildActionsParams {
     pub conversation_id: i64,
+    pub perf_logger: Option<PerfLogger>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +21,24 @@ pub struct BuildActionsResult {
 }
 
 pub fn build_actions(
+    conn: &mut Connection,
+    params: &BuildActionsParams,
+) -> Result<BuildActionsResult> {
+    let mut scope = PerfScope::new(params.perf_logger.clone(), "import.build_actions");
+    scope.field("conversation_id", params.conversation_id);
+    let result = build_actions_inner(conn, params);
+    match &result {
+        Ok(outcome) => {
+            scope.field("action_count", outcome.action_count);
+            scope.field("path_ref_count", outcome.path_ref_count);
+            scope.finish_ok();
+        }
+        Err(err) => scope.finish_error(err),
+    }
+    result
+}
+
+fn build_actions_inner(
     conn: &mut Connection,
     params: &BuildActionsParams,
 ) -> Result<BuildActionsResult> {
@@ -1325,6 +1345,7 @@ mod tests {
                 source_file_id: ids.source_file_id,
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
+                perf_logger: None,
             },
         )?;
         let NormalizeJsonlFileOutcome::Imported(normalized) = normalized else {
@@ -1336,6 +1357,7 @@ mod tests {
                 conversation_id: normalized
                     .conversation_id
                     .expect("transcript normalization should produce a conversation id"),
+                perf_logger: None,
             },
         )?;
 
@@ -1407,6 +1429,7 @@ mod tests {
                 source_file_id: ids.source_file_id,
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
+                perf_logger: None,
             },
         )?;
         let NormalizeJsonlFileOutcome::Imported(normalized) = normalized else {
@@ -1418,6 +1441,7 @@ mod tests {
                 conversation_id: normalized
                     .conversation_id
                     .expect("transcript normalization should produce a conversation id"),
+                perf_logger: None,
             },
         )?;
 
@@ -1481,6 +1505,7 @@ mod tests {
                 source_file_id: ids.source_file_id,
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
+                perf_logger: None,
             },
         )?;
         let NormalizeJsonlFileOutcome::Imported(normalized) = normalized else {
@@ -1492,6 +1517,7 @@ mod tests {
                 conversation_id: normalized
                     .conversation_id
                     .expect("transcript normalization should produce a conversation id"),
+                perf_logger: None,
             },
         )?;
 
