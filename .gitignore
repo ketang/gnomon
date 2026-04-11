@@ -4,3 +4,6 @@
 .DS_Store
 
 crates/gnomon-web/ui/node_modules/
+
+# Import perf corpus snapshot tarballs — user-local, never pushed.
+tests/fixtures/import-corpus/*.tar.zst
