@@ -861,7 +861,7 @@ The harness is a single `main()` that:
 8. Prints a one-shot human-readable report: wall time, rows per table, DB file size, JSONL MB parsed, MB/s, rows/s.
 9. Tears down unless `--keep-db`.
 
-- [ ] **Step 1: Check workspace dev-deps**
+- [x] **Step 1: Check workspace dev-deps**
 
 Run: `grep -n clap crates/gnomon-core/Cargo.toml`
 If `clap` is not already a dep of `gnomon-core`, add it under `[dev-dependencies]` in `crates/gnomon-core/Cargo.toml` using the workspace version:
@@ -874,7 +874,7 @@ tempfile = { workspace = true }
 
 (Check existing dev-deps first; only add what's missing.)
 
-- [ ] **Step 2: Write the example**
+- [x] **Step 2: Write the example**
 
 Create `crates/gnomon-core/examples/import_bench.rs` with this content:
 
@@ -1125,7 +1125,7 @@ fn count_rows(db_path: &Path) -> Result<Vec<(String, i64)>> {
 - `walkdir` needs to be accessible from the example. If it isn't a direct dep of `gnomon-core`, add it as a dev-dependency (workspace version) alongside `clap` and `tempfile`.
 - Avoid `unwrap()` — the workspace denies `clippy::unwrap_used`. Use `?` or explicit match arms everywhere.
 
-- [ ] **Step 3: Build and run smoke-test on subset, mode=full**
+- [x] **Step 3: Build and run smoke-test on subset, mode=full**
 
 Run:
 ```bash
@@ -1138,7 +1138,7 @@ Expected: prints `wall: <n>s`, row counts are nonzero for at least `project`, `r
 
 If spans are missing, something is wrong with Task 5-7 plumbing — fix before proceeding.
 
-- [ ] **Step 4: Smoke-test on subset, mode=startup**
+- [x] **Step 4: Smoke-test on subset, mode=startup**
 
 Run:
 ```bash
@@ -1147,7 +1147,7 @@ cargo run -p gnomon-core --example import_bench --release -- \
 ```
 Expected: prints a wall time (the time-to-TUI-gate); row counts reflect only the 24h window (may be zero if your real corpus' most-recent 24h has no data for the subset's projects — that is a real data property to note).
 
-- [ ] **Step 5: Quality gates and commit**
+- [x] **Step 5: Quality gates and commit**
 
 Run `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo build --workspace`.
 
@@ -1165,7 +1165,7 @@ file. Used by the import-perf Phase 1 baseline capture.
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 ```
 
-- [ ] **Step 6: Update Resume Block**
+- [x] **Step 6: Update Resume Block**
 
 `Last completed` → `Task 9: bench harness built and smoke-tested.` `Next action` → `Task 10: capture subset baselines.` Commit.
 
