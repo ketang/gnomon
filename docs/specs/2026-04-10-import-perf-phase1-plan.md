@@ -1238,19 +1238,19 @@ Commit as `log: subset baseline captured`.
 
 ## Task 11: Capture baseline — full corpus
 
-- [ ] **Step 1: Capture full, mode=full, 3 runs**
+- [x] **Step 1: Capture full, mode=full, 3 runs**
 
 Same recipe as Task 10 but with `--corpus full`. Expect significantly longer wall time — do not cancel runs.
 
-- [ ] **Step 2: Capture full, mode=startup, 3 runs**
+- [x] **Step 2: Capture full, mode=startup, 3 runs**
 
 Same. Startup mode on the full corpus is the **primary metric** we care about. Capture carefully.
 
-- [ ] **Step 3: Summarize into log**
+- [x] **Step 3: Summarize into log**
 
 New Phase Log entry `<date> — baseline: full corpus`. Same structure as Task 10. Commit as `log: full baseline captured`.
 
-- [ ] **Step 4: Populate the log's Baseline section in the Frozen Header**
+- [x] **Step 4: Populate the log's Baseline section in the Frozen Header**
 
 With the median numbers from Tasks 10 and 11, fill in the `## Baseline` placeholder in the Frozen Header. Commit as `log: populate baseline header`.
 

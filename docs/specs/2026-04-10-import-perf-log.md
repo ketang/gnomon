@@ -28,7 +28,21 @@
   - SHA256: `053ea32815905ee3936e9e596a7e759713defb198257740ad9e45c44ec35ed89`
 
 ## Baseline
-_(to be captured in Phase 1 — Tasks 10-11)_
+
+Captured on the environment above (WSL2, Ryzen 5 5600X, tmpfs DB). All numbers are medians of 3 back-to-back runs unless noted.
+
+| metric | subset (708 MB, 1 project, 1649 files) | full (1.44 GB, 31 projects, 4548 files) |
+| --- | ---: | ---: |
+| **Full mode wall** | **63.2s** | **126.1s** |
+| Full mode throughput | 10.9 MB/s | 11.4 MB/s |
+| **Startup mode wall** | **2.2s** | **5.1s** |
+| Full mode import.chunk | 61.5s | 121.2s |
+| Full mode commit_ms | 23.1s (37.5% chunk) | 40.1s (33.1% chunk) |
+| Full mode build_actions | 24.6s (40.0% chunk) | 45.9s (37.9% chunk) |
+| Full mode normalize_jsonl | 35.1s (57.0% chunk) | 69.6s (57.4% chunk) |
+| Startup scan_source | 981ms (44% wall) | 2857ms (56% wall) |
+| Startup prepare_plan | 131ms | 666ms |
+| DB size (full mode) | 187 MB | 487 MB |
 
 ## Target
 _(to be agreed with user at end of Phase 1 — Task 14)_
@@ -39,6 +53,87 @@ _(to be agreed with user at end of Phase 1 — Task 14)_
 
 ### 2026-04-10 — Phase 1 started
 Kicked off Phase 1 (measure). Design doc committed on `import-perf` (sha `dc136b5`). Phase 1 implementation plan committed (sha `cbd3516`). Running log initialized (sha `2c6e57a`). Fixture directory reserved and gitignored (sha `d49560c`). Capture script added (sha `1b1320c`).
+
+### 2026-04-11 — Task 11 complete: full-corpus baseline captured
+
+Three runs each of `import_bench --corpus full` in `--mode full` and `--mode startup`, release build. Perf logs at `/tmp/gnomon-perf-full-{full,startup}-{1,2,3}.jsonl`, run logs at `/tmp/gnomon-full-{full,startup}-{1,2,3}.log`.
+
+**Full corpus, mode=full** (31 projects, 4548 files, 162 chunks: 5 startup + 157 deferred)
+- Wall (3 runs): **106.4s / 133.6s / 126.1s — median 126.1s**
+- Throughput at median: **11.4 MB/s parsed**
+- Row counts: project=31, source_file=4548, import_chunk=162, conversation=4547, stream=4547, record=490250, message=294995, message_part=411842, turn=13363, action=120922
+- DB size: 486.86 MB
+- Per-phase split (median run = run 3):
+
+  | operation | total ms | share of import.chunk (121.2s) |
+  | --- | ---: | ---: |
+  | `import.scan_source` (outside chunk) | 3100.9 | — |
+  | `import.prepare_plan` (outside chunk) | 734.4 | — |
+  | `import.build_plan` (outside chunk) | 10.8 | — |
+  | `import.open_database` (outside chunk) | 0.6 | — |
+  | `import.chunk` (outer) | 121150.8 | 100% |
+  | &nbsp;&nbsp;`import.normalize_jsonl` | 69603.4 | 57.4% |
+  | &nbsp;&nbsp;&nbsp;&nbsp;↳ `parse_ms` | 3745.0 | 3.1% |
+  | &nbsp;&nbsp;&nbsp;&nbsp;↳ `sql_ms` | 20938.1 | 17.3% |
+  | &nbsp;&nbsp;&nbsp;&nbsp;↳ `purge_ms` | 391.5 | 0.3% |
+  | &nbsp;&nbsp;&nbsp;&nbsp;↳ `finish_import_ms` | 141.2 | 0.1% |
+  | &nbsp;&nbsp;&nbsp;&nbsp;↳ **`commit_ms`** | **40052.5** | **33.1%** |
+  | &nbsp;&nbsp;&nbsp;&nbsp;↳ untracked (line read + loop) | ≈4335 | 3.6% |
+  | &nbsp;&nbsp;`import.build_actions` | 45946.7 | 37.9% |
+  | &nbsp;&nbsp;`import.build_turns` | 2279.8 | 1.9% |
+  | &nbsp;&nbsp;`import.finalize_chunk` | 5009.3 | 4.1% |
+  | &nbsp;&nbsp;`import.rebuild_path_rollups` | 2001.7 | 1.7% |
+  | &nbsp;&nbsp;`import.rebuild_action_rollups` | 198.9 | 0.2% |
+
+**Full corpus, mode=startup** (primary user-facing metric)
+- Wall (3 runs): **7.285s / 5.114s / 4.967s — median 5.114s**
+- Row counts: conversation=55, record=10971, message=6942, turn=353, action=2695
+- DB size: 11.59 MB
+- Per-phase split (median run = run 2):
+
+  | operation | total ms | share of wall (5114ms) |
+  | --- | ---: | ---: |
+  | `import.scan_source` | **2856.6** | **55.9%** |
+  | `import.prepare_plan` | 665.8 | 13.0% |
+  | `import.build_plan` | 8.7 | 0.2% |
+  | **non-chunk floor** | **3531.1** | **69.0%** |
+  | `import.chunk` (11 ev) | 2477.8 | 48.4% |
+  | &nbsp;&nbsp;`import.normalize_jsonl` (146 ev) | 1518.5 | — |
+  | &nbsp;&nbsp;&nbsp;&nbsp;↳ `commit_ms` | 709.1 | — |
+  | &nbsp;&nbsp;`import.build_actions` (142 ev) | 873.1 | — |
+  | &nbsp;&nbsp;`import.build_turns` | 63.8 | — |
+  | &nbsp;&nbsp;`import.finalize_chunk` | 80.2 | — |
+
+  Note: wall (5.1s) < scan (2.86s) + chunk (2.48s) + prepare_plan (0.67s) = 6.0s because some chunk work overlaps with the scan return path and the benchmark includes Database::open before scan begins.
+
+  Note 2: run 1 (7.3s) was significantly slower — likely a cold-cache outlier representing the first startup of the day. Production will often see this cold-start penalty.
+
+**Scaling: subset → full corpus**
+
+| metric | subset | full | ratio | file/project ratio |
+| --- | ---: | ---: | ---: | --- |
+| Full mode wall | 63.2s | 126.1s | 2.0× | files: 2.76× |
+| commit_ms | 23.1s | 40.1s | 1.74× | sublinear: many full-corpus files are small |
+| build_actions | 24.6s | 45.9s | 1.87× | conversations: 2.76× |
+| scan_source | 838ms | 3101ms | 3.7× | projects: 31× (superlinear!) |
+| prepare_plan | 324ms | 734ms | 2.3× | |
+| Startup wall | 2.2s | 5.1s | 2.3× | |
+
+**Key findings from the full-corpus data**
+
+1. **`commit_ms` is still #1 at 40.1s (33.1% of chunk wall).** The proportional share dropped slightly from 37.5% (subset) to 33.1% because `build_actions` and `sql_ms` grew more than linearly with the number of conversations. Absolute savings from commit-batching: 4548 commits → 162 → est. **~38s saved (30% of full-mode wall).**
+
+2. **`build_actions` is 45.9s (37.9%).** Scales 1.87× for 2.76× more conversations — sublinear, suggesting fixed overhead per call is significant. Batching by chunk (162 calls instead of 4547) plus reusing in-memory state from normalize should give a substantial win.
+
+3. **`scan_source` scales 3.7× for 31× more projects.** The scaling is sublinear in projects but the constant factor is high: 3.1s on the full corpus in full mode, 2.86s in startup mode. **In startup mode, `scan_source` is 56% of wall.** This is the #1 target for startup-mode optimization. Caching the manifest (hash project-root mtimes/sizes, skip rediscovery if unchanged) would near-eliminate this cost on repeated runs.
+
+4. **`prepare_plan` is 734ms full / 666ms startup.** Now 13% of startup wall. Worth investigating — it prepares chunk metadata from the plan, so it's SQL query time. Could be optimized with better indices or batched queries.
+
+5. **`finalize_chunk` grew to 5.0s (4.1%).** On the subset it was 1.6s (2.6%). Worth a span-split in Phase 2 if commit-batching moves the bigger slices first.
+
+6. **`rebuild_path_rollups` is now 2.0s (1.7%).** Still small but now visible. Low priority.
+
+7. **Run-to-run variance on the full corpus is ~20% for full mode and ~47% for startup mode.** The first startup run (7.3s) is the cold-cache outlier — may represent the real-world "first startup of the day" case. Need to decide whether we target hot or cold for the performance goal.
 
 ### 2026-04-11 — Subset baseline v2: commit / scan / plan-build attributed
 
@@ -221,7 +316,7 @@ Decision: defer to user checkpoint (Task 13) after baselines are in hand. If the
 
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-11 (subset baseline v2 captured with new spans)
+Last updated: 2026-04-11 (end of Task 11)
 Current phase: Phase 1 — measure
 Current branch: `import-perf`
 Current worktree: `/home/ketan/project/gnomon/.worktrees/import-perf`
@@ -232,16 +327,16 @@ Primary repo root (do not implement here): `/home/ketan/project/gnomon`
 2. Verify: `git rev-parse --abbrev-ref HEAD` → must print `import-perf`
 3. Read this log's Phase Log (latest entries first) for context.
 4. Read `docs/specs/2026-04-10-import-perf-design.md` if you need the big picture.
-5. Read `docs/specs/2026-04-10-import-perf-phase1-plan.md` for the task list — you are between Task 10 and Task 11.
+5. Read `docs/specs/2026-04-10-import-perf-phase1-plan.md` for the task list — you are between Task 11 and Task 12.
 6. Continue at the "Next action" below.
 
 ### Last completed
-Subset baseline v2 — added `commit_ms` / `finish_import_ms` / `purge_ms` accumulators inside `normalize_jsonl`, plus `import.build_plan` / `import.prepare_plan` / `import.open_database` / `import.scan_source` spans (instrumentation commit `aa26c21`). Re-ran 3×full + 3×startup against the same subset corpus on the same host. Median full wall **63.249s**, median startup wall **2.216s**. **Headline finding: `commit_ms` is 23.1s — 37.5% of cold-import wall — and the startup-mode floor is `scan_source` (981 ms ≈ 50% of startup wall).** Tier-A candidate ranking rebased: commit batching is now #1 (est. 35% wall improvement on full mode), build_actions cache+batch is #2, scan_source parallel/cache is #3, faster JSON drops to #4.
+Task 11 — full-corpus baseline captured. Three runs each in full and startup mode against the 31-project, 4548-file full corpus. Median full wall **126.1s**, median startup wall **5.1s**. Baseline section in the Frozen Header populated with median numbers from both tasks. Key full-corpus findings: `commit_ms` still #1 at 40.1s (33% of chunk wall), `build_actions` at 45.9s (38%), `scan_source` is 2.86s = **56% of startup wall**, `prepare_plan` is 666ms = 13% of startup wall. Instrumentation + v2 subset baseline commit `aa26c21`, v2 subset log commit `eb6dd84`.
 
 ### Next action
-**Task 11 (Phase 1 plan):** Capture the full-corpus baseline with the same v2 instrumentation. Same recipe as Task 10 but `--corpus full`. Both modes, 3 runs each. Expect substantially longer full-mode walls (full corpus is ~2.2× subset by uncompressed bytes). Startup mode on the full corpus is the **primary user-facing metric**. `scan_source` should scale roughly 52× on the full corpus (52 projects vs the subset's 1) so the startup floor will move significantly. After capture, populate the `## Baseline` section of the Frozen Header with median numbers from both tasks.
+**Task 12 (Phase 1 plan):** Capture CPU profiles via `samply` against the full corpus. One profile for `--mode full`, one for `--mode startup`. Install samply first if not present. Save profiles under `docs/specs/profiles/`. Phase Log entry summarizing top-5 hottest functions by self-time.
 
-After Task 11, Task 12 captures one CPU profile each (full + startup) via `samply`. Then Task 13 is the first user checkpoint (review baseline, decide subset sizing) and Task 14 is the target-number checkpoint.
+After Task 12, Task 13 is the user checkpoint (review all baseline data) and Task 14 is the target-number checkpoint.
 
 ### Uncommitted state
 None. Working tree is clean on `import-perf`.
@@ -262,6 +357,7 @@ None. Working tree is clean on `import-perf`.
 - `2b59d25` log: subset baseline captured
 - `bfa304e` log: backfill subset baseline commit sha
 - `aa26c21` feat(import): add commit/finish/purge spans and scan/plan-build spans
+- `eb6dd84` log: subset baseline v2 with new commit/scan spans
 
 ### Target status
 Not set (pending Task 14, which requires Task 10-12 baseline data).
