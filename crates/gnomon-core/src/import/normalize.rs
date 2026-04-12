@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
 use super::{NormalizedToolUsePartMetadata, SourceFileKind};
@@ -74,6 +74,87 @@ pub fn normalize_jsonl_file(
     }
 }
 
+/// Normalize a JSONL file within an externally-managed transaction.
+/// Caller is responsible for transaction/savepoint commit or rollback.
+/// On `Warning` outcome, partial writes may have occurred — caller should
+/// roll back the enclosing savepoint.
+pub fn normalize_jsonl_file_in_tx(
+    conn: &Connection,
+    params: &NormalizeJsonlFileParams,
+) -> Result<NormalizeJsonlFileOutcome> {
+    match load_source_file_kind(conn, params.source_file_id)? {
+        Some(SourceFileKind::Transcript) => {
+            let mut scope = PerfScope::new(params.perf_logger.clone(), "import.normalize_jsonl");
+            scope.field("path", params.path.display().to_string());
+            let inner = normalize_transcript_jsonl_file_core(conn, params);
+            match inner {
+                Ok((outcome, breakdown)) => {
+                    scope.field("parse_ms", breakdown.parse.as_secs_f64() * 1000.0);
+                    scope.field("sql_ms", breakdown.sql.as_secs_f64() * 1000.0);
+                    scope.field("purge_ms", breakdown.purge.as_secs_f64() * 1000.0);
+                    scope.field(
+                        "finish_import_ms",
+                        breakdown.finish_import.as_secs_f64() * 1000.0,
+                    );
+                    scope.field("commit_ms", 0.0f64);
+                    match &outcome {
+                        NormalizeJsonlFileOutcome::Imported(result) => {
+                            scope.field("outcome", "imported");
+                            scope.field("record_count", result.record_count);
+                            scope.field("message_count", result.message_count);
+                            scope.field("turn_count", result.turn_count);
+                            scope.finish_ok();
+                        }
+                        NormalizeJsonlFileOutcome::Skipped => {
+                            scope.field("outcome", "skipped");
+                            scope.finish_ok();
+                        }
+                        NormalizeJsonlFileOutcome::Warning(_) => {
+                            scope.field("outcome", "warning");
+                            scope.finish_ok();
+                        }
+                    }
+                    Ok(outcome)
+                }
+                Err(err) => {
+                    scope.finish_error(&err);
+                    Err(err)
+                }
+            }
+        }
+        Some(SourceFileKind::ClaudeHistory) => {
+            let mut scope =
+                PerfScope::new(params.perf_logger.clone(), "import.normalize_history_jsonl");
+            scope.field("path", params.path.display().to_string());
+            let result = normalize_history_jsonl_file_core(conn, params);
+            match &result {
+                Ok(NormalizeJsonlFileOutcome::Imported(outcome)) => {
+                    scope.field("outcome", "imported");
+                    scope.field("record_count", outcome.record_count);
+                    scope.finish_ok();
+                }
+                Ok(NormalizeJsonlFileOutcome::Skipped) => {
+                    scope.field("outcome", "skipped");
+                    scope.finish_ok();
+                }
+                Ok(NormalizeJsonlFileOutcome::Warning(_)) => {
+                    scope.field("outcome", "warning");
+                    scope.finish_ok();
+                }
+                Err(err) => scope.finish_error(err),
+            }
+            result
+        }
+        None => Ok(NormalizeJsonlFileOutcome::Warning(NormalizeImportWarning {
+            code: WARNING_UNKNOWN_SOURCE_KIND,
+            message: format!(
+                "unable to determine source kind for source file id {}",
+                params.source_file_id
+            ),
+        })),
+    }
+}
+
 fn load_source_file_kind(conn: &Connection, source_file_id: i64) -> Result<Option<SourceFileKind>> {
     let raw_kind: Option<String> = conn
         .query_row(
@@ -130,17 +211,14 @@ fn normalize_transcript_jsonl_file(
     }
 }
 
-fn normalize_transcript_jsonl_file_inner(
-    conn: &mut Connection,
+fn normalize_transcript_jsonl_file_core(
+    conn: &Connection,
     params: &NormalizeJsonlFileParams,
 ) -> Result<(NormalizeJsonlFileOutcome, NormalizeBreakdown)> {
     let mut breakdown = NormalizeBreakdown::default();
 
-    let tx = conn
-        .transaction()
-        .context("unable to start normalization transaction")?;
     let purge_start = Instant::now();
-    purge_existing_import(&tx, params)?;
+    purge_existing_import(conn, params)?;
     breakdown.purge += purge_start.elapsed();
 
     let file = File::open(&params.path)
@@ -163,8 +241,7 @@ fn normalize_transcript_jsonl_file_inner(
             Ok(record) => record,
             Err(_) => {
                 breakdown.parse += parse_start.elapsed();
-                tx.rollback()
-                    .context("unable to roll back malformed jsonl import")?;
+                // Caller is responsible for rollback
                 return Ok((
                     NormalizeJsonlFileOutcome::Warning(NormalizeImportWarning {
                         code: WARNING_INVALID_JSON,
@@ -183,8 +260,8 @@ fn normalize_transcript_jsonl_file_inner(
         let sql_start = Instant::now();
         if state.conversation.is_none() {
             if extract_session_id(&record).is_some() {
-                state.initialize_context(&tx, &record)?;
-                state.flush_buffered_records(&tx)?;
+                state.initialize_context(conn, &record)?;
+                state.flush_buffered_records(conn)?;
             } else {
                 state.buffered_records.push(BufferedRecord {
                     source_line_no: line_no as i64,
@@ -195,16 +272,12 @@ fn normalize_transcript_jsonl_file_inner(
             }
         }
 
-        state.process_record(&tx, record, line_no as i64)?;
+        state.process_record(conn, record, line_no as i64)?;
         breakdown.sql += sql_start.elapsed();
     }
 
     if state.conversation.is_none() {
         if file_contains_only_sessionless_metadata(&state.buffered_records) {
-            let commit_start = Instant::now();
-            tx.commit()
-                .context("unable to commit skipped metadata-only import")?;
-            breakdown.commit += commit_start.elapsed();
             return Ok((NormalizeJsonlFileOutcome::Skipped, breakdown));
         }
         bail!(
@@ -215,12 +288,12 @@ fn normalize_transcript_jsonl_file_inner(
 
     if !state.buffered_records.is_empty() {
         let sql_start = Instant::now();
-        state.flush_buffered_records(&tx)?;
+        state.flush_buffered_records(conn)?;
         breakdown.sql += sql_start.elapsed();
     }
 
     let mut turns_scope = PerfScope::new(params.perf_logger.clone(), "import.build_turns");
-    let turn_count = match state.build_turns(&tx) {
+    let turn_count = match state.build_turns(conn) {
         Ok(count) => {
             turns_scope.field("turn_count", count);
             turns_scope.finish_ok();
@@ -232,11 +305,9 @@ fn normalize_transcript_jsonl_file_inner(
         }
     };
     let finish_start = Instant::now();
-    state.finish_import(&tx, turn_count)?;
+    state.finish_import(conn, turn_count)?;
     breakdown.finish_import += finish_start.elapsed();
-    let commit_start = Instant::now();
-    tx.commit().context("unable to commit normalized import")?;
-    breakdown.commit += commit_start.elapsed();
+    // No per-file commit: breakdown.commit stays at Duration::ZERO
 
     Ok((
         NormalizeJsonlFileOutcome::Imported(NormalizeJsonlFileResult {
@@ -261,6 +332,33 @@ fn normalize_transcript_jsonl_file_inner(
         }),
         breakdown,
     ))
+}
+
+fn normalize_transcript_jsonl_file_inner(
+    conn: &mut Connection,
+    params: &NormalizeJsonlFileParams,
+) -> Result<(NormalizeJsonlFileOutcome, NormalizeBreakdown)> {
+    let tx = conn
+        .transaction()
+        .context("unable to start normalization transaction")?;
+    let (outcome, mut breakdown) = normalize_transcript_jsonl_file_core(&tx, params)?;
+    match &outcome {
+        NormalizeJsonlFileOutcome::Warning(_) => {
+            // tx drops, auto-rollback undoes purge + partial writes
+        }
+        NormalizeJsonlFileOutcome::Skipped => {
+            let commit_start = Instant::now();
+            tx.commit()
+                .context("unable to commit skipped metadata-only import")?;
+            breakdown.commit = commit_start.elapsed();
+        }
+        NormalizeJsonlFileOutcome::Imported(_) => {
+            let commit_start = Instant::now();
+            tx.commit().context("unable to commit normalized import")?;
+            breakdown.commit = commit_start.elapsed();
+        }
+    }
+    Ok((outcome, breakdown))
 }
 
 fn preview_source_line(line: &str) -> String {
@@ -336,14 +434,11 @@ fn normalize_history_jsonl_file(
     result
 }
 
-fn normalize_history_jsonl_file_inner(
-    conn: &mut Connection,
+fn normalize_history_jsonl_file_core(
+    conn: &Connection,
     params: &NormalizeJsonlFileParams,
 ) -> Result<NormalizeJsonlFileOutcome> {
-    let tx = conn
-        .transaction()
-        .context("unable to start history normalization transaction")?;
-    purge_existing_import(&tx, params)?;
+    purge_existing_import(conn, params)?;
 
     let file = File::open(&params.path)
         .with_context(|| format!("unable to open jsonl source {}", params.path.display()))?;
@@ -362,8 +457,7 @@ fn normalize_history_jsonl_file_inner(
         let record: Value = match serde_json::from_str(&line) {
             Ok(record) => record,
             Err(_) => {
-                tx.rollback()
-                    .context("unable to roll back malformed history import")?;
+                // Caller is responsible for rollback
                 return Ok(NormalizeJsonlFileOutcome::Warning(NormalizeImportWarning {
                     code: WARNING_INVALID_JSON,
                     message: format!(
@@ -375,11 +469,11 @@ fn normalize_history_jsonl_file_inner(
             }
         };
 
-        insert_history_event(&tx, params, &record, line_no as i64)?;
+        insert_history_event(conn, params, &record, line_no as i64)?;
         history_event_count += 1;
     }
 
-    tx.execute(
+    conn.execute(
         "
         UPDATE import_chunk
         SET imported_record_count = imported_record_count + ?2
@@ -388,8 +482,6 @@ fn normalize_history_jsonl_file_inner(
         params![params.import_chunk_id, history_event_count as i64],
     )
     .context("unable to update import chunk counters after history normalization")?;
-    tx.commit()
-        .context("unable to commit normalized history import")?;
 
     Ok(NormalizeJsonlFileOutcome::Imported(
         NormalizeJsonlFileResult {
@@ -403,8 +495,28 @@ fn normalize_history_jsonl_file_inner(
     ))
 }
 
+fn normalize_history_jsonl_file_inner(
+    conn: &mut Connection,
+    params: &NormalizeJsonlFileParams,
+) -> Result<NormalizeJsonlFileOutcome> {
+    let tx = conn
+        .transaction()
+        .context("unable to start history normalization transaction")?;
+    let result = normalize_history_jsonl_file_core(&tx, params)?;
+    match &result {
+        NormalizeJsonlFileOutcome::Warning(_) => {
+            // tx drops, auto-rollback undoes purge + partial writes
+        }
+        _ => {
+            tx.commit()
+                .context("unable to commit normalized history import")?;
+        }
+    }
+    Ok(result)
+}
+
 fn insert_history_event(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     params: &NormalizeJsonlFileParams,
     record: &Value,
     source_line_no: i64,
@@ -428,7 +540,7 @@ fn insert_history_event(
         )
     })?;
 
-    let history_event_id = tx
+    let history_event_id = conn
         .query_row(
             "
         INSERT INTO history_event (
@@ -470,7 +582,7 @@ fn insert_history_event(
         })?;
 
     if let Some(invocation) = extract_skill_invocation(record) {
-        insert_skill_invocation(tx, params, history_event_id, &invocation)?;
+        insert_skill_invocation(conn, params, history_event_id, &invocation)?;
     }
 
     Ok(())
@@ -513,12 +625,12 @@ fn extract_skill_invocation(record: &Value) -> Option<SkillInvocationDraft> {
 }
 
 fn insert_skill_invocation(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     params: &NormalizeJsonlFileParams,
     history_event_id: i64,
     invocation: &SkillInvocationDraft,
 ) -> Result<()> {
-    tx.execute(
+    conn.execute(
         "
         INSERT INTO skill_invocation (
             import_chunk_id,
@@ -546,10 +658,7 @@ fn insert_skill_invocation(
     Ok(())
 }
 
-fn purge_existing_import(
-    conn: &Connection,
-    params: &NormalizeJsonlFileParams,
-) -> Result<()> {
+fn purge_existing_import(conn: &Connection, params: &NormalizeJsonlFileParams) -> Result<()> {
     let existing_conversation_id: Option<i64> = conn
         .query_row(
             "SELECT id FROM conversation WHERE source_file_id = ?1",
@@ -858,11 +967,7 @@ impl ImportState {
         Ok(())
     }
 
-    fn upsert_message(
-        &mut self,
-        conn: &Connection,
-        extracted: ExtractedMessage,
-    ) -> Result<()> {
+    fn upsert_message(&mut self, conn: &Connection, extracted: ExtractedMessage) -> Result<()> {
         let conversation_id = self
             .conversation
             .as_ref()

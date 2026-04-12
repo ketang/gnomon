@@ -1123,17 +1123,13 @@ fn insert_import_warning(
     Ok(())
 }
 
-fn finalize_chunk_import(
-    conn: &mut Connection,
+fn finalize_chunk_import_core(
+    conn: &Connection,
     chunk: &PreparedChunk,
     perf_logger: Option<PerfLogger>,
 ) -> Result<()> {
-    let tx = conn
-        .transaction()
-        .context("unable to start an import chunk publish transaction")?;
-
     for source_file in &chunk.source_files {
-        tx.execute(
+        conn.execute(
             "
             UPDATE source_file
             SET
@@ -1152,10 +1148,10 @@ fn finalize_chunk_import(
         })?;
     }
 
-    rebuild_chunk_action_rollups(&tx, chunk.import_chunk_id, perf_logger.clone())?;
-    rebuild_chunk_path_rollups(&tx, chunk.import_chunk_id, perf_logger.clone())?;
+    rebuild_chunk_action_rollups(conn, chunk.import_chunk_id, perf_logger.clone())?;
+    rebuild_chunk_path_rollups(conn, chunk.import_chunk_id, perf_logger.clone())?;
 
-    let next_publish_seq: i64 = tx
+    let next_publish_seq: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(publish_seq), 0) + 1 FROM import_chunk",
             [],
@@ -1163,7 +1159,7 @@ fn finalize_chunk_import(
         )
         .context("unable to allocate the next import publish sequence")?;
 
-    tx.execute(
+    conn.execute(
         "
         UPDATE import_chunk
         SET
@@ -1182,6 +1178,18 @@ fn finalize_chunk_import(
         )
     })?;
 
+    Ok(())
+}
+
+fn finalize_chunk_import(
+    conn: &mut Connection,
+    chunk: &PreparedChunk,
+    perf_logger: Option<PerfLogger>,
+) -> Result<()> {
+    let tx = conn
+        .transaction()
+        .context("unable to start an import chunk publish transaction")?;
+    finalize_chunk_import_core(&tx, chunk, perf_logger)?;
     tx.commit()
         .context("unable to commit the import chunk publish transaction")?;
     Ok(())

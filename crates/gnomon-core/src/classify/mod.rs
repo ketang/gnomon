@@ -38,25 +38,19 @@ pub fn build_actions(
     result
 }
 
-fn build_actions_inner(
-    conn: &mut Connection,
+fn build_actions_core(
+    conn: &Connection,
     params: &BuildActionsParams,
 ) -> Result<BuildActionsResult> {
-    let tx = conn
-        .transaction()
-        .context("unable to start action classification transaction")?;
-
-    let Some(context) = load_conversation_context(&tx, params.conversation_id)? else {
-        tx.commit()
-            .context("unable to commit empty classification transaction")?;
+    let Some(context) = load_conversation_context(conn, params.conversation_id)? else {
         return Ok(BuildActionsResult {
             action_count: 0,
             path_ref_count: 0,
         });
     };
 
-    purge_existing_classification(&tx, params.conversation_id)?;
-    let messages = load_messages(&tx, params.conversation_id)?;
+    purge_existing_classification(conn, params.conversation_id)?;
+    let messages = load_messages(conn, params.conversation_id)?;
     let tool_use_lookup = build_tool_use_lookup(&messages);
 
     let mut actions_written = 0usize;
@@ -80,7 +74,7 @@ fn build_actions_inner(
         for message in messages_in_turn {
             let classification = classify_message(message, &tool_use_lookup);
             path_refs_written += persist_path_refs(
-                &tx,
+                conn,
                 context.project_id,
                 &context.project_root,
                 message.id,
@@ -94,7 +88,7 @@ fn build_actions_inner(
                 }
 
                 persist_action(
-                    &tx,
+                    conn,
                     context.import_chunk_id,
                     group.turn_id,
                     next_action_sequence_no,
@@ -111,7 +105,7 @@ fn build_actions_inner(
 
         if let Some(group) = current_group.take() {
             persist_action(
-                &tx,
+                conn,
                 context.import_chunk_id,
                 group.turn_id,
                 next_action_sequence_no,
@@ -121,7 +115,7 @@ fn build_actions_inner(
         }
     }
 
-    tx.execute(
+    conn.execute(
         "
         UPDATE import_chunk
         SET imported_action_count = (
@@ -135,13 +129,42 @@ fn build_actions_inner(
     )
     .context("unable to update import chunk action count")?;
 
-    tx.commit()
-        .context("unable to commit action classification transaction")?;
-
     Ok(BuildActionsResult {
         action_count: actions_written,
         path_ref_count: path_refs_written,
     })
+}
+
+fn build_actions_inner(
+    conn: &mut Connection,
+    params: &BuildActionsParams,
+) -> Result<BuildActionsResult> {
+    let tx = conn
+        .transaction()
+        .context("unable to start action classification transaction")?;
+    let result = build_actions_core(&tx, params)?;
+    tx.commit()
+        .context("unable to commit action classification transaction")?;
+    Ok(result)
+}
+
+/// Classify actions for a conversation within an externally-managed transaction.
+pub fn build_actions_in_tx(
+    conn: &Connection,
+    params: &BuildActionsParams,
+) -> Result<BuildActionsResult> {
+    let mut scope = PerfScope::new(params.perf_logger.clone(), "import.build_actions");
+    scope.field("conversation_id", params.conversation_id);
+    let result = build_actions_core(conn, params);
+    match &result {
+        Ok(outcome) => {
+            scope.field("action_count", outcome.action_count);
+            scope.field("path_ref_count", outcome.path_ref_count);
+            scope.finish_ok();
+        }
+        Err(err) => scope.finish_error(err),
+    }
+    result
 }
 
 #[derive(Debug)]
@@ -1040,7 +1063,15 @@ fn ensure_path_node_chain(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(root_full_path.as_str());
-    let root_id = ensure_path_node(conn, project_id, None, root_name, &root_full_path, "root", 0)?;
+    let root_id = ensure_path_node(
+        conn,
+        project_id,
+        None,
+        root_name,
+        &root_full_path,
+        "root",
+        0,
+    )?;
 
     let relative_path = full_path
         .strip_prefix(project_root)

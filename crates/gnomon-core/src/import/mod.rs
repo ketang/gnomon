@@ -94,5 +94,5 @@ pub use chunk::{
 };
 pub use normalize::{
     NormalizeImportWarning, NormalizeJsonlFileOutcome, NormalizeJsonlFileParams,
-    NormalizeJsonlFileResult, normalize_jsonl_file,
+    NormalizeJsonlFileResult, normalize_jsonl_file, normalize_jsonl_file_in_tx,
 };
