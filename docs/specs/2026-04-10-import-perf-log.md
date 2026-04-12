@@ -54,6 +54,16 @@ _(to be agreed with user at end of Phase 1 — Task 14)_
 ### 2026-04-10 — Phase 1 started
 Kicked off Phase 1 (measure). Design doc committed on `import-perf` (sha `dc136b5`). Phase 1 implementation plan committed (sha `cbd3516`). Running log initialized (sha `2c6e57a`). Fixture directory reserved and gitignored (sha `d49560c`). Capture script added (sha `1b1320c`).
 
+### 2026-04-12 — Task 12 complete: baseline CPU profiles captured
+
+Captured with `samply v0.13.1` against the full corpus. Profiles saved as Firefox Profiler JSON format; view with `samply load <file>`:
+- `docs/specs/profiles/baseline-full.json.gz` — full mode, 124.4s wall (consistent with baseline). 994 KB.
+- `docs/specs/profiles/baseline-startup.json.gz` — startup mode, 3.6s wall. 204 KB. **Degraded:** corpus sessions aged out of the 24h window overnight (captured April 11, profiled April 12), so the profile captures `scan_source` + `prepare_plan` (the 69% non-chunk floor) but zero `import.chunk` work. Still useful for the dominant startup bottleneck.
+
+Profiles are unsymbolicated in the JSON — symbols resolve at browser-load time via samply's built-in symbolication against the local debug symbols. No text-mode top-function summary was extractable because `perf` is not installed on this WSL instance and samply doesn't have a CLI export mode. To get the top-5-by-self-time, open `samply load docs/specs/profiles/baseline-full.json.gz` and sort by self-time in the browser UI.
+
+Committed as sha `7110745`.
+
 ### 2026-04-11 — Task 11 complete: full-corpus baseline captured
 
 Three runs each of `import_bench --corpus full` in `--mode full` and `--mode startup`, release build. Perf logs at `/tmp/gnomon-perf-full-{full,startup}-{1,2,3}.jsonl`, run logs at `/tmp/gnomon-full-{full,startup}-{1,2,3}.log`.
@@ -316,7 +326,7 @@ Decision: defer to user checkpoint (Task 13) after baselines are in hand. If the
 
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-11 (end of Task 11)
+Last updated: 2026-04-12 (end of Task 12)
 Current phase: Phase 1 — measure
 Current branch: `import-perf`
 Current worktree: `/home/ketan/project/gnomon/.worktrees/import-perf`
@@ -327,16 +337,14 @@ Primary repo root (do not implement here): `/home/ketan/project/gnomon`
 2. Verify: `git rev-parse --abbrev-ref HEAD` → must print `import-perf`
 3. Read this log's Phase Log (latest entries first) for context.
 4. Read `docs/specs/2026-04-10-import-perf-design.md` if you need the big picture.
-5. Read `docs/specs/2026-04-10-import-perf-phase1-plan.md` for the task list — you are between Task 11 and Task 12.
+5. Read `docs/specs/2026-04-10-import-perf-phase1-plan.md` for the task list — you are between Task 12 and Task 13.
 6. Continue at the "Next action" below.
 
 ### Last completed
-Task 11 — full-corpus baseline captured. Three runs each in full and startup mode against the 31-project, 4548-file full corpus. Median full wall **126.1s**, median startup wall **5.1s**. Baseline section in the Frozen Header populated with median numbers from both tasks. Key full-corpus findings: `commit_ms` still #1 at 40.1s (33% of chunk wall), `build_actions` at 45.9s (38%), `scan_source` is 2.86s = **56% of startup wall**, `prepare_plan` is 666ms = 13% of startup wall. Instrumentation + v2 subset baseline commit `aa26c21`, v2 subset log commit `eb6dd84`.
+Task 12 — baseline CPU profiles captured with samply v0.13.1 for both full and startup modes against the full corpus. Profiles committed at `docs/specs/profiles/baseline-{full,startup}.json.gz` (sha `7110745`). Startup profile is degraded (zero chunk work because corpus sessions aged out of the 24h window overnight), but still captures the dominant `scan_source` cost. Top-function-by-self-time summary not extractable without `perf` — profiles require `samply load` for interactive browser exploration.
 
 ### Next action
-**Task 12 (Phase 1 plan):** Capture CPU profiles via `samply` against the full corpus. One profile for `--mode full`, one for `--mode startup`. Install samply first if not present. Save profiles under `docs/specs/profiles/`. Phase Log entry summarizing top-5 hottest functions by self-time.
-
-After Task 12, Task 13 is the user checkpoint (review all baseline data) and Task 14 is the target-number checkpoint.
+**Task 13 (Phase 1 plan):** User checkpoint — review baseline data. Surface a one-page summary of all baseline numbers, per-phase attribution, the rebased candidate ranking, and open questions (subset sizing, cold vs hot target, performance goal). Then Task 14 is the target-number checkpoint.
 
 ### Uncommitted state
 None. Working tree is clean on `import-perf`.
@@ -358,6 +366,8 @@ None. Working tree is clean on `import-perf`.
 - `bfa304e` log: backfill subset baseline commit sha
 - `aa26c21` feat(import): add commit/finish/purge spans and scan/plan-build spans
 - `eb6dd84` log: subset baseline v2 with new commit/scan spans
+- `ff22d89` log: full-corpus baseline captured + populate baseline header
+- `7110745` perf: add baseline CPU profiles for full and startup modes
 
 ### Target status
 Not set (pending Task 14, which requires Task 10-12 baseline data).

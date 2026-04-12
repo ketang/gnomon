@@ -1263,11 +1263,11 @@ With the median numbers from Tasks 10 and 11, fill in the `## Baseline` placehol
 - Create: `docs/specs/profiles/baseline-full.svg` (or `.html` — whichever samply produces).
 - Create: `docs/specs/profiles/baseline-startup.svg`.
 
-- [ ] **Step 1: Install samply if missing**
+- [x] **Step 1: Install samply if missing**
 
 Run: `which samply || cargo install samply`
 
-- [ ] **Step 2: Profile mode=full on full corpus**
+- [x] **Step 2: Profile mode=full on full corpus**
 
 Run:
 ```bash
@@ -1283,11 +1283,11 @@ samply load docs/specs/profiles/baseline-full.json.gz --save-svg docs/specs/prof
 ```
 (If `--save-svg` is not supported by your samply version, open the profile in the browser via `samply load ...` and export manually.)
 
-- [ ] **Step 3: Profile mode=startup on full corpus**
+- [x] **Step 3: Profile mode=startup on full corpus**
 
 Same recipe with `--mode startup` and output names `baseline-startup.*`.
 
-- [ ] **Step 4: Commit the profiles**
+- [x] **Step 4: Commit the profiles**
 
 Run:
 ```bash
@@ -1301,7 +1301,7 @@ the Phase 1 reference for ranking import-perf candidates.
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 ```
 
-- [ ] **Step 5: Log entry**
+- [x] **Step 5: Log entry**
 
 Phase Log entry `<date> — baseline profiles captured` referencing the file paths and summarizing the top 5 hottest functions by self-time from each flamegraph. Commit as `log: baseline profiles referenced`.
 
