@@ -48,6 +48,15 @@ pub enum NormalizeJsonlFileOutcome {
     Warning(NormalizeImportWarning),
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct NormalizeBreakdown {
+    parse: Duration,
+    sql: Duration,
+    purge: Duration,
+    finish_import: Duration,
+    commit: Duration,
+}
+
 pub fn normalize_jsonl_file(
     conn: &mut Connection,
     params: &NormalizeJsonlFileParams,
@@ -86,9 +95,15 @@ fn normalize_transcript_jsonl_file(
     scope.field("path", params.path.display().to_string());
     let inner = normalize_transcript_jsonl_file_inner(conn, params);
     match inner {
-        Ok((outcome, parse_total, sql_total)) => {
-            scope.field("parse_ms", parse_total.as_secs_f64() * 1000.0);
-            scope.field("sql_ms", sql_total.as_secs_f64() * 1000.0);
+        Ok((outcome, breakdown)) => {
+            scope.field("parse_ms", breakdown.parse.as_secs_f64() * 1000.0);
+            scope.field("sql_ms", breakdown.sql.as_secs_f64() * 1000.0);
+            scope.field("purge_ms", breakdown.purge.as_secs_f64() * 1000.0);
+            scope.field(
+                "finish_import_ms",
+                breakdown.finish_import.as_secs_f64() * 1000.0,
+            );
+            scope.field("commit_ms", breakdown.commit.as_secs_f64() * 1000.0);
             match &outcome {
                 NormalizeJsonlFileOutcome::Imported(result) => {
                     scope.field("outcome", "imported");
@@ -118,20 +133,21 @@ fn normalize_transcript_jsonl_file(
 fn normalize_transcript_jsonl_file_inner(
     conn: &mut Connection,
     params: &NormalizeJsonlFileParams,
-) -> Result<(NormalizeJsonlFileOutcome, Duration, Duration)> {
+) -> Result<(NormalizeJsonlFileOutcome, NormalizeBreakdown)> {
+    let mut breakdown = NormalizeBreakdown::default();
+
     let mut tx = conn
         .transaction()
         .context("unable to start normalization transaction")?;
+    let purge_start = Instant::now();
     purge_existing_import(&mut tx, params)?;
+    breakdown.purge += purge_start.elapsed();
 
     let file = File::open(&params.path)
         .with_context(|| format!("unable to open jsonl source {}", params.path.display()))?;
     let reader = BufReader::new(file);
 
     let mut state = ImportState::new(params.clone());
-
-    let mut parse_total: Duration = Duration::ZERO;
-    let mut sql_total: Duration = Duration::ZERO;
 
     for (zero_based_line_no, line_result) in reader.lines().enumerate() {
         let line_no = zero_based_line_no + 1;
@@ -146,7 +162,7 @@ fn normalize_transcript_jsonl_file_inner(
         let record: Value = match serde_json::from_str(&line) {
             Ok(record) => record,
             Err(_) => {
-                parse_total += parse_start.elapsed();
+                breakdown.parse += parse_start.elapsed();
                 tx.rollback()
                     .context("unable to roll back malformed jsonl import")?;
                 return Ok((
@@ -158,12 +174,11 @@ fn normalize_transcript_jsonl_file_inner(
                             preview_source_line(&line)
                         ),
                     }),
-                    parse_total,
-                    sql_total,
+                    breakdown,
                 ));
             }
         };
-        parse_total += parse_start.elapsed();
+        breakdown.parse += parse_start.elapsed();
 
         let sql_start = Instant::now();
         if state.conversation.is_none() {
@@ -175,20 +190,22 @@ fn normalize_transcript_jsonl_file_inner(
                     source_line_no: line_no as i64,
                     value: record,
                 });
-                sql_total += sql_start.elapsed();
+                breakdown.sql += sql_start.elapsed();
                 continue;
             }
         }
 
         state.process_record(&mut tx, record, line_no as i64)?;
-        sql_total += sql_start.elapsed();
+        breakdown.sql += sql_start.elapsed();
     }
 
     if state.conversation.is_none() {
         if file_contains_only_sessionless_metadata(&state.buffered_records) {
+            let commit_start = Instant::now();
             tx.commit()
                 .context("unable to commit skipped metadata-only import")?;
-            return Ok((NormalizeJsonlFileOutcome::Skipped, parse_total, sql_total));
+            breakdown.commit += commit_start.elapsed();
+            return Ok((NormalizeJsonlFileOutcome::Skipped, breakdown));
         }
         bail!(
             "no sessionId found in {}; unable to normalize file",
@@ -199,7 +216,7 @@ fn normalize_transcript_jsonl_file_inner(
     if !state.buffered_records.is_empty() {
         let sql_start = Instant::now();
         state.flush_buffered_records(&mut tx)?;
-        sql_total += sql_start.elapsed();
+        breakdown.sql += sql_start.elapsed();
     }
 
     let mut turns_scope = PerfScope::new(params.perf_logger.clone(), "import.build_turns");
@@ -214,8 +231,12 @@ fn normalize_transcript_jsonl_file_inner(
             return Err(err);
         }
     };
+    let finish_start = Instant::now();
     state.finish_import(&mut tx, turn_count)?;
+    breakdown.finish_import += finish_start.elapsed();
+    let commit_start = Instant::now();
     tx.commit().context("unable to commit normalized import")?;
+    breakdown.commit += commit_start.elapsed();
 
     Ok((
         NormalizeJsonlFileOutcome::Imported(NormalizeJsonlFileResult {
@@ -238,8 +259,7 @@ fn normalize_transcript_jsonl_file_inner(
             turn_count,
             history_event_count: 0,
         }),
-        parse_total,
-        sql_total,
+        breakdown,
     ))
 }
 

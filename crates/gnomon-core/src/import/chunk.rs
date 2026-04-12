@@ -290,10 +290,46 @@ pub fn import_all_with_perf_logger(
 ) -> Result<ImportExecutionReport> {
     let now = Timestamp::now();
     let time_zone = TimeZone::system();
-    let plan = build_import_plan(conn, now, &time_zone)?;
-    let prepared = prepare_import_plan(conn, &plan)?;
-    let mut database =
-        Database::open(db_path).with_context(|| format!("unable to open {}", db_path.display()))?;
+
+    let mut plan_scope = PerfScope::new(perf_logger.clone(), "import.build_plan");
+    let plan = match build_import_plan(conn, now, &time_zone) {
+        Ok(plan) => {
+            plan_scope.field("startup_chunks", plan.startup_chunks.len());
+            plan_scope.field("deferred_chunks", plan.deferred_chunks.len());
+            plan_scope.finish_ok();
+            plan
+        }
+        Err(err) => {
+            plan_scope.finish_error(&err);
+            return Err(err);
+        }
+    };
+
+    let mut prepare_scope = PerfScope::new(perf_logger.clone(), "import.prepare_plan");
+    let prepared = match prepare_import_plan(conn, &plan) {
+        Ok(prepared) => {
+            prepare_scope.field("startup_chunks", prepared.startup_chunks.len());
+            prepare_scope.field("deferred_chunks", prepared.deferred_chunks.len());
+            prepare_scope.finish_ok();
+            prepared
+        }
+        Err(err) => {
+            prepare_scope.finish_error(&err);
+            return Err(err);
+        }
+    };
+
+    let open_scope = PerfScope::new(perf_logger.clone(), "import.open_database");
+    let mut database = match Database::open(db_path) {
+        Ok(database) => {
+            open_scope.finish_ok();
+            database
+        }
+        Err(err) => {
+            open_scope.finish_error(&err);
+            return Err(err).with_context(|| format!("unable to open {}", db_path.display()));
+        }
+    };
 
     let options = ImportWorkerOptions {
         perf_logger,
@@ -342,8 +378,35 @@ fn start_startup_import_with_options(
 ) -> Result<StartupImport> {
     let now = Timestamp::now();
     let time_zone = TimeZone::system();
-    let plan = build_import_plan(conn, now, &time_zone)?;
-    let prepared = prepare_import_plan(conn, &plan)?;
+
+    let mut plan_scope = PerfScope::new(worker_options.perf_logger.clone(), "import.build_plan");
+    let plan = match build_import_plan(conn, now, &time_zone) {
+        Ok(plan) => {
+            plan_scope.field("startup_chunks", plan.startup_chunks.len());
+            plan_scope.field("deferred_chunks", plan.deferred_chunks.len());
+            plan_scope.finish_ok();
+            plan
+        }
+        Err(err) => {
+            plan_scope.finish_error(&err);
+            return Err(err);
+        }
+    };
+
+    let mut prepare_scope =
+        PerfScope::new(worker_options.perf_logger.clone(), "import.prepare_plan");
+    let prepared = match prepare_import_plan(conn, &plan) {
+        Ok(prepared) => {
+            prepare_scope.field("startup_chunks", prepared.startup_chunks.len());
+            prepare_scope.field("deferred_chunks", prepared.deferred_chunks.len());
+            prepare_scope.finish_ok();
+            prepared
+        }
+        Err(err) => {
+            prepare_scope.finish_error(&err);
+            return Err(err);
+        }
+    };
 
     if prepared.is_empty() {
         return Ok(StartupImport {

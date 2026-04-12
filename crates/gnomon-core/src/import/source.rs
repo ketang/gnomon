@@ -14,6 +14,7 @@ use crate::config::{
 };
 use crate::db::Database;
 use crate::import::SourceFileKind;
+use crate::perf::{PerfLogger, PerfScope};
 use crate::vcs::{self, ProjectIdentityKind, ResolvedProject};
 
 const CLAUDE_HISTORY_PROJECT_REASON: &str = "claude history source";
@@ -96,6 +97,35 @@ pub fn scan_source_manifest(database: &mut Database, source_root: &Path) -> Resu
         &ProjectIdentityPolicy::default(),
         &[],
     )
+}
+
+/// Like [`scan_source_manifest`] but emits an `import.scan_source` perf span
+/// (and a nested `import.discover_source_files` span) using the supplied
+/// [`PerfLogger`]. Used by the `import_bench` example to attribute the
+/// non-`import.chunk` floor of startup-mode wall time.
+pub fn scan_source_manifest_with_perf_logger(
+    database: &mut Database,
+    source_root: &Path,
+    perf_logger: Option<PerfLogger>,
+) -> Result<ScanReport> {
+    let mut scope = PerfScope::new(perf_logger, "import.scan_source");
+    scope.field("source_root", source_root.display().to_string());
+    let result = scan_source_manifest_with_policy(
+        database,
+        source_root,
+        &ProjectIdentityPolicy::default(),
+        &[],
+    );
+    match &result {
+        Ok(report) => {
+            scope.field("discovered_source_files", report.discovered_source_files);
+            scope.field("excluded_source_files", report.excluded_source_files);
+            scope.field("inserted_projects", report.inserted_projects);
+            scope.finish_ok();
+        }
+        Err(err) => scope.finish_error(err),
+    }
+    result
 }
 
 pub fn scan_source_manifest_with_policy(

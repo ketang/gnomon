@@ -14,7 +14,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, ValueEnum};
 use gnomon_core::db::Database;
 use gnomon_core::import::{
-    StartupImportMode, import_all_with_perf_logger, scan_source_manifest,
+    StartupImportMode, import_all_with_perf_logger, scan_source_manifest_with_perf_logger,
     start_startup_import_with_perf_logger,
 };
 use gnomon_core::perf::PerfLogger;
@@ -137,7 +137,8 @@ fn run_once(
         ModeChoice::Full => {
             let mut database = Database::open(&db_path)
                 .with_context(|| format!("unable to open db at {}", db_path.display()))?;
-            scan_source_manifest(&mut database, &source_root).context("source scan failed")?;
+            scan_source_manifest_with_perf_logger(&mut database, &source_root, perf_logger.clone())
+                .context("source scan failed")?;
             let report = import_all_with_perf_logger(
                 database.connection(),
                 &db_path,
@@ -155,7 +156,8 @@ fn run_once(
         ModeChoice::Startup => {
             let mut database = Database::open(&db_path)
                 .with_context(|| format!("unable to open db at {}", db_path.display()))?;
-            scan_source_manifest(&mut database, &source_root).context("source scan failed")?;
+            scan_source_manifest_with_perf_logger(&mut database, &source_root, perf_logger.clone())
+                .context("source scan failed")?;
             let startup = start_startup_import_with_perf_logger(
                 database.connection(),
                 &db_path,
