@@ -45,7 +45,34 @@ Captured on the environment above (WSL2, Ryzen 5 5600X, tmpfs DB). All numbers a
 | DB size (full mode) | 187 MB | 487 MB |
 
 ## Target
-_(to be agreed with user at end of Phase 1 — Task 14)_
+Agreed 2026-04-12. Full corpus, cold cache (worst-of-3), tmpfs DB on the baseline environment above.
+
+| metric | baseline | acceptable | stretch |
+| --- | ---: | ---: | ---: |
+| **Cold full import** (empty DB → all data) | 126.1s | **10s** | **5s** |
+| **Warm startup** (DB has data, import delta only) | 5.1s (empty DB) | **< 1s** | **300ms** |
+
+Notes:
+- "Cold full import" = `import_bench --corpus full --mode full` against a fresh SQLite. The 126.1s baseline is the v2 median; the cold-cache worst-of-3 is ~134s. The 5s stretch target implies ~25× speedup.
+- "Warm startup" = the production startup path where the DB already holds most/all prior imported data. The 5.1s baseline was measured against an *empty* DB (worst case for startup mode). With data already loaded, startup should detect "nothing new" and skip most work, so the path from 5.1s to <1s is primarily about caching `scan_source` (2.86s) and `prepare_plan` (666ms), plus a fast no-op path through `import_chunk`.
+- Benchmarking: always cold cache (first run or worst-of-3). This matches the real-world "first startup of the day" scenario.
+- Subset corpus (3%, 10%, 30%) is useful for quick iteration but full corpus is the only authoritative metric. Subset results are directional only.
+
+### Feasibility sketch
+
+**Cold full import 126s → 10s (12.6× speedup):**
+1. Commit batching (1 tx per chunk): saves ~38s → ~88s
+2. build_actions batch + cache: saves ~35–40s → ~48–53s
+3. Parallel chunk processing (6 cores): remaining ~50s ÷ 6 ≈ 8–9s
+4. Prepared statements + bulk INSERT batching in normalize: tightens the per-core work
+
+5s stretch requires all of the above plus aggressive allocation reduction and possibly SIMD JSON.
+
+**Warm startup 5.1s → <1s:**
+1. scan_source cache (hash mtimes, skip unchanged): saves ~2.8s
+2. prepare_plan optimization or cache: saves ~0.5s
+3. Fast no-op path in import_chunk (detect "already imported at current schema version"): saves most of the 2.5s chunk work
+4. 300ms stretch requires near-zero scan cost and instant plan-build on a cached manifest.
 
 ---
 
@@ -53,6 +80,16 @@ _(to be agreed with user at end of Phase 1 — Task 14)_
 
 ### 2026-04-10 — Phase 1 started
 Kicked off Phase 1 (measure). Design doc committed on `import-perf` (sha `dc136b5`). Phase 1 implementation plan committed (sha `cbd3516`). Running log initialized (sha `2c6e57a`). Fixture directory reserved and gitignored (sha `d49560c`). Capture script added (sha `1b1320c`).
+
+### 2026-04-12 — Tasks 13-14 complete: target agreed
+
+User reviewed the Phase 1 baseline summary. Targets agreed:
+- **Cold full import:** 10s acceptable, 5s stretch (from 126.1s baseline = 12.6–25× speedup)
+- **Warm startup (data already loaded):** <1s acceptable, 300ms stretch (from 5.1s empty-DB baseline)
+- **Benchmarking:** cold cache (worst-of-3 or first run)
+- **Subset:** 3%, 10%, 30% nice-to-have for iteration but full corpus is the only authoritative metric
+
+User explicitly noted build_actions is cacheable and batchable — aligns with candidate #2. No opinion on subset sizing details; full corpus is what counts.
 
 ### 2026-04-12 — Task 12 complete: baseline CPU profiles captured
 
@@ -326,7 +363,7 @@ Decision: defer to user checkpoint (Task 13) after baselines are in hand. If the
 
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-12 (end of Task 12)
+Last updated: 2026-04-12 (Phase 1 complete, target agreed)
 Current phase: Phase 1 — measure
 Current branch: `import-perf`
 Current worktree: `/home/ketan/project/gnomon/.worktrees/import-perf`
@@ -337,14 +374,14 @@ Primary repo root (do not implement here): `/home/ketan/project/gnomon`
 2. Verify: `git rev-parse --abbrev-ref HEAD` → must print `import-perf`
 3. Read this log's Phase Log (latest entries first) for context.
 4. Read `docs/specs/2026-04-10-import-perf-design.md` if you need the big picture.
-5. Read `docs/specs/2026-04-10-import-perf-phase1-plan.md` for the task list — you are between Task 12 and Task 13.
+5. Phase 1 is complete. Read the Baseline and Target sections of this log, then the design doc for Phase 2 structure.
 6. Continue at the "Next action" below.
 
 ### Last completed
-Task 12 — baseline CPU profiles captured with samply v0.13.1 for both full and startup modes against the full corpus. Profiles committed at `docs/specs/profiles/baseline-{full,startup}.json.gz` (sha `7110745`). Startup profile is degraded (zero chunk work because corpus sessions aged out of the 24h window overnight), but still captures the dominant `scan_source` cost. Top-function-by-self-time summary not extractable without `perf` — profiles require `samply load` for interactive browser exploration.
+Phase 1 complete. Targets agreed (Task 14): cold full import 10s acceptable / 5s stretch, warm startup <1s / 300ms stretch. All baseline data captured, Frozen Header fully populated.
 
 ### Next action
-**Task 13 (Phase 1 plan):** User checkpoint — review baseline data. Surface a one-page summary of all baseline numbers, per-phase attribution, the rebased candidate ranking, and open questions (subset sizing, cold vs hot target, performance goal). Then Task 14 is the target-number checkpoint.
+Phase 2: iterate loop begins. Write a Phase 2 implementation plan, starting with candidate #1 (commit batching — est. ~38s savings on cold full import). The design doc `docs/specs/2026-04-10-import-perf-design.md` Section 5 describes the Phase 2 loop structure.
 
 ### Uncommitted state
 None. Working tree is clean on `import-perf`.

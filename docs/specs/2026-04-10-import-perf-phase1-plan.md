@@ -1316,7 +1316,7 @@ Phase Log entry `<date> — baseline profiles captured` referencing the file pat
 - The two flamegraph file paths with a one-line summary each ("parse 34%, SQL 52%, rollups 8%, other 6%" — whatever the actual numbers are).
 - Any surprising findings (e.g. "DB path is on a 9p mount, fsync dominates" — if true).
 
-- [ ] **Step 1: Compose and surface the summary**
+- [x] **Step 1: Compose and surface the summary**
 
 Wait for user response before proceeding to Task 14. The user may request re-baselining (e.g. "the subset looks weird, regenerate"), additional profiling, or direct continuation.
 
@@ -1326,15 +1326,15 @@ Wait for user response before proceeding to Task 14. The user may request re-bas
 
 **Not a code task.** Collaboratively agree on a concrete target number for startup-mode wall time on the full corpus, and optionally a secondary target for cold full import.
 
-- [ ] **Step 1: Propose a target based on baseline**
+- [x] **Step 1: Propose a target based on baseline**
 
 Propose something like "startup mode < 1.5s on full corpus (median of 5 runs), stretch 0.8s" — concrete, measurable. Justification anchored in which phases are realistically compressible per the flamegraph.
 
-- [ ] **Step 2: Write the target into the log Frozen Header**
+- [x] **Step 2: Write the target into the log Frozen Header**
 
 On user agreement, edit the `## Target` section in the Frozen Header with the agreed numbers and the date of agreement.
 
-- [ ] **Step 3: Commit and update Resume Block**
+- [x] **Step 3: Commit and update Resume Block**
 
 Commit as `log: record agreed Phase 1 target`.
 
@@ -1344,7 +1344,7 @@ Resume Block: `Last completed` → `Phase 1 complete. Target agreed.` `Next acti
 
 ## Task 15: Phase 1 exit checkpoint
 
-- [ ] **Step 1: Verify gate conditions**
+- [x] **Step 1: Verify gate conditions**
 
 All of the following must be true:
 1. `docs/specs/2026-04-10-import-perf-log.md` Frozen Header is fully populated (environment, corpus SHAs, baseline, target).
@@ -1354,7 +1354,7 @@ All of the following must be true:
 5. `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo build --workspace` all pass on `import-perf`.
 6. Resume Block reflects Phase 1 complete.
 
-- [ ] **Step 2: Announce gate open**
+- [x] **Step 2: Announce gate open**
 
 Surface to user: "Phase 1 complete. Gate open. Ready to start Phase 2 iterate loop. First candidate will be chosen from the re-ranked list after reviewing the baseline profiles together — even though the design doc lists A1 (prepared statements) as the initial top pick, the profile may reshuffle. Shall I propose a candidate now?"
 
