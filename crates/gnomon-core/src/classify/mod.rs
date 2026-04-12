@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
 use crate::import::NormalizedToolUsePartMetadata;
@@ -42,7 +42,7 @@ fn build_actions_inner(
     conn: &mut Connection,
     params: &BuildActionsParams,
 ) -> Result<BuildActionsResult> {
-    let mut tx = conn
+    let tx = conn
         .transaction()
         .context("unable to start action classification transaction")?;
 
@@ -55,7 +55,7 @@ fn build_actions_inner(
         });
     };
 
-    purge_existing_classification(&mut tx, params.conversation_id)?;
+    purge_existing_classification(&tx, params.conversation_id)?;
     let messages = load_messages(&tx, params.conversation_id)?;
     let tool_use_lookup = build_tool_use_lookup(&messages);
 
@@ -80,7 +80,7 @@ fn build_actions_inner(
         for message in messages_in_turn {
             let classification = classify_message(message, &tool_use_lookup);
             path_refs_written += persist_path_refs(
-                &mut tx,
+                &tx,
                 context.project_id,
                 &context.project_root,
                 message.id,
@@ -94,7 +94,7 @@ fn build_actions_inner(
                 }
 
                 persist_action(
-                    &mut tx,
+                    &tx,
                     context.import_chunk_id,
                     group.turn_id,
                     next_action_sequence_no,
@@ -111,7 +111,7 @@ fn build_actions_inner(
 
         if let Some(group) = current_group.take() {
             persist_action(
-                &mut tx,
+                &tx,
                 context.import_chunk_id,
                 group.turn_id,
                 next_action_sequence_no,
@@ -178,8 +178,8 @@ fn load_conversation_context(
     .context("unable to load conversation context for action classification")
 }
 
-fn purge_existing_classification(tx: &mut Transaction<'_>, conversation_id: i64) -> Result<()> {
-    tx.execute(
+fn purge_existing_classification(conn: &Connection, conversation_id: i64) -> Result<()> {
+    conn.execute(
         "
         DELETE FROM message_path_ref
         WHERE message_id IN (
@@ -192,7 +192,7 @@ fn purge_existing_classification(tx: &mut Transaction<'_>, conversation_id: i64)
     )
     .context("unable to clear existing message path refs for conversation")?;
 
-    tx.execute(
+    conn.execute(
         "
         DELETE FROM action
         WHERE turn_id IN (
@@ -980,7 +980,7 @@ fn tool_use_input_from_metadata_json(raw_json: &str) -> Option<Value> {
 }
 
 fn persist_path_refs(
-    tx: &mut Transaction<'_>,
+    conn: &Connection,
     project_id: i64,
     project_root: &Path,
     message_id: i64,
@@ -994,12 +994,12 @@ fn persist_path_refs(
         }
 
         let Some(path_node_id) =
-            ensure_path_node_chain(tx, project_id, project_root, &path_ref.full_path)?
+            ensure_path_node_chain(conn, project_id, project_root, &path_ref.full_path)?
         else {
             continue;
         };
 
-        tx.execute(
+        conn.execute(
             "
             INSERT INTO message_path_ref (
                 message_id,
@@ -1026,7 +1026,7 @@ fn persist_path_refs(
 }
 
 fn ensure_path_node_chain(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     project_id: i64,
     project_root: &Path,
     full_path: &Path,
@@ -1040,7 +1040,7 @@ fn ensure_path_node_chain(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(root_full_path.as_str());
-    let root_id = ensure_path_node(tx, project_id, None, root_name, &root_full_path, "root", 0)?;
+    let root_id = ensure_path_node(conn, project_id, None, root_name, &root_full_path, "root", 0)?;
 
     let relative_path = full_path
         .strip_prefix(project_root)
@@ -1061,7 +1061,7 @@ fn ensure_path_node_chain(
         let node_kind = if is_last { "file" } else { "dir" };
         let name = component.as_os_str().to_string_lossy().to_string();
         parent_id = ensure_path_node(
-            tx,
+            conn,
             project_id,
             Some(parent_id),
             &name,
@@ -1075,7 +1075,7 @@ fn ensure_path_node_chain(
 }
 
 fn ensure_path_node(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     project_id: i64,
     parent_id: Option<i64>,
     name: &str,
@@ -1083,7 +1083,7 @@ fn ensure_path_node(
     node_kind: &str,
     depth: i64,
 ) -> Result<i64> {
-    if let Some(existing_id) = tx
+    if let Some(existing_id) = conn
         .query_row(
             "
             SELECT id
@@ -1099,7 +1099,7 @@ fn ensure_path_node(
         return Ok(existing_id);
     }
 
-    tx.query_row(
+    conn.query_row(
         "
         INSERT INTO path_node (
             project_id,
@@ -1212,13 +1212,13 @@ impl ActionGroupDraft {
 }
 
 fn persist_action(
-    tx: &mut Transaction<'_>,
+    conn: &Connection,
     import_chunk_id: i64,
     turn_id: i64,
     sequence_no: i64,
     group: ActionGroupDraft,
 ) -> Result<()> {
-    let action_id: i64 = tx.query_row(
+    let action_id: i64 = conn.query_row(
         "
         INSERT INTO action (
             turn_id,
@@ -1262,7 +1262,7 @@ fn persist_action(
     )?;
 
     for (ordinal, message_id) in group.message_ids.iter().enumerate() {
-        tx.execute(
+        conn.execute(
             "
             INSERT INTO action_message (action_id, message_id, ordinal_in_action)
             VALUES (?1, ?2, ?3)
@@ -1272,7 +1272,7 @@ fn persist_action(
     }
 
     if let Some(attribution) = group.skill_attribution() {
-        tx.execute(
+        conn.execute(
             "
             INSERT INTO action_skill_attribution (action_id, skill_name, confidence)
             VALUES (?1, ?2, ?3)
