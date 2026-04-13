@@ -2,12 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
 use super::{NormalizedToolUsePartMetadata, SourceFileKind};
+use crate::perf::{PerfLogger, PerfScope};
 
 const PRIMARY_STREAM_SEQUENCE_NO: i64 = 0;
 const SOURCE_LINE_PREVIEW_CHAR_LIMIT: usize = 160;
@@ -20,6 +22,7 @@ pub struct NormalizeJsonlFileParams {
     pub source_file_id: i64,
     pub import_chunk_id: i64,
     pub path: PathBuf,
+    pub perf_logger: Option<PerfLogger>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +48,15 @@ pub enum NormalizeJsonlFileOutcome {
     Warning(NormalizeImportWarning),
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct NormalizeBreakdown {
+    parse: Duration,
+    sql: Duration,
+    purge: Duration,
+    finish_import: Duration,
+    commit: Duration,
+}
+
 pub fn normalize_jsonl_file(
     conn: &mut Connection,
     params: &NormalizeJsonlFileParams,
@@ -52,6 +64,87 @@ pub fn normalize_jsonl_file(
     match load_source_file_kind(conn, params.source_file_id)? {
         Some(SourceFileKind::Transcript) => normalize_transcript_jsonl_file(conn, params),
         Some(SourceFileKind::ClaudeHistory) => normalize_history_jsonl_file(conn, params),
+        None => Ok(NormalizeJsonlFileOutcome::Warning(NormalizeImportWarning {
+            code: WARNING_UNKNOWN_SOURCE_KIND,
+            message: format!(
+                "unable to determine source kind for source file id {}",
+                params.source_file_id
+            ),
+        })),
+    }
+}
+
+/// Normalize a JSONL file within an externally-managed transaction.
+/// Caller is responsible for transaction/savepoint commit or rollback.
+/// On `Warning` outcome, partial writes may have occurred — caller should
+/// roll back the enclosing savepoint.
+pub fn normalize_jsonl_file_in_tx(
+    conn: &Connection,
+    params: &NormalizeJsonlFileParams,
+) -> Result<NormalizeJsonlFileOutcome> {
+    match load_source_file_kind(conn, params.source_file_id)? {
+        Some(SourceFileKind::Transcript) => {
+            let mut scope = PerfScope::new(params.perf_logger.clone(), "import.normalize_jsonl");
+            scope.field("path", params.path.display().to_string());
+            let inner = normalize_transcript_jsonl_file_core(conn, params);
+            match inner {
+                Ok((outcome, breakdown)) => {
+                    scope.field("parse_ms", breakdown.parse.as_secs_f64() * 1000.0);
+                    scope.field("sql_ms", breakdown.sql.as_secs_f64() * 1000.0);
+                    scope.field("purge_ms", breakdown.purge.as_secs_f64() * 1000.0);
+                    scope.field(
+                        "finish_import_ms",
+                        breakdown.finish_import.as_secs_f64() * 1000.0,
+                    );
+                    scope.field("commit_ms", 0.0f64);
+                    match &outcome {
+                        NormalizeJsonlFileOutcome::Imported(result) => {
+                            scope.field("outcome", "imported");
+                            scope.field("record_count", result.record_count);
+                            scope.field("message_count", result.message_count);
+                            scope.field("turn_count", result.turn_count);
+                            scope.finish_ok();
+                        }
+                        NormalizeJsonlFileOutcome::Skipped => {
+                            scope.field("outcome", "skipped");
+                            scope.finish_ok();
+                        }
+                        NormalizeJsonlFileOutcome::Warning(_) => {
+                            scope.field("outcome", "warning");
+                            scope.finish_ok();
+                        }
+                    }
+                    Ok(outcome)
+                }
+                Err(err) => {
+                    scope.finish_error(&err);
+                    Err(err)
+                }
+            }
+        }
+        Some(SourceFileKind::ClaudeHistory) => {
+            let mut scope =
+                PerfScope::new(params.perf_logger.clone(), "import.normalize_history_jsonl");
+            scope.field("path", params.path.display().to_string());
+            let result = normalize_history_jsonl_file_core(conn, params);
+            match &result {
+                Ok(NormalizeJsonlFileOutcome::Imported(outcome)) => {
+                    scope.field("outcome", "imported");
+                    scope.field("record_count", outcome.record_count);
+                    scope.finish_ok();
+                }
+                Ok(NormalizeJsonlFileOutcome::Skipped) => {
+                    scope.field("outcome", "skipped");
+                    scope.finish_ok();
+                }
+                Ok(NormalizeJsonlFileOutcome::Warning(_)) => {
+                    scope.field("outcome", "warning");
+                    scope.finish_ok();
+                }
+                Err(err) => scope.finish_error(err),
+            }
+            result
+        }
         None => Ok(NormalizeJsonlFileOutcome::Warning(NormalizeImportWarning {
             code: WARNING_UNKNOWN_SOURCE_KIND,
             message: format!(
@@ -79,10 +172,54 @@ fn normalize_transcript_jsonl_file(
     conn: &mut Connection,
     params: &NormalizeJsonlFileParams,
 ) -> Result<NormalizeJsonlFileOutcome> {
-    let mut tx = conn
-        .transaction()
-        .context("unable to start normalization transaction")?;
-    purge_existing_import(&mut tx, params)?;
+    let mut scope = PerfScope::new(params.perf_logger.clone(), "import.normalize_jsonl");
+    scope.field("path", params.path.display().to_string());
+    let inner = normalize_transcript_jsonl_file_inner(conn, params);
+    match inner {
+        Ok((outcome, breakdown)) => {
+            scope.field("parse_ms", breakdown.parse.as_secs_f64() * 1000.0);
+            scope.field("sql_ms", breakdown.sql.as_secs_f64() * 1000.0);
+            scope.field("purge_ms", breakdown.purge.as_secs_f64() * 1000.0);
+            scope.field(
+                "finish_import_ms",
+                breakdown.finish_import.as_secs_f64() * 1000.0,
+            );
+            scope.field("commit_ms", breakdown.commit.as_secs_f64() * 1000.0);
+            match &outcome {
+                NormalizeJsonlFileOutcome::Imported(result) => {
+                    scope.field("outcome", "imported");
+                    scope.field("record_count", result.record_count);
+                    scope.field("message_count", result.message_count);
+                    scope.field("turn_count", result.turn_count);
+                    scope.finish_ok();
+                }
+                NormalizeJsonlFileOutcome::Skipped => {
+                    scope.field("outcome", "skipped");
+                    scope.finish_ok();
+                }
+                NormalizeJsonlFileOutcome::Warning(_) => {
+                    scope.field("outcome", "warning");
+                    scope.finish_ok();
+                }
+            }
+            Ok(outcome)
+        }
+        Err(err) => {
+            scope.finish_error(&err);
+            Err(err)
+        }
+    }
+}
+
+fn normalize_transcript_jsonl_file_core(
+    conn: &Connection,
+    params: &NormalizeJsonlFileParams,
+) -> Result<(NormalizeJsonlFileOutcome, NormalizeBreakdown)> {
+    let mut breakdown = NormalizeBreakdown::default();
+
+    let purge_start = Instant::now();
+    purge_existing_import(conn, params)?;
+    breakdown.purge += purge_start.elapsed();
 
     let file = File::open(&params.path)
         .with_context(|| format!("unable to open jsonl source {}", params.path.display()))?;
@@ -99,43 +236,49 @@ fn normalize_transcript_jsonl_file(
             )
         })?;
 
+        let parse_start = Instant::now();
         let record: Value = match serde_json::from_str(&line) {
             Ok(record) => record,
             Err(_) => {
-                tx.rollback()
-                    .context("unable to roll back malformed jsonl import")?;
-                return Ok(NormalizeJsonlFileOutcome::Warning(NormalizeImportWarning {
-                    code: WARNING_INVALID_JSON,
-                    message: format!(
-                        "unable to parse json on line {line_no} from {} (preview: {})",
-                        params.path.display(),
-                        preview_source_line(&line)
-                    ),
-                }));
+                breakdown.parse += parse_start.elapsed();
+                // Caller is responsible for rollback
+                return Ok((
+                    NormalizeJsonlFileOutcome::Warning(NormalizeImportWarning {
+                        code: WARNING_INVALID_JSON,
+                        message: format!(
+                            "unable to parse json on line {line_no} from {} (preview: {})",
+                            params.path.display(),
+                            preview_source_line(&line)
+                        ),
+                    }),
+                    breakdown,
+                ));
             }
         };
+        breakdown.parse += parse_start.elapsed();
 
+        let sql_start = Instant::now();
         if state.conversation.is_none() {
             if extract_session_id(&record).is_some() {
-                state.initialize_context(&mut tx, &record)?;
-                state.flush_buffered_records(&mut tx)?;
+                state.initialize_context(conn, &record)?;
+                state.flush_buffered_records(conn)?;
             } else {
                 state.buffered_records.push(BufferedRecord {
                     source_line_no: line_no as i64,
                     value: record,
                 });
+                breakdown.sql += sql_start.elapsed();
                 continue;
             }
         }
 
-        state.process_record(&mut tx, record, line_no as i64)?;
+        state.process_record(conn, record, line_no as i64)?;
+        breakdown.sql += sql_start.elapsed();
     }
 
     if state.conversation.is_none() {
         if file_contains_only_sessionless_metadata(&state.buffered_records) {
-            tx.commit()
-                .context("unable to commit skipped metadata-only import")?;
-            return Ok(NormalizeJsonlFileOutcome::Skipped);
+            return Ok((NormalizeJsonlFileOutcome::Skipped, breakdown));
         }
         bail!(
             "no sessionId found in {}; unable to normalize file",
@@ -144,15 +287,30 @@ fn normalize_transcript_jsonl_file(
     }
 
     if !state.buffered_records.is_empty() {
-        state.flush_buffered_records(&mut tx)?;
+        let sql_start = Instant::now();
+        state.flush_buffered_records(conn)?;
+        breakdown.sql += sql_start.elapsed();
     }
 
-    let turn_count = state.build_turns(&mut tx)?;
-    state.finish_import(&mut tx, turn_count)?;
-    tx.commit().context("unable to commit normalized import")?;
+    let mut turns_scope = PerfScope::new(params.perf_logger.clone(), "import.build_turns");
+    let turn_count = match state.build_turns(conn) {
+        Ok(count) => {
+            turns_scope.field("turn_count", count);
+            turns_scope.finish_ok();
+            count
+        }
+        Err(err) => {
+            turns_scope.finish_error(&err);
+            return Err(err);
+        }
+    };
+    let finish_start = Instant::now();
+    state.finish_import(conn, turn_count)?;
+    breakdown.finish_import += finish_start.elapsed();
+    // No per-file commit: breakdown.commit stays at Duration::ZERO
 
-    Ok(NormalizeJsonlFileOutcome::Imported(
-        NormalizeJsonlFileResult {
+    Ok((
+        NormalizeJsonlFileOutcome::Imported(NormalizeJsonlFileResult {
             conversation_id: Some(
                 state
                     .conversation
@@ -171,8 +329,36 @@ fn normalize_transcript_jsonl_file(
             message_count: state.message_states.len(),
             turn_count,
             history_event_count: 0,
-        },
+        }),
+        breakdown,
     ))
+}
+
+fn normalize_transcript_jsonl_file_inner(
+    conn: &mut Connection,
+    params: &NormalizeJsonlFileParams,
+) -> Result<(NormalizeJsonlFileOutcome, NormalizeBreakdown)> {
+    let tx = conn
+        .transaction()
+        .context("unable to start normalization transaction")?;
+    let (outcome, mut breakdown) = normalize_transcript_jsonl_file_core(&tx, params)?;
+    match &outcome {
+        NormalizeJsonlFileOutcome::Warning(_) => {
+            // tx drops, auto-rollback undoes purge + partial writes
+        }
+        NormalizeJsonlFileOutcome::Skipped => {
+            let commit_start = Instant::now();
+            tx.commit()
+                .context("unable to commit skipped metadata-only import")?;
+            breakdown.commit = commit_start.elapsed();
+        }
+        NormalizeJsonlFileOutcome::Imported(_) => {
+            let commit_start = Instant::now();
+            tx.commit().context("unable to commit normalized import")?;
+            breakdown.commit = commit_start.elapsed();
+        }
+    }
+    Ok((outcome, breakdown))
 }
 
 fn preview_source_line(line: &str) -> String {
@@ -226,10 +412,33 @@ fn normalize_history_jsonl_file(
     conn: &mut Connection,
     params: &NormalizeJsonlFileParams,
 ) -> Result<NormalizeJsonlFileOutcome> {
-    let mut tx = conn
-        .transaction()
-        .context("unable to start history normalization transaction")?;
-    purge_existing_import(&mut tx, params)?;
+    let mut scope = PerfScope::new(params.perf_logger.clone(), "import.normalize_history_jsonl");
+    scope.field("path", params.path.display().to_string());
+    let result = normalize_history_jsonl_file_inner(conn, params);
+    match &result {
+        Ok(NormalizeJsonlFileOutcome::Imported(outcome)) => {
+            scope.field("outcome", "imported");
+            scope.field("record_count", outcome.record_count);
+            scope.finish_ok();
+        }
+        Ok(NormalizeJsonlFileOutcome::Skipped) => {
+            scope.field("outcome", "skipped");
+            scope.finish_ok();
+        }
+        Ok(NormalizeJsonlFileOutcome::Warning(_)) => {
+            scope.field("outcome", "warning");
+            scope.finish_ok();
+        }
+        Err(err) => scope.finish_error(err),
+    }
+    result
+}
+
+fn normalize_history_jsonl_file_core(
+    conn: &Connection,
+    params: &NormalizeJsonlFileParams,
+) -> Result<NormalizeJsonlFileOutcome> {
+    purge_existing_import(conn, params)?;
 
     let file = File::open(&params.path)
         .with_context(|| format!("unable to open jsonl source {}", params.path.display()))?;
@@ -248,8 +457,7 @@ fn normalize_history_jsonl_file(
         let record: Value = match serde_json::from_str(&line) {
             Ok(record) => record,
             Err(_) => {
-                tx.rollback()
-                    .context("unable to roll back malformed history import")?;
+                // Caller is responsible for rollback
                 return Ok(NormalizeJsonlFileOutcome::Warning(NormalizeImportWarning {
                     code: WARNING_INVALID_JSON,
                     message: format!(
@@ -261,21 +469,19 @@ fn normalize_history_jsonl_file(
             }
         };
 
-        insert_history_event(&tx, params, &record, line_no as i64)?;
+        insert_history_event(conn, params, &record, line_no as i64)?;
         history_event_count += 1;
     }
 
-    tx.execute(
+    conn.prepare_cached(
         "
         UPDATE import_chunk
         SET imported_record_count = imported_record_count + ?2
         WHERE id = ?1
         ",
-        params![params.import_chunk_id, history_event_count as i64],
     )
+    .and_then(|mut stmt| stmt.execute(params![params.import_chunk_id, history_event_count as i64]))
     .context("unable to update import chunk counters after history normalization")?;
-    tx.commit()
-        .context("unable to commit normalized history import")?;
 
     Ok(NormalizeJsonlFileOutcome::Imported(
         NormalizeJsonlFileResult {
@@ -289,8 +495,28 @@ fn normalize_history_jsonl_file(
     ))
 }
 
+fn normalize_history_jsonl_file_inner(
+    conn: &mut Connection,
+    params: &NormalizeJsonlFileParams,
+) -> Result<NormalizeJsonlFileOutcome> {
+    let tx = conn
+        .transaction()
+        .context("unable to start history normalization transaction")?;
+    let result = normalize_history_jsonl_file_core(&tx, params)?;
+    match &result {
+        NormalizeJsonlFileOutcome::Warning(_) => {
+            // tx drops, auto-rollback undoes purge + partial writes
+        }
+        _ => {
+            tx.commit()
+                .context("unable to commit normalized history import")?;
+        }
+    }
+    Ok(result)
+}
+
 fn insert_history_event(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     params: &NormalizeJsonlFileParams,
     record: &Value,
     source_line_no: i64,
@@ -314,8 +540,8 @@ fn insert_history_event(
         )
     })?;
 
-    let history_event_id = tx
-        .query_row(
+    let history_event_id = conn
+        .prepare_cached(
             "
         INSERT INTO history_event (
             import_chunk_id,
@@ -333,21 +559,25 @@ fn insert_history_event(
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         RETURNING id
         ",
-            params![
-                params.import_chunk_id,
-                params.source_file_id,
-                source_line_no,
-                optional_string(record.get("sessionId")),
-                optional_string(record.get("timestamp")),
-                optional_string(record.get("project")),
-                display_text,
-                pasted_contents_json,
-                input_kind.as_str(),
-                slash_command_name,
-                raw_json,
-            ],
-            |row| row.get::<_, i64>(0),
         )
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![
+                    params.import_chunk_id,
+                    params.source_file_id,
+                    source_line_no,
+                    optional_string(record.get("sessionId")),
+                    optional_string(record.get("timestamp")),
+                    optional_string(record.get("project")),
+                    display_text,
+                    pasted_contents_json,
+                    input_kind.as_str(),
+                    slash_command_name,
+                    raw_json,
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+        })
         .with_context(|| {
             format!(
                 "unable to insert normalized history event on line {source_line_no} from {}",
@@ -356,7 +586,7 @@ fn insert_history_event(
         })?;
 
     if let Some(invocation) = extract_skill_invocation(record) {
-        insert_skill_invocation(tx, params, history_event_id, &invocation)?;
+        insert_skill_invocation(conn, params, history_event_id, &invocation)?;
     }
 
     Ok(())
@@ -399,12 +629,12 @@ fn extract_skill_invocation(record: &Value) -> Option<SkillInvocationDraft> {
 }
 
 fn insert_skill_invocation(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     params: &NormalizeJsonlFileParams,
     history_event_id: i64,
     invocation: &SkillInvocationDraft,
 ) -> Result<()> {
-    tx.execute(
+    conn.prepare_cached(
         "
         INSERT INTO skill_invocation (
             import_chunk_id,
@@ -418,7 +648,9 @@ fn insert_skill_invocation(
         )
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'explicit_history')
         ",
-        params![
+    )
+    .and_then(|mut stmt| {
+        stmt.execute(params![
             params.import_chunk_id,
             history_event_id,
             params.source_file_id,
@@ -426,49 +658,42 @@ fn insert_skill_invocation(
             invocation.recorded_at_utc,
             invocation.raw_project,
             invocation.skill_name,
-        ],
-    )
+        ])
+    })
     .context("unable to insert explicit skill invocation")?;
     Ok(())
 }
 
-fn purge_existing_import(
-    tx: &mut Transaction<'_>,
-    params: &NormalizeJsonlFileParams,
-) -> Result<()> {
-    let existing_conversation_id: Option<i64> = tx
-        .query_row(
-            "SELECT id FROM conversation WHERE source_file_id = ?1",
-            [params.source_file_id],
-            |row| row.get(0),
-        )
-        .optional()
+fn purge_existing_import(conn: &Connection, params: &NormalizeJsonlFileParams) -> Result<()> {
+    let existing_conversation_id: Option<i64> = conn
+        .prepare_cached("SELECT id FROM conversation WHERE source_file_id = ?1")
+        .and_then(|mut stmt| {
+            stmt.query_row([params.source_file_id], |row| row.get(0))
+                .optional()
+        })
         .context("unable to look up existing conversation for source file")?;
 
     if let Some(conversation_id) = existing_conversation_id {
-        tx.execute("DELETE FROM conversation WHERE id = ?1", [conversation_id])
+        conn.prepare_cached("DELETE FROM conversation WHERE id = ?1")
+            .and_then(|mut stmt| stmt.execute([conversation_id]))
             .context("unable to purge existing normalized conversation state")?;
     }
 
-    tx.execute(
-        "DELETE FROM history_event WHERE source_file_id = ?1",
-        [params.source_file_id],
-    )
-    .context("unable to purge existing normalized history event state")?;
+    conn.prepare_cached("DELETE FROM history_event WHERE source_file_id = ?1")
+        .and_then(|mut stmt| stmt.execute([params.source_file_id]))
+        .context("unable to purge existing normalized history event state")?;
 
-    tx.execute(
-        "DELETE FROM skill_invocation WHERE source_file_id = ?1",
-        [params.source_file_id],
-    )
-    .context("unable to purge existing normalized skill invocation state")?;
+    conn.prepare_cached("DELETE FROM skill_invocation WHERE source_file_id = ?1")
+        .and_then(|mut stmt| stmt.execute([params.source_file_id]))
+        .context("unable to purge existing normalized skill invocation state")?;
 
-    tx.execute(
+    conn.prepare_cached(
         "
         DELETE FROM import_warning
         WHERE import_chunk_id = ?1 AND source_file_id = ?2
         ",
-        params![params.import_chunk_id, params.source_file_id],
     )
+    .and_then(|mut stmt| stmt.execute(params![params.import_chunk_id, params.source_file_id]))
     .context("unable to clear prior import warnings for source file")?;
 
     Ok(())
@@ -590,15 +815,15 @@ impl ImportState {
         }
     }
 
-    fn initialize_context(&mut self, tx: &mut Transaction<'_>, record: &Value) -> Result<()> {
+    fn initialize_context(&mut self, conn: &Connection, record: &Value) -> Result<()> {
         let session_id = extract_session_id(record)
             .ok_or_else(|| anyhow!("cannot initialize import context without sessionId"))?;
         let conversation_external_id =
             conversation_external_id(session_id, self.params.source_file_id);
         let timestamp = extract_record_timestamp(record).map(ToOwned::to_owned);
 
-        let conversation_id = tx
-            .query_row(
+        let conversation_id = conn
+            .prepare_cached(
                 "
                 INSERT INTO conversation (
                     project_id,
@@ -610,14 +835,18 @@ impl ImportState {
                 VALUES (?1, ?2, ?3, ?4, ?4)
                 RETURNING id
                 ",
-                params![
-                    self.params.project_id,
-                    self.params.source_file_id,
-                    conversation_external_id,
-                    timestamp
-                ],
-                |row| row.get(0),
             )
+            .and_then(|mut stmt| {
+                stmt.query_row(
+                    params![
+                        self.params.project_id,
+                        self.params.source_file_id,
+                        conversation_external_id,
+                        timestamp
+                    ],
+                    |row| row.get(0),
+                )
+            })
             .context("unable to insert conversation for normalized file")?;
 
         let stream_kind = if record
@@ -631,8 +860,8 @@ impl ImportState {
         };
         let stream_external_id = record.get("agentId").and_then(Value::as_str);
 
-        let stream_id = tx
-            .query_row(
+        let stream_id = conn
+            .prepare_cached(
                 "
                 INSERT INTO stream (
                     conversation_id,
@@ -646,16 +875,20 @@ impl ImportState {
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
                 RETURNING id
                 ",
-                params![
-                    conversation_id,
-                    self.params.import_chunk_id,
-                    stream_external_id,
-                    stream_kind,
-                    PRIMARY_STREAM_SEQUENCE_NO,
-                    timestamp
-                ],
-                |row| row.get(0),
             )
+            .and_then(|mut stmt| {
+                stmt.query_row(
+                    params![
+                        conversation_id,
+                        self.params.import_chunk_id,
+                        stream_external_id,
+                        stream_kind,
+                        PRIMARY_STREAM_SEQUENCE_NO,
+                        timestamp
+                    ],
+                    |row| row.get(0),
+                )
+            })
             .context("unable to insert primary stream for normalized file")?;
 
         self.conversation = Some(ConversationState {
@@ -672,17 +905,17 @@ impl ImportState {
         Ok(())
     }
 
-    fn flush_buffered_records(&mut self, tx: &mut Transaction<'_>) -> Result<()> {
+    fn flush_buffered_records(&mut self, conn: &Connection) -> Result<()> {
         let buffered_records = std::mem::take(&mut self.buffered_records);
         for record in buffered_records {
-            self.process_record(tx, record.value, record.source_line_no)?;
+            self.process_record(conn, record.value, record.source_line_no)?;
         }
         Ok(())
     }
 
     fn process_record(
         &mut self,
-        tx: &mut Transaction<'_>,
+        conn: &Connection,
         record: Value,
         source_line_no: i64,
     ) -> Result<()> {
@@ -708,7 +941,7 @@ impl ImportState {
         );
 
         let record_kind = classify_record_kind(&record);
-        tx.execute(
+        conn.prepare_cached(
             "
             INSERT INTO record (
                 import_chunk_id,
@@ -722,7 +955,9 @@ impl ImportState {
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             ",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 self.params.import_chunk_id,
                 self.params.source_file_id,
                 conversation.id,
@@ -731,24 +966,20 @@ impl ImportState {
                 self.next_record_sequence_no,
                 record_kind,
                 recorded_at_utc,
-            ],
-        )
+            ])
+        })
         .with_context(|| format!("unable to insert normalized record for line {source_line_no}"))?;
         self.next_record_sequence_no += 1;
         self.record_count += 1;
 
         if let Some(message) = extract_message(&record, source_line_no) {
-            self.upsert_message(tx, message)?;
+            self.upsert_message(conn, message)?;
         }
 
         Ok(())
     }
 
-    fn upsert_message(
-        &mut self,
-        tx: &mut Transaction<'_>,
-        extracted: ExtractedMessage,
-    ) -> Result<()> {
+    fn upsert_message(&mut self, conn: &Connection, extracted: ExtractedMessage) -> Result<()> {
         let conversation_id = self
             .conversation
             .as_ref()
@@ -761,7 +992,7 @@ impl ImportState {
             .ok_or_else(|| anyhow!("stream state missing while inserting message"))?;
 
         if let Some(state) = self.message_states.get_mut(&extracted.external_id) {
-            tx.execute(
+            conn.prepare_cached(
                 "
                 UPDATE message
                 SET
@@ -775,7 +1006,9 @@ impl ImportState {
                     output_tokens = ?9
                 WHERE id = ?1
                 ",
-                params![
+            )
+            .and_then(|mut stmt| {
+                stmt.execute(params![
                     state.id,
                     extracted.recorded_at_utc,
                     extracted.model_name,
@@ -785,8 +1018,8 @@ impl ImportState {
                     extracted.usage.cache_creation_input_tokens,
                     extracted.usage.cache_read_input_tokens,
                     extracted.usage.output_tokens,
-                ],
-            )
+                ])
+            })
             .with_context(|| {
                 format!(
                     "unable to update normalized message on line {} from {}",
@@ -806,7 +1039,7 @@ impl ImportState {
             for part in extracted.parts {
                 if state.seen_part_keys.insert(part.dedupe_key.clone()) {
                     insert_message_part(
-                        tx,
+                        conn,
                         state.id,
                         state.next_part_ordinal,
                         &part,
@@ -820,8 +1053,8 @@ impl ImportState {
             return Ok(());
         }
 
-        let message_id = tx
-            .query_row(
+        let message_id = conn
+            .prepare_cached(
                 "
                 INSERT INTO message (
                     stream_id,
@@ -846,25 +1079,29 @@ impl ImportState {
                 )
                 RETURNING id
                 ",
-                params![
-                    stream_id,
-                    conversation_id,
-                    self.params.import_chunk_id,
-                    extracted.external_id,
-                    extracted.role,
-                    extracted.message_kind,
-                    self.next_message_sequence_no,
-                    extracted.recorded_at_utc,
-                    extracted.usage.input_tokens,
-                    extracted.usage.cache_creation_input_tokens,
-                    extracted.usage.cache_read_input_tokens,
-                    extracted.usage.output_tokens,
-                    extracted.model_name,
-                    extracted.stop_reason,
-                    extracted.usage_source,
-                ],
-                |row| row.get(0),
             )
+            .and_then(|mut stmt| {
+                stmt.query_row(
+                    params![
+                        stream_id,
+                        conversation_id,
+                        self.params.import_chunk_id,
+                        extracted.external_id,
+                        extracted.role,
+                        extracted.message_kind,
+                        self.next_message_sequence_no,
+                        extracted.recorded_at_utc,
+                        extracted.usage.input_tokens,
+                        extracted.usage.cache_creation_input_tokens,
+                        extracted.usage.cache_read_input_tokens,
+                        extracted.usage.output_tokens,
+                        extracted.model_name,
+                        extracted.stop_reason,
+                        extracted.usage_source,
+                    ],
+                    |row| row.get(0),
+                )
+            })
             .with_context(|| {
                 format!(
                     "unable to insert normalized message on line {} from {}",
@@ -885,7 +1122,7 @@ impl ImportState {
         for part in extracted.parts {
             if state.seen_part_keys.insert(part.dedupe_key.clone()) {
                 insert_message_part(
-                    tx,
+                    conn,
                     state.id,
                     state.next_part_ordinal,
                     &part,
@@ -900,14 +1137,14 @@ impl ImportState {
         Ok(())
     }
 
-    fn build_turns(&self, tx: &mut Transaction<'_>) -> Result<usize> {
+    fn build_turns(&self, conn: &Connection) -> Result<usize> {
         let conversation_id = self
             .conversation
             .as_ref()
             .map(|conversation| conversation.id)
             .ok_or_else(|| anyhow!("conversation state missing while building turns"))?;
 
-        let mut stmt = tx.prepare(
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 id,
@@ -949,7 +1186,7 @@ impl ImportState {
         for message in messages {
             if message.message_kind == "user_prompt" {
                 if let Some(turn) = current_turn.take() {
-                    persist_turn(tx, conversation_id, self.params.import_chunk_id, turn)?;
+                    persist_turn(conn, conversation_id, self.params.import_chunk_id, turn)?;
                     turn_count += 1;
                 }
                 current_turn = Some(TurnDraft::new(message));
@@ -962,14 +1199,14 @@ impl ImportState {
         }
 
         if let Some(turn) = current_turn.take() {
-            persist_turn(tx, conversation_id, self.params.import_chunk_id, turn)?;
+            persist_turn(conn, conversation_id, self.params.import_chunk_id, turn)?;
             turn_count += 1;
         }
 
         Ok(turn_count)
     }
 
-    fn finish_import(&self, tx: &mut Transaction<'_>, turn_count: usize) -> Result<()> {
+    fn finish_import(&self, conn: &Connection, turn_count: usize) -> Result<()> {
         let conversation = self
             .conversation
             .as_ref()
@@ -979,31 +1216,39 @@ impl ImportState {
             .as_ref()
             .ok_or_else(|| anyhow!("stream state missing while finalizing import"))?;
 
-        tx.execute(
+        conn.prepare_cached(
             "
             UPDATE conversation
             SET started_at_utc = ?2, ended_at_utc = ?3
             WHERE id = ?1
             ",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 conversation.id,
                 conversation.started_at_utc,
                 conversation.ended_at_utc
-            ],
-        )
+            ])
+        })
         .context("unable to update conversation bounds after normalization")?;
 
-        tx.execute(
+        conn.prepare_cached(
             "
             UPDATE stream
             SET opened_at_utc = ?2, closed_at_utc = ?3
             WHERE id = ?1
             ",
-            params![stream.id, stream.opened_at_utc, stream.closed_at_utc],
         )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
+                stream.id,
+                stream.opened_at_utc,
+                stream.closed_at_utc
+            ])
+        })
         .context("unable to update stream bounds after normalization")?;
 
-        tx.execute(
+        conn.prepare_cached(
             "
             UPDATE import_chunk
             SET
@@ -1013,13 +1258,15 @@ impl ImportState {
                 imported_turn_count = imported_turn_count + ?4
             WHERE id = ?1
             ",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 self.params.import_chunk_id,
                 self.record_count as i64,
                 self.message_states.len() as i64,
                 turn_count as i64
-            ],
-        )
+            ])
+        })
         .context("unable to update import chunk counters after normalization")?;
 
         Ok(())
@@ -1089,23 +1336,24 @@ impl TurnDraft {
 }
 
 fn persist_turn(
-    tx: &mut Transaction<'_>,
+    conn: &Connection,
     conversation_id: i64,
     import_chunk_id: i64,
     turn: TurnDraft,
 ) -> Result<()> {
-    let next_turn_sequence_no: i64 = tx.query_row(
-        "
+    let next_turn_sequence_no: i64 = conn
+        .prepare_cached(
+            "
         SELECT COALESCE(MAX(sequence_no), -1) + 1
         FROM turn
         WHERE conversation_id = ?1
         ",
-        [conversation_id],
-        |row| row.get(0),
-    )?;
+        )?
+        .query_row([conversation_id], |row| row.get(0))?;
 
-    let turn_id: i64 = tx.query_row(
-        "
+    let turn_id: i64 = conn
+        .prepare_cached(
+            "
         INSERT INTO turn (
             stream_id,
             conversation_id,
@@ -1122,44 +1370,46 @@ fn persist_turn(
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         RETURNING id
         ",
-        params![
-            turn.stream_id,
-            conversation_id,
-            import_chunk_id,
-            turn.root_message_id,
-            next_turn_sequence_no,
-            turn.started_at_utc,
-            turn.ended_at_utc,
-            turn.usage.input_tokens,
-            turn.usage.cache_creation_input_tokens,
-            turn.usage.cache_read_input_tokens,
-            turn.usage.output_tokens,
-        ],
-        |row| row.get(0),
-    )?;
+        )?
+        .query_row(
+            params![
+                turn.stream_id,
+                conversation_id,
+                import_chunk_id,
+                turn.root_message_id,
+                next_turn_sequence_no,
+                turn.started_at_utc,
+                turn.ended_at_utc,
+                turn.usage.input_tokens,
+                turn.usage.cache_creation_input_tokens,
+                turn.usage.cache_read_input_tokens,
+                turn.usage.output_tokens,
+            ],
+            |row| row.get(0),
+        )?;
 
     for (ordinal_in_turn, message_id) in turn.message_ids.iter().enumerate() {
-        tx.execute(
+        conn.prepare_cached(
             "
             INSERT INTO turn_message (turn_id, message_id, ordinal_in_turn)
             VALUES (?1, ?2, ?3)
             ",
-            params![turn_id, message_id, ordinal_in_turn as i64],
-        )?;
+        )?
+        .execute(params![turn_id, message_id, ordinal_in_turn as i64])?;
     }
 
     Ok(())
 }
 
 fn insert_message_part(
-    tx: &mut Transaction<'_>,
+    conn: &Connection,
     message_id: i64,
     ordinal: i64,
     part: &ExtractedMessagePart,
     source_line_no: i64,
     source_path: &Path,
 ) -> Result<()> {
-    tx.execute(
+    conn.prepare_cached(
         "
         INSERT INTO message_part (
             message_id,
@@ -1174,7 +1424,9 @@ fn insert_message_part(
         )
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         ",
-        params![
+    )
+    .and_then(|mut stmt| {
+        stmt.execute(params![
             message_id,
             ordinal,
             part.part_kind,
@@ -1184,8 +1436,8 @@ fn insert_message_part(
             part.tool_call_id,
             part.metadata_json,
             part.is_error,
-        ],
-    )
+        ])
+    })
     .with_context(|| {
         format!(
             "unable to insert normalized message part on line {} from {}",
@@ -1576,6 +1828,7 @@ mod tests {
                 source_file_id: ids.source_file_id,
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
+                perf_logger: None,
             },
         )?;
         let NormalizeJsonlFileOutcome::Imported(result) = result else {
@@ -1671,6 +1924,7 @@ mod tests {
                 source_file_id: ids.source_file_id,
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
+                perf_logger: None,
             },
         )?;
         let NormalizeJsonlFileOutcome::Imported(result) = result else {
@@ -1723,6 +1977,7 @@ mod tests {
                 source_file_id: ids.source_file_id,
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
+                perf_logger: None,
             },
         )?;
         assert!(matches!(result, NormalizeJsonlFileOutcome::Imported(_)));
@@ -1901,6 +2156,7 @@ mod tests {
                 source_file_id: 1,
                 import_chunk_id: 1,
                 path: fixture_path.clone(),
+                perf_logger: None,
             },
         )
         .expect_err("legacy message schema should fail during insert");
@@ -1939,6 +2195,7 @@ mod tests {
                 source_file_id: ids.source_file_id,
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path.clone(),
+                perf_logger: None,
             },
         )?;
 
@@ -1984,6 +2241,7 @@ mod tests {
                 source_file_id: ids.source_file_id,
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
+                perf_logger: None,
             },
         )?;
 
@@ -2034,6 +2292,7 @@ mod tests {
                 source_file_id: first_ids.source_file_id,
                 import_chunk_id: first_ids.import_chunk_id,
                 path: first_fixture_path,
+                perf_logger: None,
             },
         )?;
         let NormalizeJsonlFileOutcome::Imported(first_result) = first_result else {
@@ -2046,6 +2305,7 @@ mod tests {
                 source_file_id: second_ids.source_file_id,
                 import_chunk_id: second_ids.import_chunk_id,
                 path: second_fixture_path,
+                perf_logger: None,
             },
         )?;
         let NormalizeJsonlFileOutcome::Imported(second_result) = second_result else {
@@ -2102,6 +2362,7 @@ mod tests {
                 source_file_id: ids.source_file_id,
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
+                perf_logger: None,
             },
         )?;
         let NormalizeJsonlFileOutcome::Imported(result) = result else {

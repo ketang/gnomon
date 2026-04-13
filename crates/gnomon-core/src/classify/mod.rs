@@ -2,14 +2,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
 use crate::import::NormalizedToolUsePartMetadata;
+use crate::perf::{PerfLogger, PerfScope};
 
 #[derive(Debug, Clone)]
 pub struct BuildActionsParams {
     pub conversation_id: i64,
+    pub perf_logger: Option<PerfLogger>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,21 +24,33 @@ pub fn build_actions(
     conn: &mut Connection,
     params: &BuildActionsParams,
 ) -> Result<BuildActionsResult> {
-    let mut tx = conn
-        .transaction()
-        .context("unable to start action classification transaction")?;
+    let mut scope = PerfScope::new(params.perf_logger.clone(), "import.build_actions");
+    scope.field("conversation_id", params.conversation_id);
+    let result = build_actions_inner(conn, params);
+    match &result {
+        Ok(outcome) => {
+            scope.field("action_count", outcome.action_count);
+            scope.field("path_ref_count", outcome.path_ref_count);
+            scope.finish_ok();
+        }
+        Err(err) => scope.finish_error(err),
+    }
+    result
+}
 
-    let Some(context) = load_conversation_context(&tx, params.conversation_id)? else {
-        tx.commit()
-            .context("unable to commit empty classification transaction")?;
+fn build_actions_core(
+    conn: &Connection,
+    params: &BuildActionsParams,
+) -> Result<BuildActionsResult> {
+    let Some(context) = load_conversation_context(conn, params.conversation_id)? else {
         return Ok(BuildActionsResult {
             action_count: 0,
             path_ref_count: 0,
         });
     };
 
-    purge_existing_classification(&mut tx, params.conversation_id)?;
-    let messages = load_messages(&tx, params.conversation_id)?;
+    purge_existing_classification(conn, params.conversation_id)?;
+    let messages = load_messages(conn, params.conversation_id)?;
     let tool_use_lookup = build_tool_use_lookup(&messages);
 
     let mut actions_written = 0usize;
@@ -60,7 +74,7 @@ pub fn build_actions(
         for message in messages_in_turn {
             let classification = classify_message(message, &tool_use_lookup);
             path_refs_written += persist_path_refs(
-                &mut tx,
+                conn,
                 context.project_id,
                 &context.project_root,
                 message.id,
@@ -74,7 +88,7 @@ pub fn build_actions(
                 }
 
                 persist_action(
-                    &mut tx,
+                    conn,
                     context.import_chunk_id,
                     group.turn_id,
                     next_action_sequence_no,
@@ -91,7 +105,7 @@ pub fn build_actions(
 
         if let Some(group) = current_group.take() {
             persist_action(
-                &mut tx,
+                conn,
                 context.import_chunk_id,
                 group.turn_id,
                 next_action_sequence_no,
@@ -101,7 +115,7 @@ pub fn build_actions(
         }
     }
 
-    tx.execute(
+    conn.prepare_cached(
         "
         UPDATE import_chunk
         SET imported_action_count = (
@@ -111,17 +125,46 @@ pub fn build_actions(
         )
         WHERE id = ?1
         ",
-        [context.import_chunk_id],
     )
+    .and_then(|mut stmt| stmt.execute([context.import_chunk_id]))
     .context("unable to update import chunk action count")?;
-
-    tx.commit()
-        .context("unable to commit action classification transaction")?;
 
     Ok(BuildActionsResult {
         action_count: actions_written,
         path_ref_count: path_refs_written,
     })
+}
+
+fn build_actions_inner(
+    conn: &mut Connection,
+    params: &BuildActionsParams,
+) -> Result<BuildActionsResult> {
+    let tx = conn
+        .transaction()
+        .context("unable to start action classification transaction")?;
+    let result = build_actions_core(&tx, params)?;
+    tx.commit()
+        .context("unable to commit action classification transaction")?;
+    Ok(result)
+}
+
+/// Classify actions for a conversation within an externally-managed transaction.
+pub fn build_actions_in_tx(
+    conn: &Connection,
+    params: &BuildActionsParams,
+) -> Result<BuildActionsResult> {
+    let mut scope = PerfScope::new(params.perf_logger.clone(), "import.build_actions");
+    scope.field("conversation_id", params.conversation_id);
+    let result = build_actions_core(conn, params);
+    match &result {
+        Ok(outcome) => {
+            scope.field("action_count", outcome.action_count);
+            scope.field("path_ref_count", outcome.path_ref_count);
+            scope.finish_ok();
+        }
+        Err(err) => scope.finish_error(err),
+    }
+    result
 }
 
 #[derive(Debug)]
@@ -135,7 +178,7 @@ fn load_conversation_context(
     conn: &Connection,
     conversation_id: i64,
 ) -> Result<Option<ConversationContext>> {
-    conn.query_row(
+    conn.prepare_cached(
         "
         SELECT c.project_id, p.root_path, m.import_chunk_id
         FROM conversation c
@@ -145,21 +188,22 @@ fn load_conversation_context(
         ORDER BY m.sequence_no
         LIMIT 1
         ",
-        [conversation_id],
-        |row| {
+    )
+    .and_then(|mut stmt| {
+        stmt.query_row([conversation_id], |row| {
             Ok(ConversationContext {
                 project_id: row.get(0)?,
                 project_root: PathBuf::from(row.get::<_, String>(1)?),
                 import_chunk_id: row.get(2)?,
             })
-        },
-    )
-    .optional()
+        })
+        .optional()
+    })
     .context("unable to load conversation context for action classification")
 }
 
-fn purge_existing_classification(tx: &mut Transaction<'_>, conversation_id: i64) -> Result<()> {
-    tx.execute(
+fn purge_existing_classification(conn: &Connection, conversation_id: i64) -> Result<()> {
+    conn.prepare_cached(
         "
         DELETE FROM message_path_ref
         WHERE message_id IN (
@@ -168,11 +212,11 @@ fn purge_existing_classification(tx: &mut Transaction<'_>, conversation_id: i64)
             WHERE conversation_id = ?1
         )
         ",
-        [conversation_id],
     )
+    .and_then(|mut stmt| stmt.execute([conversation_id]))
     .context("unable to clear existing message path refs for conversation")?;
 
-    tx.execute(
+    conn.prepare_cached(
         "
         DELETE FROM action
         WHERE turn_id IN (
@@ -181,8 +225,8 @@ fn purge_existing_classification(tx: &mut Transaction<'_>, conversation_id: i64)
             WHERE conversation_id = ?1
         )
         ",
-        [conversation_id],
     )
+    .and_then(|mut stmt| stmt.execute([conversation_id]))
     .context("unable to clear existing actions for conversation")?;
 
     Ok(())
@@ -219,7 +263,7 @@ struct LoadedMessage {
 }
 
 fn load_messages(conn: &Connection, conversation_id: i64) -> Result<Vec<LoadedMessage>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT
             m.id,
@@ -960,7 +1004,7 @@ fn tool_use_input_from_metadata_json(raw_json: &str) -> Option<Value> {
 }
 
 fn persist_path_refs(
-    tx: &mut Transaction<'_>,
+    conn: &Connection,
     project_id: i64,
     project_root: &Path,
     message_id: i64,
@@ -974,12 +1018,12 @@ fn persist_path_refs(
         }
 
         let Some(path_node_id) =
-            ensure_path_node_chain(tx, project_id, project_root, &path_ref.full_path)?
+            ensure_path_node_chain(conn, project_id, project_root, &path_ref.full_path)?
         else {
             continue;
         };
 
-        tx.execute(
+        conn.prepare_cached(
             "
             INSERT INTO message_path_ref (
                 message_id,
@@ -990,14 +1034,16 @@ fn persist_path_refs(
             )
             VALUES (?1, ?2, ?3, ?4, ?5)
             ",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 message_id,
                 path_ref.message_part_id,
                 path_node_id,
                 path_ref.ref_kind,
                 ordinal as i64,
-            ],
-        )
+            ])
+        })
         .context("unable to insert message path reference")?;
         inserted += 1;
     }
@@ -1006,7 +1052,7 @@ fn persist_path_refs(
 }
 
 fn ensure_path_node_chain(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     project_id: i64,
     project_root: &Path,
     full_path: &Path,
@@ -1020,7 +1066,15 @@ fn ensure_path_node_chain(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(root_full_path.as_str());
-    let root_id = ensure_path_node(tx, project_id, None, root_name, &root_full_path, "root", 0)?;
+    let root_id = ensure_path_node(
+        conn,
+        project_id,
+        None,
+        root_name,
+        &root_full_path,
+        "root",
+        0,
+    )?;
 
     let relative_path = full_path
         .strip_prefix(project_root)
@@ -1041,7 +1095,7 @@ fn ensure_path_node_chain(
         let node_kind = if is_last { "file" } else { "dir" };
         let name = component.as_os_str().to_string_lossy().to_string();
         parent_id = ensure_path_node(
-            tx,
+            conn,
             project_id,
             Some(parent_id),
             &name,
@@ -1055,7 +1109,7 @@ fn ensure_path_node_chain(
 }
 
 fn ensure_path_node(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     project_id: i64,
     parent_id: Option<i64>,
     name: &str,
@@ -1063,23 +1117,24 @@ fn ensure_path_node(
     node_kind: &str,
     depth: i64,
 ) -> Result<i64> {
-    if let Some(existing_id) = tx
-        .query_row(
+    if let Some(existing_id) = conn
+        .prepare_cached(
             "
             SELECT id
             FROM path_node
             WHERE project_id = ?1 AND full_path = ?2
             ",
-            params![project_id, full_path],
-            |row| row.get(0),
         )
-        .optional()
+        .and_then(|mut stmt| {
+            stmt.query_row(params![project_id, full_path], |row| row.get(0))
+                .optional()
+        })
         .context("unable to look up existing path node")?
     {
         return Ok(existing_id);
     }
 
-    tx.query_row(
+    conn.prepare_cached(
         "
         INSERT INTO path_node (
             project_id,
@@ -1092,9 +1147,13 @@ fn ensure_path_node(
         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         RETURNING id
         ",
-        params![project_id, parent_id, name, full_path, node_kind, depth],
-        |row| row.get(0),
     )
+    .and_then(|mut stmt| {
+        stmt.query_row(
+            params![project_id, parent_id, name, full_path, node_kind, depth],
+            |row| row.get(0),
+        )
+    })
     .context("unable to insert path node")
 }
 
@@ -1192,13 +1251,13 @@ impl ActionGroupDraft {
 }
 
 fn persist_action(
-    tx: &mut Transaction<'_>,
+    conn: &Connection,
     import_chunk_id: i64,
     turn_id: i64,
     sequence_no: i64,
     group: ActionGroupDraft,
 ) -> Result<()> {
-    let action_id: i64 = tx.query_row(
+    let action_id: i64 = conn.prepare_cached(
         "
         INSERT INTO action (
             turn_id,
@@ -1221,6 +1280,7 @@ fn persist_action(
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'deterministic_v1', ?9, ?10, ?11, ?12, ?13, ?14, ?15)
         RETURNING id
         ",
+    )?.query_row(
         params![
             turn_id,
             import_chunk_id,
@@ -1242,23 +1302,27 @@ fn persist_action(
     )?;
 
     for (ordinal, message_id) in group.message_ids.iter().enumerate() {
-        tx.execute(
+        conn.prepare_cached(
             "
             INSERT INTO action_message (action_id, message_id, ordinal_in_action)
             VALUES (?1, ?2, ?3)
             ",
-            params![action_id, message_id, ordinal as i64],
-        )?;
+        )?
+        .execute(params![action_id, message_id, ordinal as i64])?;
     }
 
     if let Some(attribution) = group.skill_attribution() {
-        tx.execute(
+        conn.prepare_cached(
             "
             INSERT INTO action_skill_attribution (action_id, skill_name, confidence)
             VALUES (?1, ?2, ?3)
             ",
-            params![action_id, attribution.skill_name, attribution.confidence],
-        )?;
+        )?
+        .execute(params![
+            action_id,
+            attribution.skill_name,
+            attribution.confidence
+        ])?;
     }
 
     Ok(())
@@ -1325,6 +1389,7 @@ mod tests {
                 source_file_id: ids.source_file_id,
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
+                perf_logger: None,
             },
         )?;
         let NormalizeJsonlFileOutcome::Imported(normalized) = normalized else {
@@ -1336,6 +1401,7 @@ mod tests {
                 conversation_id: normalized
                     .conversation_id
                     .expect("transcript normalization should produce a conversation id"),
+                perf_logger: None,
             },
         )?;
 
@@ -1407,6 +1473,7 @@ mod tests {
                 source_file_id: ids.source_file_id,
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
+                perf_logger: None,
             },
         )?;
         let NormalizeJsonlFileOutcome::Imported(normalized) = normalized else {
@@ -1418,6 +1485,7 @@ mod tests {
                 conversation_id: normalized
                     .conversation_id
                     .expect("transcript normalization should produce a conversation id"),
+                perf_logger: None,
             },
         )?;
 
@@ -1481,6 +1549,7 @@ mod tests {
                 source_file_id: ids.source_file_id,
                 import_chunk_id: ids.import_chunk_id,
                 path: fixture_path,
+                perf_logger: None,
             },
         )?;
         let NormalizeJsonlFileOutcome::Imported(normalized) = normalized else {
@@ -1492,6 +1561,7 @@ mod tests {
                 conversation_id: normalized
                     .conversation_id
                     .expect("transcript normalization should produce a conversation id"),
+                perf_logger: None,
             },
         )?;
 

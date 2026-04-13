@@ -3,7 +3,10 @@ use serde_json::Value;
 
 mod source;
 
-pub use source::{ScanReport, ScanWarning, scan_source_manifest, scan_source_manifest_with_policy};
+pub use source::{
+    ScanReport, ScanWarning, scan_source_manifest, scan_source_manifest_with_perf_logger,
+    scan_source_manifest_with_policy,
+};
 
 pub const STARTUP_IMPORT_WINDOW_HOURS: i64 = 24;
 pub const STARTUP_OPEN_DEADLINE_SECS: u64 = 10;
@@ -85,10 +88,11 @@ mod normalize;
 
 pub use chunk::{
     ImportExecutionReport, StartupImport, StartupImportMode, StartupOpenReason,
-    StartupProgressUpdate, StartupWorkerEvent, import_all, start_startup_import,
-    start_startup_import_with_mode_and_progress, start_startup_import_with_progress,
+    StartupProgressUpdate, StartupWorkerEvent, import_all, import_all_with_perf_logger,
+    start_startup_import, start_startup_import_with_mode_and_progress,
+    start_startup_import_with_perf_logger, start_startup_import_with_progress,
 };
 pub use normalize::{
     NormalizeImportWarning, NormalizeJsonlFileOutcome, NormalizeJsonlFileParams,
-    NormalizeJsonlFileResult, normalize_jsonl_file,
+    NormalizeJsonlFileResult, normalize_jsonl_file, normalize_jsonl_file_in_tx,
 };

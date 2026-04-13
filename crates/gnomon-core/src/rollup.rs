@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 
+use crate::perf::{PerfLogger, PerfScope};
+
 const DELETE_CHUNK_ACTION_ROLLUPS_SQL: &str = "
     DELETE FROM chunk_action_rollup
     WHERE import_chunk_id = ?1
@@ -157,13 +159,26 @@ pub(crate) fn clear_chunk_action_rollups(conn: &Connection, import_chunk_id: i64
     Ok(())
 }
 
-pub(crate) fn rebuild_chunk_action_rollups(conn: &Connection, import_chunk_id: i64) -> Result<()> {
-    clear_chunk_action_rollups(conn, import_chunk_id)?;
-    conn.execute(INSERT_CHUNK_ACTION_ROLLUPS_SQL, params![import_chunk_id])
-        .with_context(|| {
-            format!("unable to rebuild chunk action rollups for import chunk {import_chunk_id}")
-        })?;
-    Ok(())
+pub(crate) fn rebuild_chunk_action_rollups(
+    conn: &Connection,
+    import_chunk_id: i64,
+    perf_logger: Option<PerfLogger>,
+) -> Result<()> {
+    let mut scope = PerfScope::new(perf_logger, "import.rebuild_action_rollups");
+    scope.field("import_chunk_id", import_chunk_id);
+    let result = (|| -> Result<()> {
+        clear_chunk_action_rollups(conn, import_chunk_id)?;
+        conn.execute(INSERT_CHUNK_ACTION_ROLLUPS_SQL, params![import_chunk_id])
+            .with_context(|| {
+                format!("unable to rebuild chunk action rollups for import chunk {import_chunk_id}")
+            })?;
+        Ok(())
+    })();
+    match &result {
+        Ok(()) => scope.finish_ok(),
+        Err(err) => scope.finish_error(err),
+    }
+    result
 }
 
 pub(crate) fn clear_chunk_path_rollups(conn: &Connection, import_chunk_id: i64) -> Result<()> {
@@ -174,7 +189,22 @@ pub(crate) fn clear_chunk_path_rollups(conn: &Connection, import_chunk_id: i64) 
     Ok(())
 }
 
-pub(crate) fn rebuild_chunk_path_rollups(conn: &Connection, import_chunk_id: i64) -> Result<()> {
+pub(crate) fn rebuild_chunk_path_rollups(
+    conn: &Connection,
+    import_chunk_id: i64,
+    perf_logger: Option<PerfLogger>,
+) -> Result<()> {
+    let mut scope = PerfScope::new(perf_logger, "import.rebuild_path_rollups");
+    scope.field("import_chunk_id", import_chunk_id);
+    let result = rebuild_chunk_path_rollups_inner(conn, import_chunk_id);
+    match &result {
+        Ok(()) => scope.finish_ok(),
+        Err(err) => scope.finish_error(err),
+    }
+    result
+}
+
+fn rebuild_chunk_path_rollups_inner(conn: &Connection, import_chunk_id: i64) -> Result<()> {
     clear_chunk_path_rollups(conn, import_chunk_id)?;
 
     let mut stmt = conn.prepare(LOAD_CHUNK_PATH_FACTS_SQL).with_context(|| {

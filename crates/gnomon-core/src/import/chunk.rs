@@ -4,8 +4,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::classify::{BuildActionsParams, build_actions};
+use crate::classify::{BuildActionsParams, build_actions_in_tx};
 use crate::db::Database;
+use crate::perf::{PerfLogger, PerfScope};
 use crate::query::SnapshotBounds;
 use crate::rollup::{
     clear_chunk_action_rollups, clear_chunk_path_rollups, rebuild_chunk_action_rollups,
@@ -18,7 +19,7 @@ use rusqlite::{Connection, Transaction, params};
 use super::{
     IMPORT_SCHEMA_VERSION, NormalizeImportWarning, NormalizeJsonlFileOutcome,
     NormalizeJsonlFileParams, STARTUP_IMPORT_WINDOW_HOURS, STARTUP_OPEN_DEADLINE_SECS,
-    SourceFileKind, normalize_jsonl_file,
+    SourceFileKind, normalize_jsonl_file_in_tx,
 };
 
 const IMPORTER_THREAD_NAME: &str = "gnomon-importer";
@@ -66,6 +67,7 @@ impl Drop for StartupImport {
 #[derive(Debug, Clone, Default)]
 struct ImportWorkerOptions {
     per_chunk_delay: Duration,
+    perf_logger: Option<PerfLogger>,
 }
 
 #[derive(Debug)]
@@ -220,18 +222,48 @@ pub fn start_startup_import_with_mode_and_progress<F>(
     db_path: &Path,
     source_root: &Path,
     import_mode: StartupImportMode,
+    on_progress: F,
+) -> Result<StartupImport>
+where
+    F: FnMut(&StartupProgressUpdate),
+{
+    let state_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let perf_logger = PerfLogger::from_env(state_dir).ok().flatten();
+    start_startup_import_with_perf_logger(
+        conn,
+        db_path,
+        source_root,
+        import_mode,
+        perf_logger,
+        on_progress,
+    )
+}
+
+/// Like [`start_startup_import_with_mode_and_progress`] but accepts an
+/// explicit [`PerfLogger`] instead of reading `GNOMON_PERF_LOG` from the
+/// environment. Used by the `import_bench` example.
+pub fn start_startup_import_with_perf_logger<F>(
+    conn: &Connection,
+    db_path: &Path,
+    source_root: &Path,
+    import_mode: StartupImportMode,
+    perf_logger: Option<PerfLogger>,
     mut on_progress: F,
 ) -> Result<StartupImport>
 where
     F: FnMut(&StartupProgressUpdate),
 {
+    let options = ImportWorkerOptions {
+        perf_logger,
+        ..ImportWorkerOptions::default()
+    };
     start_startup_import_with_options(
         conn,
         db_path,
         source_root,
         Duration::from_secs(STARTUP_OPEN_DEADLINE_SECS),
         import_mode,
-        ImportWorkerOptions::default(),
+        options,
         Some(&mut on_progress),
     )
 }
@@ -241,21 +273,71 @@ pub fn import_all(
     db_path: &Path,
     source_root: &Path,
 ) -> Result<ImportExecutionReport> {
+    let state_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let perf_logger = PerfLogger::from_env(state_dir).ok().flatten();
+    import_all_with_perf_logger(conn, db_path, source_root, perf_logger)
+}
+
+/// Like [`import_all`] but accepts an explicit [`PerfLogger`] instead of
+/// reading `GNOMON_PERF_LOG` from the environment. Used by the
+/// `import_bench` example so it can route per-phase spans to a caller-chosen
+/// path without mutating process env vars.
+pub fn import_all_with_perf_logger(
+    conn: &Connection,
+    db_path: &Path,
+    source_root: &Path,
+    perf_logger: Option<PerfLogger>,
+) -> Result<ImportExecutionReport> {
     let now = Timestamp::now();
     let time_zone = TimeZone::system();
-    let plan = build_import_plan(conn, now, &time_zone)?;
-    let prepared = prepare_import_plan(conn, &plan)?;
-    let mut database =
-        Database::open(db_path).with_context(|| format!("unable to open {}", db_path.display()))?;
+
+    let mut plan_scope = PerfScope::new(perf_logger.clone(), "import.build_plan");
+    let plan = match build_import_plan(conn, now, &time_zone) {
+        Ok(plan) => {
+            plan_scope.field("startup_chunks", plan.startup_chunks.len());
+            plan_scope.field("deferred_chunks", plan.deferred_chunks.len());
+            plan_scope.finish_ok();
+            plan
+        }
+        Err(err) => {
+            plan_scope.finish_error(&err);
+            return Err(err);
+        }
+    };
+
+    let mut prepare_scope = PerfScope::new(perf_logger.clone(), "import.prepare_plan");
+    let prepared = match prepare_import_plan(conn, &plan) {
+        Ok(prepared) => {
+            prepare_scope.field("startup_chunks", prepared.startup_chunks.len());
+            prepare_scope.field("deferred_chunks", prepared.deferred_chunks.len());
+            prepare_scope.finish_ok();
+            prepared
+        }
+        Err(err) => {
+            prepare_scope.finish_error(&err);
+            return Err(err);
+        }
+    };
+
+    let open_scope = PerfScope::new(perf_logger.clone(), "import.open_database");
+    let mut database = match Database::open(db_path) {
+        Ok(database) => {
+            open_scope.finish_ok();
+            database
+        }
+        Err(err) => {
+            open_scope.finish_error(&err);
+            return Err(err).with_context(|| format!("unable to open {}", db_path.display()));
+        }
+    };
+
+    let options = ImportWorkerOptions {
+        perf_logger,
+        ..ImportWorkerOptions::default()
+    };
 
     for chunk in &prepared.startup_chunks {
-        import_chunk(
-            &mut database,
-            source_root,
-            chunk,
-            &ImportWorkerOptions::default(),
-        )
-        .with_context(|| {
+        import_chunk(&mut database, source_root, chunk, &options).with_context(|| {
             format!(
                 "unable to import startup chunk {}:{}",
                 chunk.project_key, chunk.chunk_day_local
@@ -265,18 +347,14 @@ pub fn import_all(
 
     let mut deferred_failures = Vec::new();
     for chunk in &prepared.deferred_chunks {
-        if let Err(err) = import_chunk(
-            &mut database,
-            source_root,
-            chunk,
-            &ImportWorkerOptions::default(),
-        )
-        .with_context(|| {
-            format!(
-                "unable to import deferred chunk {}:{}",
-                chunk.project_key, chunk.chunk_day_local
-            )
-        }) {
+        if let Err(err) =
+            import_chunk(&mut database, source_root, chunk, &options).with_context(|| {
+                format!(
+                    "unable to import deferred chunk {}:{}",
+                    chunk.project_key, chunk.chunk_day_local
+                )
+            })
+        {
             deferred_failures.push(compact_status_text(format!("{err:#}")));
         }
     }
@@ -300,8 +378,35 @@ fn start_startup_import_with_options(
 ) -> Result<StartupImport> {
     let now = Timestamp::now();
     let time_zone = TimeZone::system();
-    let plan = build_import_plan(conn, now, &time_zone)?;
-    let prepared = prepare_import_plan(conn, &plan)?;
+
+    let mut plan_scope = PerfScope::new(worker_options.perf_logger.clone(), "import.build_plan");
+    let plan = match build_import_plan(conn, now, &time_zone) {
+        Ok(plan) => {
+            plan_scope.field("startup_chunks", plan.startup_chunks.len());
+            plan_scope.field("deferred_chunks", plan.deferred_chunks.len());
+            plan_scope.finish_ok();
+            plan
+        }
+        Err(err) => {
+            plan_scope.finish_error(&err);
+            return Err(err);
+        }
+    };
+
+    let mut prepare_scope =
+        PerfScope::new(worker_options.perf_logger.clone(), "import.prepare_plan");
+    let prepared = match prepare_import_plan(conn, &plan) {
+        Ok(prepared) => {
+            prepare_scope.field("startup_chunks", prepared.startup_chunks.len());
+            prepare_scope.field("deferred_chunks", prepared.deferred_chunks.len());
+            prepare_scope.finish_ok();
+            prepared
+        }
+        Err(err) => {
+            prepare_scope.finish_error(&err);
+            return Err(err);
+        }
+    };
 
     if prepared.is_empty() {
         return Ok(StartupImport {
@@ -837,16 +942,31 @@ fn import_chunk(
         thread::sleep(options.per_chunk_delay);
     }
 
+    let mut scope = PerfScope::new(options.perf_logger.clone(), "import.chunk");
+    scope.field("project_key", chunk.project_key.as_str());
+    scope.field("chunk_day_local", chunk.chunk_day_local.as_str());
+    scope.field("source_file_count", chunk.source_files.len());
+
     let import_result = (|| {
+        let mut tx = database
+            .connection_mut()
+            .transaction()
+            .context("unable to start chunk-level import transaction")?;
+
         for source_file in &chunk.source_files {
             let path = source_root.join(&source_file.relative_path);
-            let outcome = normalize_jsonl_file(
-                database.connection_mut(),
+            let sp = tx
+                .savepoint()
+                .context("unable to create per-file savepoint")?;
+
+            let outcome = normalize_jsonl_file_in_tx(
+                &sp,
                 &NormalizeJsonlFileParams {
                     project_id: chunk.project_id,
                     source_file_id: source_file.source_file_id,
                     import_chunk_id: chunk.import_chunk_id,
                     path,
+                    perf_logger: options.perf_logger.clone(),
                 },
             )
             .with_context(|| {
@@ -859,9 +979,12 @@ fn import_chunk(
             match outcome {
                 NormalizeJsonlFileOutcome::Imported(result) => {
                     if let Some(conversation_id) = result.conversation_id {
-                        let _ = build_actions(
-                            database.connection_mut(),
-                            &BuildActionsParams { conversation_id },
+                        let _ = build_actions_in_tx(
+                            &sp,
+                            &BuildActionsParams {
+                                conversation_id,
+                                perf_logger: options.perf_logger.clone(),
+                            },
                         )
                         .with_context(|| {
                             format!(
@@ -870,11 +993,19 @@ fn import_chunk(
                             )
                         })?;
                     }
+                    sp.commit()
+                        .context("unable to release per-file savepoint")?;
                 }
-                NormalizeJsonlFileOutcome::Skipped => {}
+                NormalizeJsonlFileOutcome::Skipped => {
+                    sp.commit()
+                        .context("unable to release per-file savepoint")?;
+                }
                 NormalizeJsonlFileOutcome::Warning(warning) => {
+                    // Savepoint rollback: undoes purge + partial writes for this file.
+                    // Explicit drop triggers ROLLBACK TO SAVEPOINT via DropBehavior::Rollback.
+                    drop(sp);
                     insert_import_warning(
-                        database.connection_mut(),
+                        &tx,
                         chunk.import_chunk_id,
                         source_file.source_file_id,
                         &warning,
@@ -883,7 +1014,18 @@ fn import_chunk(
             }
         }
 
-        finalize_chunk_import(database.connection_mut(), chunk)?;
+        let mut finalize_scope =
+            PerfScope::new(options.perf_logger.clone(), "import.finalize_chunk");
+        finalize_scope.field("import_chunk_id", chunk.import_chunk_id);
+        let finalize_result = finalize_chunk_import_core(&tx, chunk, options.perf_logger.clone());
+        match &finalize_result {
+            Ok(()) => finalize_scope.finish_ok(),
+            Err(err) => finalize_scope.finish_error(err),
+        }
+        finalize_result?;
+
+        tx.commit()
+            .context("unable to commit chunk-level import transaction")?;
         Ok(())
     })();
 
@@ -894,9 +1036,11 @@ fn import_chunk(
             chunk.import_chunk_id,
             &error_message,
         );
+        scope.finish_error(&err);
         return Err(err);
     }
 
+    scope.finish_ok();
     Ok(())
 }
 
@@ -995,13 +1139,13 @@ fn insert_import_warning(
     Ok(())
 }
 
-fn finalize_chunk_import(conn: &mut Connection, chunk: &PreparedChunk) -> Result<()> {
-    let tx = conn
-        .transaction()
-        .context("unable to start an import chunk publish transaction")?;
-
+fn finalize_chunk_import_core(
+    conn: &Connection,
+    chunk: &PreparedChunk,
+    perf_logger: Option<PerfLogger>,
+) -> Result<()> {
     for source_file in &chunk.source_files {
-        tx.execute(
+        conn.execute(
             "
             UPDATE source_file
             SET
@@ -1020,10 +1164,10 @@ fn finalize_chunk_import(conn: &mut Connection, chunk: &PreparedChunk) -> Result
         })?;
     }
 
-    rebuild_chunk_action_rollups(&tx, chunk.import_chunk_id)?;
-    rebuild_chunk_path_rollups(&tx, chunk.import_chunk_id)?;
+    rebuild_chunk_action_rollups(conn, chunk.import_chunk_id, perf_logger.clone())?;
+    rebuild_chunk_path_rollups(conn, chunk.import_chunk_id, perf_logger.clone())?;
 
-    let next_publish_seq: i64 = tx
+    let next_publish_seq: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(publish_seq), 0) + 1 FROM import_chunk",
             [],
@@ -1031,7 +1175,7 @@ fn finalize_chunk_import(conn: &mut Connection, chunk: &PreparedChunk) -> Result
         )
         .context("unable to allocate the next import publish sequence")?;
 
-    tx.execute(
+    conn.execute(
         "
         UPDATE import_chunk
         SET
@@ -1050,8 +1194,6 @@ fn finalize_chunk_import(conn: &mut Connection, chunk: &PreparedChunk) -> Result
         )
     })?;
 
-    tx.commit()
-        .context("unable to commit the import chunk publish transaction")?;
     Ok(())
 }
 
@@ -1308,6 +1450,7 @@ mod tests {
             StartupImportMode::RecentFirst,
             ImportWorkerOptions {
                 per_chunk_delay: Duration::from_millis(WORKER_DELAY_MS),
+                perf_logger: None,
             },
             None,
         )?;
@@ -1395,6 +1538,7 @@ mod tests {
             StartupImportMode::Full,
             ImportWorkerOptions {
                 per_chunk_delay: Duration::from_millis(WORKER_DELAY_MS),
+                perf_logger: None,
             },
             None,
         )?;
