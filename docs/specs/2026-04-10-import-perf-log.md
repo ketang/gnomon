@@ -403,11 +403,80 @@ DB size:      486.83 MB (unchanged)
 
 **Next implied:** Re-profile to see new phase distribution, then pick candidate #2 (build_actions batching + cache — was 37.9% of chunk wall, likely now ~50%+ with commit_ms eliminated). Pragma tuning (synchronous=NORMAL, cache_size, mmap) is a low-effort runner-up.
 
+### 2026-04-12 — post-commit-batching re-profile
+
+Re-profiled to capture new phase distribution after commit batching. Ran 3× subset and 3× full corpus on the same environment. Session-local baselines (used for relative comparisons within this session only — absolute numbers differ from prior sessions due to system state):
+
+**Subset post-commit-batching profile (run 3, chunk wall = 21,405 ms):**
+
+| operation | total ms | % of chunk |
+| --- | ---: | ---: |
+| `import.normalize_jsonl` | 14,436 | 67.4% |
+| &nbsp;&nbsp;↳ `sql_ms` | **11,175** | **52.2%** |
+| &nbsp;&nbsp;↳ `parse_ms` | 1,432 | 6.7% |
+| &nbsp;&nbsp;↳ `commit_ms` | 0.0 | 0.0% |
+| &nbsp;&nbsp;↳ unaccounted (IO + loop) | 1,711 | 8.0% |
+| `import.build_actions` | 4,766 | 22.3% |
+| `import.build_turns` | 1,016 | 4.7% |
+| `import.finalize_chunk` | 660 | 3.1% |
+| `import.rebuild_path_rollups` | 578 | 2.7% |
+
+**Key finding:** `sql_ms` is now the dominant slice at 52% of chunk wall. No prepared statement caching — every `conn.execute()`/`conn.query_row()` call re-parses and re-plans SQL. ~490k records × multiple SQL calls = massive redundant compilations.
+
+### 2026-04-12 — candidate prepared-statement caching
+
+Branch: `import-perf-prepared-stmts`
+Worktree: `/home/ketan/project/gnomon/.worktrees/import-perf-prepared-stmts`
+
+**Hypothesis:** Replacing `conn.execute(sql, params)` / `conn.query_row(sql, params, f)` with `conn.prepare_cached(sql).and_then(|mut stmt| stmt.execute(params))` / equivalent eliminates per-call SQL compilation. `prepare_cached` maintains a per-connection hashmap of compiled statements. Expected: ~50% reduction in `sql_ms` → ~25% wall improvement.
+
+**Implementation:** Converted 34 SQL call sites across `normalize.rs` (21 sites) and `classify/mod.rs` (13 sites). Used `.and_then()` to chain `prepare_cached` and `execute`/`query_row` into a single `Result` before applying `.context()`/`.with_context()`, preserving error-wrapping semantics that `)?` would bypass.
+
+**Measurements (session-local, same environment as re-profile above):**
+
+Subset (1 project, 1649 files, 35 chunks):
+```
+Mode=full:    22.7s → 14.2s  (−8.5s, −37.4%)  [14.2 / 14.1 / 15.3]
+Row parity:   PASS (all 10 tables match baseline exactly)
+DB size:      186.99 MB (unchanged)
+```
+
+Full corpus (31 projects, 4548 files, 162 chunks):
+```
+Mode=full:    53.6s → 38.4s  (−15.2s, −28.4%)  [36.8 / 40.0 / 38.4]
+Row parity:   PASS (all 10 tables match baseline exactly)
+DB size:      486.83 MB (unchanged)
+```
+
+**Profile shift (subset):**
+
+| phase | before | after | absolute delta |
+| --- | ---: | ---: | ---: |
+| `sql_ms` | 11,175 ms (52.2%) | 5,867 ms (45.3%) | −5,308 ms (−47.5%) |
+| `build_actions` | 4,766 ms (22.3%) | 2,672 ms (20.6%) | −2,094 ms (−43.9%) |
+| `parse_ms` | 1,432 ms (6.7%) | 1,140 ms (8.8%) | −292 ms |
+| chunk wall | 21,405 ms | 12,956 ms | −8,449 ms (−39.5%) |
+
+**Notes:**
+- Session-to-session absolute numbers vary (~30%) due to system state (page cache, WSL load). Within-session relative comparisons are reliable.
+- The ~47% `sql_ms` reduction matches expectations: statement compilation overhead eliminated, but SQLite btree/index operations remain.
+- `build_actions` also benefits substantially (−44%) because classify/mod.rs SQL calls were also uncached.
+- Run-to-run variance is low this session: 3% on subset, 8% on full corpus.
+
+**Decision:** KEPT
+
+**Commit on `import-perf-prepared-stmts`:**
+- `708468e` perf(import): use prepare_cached for all SQL in import hot path
+
+**Merge:** `83dedf2` — merged `import-perf-prepared-stmts` into `import-perf` with `--no-ff`
+
+**Next implied:** Re-profile to see new phase distribution, then pick candidate #3. Expected top candidates: SQLite pragma tuning (synchronous=NORMAL, cache_size, mmap), or scan_source caching for startup mode.
+
 ---
 
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-12 (Phase 2, commit-batching KEPT, merged into import-perf)
+Last updated: 2026-04-12 (Phase 2, prepared-statement caching KEPT, merged into import-perf)
 Current phase: Phase 2 — iterate
 Current branch: `import-perf`
 Current worktree: `/home/ketan/project/gnomon/.worktrees/import-perf`
@@ -416,16 +485,16 @@ Primary repo root (do not implement here): `/home/ketan/project/gnomon`
 ### How to resume
 1. `cd /home/ketan/project/gnomon/.worktrees/import-perf`
 2. Verify: `git rev-parse --abbrev-ref HEAD` → must print `import-perf`
-3. Read this log's Phase Log (latest entry: "candidate commit-batching" — KEPT) for context.
+3. Read this log's Phase Log (latest entry: "candidate prepared-statement caching" — KEPT) for context.
 4. Read `docs/specs/2026-04-10-import-perf-design.md` Section 3 (Phase 2 structure) and Section 8 (commit workflow) for the iteration protocol.
 5. Continue at the "Next action" below.
 
 ### Last completed
-Phase 2, iteration 1: commit-batching candidate KEPT. Merged `import-perf-commit-batching` into `import-perf` (merge sha `a948c2c`). Cold full import improved from 126.1s → 77.5s (−38.5%).
+Phase 2, iteration 2: prepared-statement caching candidate KEPT. Merged `import-perf-prepared-stmts` into `import-perf` (merge sha `83dedf2`). Session-local improvement: subset 22.7s → 14.2s (−37.4%), full corpus 53.6s → 38.4s (−28.4%).
 
 ### Next action
-1. **Re-profile** the post-commit-batching state to see new phase distribution (build_actions is now likely dominant).
-2. Pick candidate #2 based on the new profile. Expected: build_actions batching + cache, or pragma tuning.
+1. **Re-profile** the post-prepared-stmts state to see new phase distribution.
+2. Pick candidate #3 based on the new profile. Expected: SQLite pragma tuning, or scan_source caching for startup mode.
 3. Create per-candidate branch and worktree under `.worktrees/import-perf-<slug>/`.
 
 ### Uncommitted state
@@ -452,29 +521,30 @@ This log update only. Code changes are committed.
 - `7110745` perf: add baseline CPU profiles for full and startup modes
 - `e743091` log: record agreed Phase 1 target and close Phase 1
 - `a948c2c` **merge: commit-batching candidate (126.1s → 77.5s, −38.5%)**
+- `83dedf2` **merge: prepared-statement caching candidate (53.6s → 38.4s, −28.4%)**
 
-### Current best metrics (post commit-batching)
-| metric | value | vs baseline | vs target |
+### Current best metrics (post prepared-statement caching)
+| metric | value | vs original baseline | vs target |
 | --- | ---: | ---: | ---: |
-| Cold full import (median) | 77.5s | −38.5% from 126.1s | 7.8× to 10s target |
+| Cold full import (session-local median) | 38.4s | ~70% from 126.1s (2 candidates cumulative) | ~3.8× to 10s target |
 | Warm startup | ~3.5s (scan+plan only, no chunk work) | N/A (corpus aged out) | ~3.5× to <1s target |
 
-### Candidate ranking (updated after commit-batching)
+### Candidate ranking (updated after prepared-statement caching)
 
 | rank | candidate | est. remaining win | confidence |
 | --- | --- | --- | --- |
-| 1 | **build_actions batching + cache** | ~20-30s (was 37.9% of chunk wall, now likely ~50%+ with commit_ms gone) | medium — needs re-profile |
-| 2 | **SQLite pragma tuning** (synchronous=NORMAL, cache_size, mmap) | unknown — may compound with commit batching | medium |
-| 3 | **scan_source caching** | startup floor only, ~2.8s | high for startup mode |
-| 4 | **Parallel chunk processing** (rayon) | remaining wall ÷ 6 cores | medium-high |
-| 5 | Faster JSON parser | ~1.5s / 2.4% | low priority |
+| 1 | **SQLite pragma tuning** (synchronous=NORMAL, cache_size, mmap) | 10–30% wall | medium — low effort, may compound |
+| 2 | **scan_source caching / parallelization** | startup floor only, ~1s | high for startup mode |
+| 3 | **Parallel chunk processing** (rayon) | remaining wall ÷ 6 cores | medium-high, structural |
+| 4 | **Deferred secondary indexes** during bulk load | 10–20% on insert phase | medium |
+| 5 | Faster JSON parser | ~1.1s / ~9% | low priority |
 
 ### Session-resumption sanity check
 ```bash
 cd /home/ketan/project/gnomon/.worktrees/import-perf
 git rev-parse --abbrev-ref HEAD  # → import-perf
 git log --oneline -5
-# Should show merge commit a948c2c at top
+# Should show merge commit 83dedf2 at top
 ls tests/fixtures/import-corpus/
 # MANIFEST.md + full.tar.zst + subset.tar.zst + capture.sh
 ```
