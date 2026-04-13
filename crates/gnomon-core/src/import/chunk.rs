@@ -4,7 +4,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::classify::{BuildActionsParams, build_actions};
+use crate::classify::{BuildActionsParams, build_actions_in_tx};
 use crate::db::Database;
 use crate::perf::{PerfLogger, PerfScope};
 use crate::query::SnapshotBounds;
@@ -19,7 +19,7 @@ use rusqlite::{Connection, Transaction, params};
 use super::{
     IMPORT_SCHEMA_VERSION, NormalizeImportWarning, NormalizeJsonlFileOutcome,
     NormalizeJsonlFileParams, STARTUP_IMPORT_WINDOW_HOURS, STARTUP_OPEN_DEADLINE_SECS,
-    SourceFileKind, normalize_jsonl_file,
+    SourceFileKind, normalize_jsonl_file_in_tx,
 };
 
 const IMPORTER_THREAD_NAME: &str = "gnomon-importer";
@@ -948,10 +948,19 @@ fn import_chunk(
     scope.field("source_file_count", chunk.source_files.len());
 
     let import_result = (|| {
+        let mut tx = database
+            .connection_mut()
+            .transaction()
+            .context("unable to start chunk-level import transaction")?;
+
         for source_file in &chunk.source_files {
             let path = source_root.join(&source_file.relative_path);
-            let outcome = normalize_jsonl_file(
-                database.connection_mut(),
+            let sp = tx
+                .savepoint()
+                .context("unable to create per-file savepoint")?;
+
+            let outcome = normalize_jsonl_file_in_tx(
+                &sp,
                 &NormalizeJsonlFileParams {
                     project_id: chunk.project_id,
                     source_file_id: source_file.source_file_id,
@@ -970,8 +979,8 @@ fn import_chunk(
             match outcome {
                 NormalizeJsonlFileOutcome::Imported(result) => {
                     if let Some(conversation_id) = result.conversation_id {
-                        let _ = build_actions(
-                            database.connection_mut(),
+                        let _ = build_actions_in_tx(
+                            &sp,
                             &BuildActionsParams {
                                 conversation_id,
                                 perf_logger: options.perf_logger.clone(),
@@ -984,11 +993,19 @@ fn import_chunk(
                             )
                         })?;
                     }
+                    sp.commit()
+                        .context("unable to release per-file savepoint")?;
                 }
-                NormalizeJsonlFileOutcome::Skipped => {}
+                NormalizeJsonlFileOutcome::Skipped => {
+                    sp.commit()
+                        .context("unable to release per-file savepoint")?;
+                }
                 NormalizeJsonlFileOutcome::Warning(warning) => {
+                    // Savepoint rollback: undoes purge + partial writes for this file.
+                    // Explicit drop triggers ROLLBACK TO SAVEPOINT via DropBehavior::Rollback.
+                    drop(sp);
                     insert_import_warning(
-                        database.connection_mut(),
+                        &tx,
                         chunk.import_chunk_id,
                         source_file.source_file_id,
                         &warning,
@@ -1000,16 +1017,15 @@ fn import_chunk(
         let mut finalize_scope =
             PerfScope::new(options.perf_logger.clone(), "import.finalize_chunk");
         finalize_scope.field("import_chunk_id", chunk.import_chunk_id);
-        let finalize_result = finalize_chunk_import(
-            database.connection_mut(),
-            chunk,
-            options.perf_logger.clone(),
-        );
+        let finalize_result = finalize_chunk_import_core(&tx, chunk, options.perf_logger.clone());
         match &finalize_result {
             Ok(()) => finalize_scope.finish_ok(),
             Err(err) => finalize_scope.finish_error(err),
         }
         finalize_result?;
+
+        tx.commit()
+            .context("unable to commit chunk-level import transaction")?;
         Ok(())
     })();
 
@@ -1178,20 +1194,6 @@ fn finalize_chunk_import_core(
         )
     })?;
 
-    Ok(())
-}
-
-fn finalize_chunk_import(
-    conn: &mut Connection,
-    chunk: &PreparedChunk,
-    perf_logger: Option<PerfLogger>,
-) -> Result<()> {
-    let tx = conn
-        .transaction()
-        .context("unable to start an import chunk publish transaction")?;
-    finalize_chunk_import_core(&tx, chunk, perf_logger)?;
-    tx.commit()
-        .context("unable to commit the import chunk publish transaction")?;
     Ok(())
 }
 
