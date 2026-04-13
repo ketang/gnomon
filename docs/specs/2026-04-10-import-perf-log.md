@@ -556,9 +556,37 @@ Row parity: **PASS** (all 10 tables match baseline exactly, DB size 486.83 MB id
 
 ---
 
+## Phase 2, iteration 4: candidate deferred secondary indexes — REVERTED
+
+**Hypothesis:** Dropping 21 of 23 secondary indexes before bulk import (keeping `idx_message_conversation_role_sequence` for build_turns/build_actions and `idx_action_chunk_classification` for rollup queries), then recreating them after import completes, would reduce per-INSERT index maintenance overhead by 30–50%.
+
+**Branch:** `import-perf-parallel-parse` (off `import-perf`) — deleted after revert
+
+**Approach:** Drop indexes via `sqlite_master` query before import loop, recreate after. Rollups kept inline (within per-chunk transaction) for cache locality.
+
+**Measurements (within-session, interleaved, full corpus, 3 repeats):**
+```
+Deferred indexes: 45.2 / 35.2 / 34.1  median=35.2s
+Baseline:         43.7 / 35.0 / 32.2  median=35.0s
+Delta: indistinguishable from noise
+```
+
+**Perf-log analysis (subset, single run):**
+- normalize sql_ms: 6,053 → 3,432 (**−43%**) — inserts genuinely faster
+- rebuild_path_rollups: 504 → 5,291 (**+950%**) — when rollups deferred, cache miss penalty kills it
+- With rollups inline (v2): wall time matches baseline exactly — insert savings too small to measure
+
+**Why it failed:** Per-insert index maintenance is negligible when btree pages are cached in the 64MB page cache. The dominant SQL cost is primary btree insert (finding position, inserting row, possible page split), not secondary index updates. The indexes that were dropped are on tables where the pages are hot from recent inserts.
+
+**Lesson:** With modern SQLite + WAL + large page cache, secondary index overhead during bulk import is ~0 — the pages are already in memory. Only approaches that reduce the core per-row btree cost (fewer rows, fewer tables, or parallelism) can improve further.
+
+**Decision:** REVERTED — no code committed.
+
+---
+
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-13 (Phase 2, pragma tuning KEPT, merging into import-perf)
+Last updated: 2026-04-13 (Phase 2, deferred indexes REVERTED, no merge)
 Current phase: Phase 2 — iterate
 Current branch: `import-perf`
 Current worktree: `/home/ketan/project/gnomon/.worktrees/import-perf`
@@ -567,16 +595,21 @@ Primary repo root (do not implement here): `/home/ketan/project/gnomon`
 ### How to resume
 1. `cd /home/ketan/project/gnomon/.worktrees/import-perf`
 2. Verify: `git rev-parse --abbrev-ref HEAD` → must print `import-perf`
-3. Read this log's Phase Log (latest entry: "candidate SQLite pragma tuning" — KEPT) for context.
+3. Read this log's Phase Log (latest entries: "pragma tuning" KEPT, "deferred indexes" REVERTED) for context.
 4. Read `docs/specs/2026-04-10-import-perf-design.md` Section 3 (Phase 2 structure) and Section 8 (commit workflow) for the iteration protocol.
 5. Continue at the "Next action" below.
 
 ### Last completed
-Phase 2, iteration 3: SQLite pragma tuning candidate KEPT. Merged `import-perf-pragma-tuning` into `import-perf`. Session-local improvement: full corpus 38.1s → 31.9s (−16.3%), startup 2.77s → 2.29s (−17.4%).
+Phase 2, iteration 4: Deferred secondary indexes candidate REVERTED. No measurable improvement — per-insert index maintenance is negligible with cached btree pages. The dominant SQL cost is core btree work, not index updates.
+
+Three KEPT candidates so far: commit-batching (−38.5%), prepared-statement caching (−28.4%), pragma tuning (−16.3%). Cumulative: 126.1s → 31.9s (~75%).
 
 ### Next action
-1. **Re-profile** the post-pragma state to see new phase distribution.
-2. Pick candidate #4 based on the new profile. Expected: parallel chunk processing (rayon), deferred secondary indexes, or scan_source caching.
+1. Pick candidate #5. Remaining viable candidates:
+   - **Parallel chunk processing** (rayon) — the only approach that can deliver 3× speedup needed for 10s target
+   - **scan_source caching** — startup-mode improvement only (~0.5s)
+   - **Faster JSON parser** — ~2.6s / ~8%, diminishing returns
+2. Soft checkpoint: after 4 iterations (3 KEPT, 1 REVERTED), evaluate whether to continue or close Phase 2.
 3. Create per-candidate branch and worktree under `.worktrees/import-perf-<slug>/`.
 
 ### Uncommitted state
