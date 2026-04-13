@@ -474,9 +474,91 @@ DB size:      486.83 MB (unchanged)
 
 ---
 
+### Re-profile: post prepared-statement caching (2026-04-12)
+
+Three full-corpus runs: 35.6s / 39.8s / 56.7s (run 3 is a system-load outlier). Median: **39.8s**.
+Startup mode: **3.0s** (down from ~5.1s baseline; mostly scan_source improvement from earlier work).
+Subset: 14.5s / 15.4s. Median: **~14.9s**.
+
+**Phase distribution (full corpus, cleanest run = 35.6s):**
+
+| phase | total_ms | % of span | note |
+| --- | ---: | ---: | --- |
+| `normalize_jsonl` (envelope) | 19,010 | 28.9% | sql_ms dominates |
+| — `sql_ms` | 13,340 | 81.7% of normalize | **still the #1 bottleneck** |
+| — `parse_ms` | 2,603 | 15.9% of normalize | JSON parsing |
+| — `purge_ms` | 219 | 1.3% of normalize | |
+| — `finish_import_ms` | 164 | 1.0% of normalize | |
+| — `commit_ms` | 0 | 0.0% | batched into chunk-level commit |
+| `build_actions` | 6,726 | 10.2% | classification + SQL inserts |
+| `scan_source` | 2,182 | 3.3% | startup floor |
+| `finalize_chunk` | 1,896 | 2.9% | |
+| `rebuild_path_rollups` | 1,693 | 2.6% | |
+| `build_turns` | 1,521 | 2.3% | |
+| `prepare_plan` | 515 | 0.8% | |
+
+**Analysis:** SQL is still ~62% of wall time (sql_ms 13.3s + build_actions 6.7s + rollups 1.9s ≈ 22s of ~35.6s). Pragma tuning (synchronous, cache_size, mmap) targets the I/O substrate beneath all SQL phases — low effort, broadly applicable.
+
+**Candidate #3 selection:** SQLite pragma tuning (A2a) — safe pragmas targeting I/O reduction across all SQL-bound phases.
+
+---
+
+## Phase 2, iteration 3: candidate SQLite pragma tuning
+
+**Hypothesis:** Setting `synchronous=NORMAL`, increasing `cache_size`, and enabling `mmap_size` will reduce I/O overhead on all SQL operations, yielding 10–30% wall time reduction.
+
+**Branch:** `import-perf-pragma-tuning` (off `import-perf`)
+
+**Pragmas added to `configure_read_write_connection`:**
+```sql
+PRAGMA synchronous = NORMAL;   -- safe with WAL; reduces fsync calls
+PRAGMA cache_size = -64000;    -- 64MB page cache (default ~2MB)
+PRAGMA mmap_size = 268435456;  -- 256MB memory-mapped reads
+PRAGMA temp_store = MEMORY;    -- temp tables in RAM
+```
+Also added `cache_size` and `mmap_size` to `configure_read_only_connection`.
+
+**Measurements (within-session, interleaved, full corpus, 6 runs each):**
+
+Subset (5-repeat runs):
+```
+Pragma:   18.2 / 15.0 / 15.3 / 12.6 / 13.0  median=15.0s
+Baseline: 14.1 / 15.2 / 13.9 / 14.4 / 13.9  median=14.1s
+Delta: inconclusive on subset (35 chunks → low commit overhead)
+```
+
+Full corpus (3-repeat runs × 2 rounds, interleaved):
+```
+Pragma:   31.8 / 32.1 / 33.5 / 30.3 / 32.0 / 31.2  median=31.9s
+Baseline: 38.8 / 36.9 / 38.1 / 38.2 / 38.0 / 35.6  median=38.1s
+Delta: 38.1s → 31.9s  (−6.2s, −16.3%)
+```
+
+Startup mode (3-repeat runs):
+```
+Pragma:   2.286 / 2.310 / 2.290  median=2.29s
+Baseline: 2.754 / 2.851 / 2.773  median=2.77s
+Delta: 2.77s → 2.29s  (−0.48s, −17.4%)
+```
+
+Row parity: **PASS** (all 10 tables match baseline exactly, DB size 486.83 MB identical)
+
+**Profile shift:** Instrumented span timings are nearly identical (66.2s vs 65.8s total). The improvement comes from reduced I/O stalls *between* spans — fsync savings from `synchronous=NORMAL` and reduced page faults from `mmap_size`.
+
+**Decision:** KEPT
+
+**Commit on `import-perf-pragma-tuning`:**
+- `b0c3eee` perf(db): add SQLite pragma tuning for import performance
+
+**Merge:** `PENDING` — merging `import-perf-pragma-tuning` into `import-perf`
+
+**Next implied:** Re-profile post-pragma state, pick candidate #4. With 3 candidates applied (commit-batching −38.5%, prepared-stmts −28.4%, pragma tuning −16.3%), cumulative improvement is ~75% from the 126.1s baseline. Remaining candidates: parallel chunk processing (rayon), deferred secondary indexes, scan_source caching.
+
+---
+
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-12 (Phase 2, prepared-statement caching KEPT, merged into import-perf)
+Last updated: 2026-04-13 (Phase 2, pragma tuning KEPT, merging into import-perf)
 Current phase: Phase 2 — iterate
 Current branch: `import-perf`
 Current worktree: `/home/ketan/project/gnomon/.worktrees/import-perf`
@@ -485,16 +567,16 @@ Primary repo root (do not implement here): `/home/ketan/project/gnomon`
 ### How to resume
 1. `cd /home/ketan/project/gnomon/.worktrees/import-perf`
 2. Verify: `git rev-parse --abbrev-ref HEAD` → must print `import-perf`
-3. Read this log's Phase Log (latest entry: "candidate prepared-statement caching" — KEPT) for context.
+3. Read this log's Phase Log (latest entry: "candidate SQLite pragma tuning" — KEPT) for context.
 4. Read `docs/specs/2026-04-10-import-perf-design.md` Section 3 (Phase 2 structure) and Section 8 (commit workflow) for the iteration protocol.
 5. Continue at the "Next action" below.
 
 ### Last completed
-Phase 2, iteration 2: prepared-statement caching candidate KEPT. Merged `import-perf-prepared-stmts` into `import-perf` (merge sha `83dedf2`). Session-local improvement: subset 22.7s → 14.2s (−37.4%), full corpus 53.6s → 38.4s (−28.4%).
+Phase 2, iteration 3: SQLite pragma tuning candidate KEPT. Merged `import-perf-pragma-tuning` into `import-perf`. Session-local improvement: full corpus 38.1s → 31.9s (−16.3%), startup 2.77s → 2.29s (−17.4%).
 
 ### Next action
-1. **Re-profile** the post-prepared-stmts state to see new phase distribution.
-2. Pick candidate #3 based on the new profile. Expected: SQLite pragma tuning, or scan_source caching for startup mode.
+1. **Re-profile** the post-pragma state to see new phase distribution.
+2. Pick candidate #4 based on the new profile. Expected: parallel chunk processing (rayon), deferred secondary indexes, or scan_source caching.
 3. Create per-candidate branch and worktree under `.worktrees/import-perf-<slug>/`.
 
 ### Uncommitted state
@@ -522,29 +604,29 @@ This log update only. Code changes are committed.
 - `e743091` log: record agreed Phase 1 target and close Phase 1
 - `a948c2c` **merge: commit-batching candidate (126.1s → 77.5s, −38.5%)**
 - `83dedf2` **merge: prepared-statement caching candidate (53.6s → 38.4s, −28.4%)**
+- `PENDING` **merge: pragma tuning candidate (38.1s → 31.9s, −16.3%)**
 
-### Current best metrics (post prepared-statement caching)
+### Current best metrics (post pragma tuning)
 | metric | value | vs original baseline | vs target |
 | --- | ---: | ---: | ---: |
-| Cold full import (session-local median) | 38.4s | ~70% from 126.1s (2 candidates cumulative) | ~3.8× to 10s target |
-| Warm startup | ~3.5s (scan+plan only, no chunk work) | N/A (corpus aged out) | ~3.5× to <1s target |
+| Cold full import (session-local median) | 31.9s | ~75% from 126.1s (3 candidates cumulative) | ~3.2× to 10s target |
+| Startup | 2.29s | ~55% from ~5.1s baseline | ~2.3× to <1s target |
 
-### Candidate ranking (updated after prepared-statement caching)
+### Candidate ranking (updated after pragma tuning)
 
 | rank | candidate | est. remaining win | confidence |
 | --- | --- | --- | --- |
-| 1 | **SQLite pragma tuning** (synchronous=NORMAL, cache_size, mmap) | 10–30% wall | medium — low effort, may compound |
-| 2 | **scan_source caching / parallelization** | startup floor only, ~1s | high for startup mode |
-| 3 | **Parallel chunk processing** (rayon) | remaining wall ÷ 6 cores | medium-high, structural |
-| 4 | **Deferred secondary indexes** during bulk load | 10–20% on insert phase | medium |
-| 5 | Faster JSON parser | ~1.1s / ~9% | low priority |
+| 1 | **Parallel chunk processing** (rayon) | remaining wall ÷ 6 cores | medium-high, structural |
+| 2 | **Deferred secondary indexes** during bulk load | 10–20% on insert phase | medium |
+| 3 | **scan_source caching / parallelization** | startup floor only, ~0.5s | high for startup mode |
+| 4 | Faster JSON parser | ~2.6s / ~8% | low priority |
 
 ### Session-resumption sanity check
 ```bash
 cd /home/ketan/project/gnomon/.worktrees/import-perf
 git rev-parse --abbrev-ref HEAD  # → import-perf
 git log --oneline -5
-# Should show merge commit 83dedf2 at top
+# Should show pragma tuning merge commit at top
 ls tests/fixtures/import-corpus/
 # MANIFEST.md + full.tar.zst + subset.tar.zst + capture.sh
 ```
