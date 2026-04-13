@@ -550,7 +550,7 @@ Row parity: **PASS** (all 10 tables match baseline exactly, DB size 486.83 MB id
 **Commit on `import-perf-pragma-tuning`:**
 - `b0c3eee` perf(db): add SQLite pragma tuning for import performance
 
-**Merge:** `PENDING` — merging `import-perf-pragma-tuning` into `import-perf`
+**Merge:** `d083c1b` — merged `import-perf-pragma-tuning` into `import-perf` with `--no-ff`
 
 **Next implied:** Re-profile post-pragma state, pick candidate #4. With 3 candidates applied (commit-batching −38.5%, prepared-stmts −28.4%, pragma tuning −16.3%), cumulative improvement is ~75% from the 126.1s baseline. Remaining candidates: parallel chunk processing (rayon), deferred secondary indexes, scan_source caching.
 
@@ -604,7 +604,7 @@ This log update only. Code changes are committed.
 - `e743091` log: record agreed Phase 1 target and close Phase 1
 - `a948c2c` **merge: commit-batching candidate (126.1s → 77.5s, −38.5%)**
 - `83dedf2` **merge: prepared-statement caching candidate (53.6s → 38.4s, −28.4%)**
-- `PENDING` **merge: pragma tuning candidate (38.1s → 31.9s, −16.3%)**
+- `d083c1b` **merge: pragma tuning candidate (38.1s → 31.9s, −16.3%)**
 
 ### Current best metrics (post pragma tuning)
 | metric | value | vs original baseline | vs target |
