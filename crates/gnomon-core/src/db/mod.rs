@@ -137,6 +137,10 @@ fn configure_read_write_connection(conn: &mut Connection) -> Result<()> {
         "
         PRAGMA journal_mode = WAL;
         PRAGMA foreign_keys = ON;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA cache_size = -64000;
+        PRAGMA mmap_size = 268435456;
+        PRAGMA temp_store = MEMORY;
         ",
     )
     .context("unable to configure sqlite connection pragmas")?;
@@ -151,6 +155,8 @@ fn configure_read_only_connection(conn: &mut Connection) -> Result<()> {
         "
         PRAGMA foreign_keys = ON;
         PRAGMA query_only = ON;
+        PRAGMA cache_size = -64000;
+        PRAGMA mmap_size = 268435456;
         ",
     )
     .context("unable to configure read-only sqlite connection pragmas")?;
@@ -216,6 +222,10 @@ mod tests {
                 pragma_i64(db.connection(), "busy_timeout")?,
                 DEFAULT_BUSY_TIMEOUT.as_millis() as i64
             );
+            assert_eq!(pragma_i64(db.connection(), "synchronous")?, 1); // NORMAL
+            assert_eq!(pragma_i64(db.connection(), "cache_size")?, -64000);
+            assert_eq!(pragma_i64(db.connection(), "mmap_size")?, 268435456);
+            assert_eq!(pragma_i64(db.connection(), "temp_store")?, 2); // MEMORY
 
             for table in REQUIRED_TABLES {
                 assert!(table_exists(db.connection(), table)?);
