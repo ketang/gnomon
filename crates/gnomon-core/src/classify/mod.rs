@@ -115,7 +115,7 @@ fn build_actions_core(
         }
     }
 
-    conn.execute(
+    conn.prepare_cached(
         "
         UPDATE import_chunk
         SET imported_action_count = (
@@ -125,8 +125,8 @@ fn build_actions_core(
         )
         WHERE id = ?1
         ",
-        [context.import_chunk_id],
     )
+    .and_then(|mut stmt| stmt.execute([context.import_chunk_id]))
     .context("unable to update import chunk action count")?;
 
     Ok(BuildActionsResult {
@@ -178,7 +178,7 @@ fn load_conversation_context(
     conn: &Connection,
     conversation_id: i64,
 ) -> Result<Option<ConversationContext>> {
-    conn.query_row(
+    conn.prepare_cached(
         "
         SELECT c.project_id, p.root_path, m.import_chunk_id
         FROM conversation c
@@ -188,21 +188,22 @@ fn load_conversation_context(
         ORDER BY m.sequence_no
         LIMIT 1
         ",
-        [conversation_id],
-        |row| {
+    )
+    .and_then(|mut stmt| {
+        stmt.query_row([conversation_id], |row| {
             Ok(ConversationContext {
                 project_id: row.get(0)?,
                 project_root: PathBuf::from(row.get::<_, String>(1)?),
                 import_chunk_id: row.get(2)?,
             })
-        },
-    )
-    .optional()
+        })
+        .optional()
+    })
     .context("unable to load conversation context for action classification")
 }
 
 fn purge_existing_classification(conn: &Connection, conversation_id: i64) -> Result<()> {
-    conn.execute(
+    conn.prepare_cached(
         "
         DELETE FROM message_path_ref
         WHERE message_id IN (
@@ -211,11 +212,11 @@ fn purge_existing_classification(conn: &Connection, conversation_id: i64) -> Res
             WHERE conversation_id = ?1
         )
         ",
-        [conversation_id],
     )
+    .and_then(|mut stmt| stmt.execute([conversation_id]))
     .context("unable to clear existing message path refs for conversation")?;
 
-    conn.execute(
+    conn.prepare_cached(
         "
         DELETE FROM action
         WHERE turn_id IN (
@@ -224,8 +225,8 @@ fn purge_existing_classification(conn: &Connection, conversation_id: i64) -> Res
             WHERE conversation_id = ?1
         )
         ",
-        [conversation_id],
     )
+    .and_then(|mut stmt| stmt.execute([conversation_id]))
     .context("unable to clear existing actions for conversation")?;
 
     Ok(())
@@ -262,7 +263,7 @@ struct LoadedMessage {
 }
 
 fn load_messages(conn: &Connection, conversation_id: i64) -> Result<Vec<LoadedMessage>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT
             m.id,
@@ -1022,7 +1023,7 @@ fn persist_path_refs(
             continue;
         };
 
-        conn.execute(
+        conn.prepare_cached(
             "
             INSERT INTO message_path_ref (
                 message_id,
@@ -1033,14 +1034,16 @@ fn persist_path_refs(
             )
             VALUES (?1, ?2, ?3, ?4, ?5)
             ",
-            params![
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
                 message_id,
                 path_ref.message_part_id,
                 path_node_id,
                 path_ref.ref_kind,
                 ordinal as i64,
-            ],
-        )
+            ])
+        })
         .context("unable to insert message path reference")?;
         inserted += 1;
     }
@@ -1115,22 +1118,23 @@ fn ensure_path_node(
     depth: i64,
 ) -> Result<i64> {
     if let Some(existing_id) = conn
-        .query_row(
+        .prepare_cached(
             "
             SELECT id
             FROM path_node
             WHERE project_id = ?1 AND full_path = ?2
             ",
-            params![project_id, full_path],
-            |row| row.get(0),
         )
-        .optional()
+        .and_then(|mut stmt| {
+            stmt.query_row(params![project_id, full_path], |row| row.get(0))
+                .optional()
+        })
         .context("unable to look up existing path node")?
     {
         return Ok(existing_id);
     }
 
-    conn.query_row(
+    conn.prepare_cached(
         "
         INSERT INTO path_node (
             project_id,
@@ -1143,9 +1147,13 @@ fn ensure_path_node(
         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         RETURNING id
         ",
-        params![project_id, parent_id, name, full_path, node_kind, depth],
-        |row| row.get(0),
     )
+    .and_then(|mut stmt| {
+        stmt.query_row(
+            params![project_id, parent_id, name, full_path, node_kind, depth],
+            |row| row.get(0),
+        )
+    })
     .context("unable to insert path node")
 }
 
@@ -1249,7 +1257,7 @@ fn persist_action(
     sequence_no: i64,
     group: ActionGroupDraft,
 ) -> Result<()> {
-    let action_id: i64 = conn.query_row(
+    let action_id: i64 = conn.prepare_cached(
         "
         INSERT INTO action (
             turn_id,
@@ -1272,6 +1280,7 @@ fn persist_action(
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'deterministic_v1', ?9, ?10, ?11, ?12, ?13, ?14, ?15)
         RETURNING id
         ",
+    )?.query_row(
         params![
             turn_id,
             import_chunk_id,
@@ -1293,23 +1302,27 @@ fn persist_action(
     )?;
 
     for (ordinal, message_id) in group.message_ids.iter().enumerate() {
-        conn.execute(
+        conn.prepare_cached(
             "
             INSERT INTO action_message (action_id, message_id, ordinal_in_action)
             VALUES (?1, ?2, ?3)
             ",
-            params![action_id, message_id, ordinal as i64],
-        )?;
+        )?
+        .execute(params![action_id, message_id, ordinal as i64])?;
     }
 
     if let Some(attribution) = group.skill_attribution() {
-        conn.execute(
+        conn.prepare_cached(
             "
             INSERT INTO action_skill_attribution (action_id, skill_name, confidence)
             VALUES (?1, ?2, ?3)
             ",
-            params![action_id, attribution.skill_name, attribution.confidence],
-        )?;
+        )?
+        .execute(params![
+            action_id,
+            attribution.skill_name,
+            attribution.confidence
+        ])?;
     }
 
     Ok(())
