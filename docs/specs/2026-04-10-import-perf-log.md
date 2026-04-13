@@ -359,73 +359,102 @@ Options to revisit (not fixing now):
 
 Decision: defer to user checkpoint (Task 13) after baselines are in hand. If the subset run time on full mode is acceptable (<30s wall), the current subset is fine for iteration.
 
+### 2026-04-12 — candidate commit-batching: chunk-level transaction + per-file savepoints
+
+Branch: `import-perf-commit-batching`
+Worktree: `/home/ketan/project/gnomon/.worktrees/import-perf-commit-batching`
+
+**Hypothesis:** Replacing N per-file COMMIT (WAL fsync at ~8.8ms each) with 1 per-chunk COMMIT should save ~38s (33% of chunk wall) on cold full import. Also eliminates per-conversation build_actions commits and per-chunk finalize commits.
+
+**Implementation:** Widened 14 inner helper signatures from `&mut Transaction<'_>` to `&Connection` (backward-compatible via deref coercion). Extracted `_core` functions (transaction-free) from `normalize_transcript_jsonl_file_inner`, `normalize_history_jsonl_file_inner`, `build_actions_inner`, and `finalize_chunk_import`. Added `normalize_jsonl_file_in_tx` and `build_actions_in_tx` public APIs with PerfScope wrapping. Rewired `import_chunk()` to use a single chunk-level `Transaction` with per-file `Savepoint`s.
+
+**Measurements:**
+
+Subset (1 project, 1649 files, 35 chunks):
+```
+Mode=full:    63.2s → 39.1s  (−24.1s, −38.1%)  [41.6 / 39.1 / 35.2]
+Mode=startup: N/A — corpus aged out of 24h window, 0 chunks imported
+Row parity:   PASS (all 10 tables match baseline exactly)
+DB size:      186.99 MB (unchanged)
+```
+
+Full corpus (31 projects, 4548 files, 162 chunks):
+```
+Mode=full:    126.1s → 77.5s  (−48.6s, −38.5%)  [94.7 / 60.1 / 77.5]
+Mode=startup: N/A — corpus aged out of 24h window, 0 chunks imported
+Row parity:   PASS (all 10 tables match baseline exactly)
+DB size:      486.83 MB (unchanged)
+```
+
+**Notes:**
+- The ~48.6s improvement exceeds the estimated ~38s because we also eliminated per-conversation `build_actions` commits (~4547 commits) and per-chunk `finalize` commits (162 commits), not just per-file normalize commits.
+- Startup mode comparison is not meaningful: the baseline was captured on April 11 against data within the 24h window; by April 12 those sessions aged out, so startup imports 0 chunks. The startup-mode scan_source + prepare_plan floor (~3.5s) is unaffected by commit batching.
+- Run-to-run variance on full corpus is high: 94.7s to 60.1s (58% spread). Run 1 is consistently the cold-cache outlier. Even worst-of-3 (94.7s) is 25% better than baseline (126.1s).
+- Profile shift not captured (samply run deferred to after commit decision).
+
+**Decision:** PENDING USER
+
+**Commits on `import-perf-commit-batching`:**
+- `8147cf5` refactor(import): widen helper signatures from &mut Transaction to &Connection
+- `cfa8541` refactor(import): extract _core functions and add _in_tx public APIs
+- `7840bbf` perf(import): batch commits per chunk via chunk-level transaction + per-file savepoints
+
+**Next implied:** Candidate #2 (build_actions batching + cache) — still 37.9% of chunk wall after commit batching. Or re-profile first to see the new phase distribution.
+
 ---
 
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-12 (Phase 1 complete, target agreed)
-Current phase: Phase 1 — measure
-Current branch: `import-perf`
-Current worktree: `/home/ketan/project/gnomon/.worktrees/import-perf`
+Last updated: 2026-04-12 (Phase 2, commit-batching candidate measured, pending user decision)
+Current phase: Phase 2 — iterate
+Current branch: `import-perf-commit-batching` (candidate branch)
+Long-lived feature branch: `import-perf`
+Current worktree: `/home/ketan/project/gnomon/.worktrees/import-perf-commit-batching`
 Primary repo root (do not implement here): `/home/ketan/project/gnomon`
 
 ### How to resume
-1. `cd /home/ketan/project/gnomon/.worktrees/import-perf`
-2. Verify: `git rev-parse --abbrev-ref HEAD` → must print `import-perf`
-3. Read this log's Phase Log (latest entries first) for context.
-4. Read `docs/specs/2026-04-10-import-perf-design.md` if you need the big picture.
-5. Phase 1 is complete. Read the Baseline and Target sections of this log, then the design doc for Phase 2 structure.
-6. Continue at the "Next action" below.
+1. `cd /home/ketan/project/gnomon/.worktrees/import-perf-commit-batching`
+2. Verify: `git rev-parse --abbrev-ref HEAD` → must print `import-perf-commit-batching`
+3. Read this log's Phase Log (latest entry: "candidate commit-batching") for context.
+4. Read `docs/specs/2026-04-10-import-perf-design.md` Section 3 (Phase 2 structure) and Section 8 (commit workflow) for the iteration protocol.
+5. Continue at the "Next action" below.
 
 ### Last completed
-Phase 1 complete. Targets agreed (Task 14): cold full import 10s acceptable / 5s stretch, warm startup <1s / 300ms stretch. All baseline data captured, Frozen Header fully populated.
+Phase 2, candidate commit-batching: implemented, benchmarked, measured. Awaiting user decision (keep/revert).
 
 ### Next action
-Phase 2: iterate loop begins. Write a Phase 2 implementation plan, starting with candidate #1 (commit batching — est. ~38s savings on cold full import). The design doc `docs/specs/2026-04-10-import-perf-design.md` Section 5 describes the Phase 2 loop structure.
+Present results to user for commit approval. If kept: merge `import-perf-commit-batching` into `import-perf`, re-profile, re-rank candidates. If reverted: log, leave worktree, pick next candidate.
 
 ### Uncommitted state
-None. Working tree is clean on `import-perf`.
+Log entry with measurements (this file). Will be committed after user decision.
 
-### Commits so far on `import-perf` (most recent last)
-- `dc136b5` docs: add import performance optimization design
-- `cbd3516` docs: add Phase 1 (measure) implementation plan
-- `2c6e57a` log: initialize import perf running log
-- `d49560c` chore: reserve tests/fixtures/import-corpus for perf snapshots
-- `1b1320c` feat: add corpus capture script for import-perf benchmarks
-- `9b1bd73` chore: commit import-corpus manifest for initial snapshot
-- `2a3a47a` feat(import): wire PerfLogger into import hot path
-- `d539ff6` feat(import): split parse vs SQL time in per-record loop
-- `c876463` log: tick Task 8 step boxes and update resume block
-- `0c24048` feat: add import_bench example for perf measurement
-- `929a3d0` log: tick Task 9 step boxes and record bench harness numbers
-- `43d8421` log: record environment fingerprint
-- `2b59d25` log: subset baseline captured
-- `bfa304e` log: backfill subset baseline commit sha
-- `aa26c21` feat(import): add commit/finish/purge spans and scan/plan-build spans
-- `eb6dd84` log: subset baseline v2 with new commit/scan spans
-- `ff22d89` log: full-corpus baseline captured + populate baseline header
-- `7110745` perf: add baseline CPU profiles for full and startup modes
+### Commits on `import-perf-commit-batching` (branched from `import-perf`)
+- `8147cf5` refactor(import): widen helper signatures from &mut Transaction to &Connection
+- `cfa8541` refactor(import): extract _core functions and add _in_tx public APIs
+- `7840bbf` perf(import): batch commits per chunk via chunk-level transaction + per-file savepoints
 
 ### Target status
-Not set (pending Task 14, which requires Task 10-12 baseline data).
+Cold full import: 126.1s → 77.5s (38.5% improvement). Target: 10s acceptable / 5s stretch. Remaining gap: ~7.8×.
+Warm startup: not measurable this run (corpus aged out).
 
-### Candidate ranking
-See design doc Section 4 for the initial ranking (Tier A: A1, A2a, A2b, A3, A4, A5; Tier B: B1-B5; Tier C: C1-C3). Live re-ranking starts in Phase 2 after the baseline profile is in hand.
+### Candidate ranking (updated after commit-batching measurement)
+
+| rank | candidate | est. remaining win | confidence |
+| --- | --- | --- | --- |
+| 1 | **build_actions batching + cache** | ~20-30s (was 37.9% of chunk wall, now likely ~50% after commit_ms eliminated) | medium — needs re-profile |
+| 2 | **SQLite pragma tuning** (synchronous=NORMAL, cache_size, mmap) | unknown — may compound with commit batching | medium |
+| 3 | **scan_source caching** | startup floor only, ~2.8s | high for startup mode |
+| 4 | **Parallel chunk processing** (rayon) | remaining ~50s ÷ 6 cores ≈ 8-13s | medium-high |
+| 5 | Faster JSON parser | ~1.5s / 2.4% | low priority |
 
 ### Open questions for user at next checkpoint
-1. **Subset sizing.** Is the 48%-of-full single-project subset OK for iteration, or do we want to rewrite `capture.sh` to produce a second "small" subset (smallest-first selection)?
-2. **Target number.** Depends on baseline data from Tasks 10-12.
+1. **Commit decision:** Keep or revert commit-batching candidate?
+2. **Re-profile before next candidate?** Recommended — the phase distribution has shifted.
 
 ### Session-resumption sanity check
-If you're reading this after a context reset, run:
+```bash
+cd /home/ketan/project/gnomon/.worktrees/import-perf-commit-batching
+git rev-parse --abbrev-ref HEAD  # → import-perf-commit-batching
+git log --oneline -5
 ```
-git -C /home/ketan/project/gnomon/.worktrees/import-corpus rev-parse --abbrev-ref HEAD 2>/dev/null
-```
-No — correct path:
-```
-cd /home/ketan/project/gnomon/.worktrees/import-perf
-git rev-parse --abbrev-ref HEAD
-git log --oneline -10
-ls tests/fixtures/import-corpus/
-```
-Expected: branch `import-perf`, 7 commits (design + plan + 5 log/chore/feat), `MANIFEST.md` + `full.tar.zst` + `subset.tar.zst` + `capture.sh` + `.gitkeep` present in fixtures dir.
+Expected: 3 commits on top of import-perf, branch `import-perf-commit-batching`.
