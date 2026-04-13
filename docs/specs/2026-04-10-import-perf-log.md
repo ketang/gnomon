@@ -586,80 +586,108 @@ Delta: indistinguishable from noise
 
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-13 (Phase 2, deferred indexes REVERTED, no merge)
-Current phase: Phase 2 — iterate
-Current branch: `import-perf`
-Current worktree: `/home/ketan/project/gnomon/.worktrees/import-perf`
-Primary repo root (do not implement here): `/home/ketan/project/gnomon`
+Last updated: 2026-04-13 (Phase 2 checkpoint — merged to main, Tier A exhausted)
+Current phase: Phase 2 — checkpoint pause (Tier A exhausted, Tier B next)
+All code is on `main`. The `import-perf` branch was merged to main at `87c14ff`.
+No active worktrees — create a fresh feature branch for the next candidate.
 
 ### How to resume
-1. `cd /home/ketan/project/gnomon/.worktrees/import-perf`
-2. Verify: `git rev-parse --abbrev-ref HEAD` → must print `import-perf`
-3. Read this log's Phase Log (latest entries: "pragma tuning" KEPT, "deferred indexes" REVERTED) for context.
-4. Read `docs/specs/2026-04-10-import-perf-design.md` Section 3 (Phase 2 structure) and Section 8 (commit workflow) for the iteration protocol.
+1. `cd /home/ketan/project/gnomon`
+2. Verify: `git log --oneline -1` → should show the import-perf merge commit `87c14ff`
+3. Read this log's Phase Log (iterations 1–4) for context on what was tried and what was learned.
+4. Read `docs/specs/2026-04-10-import-perf-design.md` Sections 3–4 for Phase 2 structure and candidate ranking.
 5. Continue at the "Next action" below.
 
-### Last completed
-Phase 2, iteration 4: Deferred secondary indexes candidate REVERTED. No measurable improvement — per-insert index maintenance is negligible with cached btree pages. The dominant SQL cost is core btree work, not index updates.
+### Iteration summary
 
-Three KEPT candidates so far: commit-batching (−38.5%), prepared-statement caching (−28.4%), pragma tuning (−16.3%). Cumulative: 126.1s → 31.9s (~75%).
+| # | Candidate | Result | Delta |
+| --- | --- | --- | --- |
+| 1 | Commit batching (per-chunk transactions) | **KEPT** | 126.1s → 77.5s (−38.5%) |
+| 2 | Prepared-statement caching (`prepare_cached`) | **KEPT** | 53.6s → 38.4s (−28.4%) |
+| 3 | SQLite pragma tuning (sync=NORMAL, cache, mmap) | **KEPT** | 38.1s → 31.9s (−16.3%) |
+| 4 | Deferred secondary indexes during bulk load | **REVERTED** | no measurable improvement |
 
-### Next action
-1. Pick candidate #5. Remaining viable candidates:
-   - **Parallel chunk processing** (rayon) — the only approach that can deliver 3× speedup needed for 10s target
-   - **scan_source caching** — startup-mode improvement only (~0.5s)
-   - **Faster JSON parser** — ~2.6s / ~8%, diminishing returns
-2. Soft checkpoint: after 4 iterations (3 KEPT, 1 REVERTED), evaluate whether to continue or close Phase 2.
-3. Create per-candidate branch and worktree under `.worktrees/import-perf-<slug>/`.
-
-### Uncommitted state
-This log update only. Code changes are committed.
-
-### Commits on `import-perf` (most recent last)
-- `dc136b5` docs: add import performance optimization design
-- `cbd3516` docs: add Phase 1 (measure) implementation plan
-- `2c6e57a` log: initialize import perf running log
-- `d49560c` chore: reserve tests/fixtures/import-corpus for perf snapshots
-- `1b1320c` feat: add corpus capture script for import-perf benchmarks
-- `9b1bd73` chore: commit import-corpus manifest for initial snapshot
-- `2a3a47a` feat(import): wire PerfLogger into import hot path
-- `d539ff6` feat(import): split parse vs SQL time in per-record loop
-- `c876463` log: tick Task 8 step boxes and update resume block
-- `0c24048` feat: add import_bench example for perf measurement
-- `929a3d0` log: tick Task 9 step boxes and record bench harness numbers
-- `43d8421` log: record environment fingerprint
-- `2b59d25` log: subset baseline captured
-- `bfa304e` log: backfill subset baseline commit sha
-- `aa26c21` feat(import): add commit/finish/purge spans and scan/plan-build spans
-- `eb6dd84` log: subset baseline v2 with new commit/scan spans
-- `ff22d89` log: full-corpus baseline captured + populate baseline header
-- `7110745` perf: add baseline CPU profiles for full and startup modes
-- `e743091` log: record agreed Phase 1 target and close Phase 1
-- `a948c2c` **merge: commit-batching candidate (126.1s → 77.5s, −38.5%)**
-- `83dedf2` **merge: prepared-statement caching candidate (53.6s → 38.4s, −28.4%)**
-- `d083c1b` **merge: pragma tuning candidate (38.1s → 31.9s, −16.3%)**
-
-### Current best metrics (post pragma tuning)
+### Current best metrics (post pragma tuning, on main)
 | metric | value | vs original baseline | vs target |
 | --- | ---: | ---: | ---: |
 | Cold full import (session-local median) | 31.9s | ~75% from 126.1s (3 candidates cumulative) | ~3.2× to 10s target |
 | Startup | 2.29s | ~55% from ~5.1s baseline | ~2.3× to <1s target |
 
-### Candidate ranking (updated after pragma tuning)
+### Current phase distribution (full corpus, post-pragma, ~34s wall)
 
-| rank | candidate | est. remaining win | confidence |
-| --- | --- | --- | --- |
-| 1 | **Parallel chunk processing** (rayon) | remaining wall ÷ 6 cores | medium-high, structural |
-| 2 | **Deferred secondary indexes** during bulk load | 10–20% on insert phase | medium |
-| 3 | **scan_source caching / parallelization** | startup floor only, ~0.5s | high for startup mode |
-| 4 | Faster JSON parser | ~2.6s / ~8% | low priority |
+| phase | time | % of wall | note |
+| --- | ---: | ---: | --- |
+| normalize_jsonl.sql_ms | 10.5s | 33% | **CPU-bound btree inserts** — 490K records, 295K messages, 412K message_parts |
+| build_actions | 7.1s | 22% | load_messages JOIN + classification + action/path_ref inserts |
+| normalize_jsonl.parse_ms | 3.3s | 10% | serde_json::from_str per line |
+| scan_source | 2.5s | 8% | directory walk + VCS resolution |
+| finalize_chunk + rollups | 3.6s | 11% | path rollup is the expensive part |
+| build_turns | 1.5s | 5% | re-reads messages from DB, then inserts turns |
+| other (uninstrumented) | 3.4s | 11% | |
+
+### Key findings from Tier A exploration
+1. **Btree pages are cached.** With 64MB page cache + WAL, secondary index maintenance during inserts is essentially free. Deferred indexes provided zero measurable benefit.
+2. **The remaining SQL cost is core btree insert work** — finding position, inserting row, possible page splits. This is CPU-bound, not I/O-bound.
+3. **build_turns and build_actions re-read data from DB that was just inserted.** Eliminating these redundant reads (in-memory turn building, in-memory classification data passing) would save ~2–3s and is a prerequisite for parallelization.
+4. **Session-to-session variance is high (~30%)** on this WSL2 host. Within-session relative comparisons are reliable. Always use interleaved multi-repeat runs for measurement.
+
+### What must change to reach 10s
+The 10s target requires ~3.2× more speedup from 31.9s. The remaining bottleneck is CPU-bound sequential work. Only two approaches can deliver this magnitude:
+
+**Tier B — Parallel chunk processing (recommended next):**
+- Separate CPU work (JSON parsing, classification) from DB writes
+- Use rayon to parse/classify all files in parallel
+- Single SQLite writer thread for serial DB operations
+- Expected: CPU portion (~40% of wall) parallelizes across 6 cores → ~30–40% wall reduction
+- Prerequisite: refactor normalize to return in-memory parsed data, refactor build_turns/build_actions to accept in-memory data instead of re-reading from DB
+
+**Tier C — Alternative storage (requires design review):**
+- In-memory staging DB → VACUUM INTO (eliminates all mid-import I/O)
+- Skip `record` table during import (490K rows, only needed for raw access)
+- DuckDB or columnar store for analytical queries
+
+### Candidate ranking (updated after checkpoint)
+
+| rank | candidate | est. remaining win | confidence | tier |
+| --- | --- | --- | --- | --- |
+| 1 | **Parallel parse + classify** (rayon, in-memory intermediates) | 30–40% wall | medium-high | B |
+| 2 | **In-memory turn/classification data passing** (eliminate redundant DB reads) | ~2–3s / ~8% | high | A (prerequisite for #1) |
+| 3 | **scan_source caching** | startup floor only, ~0.5s | high for startup | A |
+| 4 | Faster JSON parser (simd-json) | ~2.6s / ~8% | low | B |
+| 5 | Skip `record` table inserts | ~10s / ~33% | needs product review | C |
+
+Candidate #2 (in-memory data passing) is both a standalone ~8% win AND a prerequisite for #1 (parallelism). Recommend implementing #2 first, then #1.
+
+### Bench harness
+```bash
+# Build
+cargo build -p gnomon-core --example import_bench --release
+
+# Subset (fast iteration, ~15s)
+cargo run -p gnomon-core --example import_bench --release -- \
+  --corpus subset --mode full --repeats 3
+
+# Full corpus (truth, ~32s)
+cargo run -p gnomon-core --example import_bench --release -- \
+  --corpus full --mode full --repeats 3
+
+# With perf log
+cargo run -p gnomon-core --example import_bench --release -- \
+  --corpus full --mode full --perf-log /tmp/gnomon-perf.jsonl
+
+# Corpus tarballs are gitignored; they live at:
+#   tests/fixtures/import-corpus/{full,subset}.tar.zst
+# If missing, run: tests/fixtures/import-corpus/capture.sh
+```
 
 ### Session-resumption sanity check
 ```bash
-cd /home/ketan/project/gnomon/.worktrees/import-perf
-git rev-parse --abbrev-ref HEAD  # → import-perf
-git log --oneline -5
-# Should show pragma tuning merge commit at top
+cd /home/ketan/project/gnomon
+git log --oneline -3
+# Should show import-perf merge at 87c14ff
 ls tests/fixtures/import-corpus/
-# MANIFEST.md + full.tar.zst + subset.tar.zst + capture.sh
+# MANIFEST.md + capture.sh (tarballs are gitignored, may need re-capture)
+cargo run -p gnomon-core --example import_bench --release -- \
+  --corpus subset --mode full --repeats 1
+# Should complete in ~15s
 ```

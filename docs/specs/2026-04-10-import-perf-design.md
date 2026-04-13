@@ -1,7 +1,7 @@
 # Import Performance Optimization — Design
 
 **Date:** 2026-04-10
-**Status:** Draft, awaiting user review
+**Status:** Phase 2 checkpoint — Tier A exhausted, Tier B next. Merged to main 2026-04-13.
 **Running log:** [`2026-04-10-import-perf-log.md`](./2026-04-10-import-perf-log.md)
 
 ## 1. Goals & Non-Goals
@@ -280,3 +280,50 @@ In any of those cases the assistant surfaces the situation rather than silently 
 - **Parity verification depth.** Row counts per table is a weak check; query-result spot-checks are better but slower. The design uses both. If a candidate passes row-count parity but fails a spot check, treat it as criterion 6 (unexplained parity failure).
 - **Rollup semantics under A4.** Moving rollup rebuilds out of the finalize transaction may expose in-progress state to concurrent readers. A4 must include a check that no reader relies on rollups being live at chunk-finalize time.
 - **Subset representativeness.** A 5%/100 MB subset of largest projects may not reflect optimizations that matter for small-project workloads. Full-corpus runs remain the authoritative measurement for every kept candidate.
+
+## 11. Checkpoint: Tier A Exhausted (2026-04-13)
+
+Merged to `main` at `87c14ff`. Three Tier A candidates KEPT, one REVERTED. The
+import-perf branch no longer exists separately — all work is on main.
+
+### What landed
+
+| Candidate | Code location | Mechanism |
+| --- | --- | --- |
+| Commit batching | `chunk.rs` — chunk-level tx + per-file savepoints | Eliminated per-file commit overhead |
+| Prepared-statement caching | `normalize.rs`, `classify/mod.rs` — `prepare_cached()` | Eliminated per-row SQL compilation |
+| Pragma tuning | `db/mod.rs` — `configure_read_write_connection()` | synchronous=NORMAL, 64MB cache, 256MB mmap, temp_store=MEMORY |
+
+### What we learned (invalidated assumptions)
+
+1. **Deferred secondary indexes do nothing** with a 64MB page cache. Btree pages are cached; index maintenance per insert is ~0. The dominant cost is the primary btree insert itself.
+2. **Rollup queries are cache-locality sensitive.** Moving rollups out of the per-chunk transaction causes 10× regression because the data pages are evicted by index-recreation I/O.
+3. **Session-to-session wall time varies ~30%** on WSL2. Only within-session interleaved comparisons are reliable.
+4. **The remaining bottleneck is CPU-bound.** Not I/O, not fsync, not index overhead. Pure btree traversal and page manipulation for ~1.2M inserts across 7 tables.
+
+### What must happen next
+
+The remaining ~32s breaks down as:
+- **~18s SQL inserts** (btree work, cannot be reduced without fewer rows or parallelism)
+- **~7s build_actions** (2–3s is a redundant load_messages re-read from DB; rest is classification + inserts)
+- **~3.3s JSON parsing** (serde_json, per-line)
+- **~3.6s rollups + finalize** (path rollup dominant)
+- **~2.5s scan_source** (directory walk)
+
+To reach 10s, the recommended path is:
+
+**Step 1 — In-memory data passing (candidate #2 in ranking):**
+- Refactor `build_turns` to use in-memory message data instead of re-reading from DB
+- Refactor `build_actions` to accept parsed message + part data instead of the `load_messages` JOIN
+- Saves ~2–3s directly, and is a **prerequisite** for parallel processing
+
+**Step 2 — Parallel parse + classify (candidate #1 in ranking):**
+- Use rayon to parse all JSONL files in parallel → `Vec<ParsedConversation>`
+- Classify actions in parallel on in-memory data
+- Single SQLite writer thread for all inserts
+- Expected: ~30–40% wall reduction (CPU portion parallelizes across 6 cores)
+
+**Step 3 (optional) — Structural changes requiring product review:**
+- Skip `record` table inserts (~490K rows, 33% of insert time) if raw-record access isn't needed
+- In-memory staging DB → `VACUUM INTO` for zero mid-import I/O
+- Alternative storage engine (DuckDB) for analytical queries
