@@ -1137,10 +1137,6 @@ fn purge_chunk_data(tx: &Transaction<'_>, import_chunk_id: i64) -> Result<()> {
             WHERE import_chunk_id = ?1
             UNION
             SELECT DISTINCT conversation_id
-            FROM record
-            WHERE import_chunk_id = ?1
-            UNION
-            SELECT DISTINCT conversation_id
             FROM message
             WHERE import_chunk_id = ?1
             UNION

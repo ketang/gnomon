@@ -112,7 +112,12 @@ pub const IMPORT_CHUNK_UNIT: &str = "project x day";
 /// - `tool_call_id` — joins `tool_use` with its `tool_result`
 /// - `metadata_json` — only the `input` key, only for `tool_use` parts
 /// - `text_value` — transcript text used for skill confirmation heuristics
-pub const IMPORT_SCHEMA_VERSION: i64 = 4;
+/// ## v5 changes
+///
+/// The `record` table is no longer populated during import. All JSONL lines
+/// are still counted (`imported_record_count`) but individual records are not
+/// persisted. This eliminates ~490K INSERTs per full corpus import.
+pub const IMPORT_SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceFileKind {
@@ -183,7 +188,6 @@ pub(in crate::import) struct ParsedRecord {
     pub(in crate::import) source_line_no: i64,
     pub(in crate::import) value: serde_json::Value,
     pub(in crate::import) recorded_at_utc: Option<String>,
-    pub(in crate::import) record_kind: &'static str,
     pub(in crate::import) extracted_message: Option<normalize::ExtractedMessage>,
 }
 
