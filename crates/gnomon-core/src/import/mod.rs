@@ -159,6 +159,34 @@ impl NormalizedToolUsePartMetadata {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pre-parsed file types for parallel parse → serial write pipeline
+// ---------------------------------------------------------------------------
+
+/// Result of parsing a single JSONL file (CPU-only, no DB access).
+pub(in crate::import) enum ParseResult {
+    /// File parsed successfully; ready for serial DB writes.
+    Parsed(ParsedFile),
+    /// File contains only sessionless metadata records (no session ID).
+    SessionlessMetadata,
+    /// A parse error occurred; caller should rollback the savepoint.
+    Warning(normalize::NormalizeImportWarning),
+}
+
+/// Pre-parsed JSONL file — all CPU work done, ready for serial DB writes.
+pub(in crate::import) struct ParsedFile {
+    pub(in crate::import) records: Vec<ParsedRecord>,
+}
+
+/// A single parsed JSONL line with pre-extracted metadata.
+pub(in crate::import) struct ParsedRecord {
+    pub(in crate::import) source_line_no: i64,
+    pub(in crate::import) value: serde_json::Value,
+    pub(in crate::import) recorded_at_utc: Option<String>,
+    pub(in crate::import) record_kind: &'static str,
+    pub(in crate::import) extracted_message: Option<normalize::ExtractedMessage>,
+}
+
 mod chunk;
 mod normalize;
 

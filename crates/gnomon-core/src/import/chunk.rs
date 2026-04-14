@@ -16,10 +16,12 @@ use anyhow::{Context, Result, anyhow};
 use jiff::{Timestamp, ToSpan, tz::TimeZone};
 use rusqlite::{Connection, Transaction, params};
 
+use rayon::prelude::*;
+
 use super::{
     IMPORT_SCHEMA_VERSION, NormalizeImportWarning, NormalizeJsonlFileOutcome,
-    NormalizeJsonlFileParams, STARTUP_IMPORT_WINDOW_HOURS, STARTUP_OPEN_DEADLINE_SECS,
-    SourceFileKind, normalize_jsonl_file_in_tx,
+    NormalizeJsonlFileParams, ParseResult, STARTUP_IMPORT_WINDOW_HOURS, STARTUP_OPEN_DEADLINE_SECS,
+    SourceFileKind, normalize::parse_jsonl_file, normalize::write_parsed_file_in_tx,
 };
 
 const IMPORTER_THREAD_NAME: &str = "gnomon-importer";
@@ -953,64 +955,102 @@ fn import_chunk(
             .transaction()
             .context("unable to start chunk-level import transaction")?;
 
-        for source_file in &chunk.source_files {
-            let path = source_root.join(&source_file.relative_path);
-            let sp = tx
-                .savepoint()
-                .context("unable to create per-file savepoint")?;
+        // Phase 1: Parse all JSONL files in parallel (CPU-only, no DB access).
+        // rayon's par_iter preserves input ordering in the collected Vec.
+        let parsed_files: Vec<ParseResult> = chunk
+            .source_files
+            .par_iter()
+            .map(|source_file| {
+                let path = source_root.join(&source_file.relative_path);
+                parse_jsonl_file(&path, source_file.source_kind)
+            })
+            .collect();
 
-            let (outcome, normalized_messages) = normalize_jsonl_file_in_tx(
-                &sp,
-                &NormalizeJsonlFileParams {
-                    project_id: chunk.project_id,
-                    source_file_id: source_file.source_file_id,
-                    import_chunk_id: chunk.import_chunk_id,
-                    path,
-                    perf_logger: options.perf_logger.clone(),
-                },
-            )
-            .with_context(|| {
-                format!(
-                    "unable to normalize source file {}",
-                    source_root.join(&source_file.relative_path).display()
-                )
-            })?;
-
-            match outcome {
-                NormalizeJsonlFileOutcome::Imported(result) => {
-                    if let Some(conversation_id) = result.conversation_id {
-                        let _ = build_actions_in_tx_with_messages(
-                            &sp,
-                            &BuildActionsParams {
-                                conversation_id,
-                                perf_logger: options.perf_logger.clone(),
-                            },
-                            normalized_messages,
-                        )
-                        .with_context(|| {
-                            format!(
-                                "unable to build actions for source file {}",
-                                source_root.join(&source_file.relative_path).display()
-                            )
-                        })?;
-                    }
-                    sp.commit()
-                        .context("unable to release per-file savepoint")?;
-                }
-                NormalizeJsonlFileOutcome::Skipped => {
-                    sp.commit()
-                        .context("unable to release per-file savepoint")?;
-                }
-                NormalizeJsonlFileOutcome::Warning(warning) => {
-                    // Savepoint rollback: undoes purge + partial writes for this file.
-                    // Explicit drop triggers ROLLBACK TO SAVEPOINT via DropBehavior::Rollback.
-                    drop(sp);
+        // Phase 2: Write pre-parsed data to DB serially (single writer).
+        for (source_file, parse_result) in chunk.source_files.iter().zip(parsed_files) {
+            match parse_result {
+                ParseResult::Warning(warning) => {
                     insert_import_warning(
                         &tx,
                         chunk.import_chunk_id,
                         source_file.source_file_id,
                         &warning,
                     )?;
+                }
+                ParseResult::SessionlessMetadata => {
+                    // Nothing to write — file had no session ID and contained
+                    // only metadata records. Create + immediately release a
+                    // savepoint so the per-file purge still runs.
+                    let sp = tx
+                        .savepoint()
+                        .context("unable to create per-file savepoint")?;
+                    let params = NormalizeJsonlFileParams {
+                        project_id: chunk.project_id,
+                        source_file_id: source_file.source_file_id,
+                        import_chunk_id: chunk.import_chunk_id,
+                        path: source_root.join(&source_file.relative_path),
+                        perf_logger: options.perf_logger.clone(),
+                    };
+                    super::normalize::purge_existing_import(&sp, &params)?;
+                    sp.commit()
+                        .context("unable to release per-file savepoint")?;
+                }
+                ParseResult::Parsed(parsed_file) => {
+                    let sp = tx
+                        .savepoint()
+                        .context("unable to create per-file savepoint")?;
+                    let params = NormalizeJsonlFileParams {
+                        project_id: chunk.project_id,
+                        source_file_id: source_file.source_file_id,
+                        import_chunk_id: chunk.import_chunk_id,
+                        path: source_root.join(&source_file.relative_path),
+                        perf_logger: options.perf_logger.clone(),
+                    };
+
+                    let (outcome, normalized_messages) =
+                        write_parsed_file_in_tx(&sp, &params, parsed_file, source_file.source_kind)
+                            .with_context(|| {
+                                format!(
+                                    "unable to normalize source file {}",
+                                    source_root.join(&source_file.relative_path).display()
+                                )
+                            })?;
+
+                    match outcome {
+                        NormalizeJsonlFileOutcome::Imported(result) => {
+                            if let Some(conversation_id) = result.conversation_id {
+                                let _ = build_actions_in_tx_with_messages(
+                                    &sp,
+                                    &BuildActionsParams {
+                                        conversation_id,
+                                        perf_logger: options.perf_logger.clone(),
+                                    },
+                                    normalized_messages,
+                                )
+                                .with_context(|| {
+                                    format!(
+                                        "unable to build actions for source file {}",
+                                        source_root.join(&source_file.relative_path).display()
+                                    )
+                                })?;
+                            }
+                            sp.commit()
+                                .context("unable to release per-file savepoint")?;
+                        }
+                        NormalizeJsonlFileOutcome::Skipped => {
+                            sp.commit()
+                                .context("unable to release per-file savepoint")?;
+                        }
+                        NormalizeJsonlFileOutcome::Warning(warning) => {
+                            drop(sp);
+                            insert_import_warning(
+                                &tx,
+                                chunk.import_chunk_id,
+                                source_file.source_file_id,
+                                &warning,
+                            )?;
+                        }
+                    }
                 }
             }
         }
