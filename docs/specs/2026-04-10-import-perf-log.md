@@ -584,18 +584,62 @@ Delta: indistinguishable from noise
 
 ---
 
+## Phase 2, iteration 5: candidate in-memory data passing — KEPT
+
+**Hypothesis:** Eliminating redundant DB reads in `build_turns` and `build_actions` by passing normalized message data in-memory through the pipeline will save ~2–3s. More importantly, it is an architectural prerequisite for parallel parse+classify (candidate #1).
+
+**Branch:** `import-perf-inmemory` (off `main`)
+
+**Implementation:**
+- Defined shared `Usage`, `NormalizedMessage`, `NormalizedPart` types in `import/mod.rs`
+- Enriched `MessageState` to retain message_kind, timestamps, sequence_no, and parts during normalization
+- Refactored `build_turns` to iterate in-memory `Vec<NormalizedMessage>` instead of DB SELECT
+- Added `build_actions_in_tx_with_messages` in classify, skipping the 4-way `load_messages` JOIN
+- Used `last_insert_rowid()` for part IDs (RETURNING id was 2.8s slower on 412K parts)
+- Extracted `classify_and_persist_actions` helper to share logic between DB and in-memory paths
+
+**Measurements (full corpus, 3 repeats + 1 perf-logged run):**
+
+Wall time:
+```
+In-memory:  32.9 / 31.9 / 31.8 / 31.5  median=31.8s
+Baseline:   31.9s (previous best median)
+Delta: within session noise
+```
+
+Phase breakdown (single perf-logged run, 31.5s wall):
+```
+build_actions:   7.1s → 5.6s  (−1.5s, −21%) — skip load_messages JOIN
+build_turns:     1.5s → 1.1s  (−0.4s, −27%) — in-memory iteration
+sql_ms:         10.5s → 9.7s  (−0.8s) — possibly reduced cache pressure
+parse_ms:        3.3s → 3.0s  (noise)
+```
+
+Row parity: **PASS** (all 10 tables match exactly, DB size 486.83 MB identical)
+
+**Lesson learned:** `RETURNING id` on high-frequency INSERTs (412K parts) adds ~6.8µs/row overhead vs `last_insert_rowid()`. For perf-sensitive bulk paths, always prefer `last_insert_rowid()`.
+
+**Decision:** KEPT
+
+**Commit on `import-perf-inmemory`:** `0c0048c`
+**Merge to main:** `2eca9fa`
+
+**Next implied:** Candidate #1 (parallel parse + classify via rayon). The in-memory data flow is now in place — normalize produces `Vec<NormalizedMessage>` that can be built in parallel workers and funneled to a single SQLite writer thread.
+
+---
+
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-13 (Phase 2 checkpoint — merged to main, Tier A exhausted)
-Current phase: Phase 2 — checkpoint pause (Tier A exhausted, Tier B next)
-All code is on `main`. The `import-perf` branch was merged to main at `87c14ff`.
+Last updated: 2026-04-13 (Phase 2, iteration 5 — in-memory data passing KEPT)
+Current phase: Phase 2 — iteration 5 complete, ready for candidate #1 (parallel parse+classify)
+All code is on `main`. Latest merge: `2eca9fa` (in-memory data passing).
 No active worktrees — create a fresh feature branch for the next candidate.
 
 ### How to resume
 1. `cd /home/ketan/project/gnomon`
-2. Verify: `git log --oneline -1` → should show the import-perf merge commit `87c14ff`
-3. Read this log's Phase Log (iterations 1–4) for context on what was tried and what was learned.
-4. Read `docs/specs/2026-04-10-import-perf-design.md` Sections 3–4 for Phase 2 structure and candidate ranking.
+2. Verify: `git log --oneline -1` → should show merge commit `2eca9fa`
+3. Read this log's Phase Log (iterations 1–5) for context on what was tried and what was learned.
+4. Read `docs/specs/2026-04-10-import-perf-design.md` Sections 3–4 and Section 11 for Phase 2 structure and candidate ranking.
 5. Continue at the "Next action" below.
 
 ### Iteration summary
@@ -606,64 +650,64 @@ No active worktrees — create a fresh feature branch for the next candidate.
 | 2 | Prepared-statement caching (`prepare_cached`) | **KEPT** | 53.6s → 38.4s (−28.4%) |
 | 3 | SQLite pragma tuning (sync=NORMAL, cache, mmap) | **KEPT** | 38.1s → 31.9s (−16.3%) |
 | 4 | Deferred secondary indexes during bulk load | **REVERTED** | no measurable improvement |
+| 5 | In-memory data passing (build_turns + build_actions) | **KEPT** | build_actions −21%, build_turns −27%; wall ~noise |
 
-### Current best metrics (post pragma tuning, on main)
+### Current best metrics (post in-memory data passing, on main)
 | metric | value | vs original baseline | vs target |
 | --- | ---: | ---: | ---: |
-| Cold full import (session-local median) | 31.9s | ~75% from 126.1s (3 candidates cumulative) | ~3.2× to 10s target |
-| Startup | 2.29s | ~55% from ~5.1s baseline | ~2.3× to <1s target |
+| Cold full import (session-local median) | ~31.8s | ~75% from 126.1s | ~3.2× to 10s target |
+| Startup | ~2.29s | ~55% from ~5.1s baseline | ~2.3× to <1s target |
 
-### Current phase distribution (full corpus, post-pragma, ~34s wall)
+### Current phase distribution (full corpus, post-inmemory, ~31.5s wall)
 
 | phase | time | % of wall | note |
 | --- | ---: | ---: | --- |
-| normalize_jsonl.sql_ms | 10.5s | 33% | **CPU-bound btree inserts** — 490K records, 295K messages, 412K message_parts |
-| build_actions | 7.1s | 22% | load_messages JOIN + classification + action/path_ref inserts |
-| normalize_jsonl.parse_ms | 3.3s | 10% | serde_json::from_str per line |
-| scan_source | 2.5s | 8% | directory walk + VCS resolution |
-| finalize_chunk + rollups | 3.6s | 11% | path rollup is the expensive part |
-| build_turns | 1.5s | 5% | re-reads messages from DB, then inserts turns |
-| other (uninstrumented) | 3.4s | 11% | |
+| normalize_jsonl.sql_ms | 9.7s | 31% | CPU-bound btree inserts — 490K records, 295K messages, 412K parts |
+| build_actions | 5.6s | 18% | classification + action/path_ref inserts (no more load_messages JOIN) |
+| normalize_jsonl.parse_ms | 3.0s | 10% | serde_json::from_str per line |
+| scan_source | 2.7s | 9% | directory walk + VCS resolution |
+| finalize_chunk + rollups | 1.7s + 1.5s | 10% | path rollup is the expensive part |
+| build_turns | 1.1s | 3% | in-memory iteration, then inserts turns |
+| other (uninstrumented) | 6.2s | 20% | Vec<NormalizedMessage> assembly, overhead |
 
-### Key findings from Tier A exploration
-1. **Btree pages are cached.** With 64MB page cache + WAL, secondary index maintenance during inserts is essentially free. Deferred indexes provided zero measurable benefit.
-2. **The remaining SQL cost is core btree insert work** — finding position, inserting row, possible page splits. This is CPU-bound, not I/O-bound.
-3. **build_turns and build_actions re-read data from DB that was just inserted.** Eliminating these redundant reads (in-memory turn building, in-memory classification data passing) would save ~2–3s and is a prerequisite for parallelization.
-4. **Session-to-session variance is high (~30%)** on this WSL2 host. Within-session relative comparisons are reliable. Always use interleaved multi-repeat runs for measurement.
+### Key findings (cumulative)
+1. **Btree pages are cached.** With 64MB page cache + WAL, secondary index maintenance during inserts is essentially free.
+2. **The remaining SQL cost is core btree insert work** — CPU-bound, not I/O-bound.
+3. **In-memory data passing saves ~2s in build_actions + build_turns** but the Vec assembly overhead partially offsets gains. Primary value: **architectural prerequisite for parallelism**.
+4. **`RETURNING id` is expensive on high-frequency INSERTs.** 412K parts × ~6.8µs/row = 2.8s overhead. Use `last_insert_rowid()` instead.
+5. **Session-to-session variance is high (~30%)** on WSL2. Within-session relative comparisons are reliable.
 
 ### What must change to reach 10s
-The 10s target requires ~3.2× more speedup from 31.9s. The remaining bottleneck is CPU-bound sequential work. Only two approaches can deliver this magnitude:
+The 10s target requires ~3× more speedup from ~32s. The pipeline now passes data in-memory, enabling:
 
-**Tier B — Parallel chunk processing (recommended next):**
-- Separate CPU work (JSON parsing, classification) from DB writes
-- Use rayon to parse/classify all files in parallel
-- Single SQLite writer thread for serial DB operations
-- Expected: CPU portion (~40% of wall) parallelizes across 6 cores → ~30–40% wall reduction
-- Prerequisite: refactor normalize to return in-memory parsed data, refactor build_turns/build_actions to accept in-memory data instead of re-reading from DB
+**Next: Parallel parse + classify (candidate #1, Tier B):**
+- The in-memory data flow is now in place: normalize produces `Vec<NormalizedMessage>`
+- Use rayon to parse JSONL files in parallel → `Vec<NormalizedMessage>` per file
+- Classify actions in parallel on in-memory data
+- Single SQLite writer thread drains results for serial DB operations
+- Expected: CPU portion (~40% of wall) parallelizes across available cores → ~30–40% wall reduction
 
-**Tier C — Alternative storage (requires design review):**
-- In-memory staging DB → VACUUM INTO (eliminates all mid-import I/O)
-- Skip `record` table during import (490K rows, only needed for raw access)
+**Later: Structural changes (Tier C, requires approval):**
+- Skip `record` table inserts (~490K rows, ~33% of insert time)
+- In-memory staging DB → `VACUUM INTO`
 - DuckDB or columnar store for analytical queries
 
-### Candidate ranking (updated after checkpoint)
+### Candidate ranking (updated after iteration 5)
 
 | rank | candidate | est. remaining win | confidence | tier |
 | --- | --- | --- | --- | --- |
-| 1 | **Parallel parse + classify** (rayon, in-memory intermediates) | 30–40% wall | medium-high | B |
-| 2 | **In-memory turn/classification data passing** (eliminate redundant DB reads) | ~2–3s / ~8% | high | A (prerequisite for #1) |
+| 1 | **Parallel parse + classify** (rayon, in-memory data flow now ready) | 30–40% wall | medium-high | B |
+| 2 | ~~In-memory data passing~~ | **DONE** (iteration 5) | — | — |
 | 3 | **scan_source caching** | startup floor only, ~0.5s | high for startup | A |
-| 4 | Faster JSON parser (simd-json) | ~2.6s / ~8% | low | B |
+| 4 | Faster JSON parser (simd-json) | ~2.4s / ~8% | low | B |
 | 5 | Skip `record` table inserts | ~10s / ~33% | needs product review | C |
-
-Candidate #2 (in-memory data passing) is both a standalone ~8% win AND a prerequisite for #1 (parallelism). Recommend implementing #2 first, then #1.
 
 ### Bench harness
 ```bash
 # Build
 cargo build -p gnomon-core --example import_bench --release
 
-# Subset (fast iteration, ~15s)
+# Subset (fast iteration, ~14s)
 cargo run -p gnomon-core --example import_bench --release -- \
   --corpus subset --mode full --repeats 3
 
@@ -684,10 +728,10 @@ cargo run -p gnomon-core --example import_bench --release -- \
 ```bash
 cd /home/ketan/project/gnomon
 git log --oneline -3
-# Should show import-perf merge at 87c14ff
+# Should show in-memory merge at 2eca9fa
 ls tests/fixtures/import-corpus/
 # MANIFEST.md + capture.sh (tarballs are gitignored, may need re-capture)
 cargo run -p gnomon-core --example import_bench --release -- \
   --corpus subset --mode full --repeats 1
-# Should complete in ~15s
+# Should complete in ~14s
 ```
