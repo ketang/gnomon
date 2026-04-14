@@ -208,7 +208,6 @@ fn parse_jsonl_file_inner(
         };
 
         let recorded_at_utc = extract_record_timestamp(&value).map(ToOwned::to_owned);
-        let record_kind = classify_record_kind(&value);
         let extracted_message = match source_kind {
             super::SourceFileKind::Transcript => extract_message(&value, line_no),
             super::SourceFileKind::ClaudeHistory => None,
@@ -218,7 +217,6 @@ fn parse_jsonl_file_inner(
             source_line_no: line_no,
             value,
             recorded_at_utc,
-            record_kind,
             extracted_message,
         });
     }
@@ -1265,35 +1263,6 @@ impl ImportState {
             &recorded_at_utc,
         );
 
-        let record_kind = classify_record_kind(&record);
-        conn.prepare_cached(
-            "
-            INSERT INTO record (
-                import_chunk_id,
-                source_file_id,
-                conversation_id,
-                stream_id,
-                source_line_no,
-                sequence_no,
-                record_kind,
-                recorded_at_utc
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            ",
-        )
-        .and_then(|mut stmt| {
-            stmt.execute(params![
-                self.params.import_chunk_id,
-                self.params.source_file_id,
-                conversation.id,
-                stream.id,
-                source_line_no,
-                self.next_record_sequence_no,
-                record_kind,
-                recorded_at_utc,
-            ])
-        })
-        .with_context(|| format!("unable to insert normalized record for line {source_line_no}"))?;
         self.next_record_sequence_no += 1;
         self.record_count += 1;
 
@@ -1331,39 +1300,6 @@ impl ImportState {
             &record.recorded_at_utc,
         );
 
-        conn.prepare_cached(
-            "
-            INSERT INTO record (
-                import_chunk_id,
-                source_file_id,
-                conversation_id,
-                stream_id,
-                source_line_no,
-                sequence_no,
-                record_kind,
-                recorded_at_utc
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            ",
-        )
-        .and_then(|mut stmt| {
-            stmt.execute(params![
-                self.params.import_chunk_id,
-                self.params.source_file_id,
-                conversation.id,
-                stream.id,
-                record.source_line_no,
-                self.next_record_sequence_no,
-                record.record_kind,
-                record.recorded_at_utc,
-            ])
-        })
-        .with_context(|| {
-            format!(
-                "unable to insert normalized record for line {}",
-                record.source_line_no
-            )
-        })?;
         self.next_record_sequence_no += 1;
         self.record_count += 1;
 
@@ -2052,34 +1988,6 @@ fn extract_message_parts(
     }
 }
 
-fn classify_record_kind(record: &Value) -> &'static str {
-    match record.get("type").and_then(Value::as_str) {
-        Some("file-history-snapshot") => "file_history_snapshot",
-        Some("progress") => match record.pointer("/data/type").and_then(Value::as_str) {
-            Some("hook_progress") => "hook_progress",
-            Some("agent_progress") => "agent_progress_relay",
-            _ => "other",
-        },
-        Some("assistant") => "assistant_message",
-        Some("user") => {
-            if record.pointer("/toolUseResult/usage").is_some() {
-                "agent_run_summary"
-            } else if record
-                .get("message")
-                .and_then(|message| message.get("role"))
-                .and_then(Value::as_str)
-                == Some("user")
-                && content_is_tool_result_only(record.pointer("/message/content"))
-            {
-                "user_tool_result"
-            } else {
-                "user_prompt"
-            }
-        }
-        _ => "other",
-    }
-}
-
 fn content_is_tool_result_only(content: Option<&Value>) -> bool {
     let Some(Value::Array(values)) = content else {
         return false;
@@ -2651,15 +2559,12 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM conversation", [], |row| row.get(0))?;
         let stream_count: i64 =
             conn.query_row("SELECT COUNT(*) FROM stream", [], |row| row.get(0))?;
-        let record_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM record", [], |row| row.get(0))?;
         let message_count: i64 =
             conn.query_row("SELECT COUNT(*) FROM message", [], |row| row.get(0))?;
         let turn_count: i64 = conn.query_row("SELECT COUNT(*) FROM turn", [], |row| row.get(0))?;
 
         assert_eq!(conversation_count, 0);
         assert_eq!(stream_count, 0);
-        assert_eq!(record_count, 0);
         assert_eq!(message_count, 0);
         assert_eq!(turn_count, 0);
 
