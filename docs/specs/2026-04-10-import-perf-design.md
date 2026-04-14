@@ -312,18 +312,132 @@ The remaining ~32s breaks down as:
 
 To reach 10s, the recommended path is:
 
-**Step 1 — In-memory data passing (candidate #2 in ranking):**
-- Refactor `build_turns` to use in-memory message data instead of re-reading from DB
-- Refactor `build_actions` to accept parsed message + part data instead of the `load_messages` JOIN
-- Saves ~2–3s directly, and is a **prerequisite** for parallel processing
+**Step 1 — In-memory data passing (candidate #2 in ranking): DONE**
+- ~~Refactor `build_turns` to use in-memory message data instead of re-reading from DB~~
+- ~~Refactor `build_actions` to accept parsed message + part data instead of the `load_messages` JOIN~~
+- Landed at `2eca9fa`. Saves ~2s in build_actions + build_turns. Prerequisite for Step 2.
 
-**Step 2 — Parallel parse + classify (candidate #1 in ranking):**
-- Use rayon to parse all JSONL files in parallel → `Vec<ParsedConversation>`
+**Step 2 — Parallel parse + classify (candidate #1 in ranking): NEXT**
+- Use rayon to parse all JSONL files in parallel → `Vec<NormalizedMessage>` per file
 - Classify actions in parallel on in-memory data
 - Single SQLite writer thread for all inserts
-- Expected: ~30–40% wall reduction (CPU portion parallelizes across 6 cores)
+- Expected: ~30–40% wall reduction (CPU portion parallelizes across available cores)
+- See Section 12 for architectural details and implementation guidance.
 
 **Step 3 (optional) — Structural changes requiring product review:**
 - Skip `record` table inserts (~490K rows, 33% of insert time) if raw-record access isn't needed
 - In-memory staging DB → `VACUUM INTO` for zero mid-import I/O
 - Alternative storage engine (DuckDB) for analytical queries
+
+## 12. Checkpoint: In-Memory Data Passing Complete (2026-04-13)
+
+Merged to `main` at `2eca9fa`. In-memory data passing (iteration 5) KEPT.
+
+### What landed
+
+| Candidate | Code location | Mechanism |
+| --- | --- | --- |
+| In-memory data passing | `import/mod.rs`, `normalize.rs`, `classify/mod.rs`, `chunk.rs` | Normalize produces `Vec<NormalizedMessage>` → build_turns annotates turn fields in-place → build_actions consumes directly, skipping `load_messages` 4-way JOIN |
+
+### Current pipeline data flow
+
+```
+import_chunk (chunk.rs:933)
+  └─ for each source_file:
+       ├─ normalize_jsonl_file_in_tx(conn, params)
+       │    → Returns (NormalizeJsonlFileOutcome, Vec<NormalizedMessage>)
+       │    │  normalize_transcript_jsonl_file_core:
+       │    │    1. Parse JSONL → INSERT records, messages, message_parts
+       │    │    2. Build Vec<NormalizedMessage> from ImportState.message_states
+       │    │    3. build_turns(&mut normalized_messages) — in-memory, back-annotates turn_id
+       │    │    4. finish_import() — update counters
+       │    └─ Returns outcome + normalized_messages
+       └─ build_actions_in_tx_with_messages(conn, params, normalized_messages)
+            └─ classify_and_persist_actions() — uses in-memory messages directly
+```
+
+### Key types (import/mod.rs)
+
+- `NormalizedMessage` — id, stream_id, sequence_no, message_kind, timestamps, usage, parts, turn_id/turn_sequence_no/ordinal_in_turn
+- `NormalizedPart` — id, part_kind, tool_name, tool_call_id, metadata_json
+- `Usage` — shared token counter type (replaces duplicate definitions in normalize + classify)
+
+### Current phase distribution (full corpus, ~31.5s wall)
+
+| phase | time | % of wall | parallelizable? |
+| --- | ---: | ---: | --- |
+| normalize sql_ms | 9.7s | 31% | No (single SQLite writer) |
+| build_actions | 5.6s | 18% | Classification: yes. Persist: no. |
+| parse_ms | 3.0s | 10% | **Yes** (pure CPU, per-file independent) |
+| scan_source | 2.7s | 9% | Partially (directory walk) |
+| finalize + rollups | 3.2s | 10% | No (DB-bound) |
+| build_turns | 1.1s | 3% | Turn grouping: yes. Persist: no. |
+| other/overhead | 6.2s | 20% | Unknown |
+
+### What parallelism can target
+
+The CPU-bound work that can run in parallel across files:
+1. **JSON parsing** (3.0s) — `serde_json::from_str` per line, per-file independent
+2. **Message extraction** — `extract_message()` + `ExtractedMessage` construction
+3. **Classification** — `classify_message()` + `build_tool_use_lookup()` + path ref extraction
+4. **Turn grouping** — grouping messages into turns (just the logic, not the DB persist)
+
+The DB-bound work that must remain serial:
+1. **All INSERTs** — record, message, message_part, turn, turn_message, action, action_message, message_path_ref
+2. **Rollup rebuilds** — rebuild_chunk_action_rollups, rebuild_chunk_path_rollups
+3. **Finalize** — update counters
+
+### Architecture for parallel import
+
+**Recommended approach: parse-ahead pipeline**
+
+```
+Phase 1: Parallel parse (rayon thread pool)
+  - For each source file in chunk, spawn a rayon task:
+    - Read JSONL file
+    - Parse all lines → Vec<serde_json::Value>
+    - Extract messages → Vec<ExtractedMessage> (with parts)
+    - No DB access in this phase
+  - Result: Vec<ParsedFile> where ParsedFile holds the extracted data
+
+Phase 2: Serial write (single thread, current connection)
+  - For each ParsedFile:
+    - INSERT records, messages, message_parts (using existing ImportState logic)
+    - Build Vec<NormalizedMessage> from ImportState
+    - build_turns (in-memory, persist to DB)
+    - build_actions_in_tx_with_messages (classify in-memory, persist to DB)
+  - This phase is identical to today's flow but fed from pre-parsed data
+
+Why not parallel writes?
+  - SQLite WAL allows only one writer at a time
+  - Sharding (one DB per project) would give parallel writes but breaks the
+    single-DB assumption throughout the read path — that's a Tier C change
+```
+
+**Alternative: deeper parallelism (classify in parallel too)**
+
+```
+Phase 1: Parallel parse + classify (rayon)
+  - Parse JSONL → extract messages → group into turns → classify actions
+  - All in-memory, no DB access
+  - Result: Vec<ClassifiedFile> with messages, turns, actions, path_refs
+
+Phase 2: Serial write
+  - Bulk INSERT all pre-computed data
+  - Possibly with multi-row INSERT batching for additional speed
+
+This is more complex but saves the build_actions time (~5.6s) from serial execution.
+The classification logic (classify/mod.rs) would need to be refactored to work
+on ExtractedMessage/ExtractedMessagePart rather than NormalizedMessage (which has
+DB-assigned IDs). Turn grouping can happen without DB IDs. Action classification
+can happen without DB IDs. Only the persist step needs IDs.
+```
+
+### Constraints for the parallel implementation
+
+1. **Record sequence numbers** must be globally ordered per conversation. Currently assigned by `ImportState.next_record_sequence_no` during serial processing. With parallel parsing, assign after parsing completes (sort by source_line_no).
+2. **Message sequence numbers** similarly must be ordered. Assign post-parse.
+3. **Part deduplication** (`seen_part_keys` in MessageState) happens per-message. This is already per-file scoped and safe in parallel.
+4. **Conversation/stream creation** (INSERT into conversation, stream tables) must happen before message INSERTs due to FK constraints. This is per-file and can be batched.
+5. **`import_chunk` processes files serially within a chunk transaction.** The parallelism should be at the file level within a chunk, or across chunks.
+6. **Error handling:** a parse failure in one file should not abort other files. Use `Result` collection and handle failures per-file as today (savepoint rollback).
