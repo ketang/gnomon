@@ -628,19 +628,58 @@ Row parity: **PASS** (all 10 tables match exactly, DB size 486.83 MB identical)
 
 ---
 
+### Iteration 6 — Parallel JSONL parsing (rayon)
+
+**What changed:**
+
+Split `normalize_jsonl_file_in_tx` into two phases:
+1. `parse_jsonl_file` — pure CPU (JSON parsing, message extraction), runs in
+   parallel via `rayon::par_iter` across all files in a chunk
+2. `write_parsed_file_in_tx` — serial DB writes from pre-parsed data
+
+New types `ParsedFile`, `ParsedRecord`, `ParseResult` carry pre-parsed data
+from the parallel phase to the serial write phase. `rayon 1.12` added as a
+workspace dependency.
+
+**Measurements (full corpus, interleaved comparison with main):**
+
+Interleaved runs (discarding cold outliers):
+```
+Main:      37.3s / 32.1s
+Parallel:  29.9s / 29.0s / 28.8s
+Best-vs-best: 28.8s vs 32.1s (−10.3%)
+```
+
+Row parity: **PASS** (all 10 tables match exactly, DB size 486.83 MB identical)
+
+Quality gates: `cargo fmt`, `clippy -D warnings`, `cargo test` — all pass (142 tests).
+
+**Analysis:** The ~10% wall reduction comes from two sources:
+1. Parse parallelism — the ~3s JSON parse work is spread across cores
+2. I/O separation — file reads happen upfront in parallel, so the serial write
+   phase never waits on file I/O
+
+The simple barrier approach (`par_iter().collect()` before serial writes) is
+effective. A channel-based pipeline (overlap parse N+1 with write N) could
+extract more, but the current gains are solid.
+
+**Decision:** KEPT
+
+**Commit on `import-perf-parallel`:** `a8b62a6`
+
+---
+
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-13 (Phase 2, iteration 5 — in-memory data passing KEPT)
-Current phase: Phase 2 — iteration 5 complete, ready for candidate #1 (parallel parse+classify)
-All code is on `main`. Latest merge: `2eca9fa` (in-memory data passing).
-No active worktrees — create a fresh feature branch for the next candidate.
+Last updated: 2026-04-14 (Phase 2, iteration 6 — parallel JSONL parsing KEPT)
+Current phase: Phase 2 — iteration 6 complete (parallel JSONL parsing KEPT)
+Latest code on `import-perf-parallel` branch, pending merge to `main`.
 
 ### How to resume
 1. `cd /home/ketan/project/gnomon`
-2. Verify: `git log --oneline -1` → should show merge commit `2eca9fa`
-3. Read this log's Phase Log (iterations 1–5) for context on what was tried and what was learned.
-4. Read `docs/specs/2026-04-10-import-perf-design.md` Sections 3–4 and Section 11 for Phase 2 structure and candidate ranking.
-5. Continue at the "Next action" below.
+2. Read this log's Phase Log (iterations 1–6) for context on what was tried and what was learned.
+3. Read `docs/specs/2026-04-10-import-perf-design.md` Sections 3–4 and Section 12 for architecture.
+4. Continue at the "Next action" below.
 
 ### Iteration summary
 
@@ -651,11 +690,12 @@ No active worktrees — create a fresh feature branch for the next candidate.
 | 3 | SQLite pragma tuning (sync=NORMAL, cache, mmap) | **KEPT** | 38.1s → 31.9s (−16.3%) |
 | 4 | Deferred secondary indexes during bulk load | **REVERTED** | no measurable improvement |
 | 5 | In-memory data passing (build_turns + build_actions) | **KEPT** | build_actions −21%, build_turns −27%; wall ~noise |
+| 6 | Parallel JSONL parsing (rayon par_iter) | **KEPT** | ~29s vs ~32s (−10%) |
 
-### Current best metrics (post in-memory data passing, on main)
+### Current best metrics (post parallel parsing)
 | metric | value | vs original baseline | vs target |
 | --- | ---: | ---: | ---: |
-| Cold full import (session-local median) | ~31.8s | ~75% from 126.1s | ~3.2× to 10s target |
+| Cold full import (session-local best) | ~28.8s | ~77% from 126.1s | ~2.9× to 10s target |
 | Startup | ~2.29s | ~55% from ~5.1s baseline | ~2.3× to <1s target |
 
 ### Current phase distribution (full corpus, post-inmemory, ~31.5s wall)
@@ -678,16 +718,21 @@ No active worktrees — create a fresh feature branch for the next candidate.
 5. **Session-to-session variance is high (~30%)** on WSL2. Within-session relative comparisons are reliable.
 
 ### What must change to reach 10s
-The 10s target requires ~3× more speedup from ~32s. The pipeline now passes data in-memory, enabling:
+The 10s target requires ~2.9× more speedup from ~29s. Parallel parsing is in
+place. Remaining options:
 
-**Next: Parallel parse + classify (candidate #1, Tier B):**
-- The in-memory data flow is now in place: normalize produces `Vec<NormalizedMessage>`
-- Use rayon to parse JSONL files in parallel → `Vec<NormalizedMessage>` per file
-- Classify actions in parallel on in-memory data
-- Single SQLite writer thread drains results for serial DB operations
-- Expected: CPU portion (~40% of wall) parallelizes across available cores → ~30–40% wall reduction
+**Next: Parallel classify (candidate #1b, Tier B):**
+- Extend rayon parallelism to the classification phase (build_actions)
+- Classification is ~5.6s, mostly CPU-bound (classify_message, path ref extraction)
+- Would require running classification on ParsedFile data before DB IDs are assigned
+- Expected: additional ~10–15% wall reduction
 
-**Later: Structural changes (Tier C, requires approval):**
+**Channel-based pipeline (follow-up to iteration 6):**
+- Replace barrier (`par_iter().collect()`) with producer-consumer channel
+- Overlap parsing file N+1 with writing file N
+- Expected: modest additional gain if parse and write phases are similarly sized
+
+**Structural changes (Tier C, requires approval):**
 - Skip `record` table inserts (~490K rows, ~33% of insert time)
 - In-memory staging DB → `VACUUM INTO`
 - DuckDB or columnar store for analytical queries
@@ -696,7 +741,8 @@ The 10s target requires ~3× more speedup from ~32s. The pipeline now passes dat
 
 | rank | candidate | est. remaining win | confidence | tier |
 | --- | --- | --- | --- | --- |
-| 1 | **Parallel parse + classify** (rayon, in-memory data flow now ready) | 30–40% wall | medium-high | B |
+| 1 | ~~Parallel parse + classify~~ | **DONE** (iteration 6, parse only — ~10%) | — | — |
+| 1b | **Parallel classify** (extend rayon to classification phase) | 10–15% wall | medium | B |
 | 2 | ~~In-memory data passing~~ | **DONE** (iteration 5) | — | — |
 | 3 | **scan_source caching** | startup floor only, ~0.5s | high for startup | A |
 | 4 | Faster JSON parser (simd-json) | ~2.4s / ~8% | low | B |
