@@ -669,11 +669,44 @@ extract more, but the current gains are solid.
 
 ---
 
+### Iteration 7 — Skip record table inserts
+
+**What changed:**
+
+Removed all `INSERT INTO record` statements from `process_record` and
+`process_record_from_parsed`. The `record` table stored one row per JSONL line
+(~490K rows for the full corpus) but was never read by any query, TUI, web, or
+rollup code. The `record_count` counter is still maintained for reporting.
+
+Also removed: `classify_record_kind` (dead code), `FROM record` arm in
+`purge_chunk_data` (redundant with `stream`). Bumped `IMPORT_SCHEMA_VERSION`
+to 5 to trigger reimport.
+
+**Measurements (full corpus, interleaved comparison with main):**
+
+Interleaved runs:
+```
+Main (iter 6):    37.1s / 32.3s / 36.8s
+Skip-records:     29.3s / 29.8s / 28.4s / 27.2s
+Best: 27.2s vs 32.3s (−15.8%)
+```
+
+Row parity: **PASS** — all tables match except `record` (0, by design).
+DB size: 425.58 MB (down from 486.83 MB, −13%).
+
+Quality gates: `cargo fmt`, `clippy -D warnings`, `cargo test` — all pass (364 tests).
+
+**Decision:** KEPT (user approved: no current readers, future features trigger reimport)
+
+**Commit on `import-perf-skip-records`:** `1aca5c6`
+
+---
+
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-14 (Phase 2, iteration 6 — parallel JSONL parsing KEPT)
-Current phase: Phase 2 — iteration 6 complete (parallel JSONL parsing KEPT)
-Latest code on `import-perf-parallel` branch, pending merge to `main`.
+Last updated: 2026-04-14 (Phase 2, iteration 7 — skip record inserts KEPT)
+Current phase: Phase 2 — iteration 7 complete
+Latest code on `import-perf-skip-records` branch, pending merge to `main`.
 
 ### How to resume
 1. `cd /home/ketan/project/gnomon`
@@ -691,24 +724,25 @@ Latest code on `import-perf-parallel` branch, pending merge to `main`.
 | 4 | Deferred secondary indexes during bulk load | **REVERTED** | no measurable improvement |
 | 5 | In-memory data passing (build_turns + build_actions) | **KEPT** | build_actions −21%, build_turns −27%; wall ~noise |
 | 6 | Parallel JSONL parsing (rayon par_iter) | **KEPT** | ~29s vs ~32s (−10%) |
+| 7 | Skip record table inserts | **KEPT** | ~27s vs ~29s (−7%), DB −13% |
 
-### Current best metrics (post parallel parsing)
+### Current best metrics (post skip-records)
 | metric | value | vs original baseline | vs target |
 | --- | ---: | ---: | ---: |
-| Cold full import (session-local best) | ~28.8s | ~77% from 126.1s | ~2.9× to 10s target |
+| Cold full import (session-local best) | ~27.2s | ~78% from 126.1s | ~2.7× to 10s target |
 | Startup | ~2.29s | ~55% from ~5.1s baseline | ~2.3× to <1s target |
 
-### Current phase distribution (full corpus, post-inmemory, ~31.5s wall)
+### Current phase distribution (full corpus, post skip-records, ~27s wall)
 
 | phase | time | % of wall | note |
 | --- | ---: | ---: | --- |
-| normalize_jsonl.sql_ms | 9.7s | 31% | CPU-bound btree inserts — 490K records, 295K messages, 412K parts |
-| build_actions | 5.6s | 18% | classification + action/path_ref inserts (no more load_messages JOIN) |
-| normalize_jsonl.parse_ms | 3.0s | 10% | serde_json::from_str per line |
-| scan_source | 2.7s | 9% | directory walk + VCS resolution |
-| finalize_chunk + rollups | 1.7s + 1.5s | 10% | path rollup is the expensive part |
-| build_turns | 1.1s | 3% | in-memory iteration, then inserts turns |
-| other (uninstrumented) | 6.2s | 20% | Vec<NormalizedMessage> assembly, overhead |
+| normalize_jsonl.sql_ms | ~5s | ~19% | 295K messages + 412K parts only (no record inserts) |
+| build_actions | ~5.6s | ~21% | classification + action/path_ref inserts |
+| normalize_jsonl.parse_ms | ~0s | ~0% | parallelized in Phase 1 (rayon) |
+| scan_source | ~2.7s | ~10% | directory walk + VCS resolution |
+| finalize_chunk + rollups | ~3.2s | ~12% | path rollup is the expensive part |
+| build_turns | ~1.1s | ~4% | in-memory iteration, then inserts turns |
+| other (uninstrumented) | ~9s | ~33% | Vec assembly, parse phase wall, overhead |
 
 ### Key findings (cumulative)
 1. **Btree pages are cached.** With 64MB page cache + WAL, secondary index maintenance during inserts is essentially free.
@@ -718,8 +752,7 @@ Latest code on `import-perf-parallel` branch, pending merge to `main`.
 5. **Session-to-session variance is high (~30%)** on WSL2. Within-session relative comparisons are reliable.
 
 ### What must change to reach 10s
-The 10s target requires ~2.9× more speedup from ~29s. Parallel parsing is in
-place. Remaining options:
+The 10s target requires ~2.7× more speedup from ~27s. Remaining options:
 
 **Next: Parallel classify (candidate #1b, Tier B):**
 - Extend rayon parallelism to the classification phase (build_actions)
@@ -733,7 +766,6 @@ place. Remaining options:
 - Expected: modest additional gain if parse and write phases are similarly sized
 
 **Structural changes (Tier C, requires approval):**
-- Skip `record` table inserts (~490K rows, ~33% of insert time)
 - In-memory staging DB → `VACUUM INTO`
 - DuckDB or columnar store for analytical queries
 
@@ -746,7 +778,7 @@ place. Remaining options:
 | 2 | ~~In-memory data passing~~ | **DONE** (iteration 5) | — | — |
 | 3 | **scan_source caching** | startup floor only, ~0.5s | high for startup | A |
 | 4 | Faster JSON parser (simd-json) | ~2.4s / ~8% | low | B |
-| 5 | Skip `record` table inserts | ~10s / ~33% | needs product review | C |
+| 5 | ~~Skip `record` table inserts~~ | **DONE** (iteration 7, −7% wall, −13% DB) | — | — |
 
 ### Bench harness
 ```bash
