@@ -705,14 +705,16 @@ Quality gates: `cargo fmt`, `clippy -D warnings`, `cargo test` — all pass (364
 ## RESUME HERE (if session was reset, read this first)
 
 Last updated: 2026-04-14 (Phase 2, iteration 7 — skip record inserts KEPT)
-Current phase: Phase 2 — iteration 7 complete
-Latest code on `import-perf-skip-records` branch, pending merge to `main`.
+Current phase: Phase 2 — iteration 7 complete, ready for next candidate
+All code is on `main`. Latest merge: `c524747` (skip record inserts).
+No active worktrees — create a fresh feature branch for the next candidate.
 
 ### How to resume
 1. `cd /home/ketan/project/gnomon`
-2. Read this log's Phase Log (iterations 1–6) for context on what was tried and what was learned.
-3. Read `docs/specs/2026-04-10-import-perf-design.md` Sections 3–4 and Section 12 for architecture.
-4. Continue at the "Next action" below.
+2. Verify: `git log --oneline -1` → should show merge commit `c524747`
+3. Read this log's Phase Log (iterations 1–7) for context on what was tried and what was learned.
+4. Read `docs/specs/2026-04-10-import-perf-design.md` Sections 3–4 and Section 12 for architecture.
+5. Continue at the "Next action" below.
 
 ### Iteration summary
 
@@ -769,7 +771,7 @@ The 10s target requires ~2.7× more speedup from ~27s. Remaining options:
 - In-memory staging DB → `VACUUM INTO`
 - DuckDB or columnar store for analytical queries
 
-### Candidate ranking (updated after iteration 5)
+### Candidate ranking (updated after iteration 7)
 
 | rank | candidate | est. remaining win | confidence | tier |
 | --- | --- | --- | --- | --- |
@@ -789,7 +791,7 @@ cargo build -p gnomon-core --example import_bench --release
 cargo run -p gnomon-core --example import_bench --release -- \
   --corpus subset --mode full --repeats 3
 
-# Full corpus (truth, ~32s)
+# Full corpus (truth, ~27s)
 cargo run -p gnomon-core --example import_bench --release -- \
   --corpus full --mode full --repeats 3
 
@@ -806,10 +808,10 @@ cargo run -p gnomon-core --example import_bench --release -- \
 ```bash
 cd /home/ketan/project/gnomon
 git log --oneline -3
-# Should show in-memory merge at 2eca9fa
+# Should show merge commit c524747
 ls tests/fixtures/import-corpus/
 # MANIFEST.md + capture.sh (tarballs are gitignored, may need re-capture)
 cargo run -p gnomon-core --example import_bench --release -- \
   --corpus subset --mode full --repeats 1
-# Should complete in ~14s
+# Should complete in ~12s
 ```
