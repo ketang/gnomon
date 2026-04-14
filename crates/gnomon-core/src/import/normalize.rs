@@ -160,6 +160,320 @@ pub fn normalize_jsonl_file_in_tx(
     }
 }
 
+/// Parse a JSONL file without any DB access (pure CPU work).
+///
+/// Reads the file, parses every line as JSON, extracts record metadata and
+/// messages. Returns a [`ParseResult`](super::ParseResult) that can be fed
+/// to [`write_parsed_file_in_tx`] for serial DB writes.
+pub fn parse_jsonl_file(path: &Path, source_kind: super::SourceFileKind) -> super::ParseResult {
+    match parse_jsonl_file_inner(path, source_kind) {
+        Ok(result) => result,
+        // Convert unexpected I/O errors into warnings so the caller can
+        // roll back the savepoint without propagating a hard error that
+        // aborts the entire chunk.
+        Err(err) => super::ParseResult::Warning(NormalizeImportWarning {
+            code: WARNING_INVALID_JSON,
+            message: format!("unable to parse {}: {err:#}", path.display()),
+        }),
+    }
+}
+
+fn parse_jsonl_file_inner(
+    path: &Path,
+    source_kind: super::SourceFileKind,
+) -> Result<super::ParseResult> {
+    let file = File::open(path)
+        .with_context(|| format!("unable to open jsonl source {}", path.display()))?;
+    let reader = BufReader::new(file);
+
+    let mut records = Vec::new();
+
+    for (zero_based_line_no, line_result) in reader.lines().enumerate() {
+        let line_no = (zero_based_line_no + 1) as i64;
+        let line = line_result
+            .with_context(|| format!("unable to read line {line_no} from {}", path.display()))?;
+
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(super::ParseResult::Warning(NormalizeImportWarning {
+                    code: WARNING_INVALID_JSON,
+                    message: format!(
+                        "unable to parse json on line {line_no} from {} (preview: {})",
+                        path.display(),
+                        preview_source_line(&line)
+                    ),
+                }));
+            }
+        };
+
+        let recorded_at_utc = extract_record_timestamp(&value).map(ToOwned::to_owned);
+        let record_kind = classify_record_kind(&value);
+        let extracted_message = match source_kind {
+            super::SourceFileKind::Transcript => extract_message(&value, line_no),
+            super::SourceFileKind::ClaudeHistory => None,
+        };
+
+        records.push(super::ParsedRecord {
+            source_line_no: line_no,
+            value,
+            recorded_at_utc,
+            record_kind,
+            extracted_message,
+        });
+    }
+
+    // For transcript files: detect sessionless-metadata-only files.
+    if matches!(source_kind, super::SourceFileKind::Transcript) {
+        let has_session_id = records
+            .iter()
+            .any(|r| extract_session_id(&r.value).is_some());
+        if !has_session_id {
+            let all_metadata = !records.is_empty()
+                && records
+                    .iter()
+                    .all(|r| is_sessionless_metadata_record(&r.value));
+            if all_metadata {
+                return Ok(super::ParseResult::SessionlessMetadata);
+            }
+            // No session ID and not all metadata — this will be an error
+            // during the write phase (matches existing behavior).
+        }
+    }
+
+    Ok(super::ParseResult::Parsed(super::ParsedFile { records }))
+}
+
+/// Write a pre-parsed file to the database within an externally-managed
+/// transaction. This is the serial write counterpart to [`parse_jsonl_file`].
+///
+/// Caller is responsible for transaction/savepoint commit or rollback.
+/// On `Warning` outcome, partial writes may have occurred — caller should
+/// roll back the enclosing savepoint.
+pub fn write_parsed_file_in_tx(
+    conn: &Connection,
+    params: &NormalizeJsonlFileParams,
+    parsed: super::ParsedFile,
+    source_kind: super::SourceFileKind,
+) -> Result<(NormalizeJsonlFileOutcome, Vec<NormalizedMessage>)> {
+    match source_kind {
+        super::SourceFileKind::Transcript => {
+            let mut scope = PerfScope::new(params.perf_logger.clone(), "import.normalize_jsonl");
+            scope.field("path", params.path.display().to_string());
+            let inner = write_parsed_transcript_core(conn, params, parsed);
+            match inner {
+                Ok((outcome, breakdown, messages)) => {
+                    scope.field("parse_ms", 0.0f64); // parsing done in parallel phase
+                    scope.field("sql_ms", breakdown.sql.as_secs_f64() * 1000.0);
+                    scope.field("purge_ms", breakdown.purge.as_secs_f64() * 1000.0);
+                    scope.field(
+                        "finish_import_ms",
+                        breakdown.finish_import.as_secs_f64() * 1000.0,
+                    );
+                    scope.field("commit_ms", 0.0f64);
+                    match &outcome {
+                        NormalizeJsonlFileOutcome::Imported(result) => {
+                            scope.field("outcome", "imported");
+                            scope.field("record_count", result.record_count);
+                            scope.field("message_count", result.message_count);
+                            scope.field("turn_count", result.turn_count);
+                            scope.finish_ok();
+                        }
+                        NormalizeJsonlFileOutcome::Skipped => {
+                            scope.field("outcome", "skipped");
+                            scope.finish_ok();
+                        }
+                        NormalizeJsonlFileOutcome::Warning(_) => {
+                            scope.field("outcome", "warning");
+                            scope.finish_ok();
+                        }
+                    }
+                    Ok((outcome, messages))
+                }
+                Err(err) => {
+                    scope.finish_error(&err);
+                    Err(err)
+                }
+            }
+        }
+        super::SourceFileKind::ClaudeHistory => {
+            let mut scope =
+                PerfScope::new(params.perf_logger.clone(), "import.normalize_history_jsonl");
+            scope.field("path", params.path.display().to_string());
+            let result = write_parsed_history_core(conn, params, parsed);
+            match &result {
+                Ok(NormalizeJsonlFileOutcome::Imported(outcome)) => {
+                    scope.field("outcome", "imported");
+                    scope.field("record_count", outcome.record_count);
+                    scope.finish_ok();
+                }
+                Ok(NormalizeJsonlFileOutcome::Skipped) => {
+                    scope.field("outcome", "skipped");
+                    scope.finish_ok();
+                }
+                Ok(NormalizeJsonlFileOutcome::Warning(_)) => {
+                    scope.field("outcome", "warning");
+                    scope.finish_ok();
+                }
+                Err(err) => scope.finish_error(err),
+            }
+            result.map(|outcome| (outcome, Vec::new()))
+        }
+    }
+}
+
+/// Serial write phase for transcript files — fed from pre-parsed data.
+fn write_parsed_transcript_core(
+    conn: &Connection,
+    params: &NormalizeJsonlFileParams,
+    parsed: super::ParsedFile,
+) -> Result<(
+    NormalizeJsonlFileOutcome,
+    NormalizeBreakdown,
+    Vec<NormalizedMessage>,
+)> {
+    let mut breakdown = NormalizeBreakdown::default();
+
+    let purge_start = Instant::now();
+    purge_existing_import(conn, params)?;
+    breakdown.purge += purge_start.elapsed();
+
+    let mut state = ImportState::new(params.clone());
+
+    for record in parsed.records {
+        let sql_start = Instant::now();
+        if state.conversation.is_none() {
+            if extract_session_id(&record.value).is_some() {
+                state.initialize_context(conn, &record.value)?;
+                state.flush_buffered_records(conn)?;
+            } else {
+                state.buffered_records.push(BufferedRecord {
+                    source_line_no: record.source_line_no,
+                    value: record.value,
+                });
+                breakdown.sql += sql_start.elapsed();
+                continue;
+            }
+        }
+
+        state.process_record_from_parsed(conn, record)?;
+        breakdown.sql += sql_start.elapsed();
+    }
+
+    if state.conversation.is_none() {
+        // The parse phase already detects sessionless-metadata-only files and
+        // returns SessionlessMetadata, so reaching here means a genuine
+        // missing sessionId.
+        bail!(
+            "no sessionId found in {}; unable to normalize file",
+            params.path.display()
+        );
+    }
+
+    if !state.buffered_records.is_empty() {
+        let sql_start = Instant::now();
+        state.flush_buffered_records(conn)?;
+        breakdown.sql += sql_start.elapsed();
+    }
+
+    let mut normalized_messages: Vec<NormalizedMessage> = state
+        .message_states
+        .values()
+        .map(|ms| NormalizedMessage {
+            id: ms.id,
+            stream_id: ms.stream_id,
+            sequence_no: ms.sequence_no,
+            message_kind: ms.message_kind.clone(),
+            created_at_utc: ms.created_at_utc.clone(),
+            completed_at_utc: ms.completed_at_utc.clone(),
+            usage: ms.usage.clone(),
+            parts: ms.parts.clone(),
+            turn_id: None,
+            turn_sequence_no: None,
+            ordinal_in_turn: None,
+        })
+        .collect();
+    normalized_messages.sort_by_key(|m| (m.sequence_no, m.id));
+
+    let mut turns_scope = PerfScope::new(params.perf_logger.clone(), "import.build_turns");
+    let turn_count = match state.build_turns(conn, &mut normalized_messages) {
+        Ok(count) => {
+            turns_scope.field("turn_count", count);
+            turns_scope.finish_ok();
+            count
+        }
+        Err(err) => {
+            turns_scope.finish_error(&err);
+            return Err(err);
+        }
+    };
+    let finish_start = Instant::now();
+    state.finish_import(conn, turn_count)?;
+    breakdown.finish_import += finish_start.elapsed();
+
+    Ok((
+        NormalizeJsonlFileOutcome::Imported(NormalizeJsonlFileResult {
+            conversation_id: Some(
+                state
+                    .conversation
+                    .as_ref()
+                    .map(|conversation| conversation.id)
+                    .ok_or_else(|| anyhow!("conversation missing after import"))?,
+            ),
+            stream_id: Some(
+                state
+                    .stream
+                    .as_ref()
+                    .map(|stream| stream.id)
+                    .ok_or_else(|| anyhow!("stream missing after import"))?,
+            ),
+            record_count: state.record_count,
+            message_count: state.message_states.len(),
+            turn_count,
+            history_event_count: 0,
+        }),
+        breakdown,
+        normalized_messages,
+    ))
+}
+
+/// Serial write phase for history files — fed from pre-parsed data.
+fn write_parsed_history_core(
+    conn: &Connection,
+    params: &NormalizeJsonlFileParams,
+    parsed: super::ParsedFile,
+) -> Result<NormalizeJsonlFileOutcome> {
+    purge_existing_import(conn, params)?;
+
+    let mut history_event_count = 0usize;
+
+    for record in parsed.records {
+        insert_history_event(conn, params, &record.value, record.source_line_no)?;
+        history_event_count += 1;
+    }
+
+    conn.prepare_cached(
+        "
+        UPDATE import_chunk
+        SET imported_record_count = imported_record_count + ?2
+        WHERE id = ?1
+        ",
+    )
+    .and_then(|mut stmt| stmt.execute(params![params.import_chunk_id, history_event_count as i64]))
+    .context("unable to update import chunk counters after history normalization")?;
+
+    Ok(NormalizeJsonlFileOutcome::Imported(
+        NormalizeJsonlFileResult {
+            conversation_id: None,
+            stream_id: None,
+            record_count: history_event_count,
+            message_count: 0,
+            turn_count: 0,
+            history_event_count,
+        },
+    ))
+}
+
 fn load_source_file_kind(conn: &Connection, source_file_id: i64) -> Result<Option<SourceFileKind>> {
     let raw_kind: Option<String> = conn
         .query_row(
@@ -696,7 +1010,10 @@ fn insert_skill_invocation(
     Ok(())
 }
 
-fn purge_existing_import(conn: &Connection, params: &NormalizeJsonlFileParams) -> Result<()> {
+pub(super) fn purge_existing_import(
+    conn: &Connection,
+    params: &NormalizeJsonlFileParams,
+) -> Result<()> {
     let existing_conversation_id: Option<i64> = conn
         .prepare_cached("SELECT id FROM conversation WHERE source_file_id = ?1")
         .and_then(|mut stmt| {
@@ -752,17 +1069,17 @@ struct BufferedRecord {
 }
 
 #[derive(Debug, Clone)]
-struct ExtractedMessage {
-    external_id: String,
-    source_line_no: i64,
-    role: String,
-    message_kind: &'static str,
-    recorded_at_utc: Option<String>,
-    model_name: Option<String>,
-    stop_reason: Option<String>,
-    usage_source: Option<&'static str>,
-    usage: Usage,
-    parts: Vec<ExtractedMessagePart>,
+pub(super) struct ExtractedMessage {
+    pub(super) external_id: String,
+    pub(super) source_line_no: i64,
+    pub(super) role: String,
+    pub(super) message_kind: &'static str,
+    pub(super) recorded_at_utc: Option<String>,
+    pub(super) model_name: Option<String>,
+    pub(super) stop_reason: Option<String>,
+    pub(super) usage_source: Option<&'static str>,
+    pub(super) usage: Usage,
+    pub(super) parts: Vec<ExtractedMessagePart>,
 }
 
 /// Normalized message part fields extracted during import.
@@ -771,15 +1088,15 @@ struct ExtractedMessage {
 /// See [`IMPORT_SCHEMA_VERSION`](super::IMPORT_SCHEMA_VERSION) for the field
 /// contract.
 #[derive(Debug, Clone)]
-struct ExtractedMessagePart {
-    part_kind: String,
-    mime_type: Option<String>,
-    text_value: Option<String>,
-    tool_name: Option<String>,
-    tool_call_id: Option<String>,
-    metadata_json: Option<String>,
-    is_error: bool,
-    dedupe_key: String,
+pub(super) struct ExtractedMessagePart {
+    pub(super) part_kind: String,
+    pub(super) mime_type: Option<String>,
+    pub(super) text_value: Option<String>,
+    pub(super) tool_name: Option<String>,
+    pub(super) tool_call_id: Option<String>,
+    pub(super) metadata_json: Option<String>,
+    pub(super) is_error: bool,
+    pub(super) dedupe_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -981,6 +1298,76 @@ impl ImportState {
         self.record_count += 1;
 
         if let Some(message) = extract_message(&record, source_line_no) {
+            self.upsert_message(conn, message)?;
+        }
+
+        Ok(())
+    }
+
+    /// Like [`process_record`] but uses pre-extracted fields from the parallel
+    /// parse phase, avoiding redundant JSON traversal.
+    fn process_record_from_parsed(
+        &mut self,
+        conn: &Connection,
+        record: super::ParsedRecord,
+    ) -> Result<()> {
+        let conversation = self
+            .conversation
+            .as_mut()
+            .ok_or_else(|| anyhow!("conversation state missing while processing record"))?;
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| anyhow!("stream state missing while processing record"))?;
+
+        update_bounds(
+            &mut conversation.started_at_utc,
+            &mut conversation.ended_at_utc,
+            &record.recorded_at_utc,
+        );
+        update_bounds(
+            &mut stream.opened_at_utc,
+            &mut stream.closed_at_utc,
+            &record.recorded_at_utc,
+        );
+
+        conn.prepare_cached(
+            "
+            INSERT INTO record (
+                import_chunk_id,
+                source_file_id,
+                conversation_id,
+                stream_id,
+                source_line_no,
+                sequence_no,
+                record_kind,
+                recorded_at_utc
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ",
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
+                self.params.import_chunk_id,
+                self.params.source_file_id,
+                conversation.id,
+                stream.id,
+                record.source_line_no,
+                self.next_record_sequence_no,
+                record.record_kind,
+                record.recorded_at_utc,
+            ])
+        })
+        .with_context(|| {
+            format!(
+                "unable to insert normalized record for line {}",
+                record.source_line_no
+            )
+        })?;
+        self.next_record_sequence_no += 1;
+        self.record_count += 1;
+
+        if let Some(message) = record.extracted_message {
             self.upsert_message(conn, message)?;
         }
 
