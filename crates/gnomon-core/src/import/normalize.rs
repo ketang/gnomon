@@ -8,7 +8,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
-use super::{NormalizedToolUsePartMetadata, SourceFileKind};
+use super::{
+    NormalizedMessage, NormalizedPart, NormalizedToolUsePartMetadata, SourceFileKind, Usage,
+};
 use crate::perf::{PerfLogger, PerfScope};
 
 const PRIMARY_STREAM_SEQUENCE_NO: i64 = 0;
@@ -81,14 +83,14 @@ pub fn normalize_jsonl_file(
 pub fn normalize_jsonl_file_in_tx(
     conn: &Connection,
     params: &NormalizeJsonlFileParams,
-) -> Result<NormalizeJsonlFileOutcome> {
+) -> Result<(NormalizeJsonlFileOutcome, Vec<NormalizedMessage>)> {
     match load_source_file_kind(conn, params.source_file_id)? {
         Some(SourceFileKind::Transcript) => {
             let mut scope = PerfScope::new(params.perf_logger.clone(), "import.normalize_jsonl");
             scope.field("path", params.path.display().to_string());
             let inner = normalize_transcript_jsonl_file_core(conn, params);
             match inner {
-                Ok((outcome, breakdown)) => {
+                Ok((outcome, breakdown, messages)) => {
                     scope.field("parse_ms", breakdown.parse.as_secs_f64() * 1000.0);
                     scope.field("sql_ms", breakdown.sql.as_secs_f64() * 1000.0);
                     scope.field("purge_ms", breakdown.purge.as_secs_f64() * 1000.0);
@@ -114,7 +116,7 @@ pub fn normalize_jsonl_file_in_tx(
                             scope.finish_ok();
                         }
                     }
-                    Ok(outcome)
+                    Ok((outcome, messages))
                 }
                 Err(err) => {
                     scope.finish_error(&err);
@@ -143,15 +145,18 @@ pub fn normalize_jsonl_file_in_tx(
                 }
                 Err(err) => scope.finish_error(err),
             }
-            result
+            result.map(|outcome| (outcome, Vec::new()))
         }
-        None => Ok(NormalizeJsonlFileOutcome::Warning(NormalizeImportWarning {
-            code: WARNING_UNKNOWN_SOURCE_KIND,
-            message: format!(
-                "unable to determine source kind for source file id {}",
-                params.source_file_id
-            ),
-        })),
+        None => Ok((
+            NormalizeJsonlFileOutcome::Warning(NormalizeImportWarning {
+                code: WARNING_UNKNOWN_SOURCE_KIND,
+                message: format!(
+                    "unable to determine source kind for source file id {}",
+                    params.source_file_id
+                ),
+            }),
+            Vec::new(),
+        )),
     }
 }
 
@@ -214,7 +219,11 @@ fn normalize_transcript_jsonl_file(
 fn normalize_transcript_jsonl_file_core(
     conn: &Connection,
     params: &NormalizeJsonlFileParams,
-) -> Result<(NormalizeJsonlFileOutcome, NormalizeBreakdown)> {
+) -> Result<(
+    NormalizeJsonlFileOutcome,
+    NormalizeBreakdown,
+    Vec<NormalizedMessage>,
+)> {
     let mut breakdown = NormalizeBreakdown::default();
 
     let purge_start = Instant::now();
@@ -252,6 +261,7 @@ fn normalize_transcript_jsonl_file_core(
                         ),
                     }),
                     breakdown,
+                    Vec::new(),
                 ));
             }
         };
@@ -278,7 +288,7 @@ fn normalize_transcript_jsonl_file_core(
 
     if state.conversation.is_none() {
         if file_contains_only_sessionless_metadata(&state.buffered_records) {
-            return Ok((NormalizeJsonlFileOutcome::Skipped, breakdown));
+            return Ok((NormalizeJsonlFileOutcome::Skipped, breakdown, Vec::new()));
         }
         bail!(
             "no sessionId found in {}; unable to normalize file",
@@ -292,8 +302,29 @@ fn normalize_transcript_jsonl_file_core(
         breakdown.sql += sql_start.elapsed();
     }
 
+    // Build in-memory message collection from import state, sorted by (sequence_no, id)
+    // to match the ORDER BY of the previous DB query.
+    let mut normalized_messages: Vec<NormalizedMessage> = state
+        .message_states
+        .values()
+        .map(|ms| NormalizedMessage {
+            id: ms.id,
+            stream_id: ms.stream_id,
+            sequence_no: ms.sequence_no,
+            message_kind: ms.message_kind.clone(),
+            created_at_utc: ms.created_at_utc.clone(),
+            completed_at_utc: ms.completed_at_utc.clone(),
+            usage: ms.usage.clone(),
+            parts: ms.parts.clone(),
+            turn_id: None,
+            turn_sequence_no: None,
+            ordinal_in_turn: None,
+        })
+        .collect();
+    normalized_messages.sort_by_key(|m| (m.sequence_no, m.id));
+
     let mut turns_scope = PerfScope::new(params.perf_logger.clone(), "import.build_turns");
-    let turn_count = match state.build_turns(conn) {
+    let turn_count = match state.build_turns(conn, &mut normalized_messages) {
         Ok(count) => {
             turns_scope.field("turn_count", count);
             turns_scope.finish_ok();
@@ -331,6 +362,7 @@ fn normalize_transcript_jsonl_file_core(
             history_event_count: 0,
         }),
         breakdown,
+        normalized_messages,
     ))
 }
 
@@ -341,7 +373,7 @@ fn normalize_transcript_jsonl_file_inner(
     let tx = conn
         .transaction()
         .context("unable to start normalization transaction")?;
-    let (outcome, mut breakdown) = normalize_transcript_jsonl_file_core(&tx, params)?;
+    let (outcome, mut breakdown, _messages) = normalize_transcript_jsonl_file_core(&tx, params)?;
     match &outcome {
         NormalizeJsonlFileOutcome::Warning(_) => {
             // tx drops, auto-rollback undoes purge + partial writes
@@ -719,36 +751,6 @@ struct BufferedRecord {
     value: Value,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct Usage {
-    input_tokens: Option<i64>,
-    cache_creation_input_tokens: Option<i64>,
-    cache_read_input_tokens: Option<i64>,
-    output_tokens: Option<i64>,
-}
-
-impl Usage {
-    fn from_value(value: Option<&Value>) -> Self {
-        let Some(value) = value else {
-            return Self::default();
-        };
-
-        Self {
-            input_tokens: usage_field(value, "input_tokens"),
-            cache_creation_input_tokens: usage_field(value, "cache_creation_input_tokens"),
-            cache_read_input_tokens: usage_field(value, "cache_read_input_tokens"),
-            output_tokens: usage_field(value, "output_tokens"),
-        }
-    }
-
-    fn has_any(&self) -> bool {
-        self.input_tokens.is_some()
-            || self.cache_creation_input_tokens.is_some()
-            || self.cache_read_input_tokens.is_some()
-            || self.output_tokens.is_some()
-    }
-}
-
 #[derive(Debug, Clone)]
 struct ExtractedMessage {
     external_id: String,
@@ -783,10 +785,16 @@ struct ExtractedMessagePart {
 #[derive(Debug, Clone)]
 struct MessageState {
     id: i64,
+    stream_id: i64,
+    sequence_no: i64,
+    message_kind: String,
+    created_at_utc: Option<String>,
+    completed_at_utc: Option<String>,
     recorded_at_utc: Option<String>,
     usage: Usage,
     next_part_ordinal: i64,
     seen_part_keys: HashSet<String>,
+    parts: Vec<NormalizedPart>,
 }
 
 #[derive(Debug)]
@@ -1032,13 +1040,17 @@ impl ImportState {
                 .recorded_at_utc
                 .clone()
                 .or_else(|| state.recorded_at_utc.clone());
+            state.completed_at_utc = extracted
+                .recorded_at_utc
+                .clone()
+                .or_else(|| state.completed_at_utc.clone());
             if extracted.usage.has_any() {
                 state.usage = extracted.usage.clone();
             }
 
             for part in extracted.parts {
                 if state.seen_part_keys.insert(part.dedupe_key.clone()) {
-                    insert_message_part(
+                    let part_id = insert_message_part(
                         conn,
                         state.id,
                         state.next_part_ordinal,
@@ -1046,6 +1058,13 @@ impl ImportState {
                         extracted.source_line_no,
                         &self.params.path,
                     )?;
+                    state.parts.push(NormalizedPart {
+                        id: part_id,
+                        part_kind: part.part_kind.clone(),
+                        tool_name: part.tool_name.clone(),
+                        tool_call_id: part.tool_call_id.clone(),
+                        metadata_json: part.metadata_json.clone(),
+                    });
                     state.next_part_ordinal += 1;
                 }
             }
@@ -1112,16 +1131,22 @@ impl ImportState {
 
         let mut state = MessageState {
             id: message_id,
+            stream_id,
+            sequence_no: self.next_message_sequence_no,
+            message_kind: extracted.message_kind.to_string(),
+            created_at_utc: extracted.recorded_at_utc.clone(),
+            completed_at_utc: extracted.recorded_at_utc.clone(),
             recorded_at_utc: extracted.recorded_at_utc.clone(),
             usage: extracted.usage.clone(),
             next_part_ordinal: 0,
             seen_part_keys: HashSet::new(),
+            parts: Vec::new(),
         };
         self.next_message_sequence_no += 1;
 
         for part in extracted.parts {
             if state.seen_part_keys.insert(part.dedupe_key.clone()) {
-                insert_message_part(
+                let part_id = insert_message_part(
                     conn,
                     state.id,
                     state.next_part_ordinal,
@@ -1129,6 +1154,13 @@ impl ImportState {
                     extracted.source_line_no,
                     &self.params.path,
                 )?;
+                state.parts.push(NormalizedPart {
+                    id: part_id,
+                    part_kind: part.part_kind.clone(),
+                    tool_name: part.tool_name.clone(),
+                    tool_call_id: part.tool_call_id.clone(),
+                    metadata_json: part.metadata_json.clone(),
+                });
                 state.next_part_ordinal += 1;
             }
         }
@@ -1137,69 +1169,59 @@ impl ImportState {
         Ok(())
     }
 
-    fn build_turns(&self, conn: &Connection) -> Result<usize> {
+    fn build_turns(&self, conn: &Connection, messages: &mut [NormalizedMessage]) -> Result<usize> {
         let conversation_id = self
             .conversation
             .as_ref()
             .map(|conversation| conversation.id)
             .ok_or_else(|| anyhow!("conversation state missing while building turns"))?;
 
-        let mut stmt = conn.prepare_cached(
-            "
-            SELECT
-                id,
-                stream_id,
-                message_kind,
-                created_at_utc,
-                completed_at_utc,
-                input_tokens,
-                cache_creation_input_tokens,
-                cache_read_input_tokens,
-                output_tokens
-            FROM message
-            WHERE conversation_id = ?1
-            ORDER BY sequence_no, id
-            ",
-        )?;
-
-        let rows = stmt.query_map([conversation_id], |row| {
-            Ok(TurnCandidateMessage {
-                id: row.get(0)?,
-                stream_id: row.get(1)?,
-                message_kind: row.get(2)?,
-                created_at_utc: row.get(3)?,
-                completed_at_utc: row.get(4)?,
-                usage: Usage {
-                    input_tokens: row.get(5)?,
-                    cache_creation_input_tokens: row.get(6)?,
-                    cache_read_input_tokens: row.get(7)?,
-                    output_tokens: row.get(8)?,
-                },
-            })
-        })?;
-        let messages: Vec<TurnCandidateMessage> = rows.collect::<rusqlite::Result<_>>()?;
-        drop(stmt);
-
         let mut turn_count = 0usize;
         let mut current_turn: Option<TurnDraft> = None;
+        let mut current_turn_msg_indices: Vec<usize> = Vec::new();
+        let msg_len = messages.len();
 
-        for message in messages {
-            if message.message_kind == "user_prompt" {
+        for idx in 0..msg_len {
+            let candidate = TurnCandidateMessage {
+                id: messages[idx].id,
+                stream_id: messages[idx].stream_id,
+                message_kind: messages[idx].message_kind.clone(),
+                created_at_utc: messages[idx].created_at_utc.clone(),
+                completed_at_utc: messages[idx].completed_at_utc.clone(),
+                usage: messages[idx].usage.clone(),
+            };
+
+            if candidate.message_kind == "user_prompt" {
                 if let Some(turn) = current_turn.take() {
-                    persist_turn(conn, conversation_id, self.params.import_chunk_id, turn)?;
+                    let (turn_id, turn_seq) =
+                        persist_turn(conn, conversation_id, self.params.import_chunk_id, turn)?;
+                    for (ordinal, &msg_idx) in current_turn_msg_indices.iter().enumerate() {
+                        messages[msg_idx].turn_id = Some(turn_id);
+                        messages[msg_idx].turn_sequence_no = Some(turn_seq);
+                        messages[msg_idx].ordinal_in_turn = Some(ordinal as i64);
+                    }
                     turn_count += 1;
                 }
-                current_turn = Some(TurnDraft::new(message));
+                current_turn_msg_indices.clear();
+                current_turn = Some(TurnDraft::new(candidate));
+                current_turn_msg_indices.push(idx);
                 continue;
             }
 
             if let Some(turn) = current_turn.as_mut() {
-                turn.push(message);
+                turn.push(candidate);
+                current_turn_msg_indices.push(idx);
             }
         }
 
         if let Some(turn) = current_turn.take() {
-            persist_turn(conn, conversation_id, self.params.import_chunk_id, turn)?;
+            let (turn_id, turn_seq) =
+                persist_turn(conn, conversation_id, self.params.import_chunk_id, turn)?;
+            for (ordinal, &msg_idx) in current_turn_msg_indices.iter().enumerate() {
+                messages[msg_idx].turn_id = Some(turn_id);
+                messages[msg_idx].turn_sequence_no = Some(turn_seq);
+                messages[msg_idx].ordinal_in_turn = Some(ordinal as i64);
+            }
             turn_count += 1;
         }
 
@@ -1320,16 +1342,16 @@ impl TurnDraft {
         update_bounds(&mut self.started_at_utc, &mut self.ended_at_utc, &start);
         update_end(&mut self.ended_at_utc, &end);
 
-        add_usage(&mut self.usage.input_tokens, message.usage.input_tokens);
-        add_usage(
+        Usage::add_field(&mut self.usage.input_tokens, message.usage.input_tokens);
+        Usage::add_field(
             &mut self.usage.cache_creation_input_tokens,
             message.usage.cache_creation_input_tokens,
         );
-        add_usage(
+        Usage::add_field(
             &mut self.usage.cache_read_input_tokens,
             message.usage.cache_read_input_tokens,
         );
-        add_usage(&mut self.usage.output_tokens, message.usage.output_tokens);
+        Usage::add_field(&mut self.usage.output_tokens, message.usage.output_tokens);
 
         self.message_ids.push(message.id);
     }
@@ -1340,7 +1362,7 @@ fn persist_turn(
     conversation_id: i64,
     import_chunk_id: i64,
     turn: TurnDraft,
-) -> Result<()> {
+) -> Result<(i64, i64)> {
     let next_turn_sequence_no: i64 = conn
         .prepare_cached(
             "
@@ -1398,7 +1420,7 @@ fn persist_turn(
         .execute(params![turn_id, message_id, ordinal_in_turn as i64])?;
     }
 
-    Ok(())
+    Ok((turn_id, next_turn_sequence_no))
 }
 
 fn insert_message_part(
@@ -1408,7 +1430,7 @@ fn insert_message_part(
     part: &ExtractedMessagePart,
     source_line_no: i64,
     source_path: &Path,
-) -> Result<()> {
+) -> Result<i64> {
     conn.prepare_cached(
         "
         INSERT INTO message_part (
@@ -1446,7 +1468,7 @@ fn insert_message_part(
         )
     })?;
 
-    Ok(())
+    Ok(conn.last_insert_rowid())
 }
 
 fn extract_message(record: &Value, source_line_no: i64) -> Option<ExtractedMessage> {
@@ -1480,7 +1502,7 @@ fn extract_top_level_assistant(record: &Value, source_line_no: i64) -> Option<Ex
         } else {
             None
         },
-        usage: Usage::from_value(wrapper.get("usage")),
+        usage: Usage::from_json(wrapper.get("usage")),
         parts,
     })
 }
@@ -1513,7 +1535,7 @@ fn extract_top_level_user(record: &Value, source_line_no: i64) -> Option<Extract
             None
         },
         usage: if is_agent_run_summary {
-            Usage::from_value(record.pointer("/toolUseResult/usage"))
+            Usage::from_json(record.pointer("/toolUseResult/usage"))
         } else {
             Usage::default()
         },
@@ -1541,7 +1563,7 @@ fn extract_relay_message(record: &Value, source_line_no: i64) -> Option<Extracte
         None
     };
     let usage = if role == "assistant" {
-        Usage::from_value(message_wrapper.get("usage"))
+        Usage::from_json(message_wrapper.get("usage"))
     } else {
         Usage::default()
     };
@@ -1732,10 +1754,6 @@ fn optional_string(value: Option<&Value>) -> Option<String> {
     value.and_then(Value::as_str).map(ToOwned::to_owned)
 }
 
-fn usage_field(value: &Value, field_name: &str) -> Option<i64> {
-    value.get(field_name).and_then(Value::as_i64)
-}
-
 fn update_bounds(start: &mut Option<String>, end: &mut Option<String>, candidate: &Option<String>) {
     if let Some(candidate) = candidate {
         if start.as_ref().is_none_or(|current| candidate < current) {
@@ -1752,12 +1770,6 @@ fn update_end(end: &mut Option<String>, candidate: &Option<String>) {
         && end.as_ref().is_none_or(|current| candidate > current)
     {
         *end = Some(candidate.clone());
-    }
-}
-
-fn add_usage(total: &mut Option<i64>, candidate: Option<i64>) {
-    if let Some(candidate) = candidate {
-        *total = Some(total.unwrap_or(0) + candidate);
     }
 }
 

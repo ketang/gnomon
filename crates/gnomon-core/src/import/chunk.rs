@@ -4,7 +4,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::classify::{BuildActionsParams, build_actions_in_tx};
+use crate::classify::{BuildActionsParams, build_actions_in_tx_with_messages};
 use crate::db::Database;
 use crate::perf::{PerfLogger, PerfScope};
 use crate::query::SnapshotBounds;
@@ -959,7 +959,7 @@ fn import_chunk(
                 .savepoint()
                 .context("unable to create per-file savepoint")?;
 
-            let outcome = normalize_jsonl_file_in_tx(
+            let (outcome, normalized_messages) = normalize_jsonl_file_in_tx(
                 &sp,
                 &NormalizeJsonlFileParams {
                     project_id: chunk.project_id,
@@ -979,12 +979,13 @@ fn import_chunk(
             match outcome {
                 NormalizeJsonlFileOutcome::Imported(result) => {
                     if let Some(conversation_id) = result.conversation_id {
-                        let _ = build_actions_in_tx(
+                        let _ = build_actions_in_tx_with_messages(
                             &sp,
                             &BuildActionsParams {
                                 conversation_id,
                                 perf_logger: options.perf_logger.clone(),
                             },
+                            normalized_messages,
                         )
                         .with_context(|| {
                             format!(

@@ -1,6 +1,82 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+// ---------------------------------------------------------------------------
+// Shared types used by both normalize and classify phases
+// ---------------------------------------------------------------------------
+
+/// Token usage counters shared between normalize and classify phases.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: Option<i64>,
+    pub cache_creation_input_tokens: Option<i64>,
+    pub cache_read_input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+}
+
+impl Usage {
+    pub fn from_json(value: Option<&Value>) -> Self {
+        let Some(value) = value else {
+            return Self::default();
+        };
+
+        Self {
+            input_tokens: usage_field(value, "input_tokens"),
+            cache_creation_input_tokens: usage_field(value, "cache_creation_input_tokens"),
+            cache_read_input_tokens: usage_field(value, "cache_read_input_tokens"),
+            output_tokens: usage_field(value, "output_tokens"),
+        }
+    }
+
+    pub fn has_any(&self) -> bool {
+        self.input_tokens.is_some()
+            || self.cache_creation_input_tokens.is_some()
+            || self.cache_read_input_tokens.is_some()
+            || self.output_tokens.is_some()
+    }
+
+    pub fn add_field(total: &mut Option<i64>, candidate: Option<i64>) {
+        if let Some(candidate) = candidate {
+            *total = Some(total.unwrap_or(0) + candidate);
+        }
+    }
+}
+
+fn usage_field(value: &Value, field_name: &str) -> Option<i64> {
+    value.get(field_name).and_then(Value::as_i64)
+}
+
+/// A message part retained in memory after normalization for downstream
+/// consumption by `build_actions`. Only fields needed by classify are kept.
+#[derive(Debug, Clone)]
+pub struct NormalizedPart {
+    pub id: i64,
+    pub part_kind: String,
+    pub tool_name: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub metadata_json: Option<String>,
+}
+
+/// A fully-normalized message retained in memory after normalization for
+/// downstream consumption by `build_turns` and `build_actions`.
+#[derive(Debug, Clone)]
+pub struct NormalizedMessage {
+    pub id: i64,
+    pub stream_id: i64,
+    pub sequence_no: i64,
+    pub message_kind: String,
+    pub created_at_utc: Option<String>,
+    pub completed_at_utc: Option<String>,
+    pub usage: Usage,
+    pub parts: Vec<NormalizedPart>,
+    /// Populated by `build_turns`; `None` for messages outside any turn.
+    pub turn_id: Option<i64>,
+    /// Populated by `build_turns`.
+    pub turn_sequence_no: Option<i64>,
+    /// Populated by `build_turns`.
+    pub ordinal_in_turn: Option<i64>,
+}
+
 mod source;
 
 pub use source::{
@@ -96,3 +172,6 @@ pub use normalize::{
     NormalizeImportWarning, NormalizeJsonlFileOutcome, NormalizeJsonlFileParams,
     NormalizeJsonlFileResult, normalize_jsonl_file, normalize_jsonl_file_in_tx,
 };
+
+// Re-export shared types at crate level for external consumers
+// (NormalizedMessage, NormalizedPart, Usage are defined at the top of this file)

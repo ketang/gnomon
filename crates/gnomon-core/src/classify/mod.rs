@@ -5,8 +5,11 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
-use crate::import::NormalizedToolUsePartMetadata;
+use crate::import::{NormalizedMessage, NormalizedPart, NormalizedToolUsePartMetadata, Usage};
 use crate::perf::{PerfLogger, PerfScope};
+
+type LoadedMessage = NormalizedMessage;
+type LoadedPart = NormalizedPart;
 
 #[derive(Debug, Clone)]
 pub struct BuildActionsParams {
@@ -51,13 +54,37 @@ fn build_actions_core(
 
     purge_existing_classification(conn, params.conversation_id)?;
     let messages = load_messages(conn, params.conversation_id)?;
-    let tool_use_lookup = build_tool_use_lookup(&messages);
+    classify_and_persist_actions(conn, &context, &messages)
+}
+
+fn build_actions_core_with_messages(
+    conn: &Connection,
+    params: &BuildActionsParams,
+    messages: Vec<LoadedMessage>,
+) -> Result<BuildActionsResult> {
+    let Some(context) = load_conversation_context(conn, params.conversation_id)? else {
+        return Ok(BuildActionsResult {
+            action_count: 0,
+            path_ref_count: 0,
+        });
+    };
+
+    purge_existing_classification(conn, params.conversation_id)?;
+    classify_and_persist_actions(conn, &context, &messages)
+}
+
+fn classify_and_persist_actions(
+    conn: &Connection,
+    context: &ConversationContext,
+    messages: &[LoadedMessage],
+) -> Result<BuildActionsResult> {
+    let tool_use_lookup = build_tool_use_lookup(messages);
 
     let mut actions_written = 0usize;
     let mut path_refs_written = 0usize;
 
     let mut turns: BTreeMap<i64, Vec<&LoadedMessage>> = BTreeMap::new();
-    for message in &messages {
+    for message in messages {
         if let Some(turn_sequence_no) = message.turn_sequence_no {
             turns.entry(turn_sequence_no).or_default().push(message);
         }
@@ -167,6 +194,28 @@ pub fn build_actions_in_tx(
     result
 }
 
+/// Classify actions using in-memory normalized messages (no DB read).
+///
+/// Used during import when messages are already available from normalization.
+pub fn build_actions_in_tx_with_messages(
+    conn: &Connection,
+    params: &BuildActionsParams,
+    messages: Vec<NormalizedMessage>,
+) -> Result<BuildActionsResult> {
+    let mut scope = PerfScope::new(params.perf_logger.clone(), "import.build_actions");
+    scope.field("conversation_id", params.conversation_id);
+    let result = build_actions_core_with_messages(conn, params, messages);
+    match &result {
+        Ok(outcome) => {
+            scope.field("action_count", outcome.action_count);
+            scope.field("path_ref_count", outcome.path_ref_count);
+            scope.finish_ok();
+        }
+        Err(err) => scope.finish_error(err),
+    }
+    result
+}
+
 #[derive(Debug)]
 struct ConversationContext {
     project_id: i64,
@@ -232,36 +281,6 @@ fn purge_existing_classification(conn: &Connection, conversation_id: i64) -> Res
     Ok(())
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Usage {
-    input_tokens: Option<i64>,
-    cache_creation_input_tokens: Option<i64>,
-    cache_read_input_tokens: Option<i64>,
-    output_tokens: Option<i64>,
-}
-
-#[derive(Debug, Clone)]
-struct LoadedPart {
-    id: i64,
-    part_kind: String,
-    tool_name: Option<String>,
-    tool_call_id: Option<String>,
-    metadata_json: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct LoadedMessage {
-    id: i64,
-    turn_id: Option<i64>,
-    turn_sequence_no: Option<i64>,
-    ordinal_in_turn: Option<i64>,
-    message_kind: String,
-    created_at_utc: Option<String>,
-    completed_at_utc: Option<String>,
-    usage: Usage,
-    parts: Vec<LoadedPart>,
-}
-
 fn load_messages(conn: &Connection, conversation_id: i64) -> Result<Vec<LoadedMessage>> {
     let mut stmt = conn.prepare_cached(
         "
@@ -281,7 +300,9 @@ fn load_messages(conn: &Connection, conversation_id: i64) -> Result<Vec<LoadedMe
             mp.part_kind,
             mp.tool_name,
             mp.tool_call_id,
-            mp.metadata_json
+            mp.metadata_json,
+            m.stream_id,
+            m.sequence_no
         FROM message m
         LEFT JOIN turn_message tm ON tm.message_id = m.id
         LEFT JOIN turn t ON t.id = tm.turn_id
@@ -311,6 +332,8 @@ fn load_messages(conn: &Connection, conversation_id: i64) -> Result<Vec<LoadedMe
             part_tool_name: row.get(13)?,
             part_tool_call_id: row.get(14)?,
             part_metadata_json: row.get(15)?,
+            stream_id: row.get(16)?,
+            message_sequence_no: row.get(17)?,
         })
     })?;
 
@@ -325,6 +348,8 @@ fn load_messages(conn: &Connection, conversation_id: i64) -> Result<Vec<LoadedMe
             let index = messages.len();
             messages.push(LoadedMessage {
                 id: row.id,
+                stream_id: row.stream_id,
+                sequence_no: row.message_sequence_no,
                 turn_id: row.turn_id,
                 turn_sequence_no: row.turn_sequence_no,
                 ordinal_in_turn: row.ordinal_in_turn,
@@ -355,6 +380,8 @@ fn load_messages(conn: &Connection, conversation_id: i64) -> Result<Vec<LoadedMe
 #[derive(Debug)]
 struct LoadedMessageRow {
     id: i64,
+    stream_id: i64,
+    message_sequence_no: i64,
     turn_id: Option<i64>,
     turn_sequence_no: Option<i64>,
     ordinal_in_turn: Option<i64>,
@@ -1218,16 +1245,16 @@ impl ActionGroupDraft {
             self.ended_at_utc = Some(candidate);
         }
 
-        add_usage(&mut self.usage.input_tokens, message.usage.input_tokens);
-        add_usage(
+        Usage::add_field(&mut self.usage.input_tokens, message.usage.input_tokens);
+        Usage::add_field(
             &mut self.usage.cache_creation_input_tokens,
             message.usage.cache_creation_input_tokens,
         );
-        add_usage(
+        Usage::add_field(
             &mut self.usage.cache_read_input_tokens,
             message.usage.cache_read_input_tokens,
         );
-        add_usage(&mut self.usage.output_tokens, message.usage.output_tokens);
+        Usage::add_field(&mut self.usage.output_tokens, message.usage.output_tokens);
         self.message_ids.push(message.id);
         self.skill_references
             .extend(classification.skill_references.iter().cloned());
@@ -1326,12 +1353,6 @@ fn persist_action(
     }
 
     Ok(())
-}
-
-fn add_usage(total: &mut Option<i64>, candidate: Option<i64>) {
-    if let Some(candidate) = candidate {
-        *total = Some(total.unwrap_or(0) + candidate);
-    }
 }
 
 #[cfg(test)]
