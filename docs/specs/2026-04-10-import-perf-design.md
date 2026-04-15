@@ -486,65 +486,98 @@ opportunity.
 (iteration 5). `message_path_ref.message_part_id` is a nullable FK
 (`ON DELETE SET NULL`).
 
-### Revised 10s target assessment
+### D0 result: CPU floor measured (2026-04-15)
 
-The previous assessment assumed btree operations were irreducible. The
-join-table analysis shows 46% of btree ops are structurally eliminable, and
-a further 16% (message_part) can be deferred. Combined with rollup deferral
-(3.6s) and simd-json (~1s), the 10s target is now plausibly reachable:
+Added `GNOMON_ZERO_WRITE=1` env-var gate (OnceLock-cached) to all
+INSERT/UPDATE/DELETE calls in `normalize.rs`, `chunk.rs`, and
+`classify/mod.rs`. Parse, JSONL extraction, in-memory turn grouping, and
+classification logic still execute.
 
-| change | est. savings | cumulative wall |
-| --- | ---: | ---: |
-| current baseline | — | ~21.6s |
-| D1: denormalize join tables | ~4-5s | ~17s |
-| D2: defer message_part persistence | ~2-3s | ~14.5s |
-| D3: defer rollup computation | ~3.6s | ~11s |
-| D4: simd-json | ~1s | ~10s |
+| measurement | subset avg |
+| --- | ---: |
+| Baseline (confirmation) | 8.51s |
+| Zero-write (CPU floor) | 2.82s |
+| SQL write overhead | ~5.7s (67% of wall) |
 
-### New candidate ranking (Phase 2, iteration 14+)
+The floor (2.82s) is well below the 10s target. SQL writes account for 67%
+of import wall time on the subset. The btree-ops model is validated: there is
+room to reach 10s if the structural changes below deliver their projected savings.
 
-The prior Tier A–C ranking is superseded by this re-analysis. The candidates
-below are ordered by expected impact and should be evaluated in sequence.
-Re-rank after each measurement as before.
+Branch `import-perf-d0-zero-write` kept as reference, not merged.
 
-**D0. Zero-write diagnostic (not a candidate — a measurement).** Comment out
-all INSERT/UPDATE calls in normalize + build_actions + build_turns. Measure
-pure CPU processing time. This establishes the floor — the minimum wall time
-even with zero-cost DB writes — and validates that btree ops are where the
-remaining time goes. If the floor is >15s, the projection above is wrong and
-the bottleneck is elsewhere. If the floor is 4-6s, the projection is
-conservative and there is more room than estimated. Run once, log the number,
-discard the branch.
+### D1 result: REVERTED — denormalize-via-UPDATE is a regression (2026-04-15)
 
-**D1. Denormalize join tables into message table (est. ~4-5s, −20-23%).**
-Add `turn_id INTEGER REFERENCES turn(id)` and `action_id INTEGER REFERENCES
-action(id)` columns to `message`. Add `idx_message_action_id` for query-time
-lookups. Drop `turn_message` and `action_message` tables entirely.
+Schema migration 0011 added `turn_id` and `action_id` nullable columns to
+`message`, created the corresponding indexes, and dropped `turn_message` and
+`action_message`. `persist_turn` changed to `UPDATE message SET turn_id`.
+`persist_action` changed to `UPDATE message SET action_id`. Five JOIN rewrites
+in `query/mod.rs`.
 
-Pipeline change: during normalize, compute turn boundaries in memory first
-(already partially done — `build_turns` annotates `NormalizedMessage.turn_id`
-in-place), then INSERT messages with `turn_id` already set. During
-`build_actions`, UPDATE `message SET action_id = ?` per action group (~114K
-grouped UPDATEs instead of ~295K individual join-table INSERTs × 4 btrees
-each). TUI queries simplify: `JOIN action_message am ON am.action_id = a.id
-JOIN message m ON m.id = am.message_id` becomes `JOIN message m ON
-m.action_id = a.id`.
+Two variants tested on the subset (baseline avg 8.51s):
 
-Btree ops eliminated: ~2,360K (46%). Btree ops added: ~114K UPDATEs × ~2
-ops = ~228K. Net reduction: ~2,132K ops (42% of all btree work). Risk: low.
-Schema migration required but DB is disposable (reimport on schema bump).
-Requires updating TUI queries, classify/mod.rs reads, and
-import_corpus_integration tests.
+| variant | times | avg | delta |
+| --- | --- | ---: | ---: |
+| Individual UPDATEs (one per message) | 10.08s, 9.69s, 10.54s | 10.1s | +19% |
+| Batched UPDATEs (`WHERE id IN (...)`) | 10.04s, 9.90s, 10.02s | 10.0s | +18% |
 
-**D2. Defer message_part persistence (est. ~2-3s, −10-14%).** Skip
-`message_part` INSERTs during import. Classification already receives parts
-in memory (iteration 5). Set `message_path_ref.message_part_id = NULL` (FK
-is nullable, `ON DELETE SET NULL`). The `load_skill_transcript_evidence`
-query (`query/mod.rs:1818`) loses data — either accept this (minor feature)
-or defer part INSERTs to a background pass after TUI opens.
+Row parity: PASS (7/7 integration tests). DB size: 152.57 MB vs 160.70 MB
+baseline (−5%).
 
-Btree ops eliminated: 824K (16%). Risk: low if skill transcript evidence is
-acceptable to lose; medium if background deferral is needed.
+**Key finding #9:** The btree-ops COUNT model is correct (join tables account
+for 46% of btree operations) but the cost model was wrong. Replacing join
+table INSERTs with UPDATEs on the `message` table is MORE expensive, not
+less, because:
+
+- UPDATE requires search+modify (random write) vs INSERT's append-friendly
+  sequential write into compact new btrees.
+- The `message` table is large and hot during import; its btrees require
+  deeper traversals than the smaller join-table btrees.
+- Batching (`WHERE id IN ...`) reduces SQL statement count but not btree
+  work, confirming the bottleneck is per-row btree operation cost.
+
+The correct approach to eliminate join-table overhead is to **preset `turn_id`
+at message INSERT time** — compute turn boundaries in memory before persisting
+messages to the DB, so no UPDATE is ever needed (D1b below).
+
+Branch `import-perf-d1-denormalize-joins` kept as reference, not merged.
+
+### Updated 10s target assessment
+
+D0 confirmed the floor. D1 failure invalidated the post-hoc UPDATE path.
+The projection table is updated with measured results and a revised route:
+
+| change | est. savings | cumulative wall | status |
+| --- | ---: | ---: | --- |
+| current baseline | — | ~21.6s | measured |
+| D1: denormalize via post-hoc UPDATE | — | — | **FAILED (+18%)** |
+| D1b: preset turn_id at message INSERT | ~3-4s | ~18s | candidate |
+| D2: defer message_part persistence | ~2-3s | ~15s | candidate |
+| D3: defer rollup computation | ~3.6s | ~11s | candidate |
+| D4: simd-json | ~1s | ~10s | candidate |
+
+### Candidate ranking (Phase 2, iteration 14+, updated post-D1)
+
+Re-ranked after D1 failure. D1b is new. D3 is next because it avoids the
+UPDATE pitfall entirely (defers work, not restructures it).
+
+**D0. Zero-write diagnostic — COMPLETE.** CPU floor = 2.82s (subset). SQL
+writes = 67% of wall. Btree-ops model validated. Branch kept as reference.
+
+**D1. Denormalize join tables via post-hoc UPDATE — REVERTED.** Both
+individual and batched UPDATE variants are +18% regressions. See key finding
+#9 above. Branch kept as reference.
+
+**D1b. Preset `turn_id` at message INSERT time (est. ~3-4s, −14-19%).**
+The correct denormalization path. Instead of inserting messages then updating
+`turn_id`, compute turn boundaries in memory before the first message INSERT,
+then pass `turn_id` into the INSERT directly. Requires reordering the
+normalize pipeline: group messages into turns in memory (already done via
+`build_turns` annotation), then INSERT messages with `turn_id` already
+populated. No UPDATE ever issued. The `action_id` case is harder because
+action classification runs after message persists (needs DB IDs for part
+mapping); `action_id` may need to remain a post-hoc UPDATE unless part ID
+assignment is also restructured. Risk: medium. Requires careful sequencing of
+turn grouping relative to DB ID assignment.
 
 **D3. Defer rollup computation (est. ~3.6s, −17%).** `finalize_chunk +
 rollups` = 3.6s (15% of wall). Rollups are pre-aggregated tables for fast
@@ -560,35 +593,24 @@ transaction and saw no improvement because the total SQL work was the same.
 D3 is different: it defers rollups entirely out of the import path, either
 to read time or to a background worker. Risk: medium. Requires the TUI to
 handle missing rollup data gracefully (either block on first access or show
-a loading state).
+a loading state). **Next to try.**
+
+**D2. Defer message_part persistence (est. ~2-3s, −10-14%).** Skip
+`message_part` INSERTs during import. Classification already receives parts
+in memory (iteration 5). Set `message_path_ref.message_part_id = NULL` (FK
+is nullable, `ON DELETE SET NULL`). The `load_skill_transcript_evidence`
+query (`query/mod.rs:1818`) loses data — either accept this (minor feature)
+or defer part INSERTs to a background pass after TUI opens.
+
+Btree ops eliminated: 824K (16%). Risk: low if skill transcript evidence is
+acceptable to lose; medium if background deferral is needed.
 
 **D4. simd-json (est. ~1s, −5%).** Replace `serde_json` with `simd-json` or
 `sonic-rs` for JSONL parsing. The parse phase is ~2.9s (12% of wall) with
 rayon parallelism. SIMD-accelerated parsing could halve this. Risk: low-medium.
-Only worthwhile after D1-D3 land and parse becomes a larger fraction of the
-remaining wall time.
+Only worthwhile after D1b/D2/D3 land and parse becomes a larger fraction of
+the remaining wall time.
 
 **D5. scan_source caching (startup only, est. ~0.5s).** Cache the directory
 walk results from `scan_source` for warm-startup reimports. Does not affect
 cold full import. Risk: low.
-
-### Implementation notes for D1
-
-The schema change is a new migration. Key steps:
-
-1. Add `turn_id` and `action_id` nullable columns to `message`.
-2. Add `idx_message_action_id(action_id)` index.
-3. Drop `turn_message` and `action_message` tables.
-4. Update normalize pipeline: `build_turns` already annotates
-   `NormalizedMessage.turn_id` in memory. Pass this value through to
-   the message INSERT.
-5. Update `build_actions_in_tx_with_messages`: after inserting each action,
-   UPDATE the constituent messages with the action_id. Replace the
-   `action_message` INSERT loop.
-6. Update classify/mod.rs `load_messages`: remove the `LEFT JOIN
-   turn_message` (use `message.turn_id` directly).
-7. Update all TUI queries in `query/mod.rs` that join through
-   `action_message`: replace with `JOIN message m ON m.action_id = a.id`.
-8. Update `import_corpus_integration.rs` expected counts (turn_message and
-   action_message tables removed).
-9. Run quality gates + regression suite.
