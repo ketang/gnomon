@@ -68,9 +68,10 @@ Enters only after the Phase 1 gate opens. One iteration:
 3. Implement the candidate.
 4. Run the harness: subset first (fast feedback), then full (truth). Capture deltas vs. the current best.
 5. Verify parity: row counts per table match the baseline database; spot-check representative queries for identical results.
-6. Write a log entry covering hypothesis, measurements, kept/reverted decision, rationale, and implied next candidate.
-7. **If kept:** summarize for the user, request commit approval, commit on approval, merge the candidate branch into the long-lived `import-perf` branch, re-profile, re-rank candidates.
-8. **If reverted:** log the result, leave the worktree alone, pick the next candidate.
+6. Run the corpus-backed ingestion regression suite: `cargo test --package gnomon-core --test import_corpus_integration -- --ignored`. All 7 tests must pass. This catches semantic regressions (wrong row counts, broken reimport idempotency, startup-import ordering violations) that the performance harness and row-parity spot-checks do not cover.
+7. Write a log entry covering hypothesis, measurements, kept/reverted decision, rationale, and implied next candidate.
+8. **If kept:** summarize for the user, request commit approval, commit on approval, merge the candidate branch into the long-lived `import-perf` branch, re-profile, re-rank candidates.
+9. **If reverted:** log the result, leave the worktree alone, pick the next candidate.
 
 ### Soft checkpoints
 
@@ -240,7 +241,7 @@ Next implied: <next candidate and why>
 - Log-only updates (committed directly).
 - Profile artifacts and flamegraphs (committed as part of their log entry).
 
-**Quality gates before every commit prompt.** `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo build --workspace` all pass. If any fail, the assistant fixes first, surfaces the fix, and only then re-prompts. Hooks are never skipped.
+**Quality gates before every commit prompt.** `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo build --workspace`, and `cargo test --package gnomon-core --test import_corpus_integration -- --ignored` all pass. If any fail, the assistant fixes first, surfaces the fix, and only then re-prompts. Hooks are never skipped.
 
 **Merge to main.** Never automatic. At stopping time, or on explicit request, the assistant summarizes the cumulative delta and proposes the merge. The user approves or defers.
 
