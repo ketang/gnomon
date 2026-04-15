@@ -1,16 +1,16 @@
-# Next Session: Import Perf — Iteration 8+
+# Next Session: Import Perf — Iteration 9+
 
-**Date:** 2026-04-14
+**Date:** 2026-04-15
 **For:** Fresh Claude session continuing the import performance optimization.
 
 ## What to do
 
-Resume the import performance optimization project. Seven iterations complete
-(6 KEPT, 1 REVERTED). Current best is ~27s, target is 10s.
+Resume the import performance optimization project. Eight iterations complete
+(6 KEPT, 2 REVERTED). Current best is ~24s, target is 10s.
 
-The next candidate is **parallel classify** (candidate #1b) — extending the
-existing rayon parallelism to cover the classification phase (`build_actions`),
-which is ~5.6s and mostly CPU-bound.
+**Iteration 8 (parallel classify) was REVERTED** — the classify_message() CPU
+cost is only ~300ms total (~6% of build_actions). The build_actions phase is
+~95% DB persist. No wall improvement from parallelizing classification.
 
 ## How to start
 
@@ -24,103 +24,87 @@ which is ~5.6s and mostly CPU-bound.
    - **Section 4** — Candidate ranking
    - **Section 7** — Running log protocol (how to write log entries)
    - **Section 8** — Commit & merge workflow
-   - **Section 12** — Pipeline data flow, phase distribution, and the
-     **"deeper parallelism" architecture** that parallelizes classification.
 
 3. Create a feature branch + worktree per repo policy:
    ```bash
    cd /home/ketan/project/gnomon
-   git branch import-perf-classify main
-   git worktree add .worktrees/import-perf-classify import-perf-classify
+   git branch import-perf-<slug> main
+   git worktree add .worktrees/import-perf-<slug> import-perf-<slug>
    ```
 
 4. Corpus tarballs are gitignored. Symlink from an existing worktree:
    ```bash
-   cd .worktrees/import-perf-classify/tests/fixtures/import-corpus
-   ln -s /home/ketan/project/gnomon/.worktrees/import-perf/tests/fixtures/import-corpus/full.tar.zst .
-   ln -s /home/ketan/project/gnomon/.worktrees/import-perf/tests/fixtures/import-corpus/subset.tar.zst .
+   cd .worktrees/import-perf-<slug>/tests/fixtures/import-corpus
+   ln -s /home/ketan/project/gnomon/tests/fixtures/import-corpus/full.tar.zst .
+   ln -s /home/ketan/project/gnomon/tests/fixtures/import-corpus/subset.tar.zst .
    ```
 
 ## Current state
 
-- **Branch:** `main` at `c524747`
-- **Current best:** ~27.2s cold full import (from 126.1s baseline, −78%)
+- **Branch:** `main` at latest (post iteration 8 log commit)
+- **Current best:** ~24.4s cold full import (from 126.1s baseline, −81%)
 - **Target:** 10s
-- **7 iterations complete:** 6 KEPT, 1 REVERTED
+- **8 iterations complete:** 6 KEPT, 2 REVERTED
 
-### What just landed (iterations 6 + 7)
+### What just happened (iteration 8)
 
-**Iteration 6 — Parallel JSONL parsing (rayon):**
-Split `normalize_jsonl_file_in_tx` into `parse_jsonl_file` (pure CPU, rayon
-`par_iter`) + `write_parsed_file_in_tx` (serial DB writes). New types
-`ParsedFile`, `ParsedRecord`, `ParseResult` carry pre-parsed data. ~29s (−10%).
-
-**Iteration 7 — Skip record table inserts:**
-Removed all `INSERT INTO record` (490K rows). The `record` table was never
-read outside the import pipeline. `IMPORT_SCHEMA_VERSION` bumped to 5.
-~27s (−7%), DB size −13%.
+**Iteration 8 — Parallel classify (REVERTED):**
+Pre-classified messages during rayon Phase 1 (parse). Properly handled message
+upserts via external_id-keyed HashMap, part dedup, and ID resolution. Correctness
+verified (all row counts identical). But classify_message() CPU is only ~300ms
+total across 4547 conversations — the build_actions phase is 95% DB persist.
+No measurable wall improvement.
 
 ### Key files
 
 | File | Role |
 |------|------|
-| `crates/gnomon-core/src/import/mod.rs` | Shared types: `ParsedFile`, `ParsedRecord`, `ParseResult`, `NormalizedMessage` |
+| `crates/gnomon-core/src/import/mod.rs` | Shared types: `ParsedFile`, `ParsedRecord`, `NormalizedMessage` |
 | `crates/gnomon-core/src/import/normalize.rs` | `parse_jsonl_file` (parallel CPU) + `write_parsed_file_in_tx` (serial DB) |
 | `crates/gnomon-core/src/import/chunk.rs` | `import_chunk` — rayon `par_iter` parse, then serial write loop |
 | `crates/gnomon-core/src/classify/mod.rs` | `build_actions_in_tx_with_messages` — classification + persist |
 | `docs/specs/2026-04-10-import-perf-log.md` | Running log with RESUME HERE block |
-| `docs/specs/2026-04-10-import-perf-design.md` | Design doc with Section 12 architecture |
+| `docs/specs/2026-04-10-import-perf-design.md` | Design doc with architecture |
 
-### Phase distribution (~27s wall)
+### Phase distribution (~24.4s wall, from perf-log)
 
 | phase | time | parallelizable? |
 | --- | ---: | --- |
-| normalize sql_ms (messages + parts) | ~5s | No (single SQLite writer) |
-| build_actions (classify + persist) | ~5.6s | Classification: yes. Persist: no. |
-| parse_ms (rayon parallel) | ~0s | Already parallelized |
-| scan_source | ~2.7s | Partially |
-| finalize + rollups | ~3.2s | No |
-| build_turns | ~1.1s | Grouping: yes. Persist: no. |
-| other/overhead | ~9s | Unknown |
+| normalize_jsonl (messages + parts INSERTs) | ~9.0s | No (single SQLite writer) |
+| build_actions (~5.1s persist + ~0.3s classify) | ~5.5s | Persist: no. Classify: yes but negligible. |
+| scan_source | ~2.8s | Partially |
+| finalize + rollups | ~3.3s | No |
+| build_turns | ~1.1s | Partially |
+| other/overhead | ~3.3s | Unknown |
 
-## What to implement next
+## What to consider next
 
-### Candidate #1b — Parallel classify
+### 1. Fresh perf-log profile run
+The uninstrumented overhead is now ~3.3s (down from ~9s in earlier sessions).
+This difference is likely session-to-session variance. A fresh profile would
+clarify where time is actually spent and whether the candidate ranking is stale.
 
-The current pipeline parses files in parallel (rayon), then writes serially.
-Classification (`build_actions_in_tx_with_messages`) happens inside the serial
-write phase. The CPU-bound classification work (~3-4s of the 5.6s) could be
-moved to the parallel parse phase.
-
-**Challenge:** Classification currently works on `NormalizedMessage` which has
-DB-assigned IDs (`id`, `stream_id`). To classify in parallel (before DB
-writes), the classification logic needs to work on `ExtractedMessage` data
-without IDs. Only the persist step needs IDs.
-
-**Approach from design doc Section 12:**
-1. Extend the parallel parse phase to also classify: parse JSONL → extract
-   messages → group into turns → classify actions (all in-memory)
-2. Result: `ClassifiedFile` with messages, turns, actions, path_refs
-3. Serial write phase: bulk INSERT all pre-computed data, assigning IDs at
-   persist time
-
-### Alternative: Channel-based pipeline
-
+### 2. Channel-based pipeline (candidate #6)
 Replace the `par_iter().collect()` barrier with a producer-consumer channel
-(crossbeam) to overlap parsing file N+1 with writing file N. Simpler than
-parallel classify but lower expected gain.
+(crossbeam) to overlap parsing file N+1 with writing file N. Expected: modest
+gain if parse and write phases are similarly sized. Simpler than structural changes.
 
-### Alternative: Fresh perf-log run to update phase distribution
+### 3. Reduce action/path_ref persist cost (candidate #7)
+build_actions is ~5.5s, almost all DB persist. Options:
+- Batch INSERT for actions (multi-row VALUES)
+- Skip path_ref inserts for non-file-tool actions
+- Reduce number of action rows (coarser grouping)
 
-The phase distribution is stale (pre-parallel-parse, pre-skip-records). A
-perf-logged run would reveal the actual current bottleneck breakdown, which
-might change the priority of candidates.
+### 4. Structural changes (Tier C, requires approval)
+- In-memory staging DB → `VACUUM INTO` for zero mid-import I/O
+- DuckDB or columnar store for analytical queries
+- Skip/defer action+path_ref tables entirely
 
 ## Measurement protocol
 
 Per the design doc Section 7:
 - Write a log entry skeleton BEFORE implementation starts
-- Run subset first (fast feedback, ~12s), then full corpus (truth, ~27s)
+- Run subset first (fast feedback, ~9s), then full corpus (truth, ~24s)
 - Use interleaved multi-repeat runs for reliable comparison
 - Verify row parity (9 non-record tables must match baseline)
 - Quality gates: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
