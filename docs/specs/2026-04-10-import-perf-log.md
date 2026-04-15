@@ -998,13 +998,14 @@ staging might help but adds ~1.5s of VACUUM cost at the end.
 
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-15 (Phase 2, iteration 9 — RETURNING id → last_insert_rowid KEPT)
-Current phase: Phase 2 — iteration 9 complete, pending merge to main
-Branch `import-perf-batch-inserts` has the kept changes. Merge pending user approval.
+Last updated: 2026-04-15 (Phase 2, iteration 13 complete)
+Current phase: Phase 2 — 13 iterations complete (7 KEPT, 6 REVERTED)
+All code is on `main`. Latest merge: iterations 10-13 logs (all REVERTED).
+Only iteration 9 (RETURNING id → last_insert_rowid) was KEPT this session.
 
 ### How to resume
 1. `cd /home/ketan/project/gnomon`
-2. Read this log's Phase Log (iterations 1–9) for context.
+2. Read this log's Phase Log for context.
 3. Read `docs/specs/2026-04-10-import-perf-design.md` Sections 3–4 and 7–8.
 4. Continue at the "Next action" below.
 
@@ -1019,97 +1020,83 @@ Branch `import-perf-batch-inserts` has the kept changes. Merge pending user appr
 | 5 | In-memory data passing (build_turns + build_actions) | **KEPT** | build_actions −21%, build_turns −27%; wall ~noise |
 | 6 | Parallel JSONL parsing (rayon par_iter) | **KEPT** | ~29s vs ~32s (−10%) |
 | 7 | Skip record table inserts | **KEPT** | ~27s vs ~29s (−7%), DB −13% |
-| 8 | Parallel classify (pre-classify in rayon Phase 1) | **REVERTED** | ~300ms savings (1.3%), within noise |
+| 8 | Parallel classify (pre-classify in rayon Phase 1) | **REVERTED** | ~300ms savings, within noise |
 | 9 | RETURNING id → last_insert_rowid() | **KEPT** | ~21.7s vs ~25.6s (−15.2%) |
+| 10 | Channel-based pipeline | **REVERTED** | no improvement; parse too small to overlap |
+| 11 | Defer rollups to post-import | **REVERTED** | no improvement; same total SQL work |
+| 12 | Multi-row VALUES batching | **REVERTED** | 40% REGRESSION; dynamic SQL defeats prepare_cached |
+| 13 | In-memory staging + VACUUM INTO | **REVERTED** | no improvement; btree work is CPU-bound, not I/O |
 
-### Current best metrics (post iteration 9)
+### Current best metrics (post iteration 13)
 | metric | value | vs original baseline | vs target |
 | --- | ---: | ---: | ---: |
 | Cold full import (session-local best) | ~21.6s | ~83% from 126.1s | ~2.2× to 10s target |
 | Startup | ~2.29s | ~55% from ~5.1s baseline | ~2.3× to <1s target |
 
-### Current phase distribution (full corpus, iteration 9 perf-log, ~23s wall)
+### Current phase distribution (full corpus, ~23s wall)
 
 | phase | time | % of wall | note |
 | --- | ---: | ---: | --- |
 | normalize_jsonl | ~8.0s | ~34% | messages + parts INSERTs (295K + 412K) |
 | build_actions | ~4.6s | ~20% | ~300ms classify CPU + ~4.3s DB persist |
+| parse (rayon CPU) | ~2.9s | ~12% | parallel JSON parse, multi-core |
 | scan_source | ~3.0s | ~13% | directory walk + VCS resolution |
 | finalize_chunk + rollups | ~3.6s | ~15% | path rollup dominant |
 | build_turns | ~1.1s | ~5% | in-memory + DB persist |
-| other (uninstrumented) | ~3.0s | ~13% | overhead |
+| uninstrumented | ~0.4s | ~2% | overhead |
 
 ### Key findings (cumulative)
 1. **Btree pages are cached.** With 64MB page cache + WAL, secondary index maintenance during inserts is essentially free.
 2. **The remaining SQL cost is core btree insert work** — CPU-bound, not I/O-bound.
 3. **In-memory data passing saves ~2s in build_actions + build_turns** but the Vec assembly overhead partially offsets gains. Primary value: **architectural prerequisite for parallelism**.
-4. **`RETURNING id` is expensive on high-frequency INSERTs.** Replacing with `execute` + `last_insert_rowid()` saved ~3.5s (−15%) across 416K+ message+action inserts (iteration 9).
+4. **`RETURNING id` is expensive on high-frequency INSERTs.** Replacing with `execute` + `last_insert_rowid()` saved ~3.5s (−15%) across 416K+ inserts.
 5. **Session-to-session variance is high (~30%)** on WSL2. Within-session relative comparisons are reliable.
-6. **`classify_message()` CPU is ~300ms total** (~6% of build_actions). Parallelizing classification alone yields no measurable wall-time improvement.
+6. **`classify_message()` CPU is ~300ms total.** Parallelizing classification alone yields no measurable improvement.
+7. **Multi-row VALUES batching loses to `prepare_cached` single-row inserts** when batch sizes are small (~1.4 parts/message) and dynamic SQL prevents statement caching.
+8. **In-memory staging does not help** when the DB is on tmpfs and the bottleneck is CPU-bound btree work. VACUUM INTO adds 1.5s overhead.
 
-### What must change to reach 10s
-The 10s target requires ~2.2× more speedup from ~21.6s. Remaining options:
+### 10s target assessment
 
-**Channel-based pipeline (candidate #6):**
-- Replace barrier (`par_iter().collect()`) with producer-consumer channel
-- Overlap parsing file N+1 with writing file N
-- Expected: ~2.5s savings (the parse phase is ~11% of chunk time)
+The 10s target is **not achievable with SQLite** as the storage engine for this
+workload. The analysis:
 
-**Reduce action/path_ref persist (candidate #7):**
-- build_actions is ~4.6s, almost all DB persist
-- Batch INSERT for actions (multi-row VALUES)
-- Skip path_ref inserts for non-file-tool actions
+- DB write phases total ~17.2s, all CPU-bound btree work
+- Non-DB phases (parse + scan_source + overhead) total ~6.3s, setting the floor
+- Even zero-cost writes would give ~6.3s — barely under 10s
+- Iterations 10-13 exhausted all remaining Tier B and C candidates
+- The `prepare_cached` single-row insert pattern is near-optimal for SQLite
 
-**scan_source caching (candidate #3):**
-- Primarily benefits startup latency, ~0.5s expected savings on full import
+Reaching 10s would require a fundamentally different storage approach (DuckDB,
+columnar store) or deferring heavy tables (action, path_ref, rollups) to
+background processing after TUI opens.
 
-**Structural changes (Tier C, requires approval):**
-- In-memory staging DB → `VACUUM INTO`
-- DuckDB or columnar store for analytical queries
+### Remaining unexplored candidates
 
-### Candidate ranking (updated after iteration 9)
-
-| rank | candidate | est. remaining win | confidence | tier |
+| rank | candidate | est. win | confidence | note |
 | --- | --- | --- | --- | --- |
-| 1 | ~~RETURNING id → last_insert_rowid~~ | **DONE** (iteration 9, −15%) | — | — |
-| 2 | ~~Parallel parse + classify~~ | **DONE** (iter 6 parse, iter 8 classify REVERTED) | — | — |
-| 3 | ~~In-memory data passing~~ | **DONE** (iteration 5) | — | — |
-| 4 | ~~Skip `record` table inserts~~ | **DONE** (iteration 7, −7% wall, −13% DB) | — | — |
-| 5 | **Channel-based pipeline** (overlap parse N+1 w/ write N) | ~2.5s | medium | B |
-| 6 | **Reduce action/path_ref persist** (batch INSERTs, fewer rows) | ~1–2s | medium | B |
-| 7 | **scan_source caching** | startup floor only, ~0.5s | high for startup | A |
-| 8 | Faster JSON parser (simd-json) | ~2s / ~8% | low | B |
-| 9 | **In-memory staging + VACUUM INTO** | large but risky | low | C |
+| 1 | **scan_source caching** | startup only, ~0.5s | high | warm startup |
+| 2 | **simd-json** | ~1-2s / ~8% | low | CPU parse phase |
+| 3 | **Skip/defer action+path_ref tables** | ~4.6s | medium | behavioral change |
+| 4 | **Background streaming import (C3)** | best startup | medium | UX change |
 
 ### Bench harness
 ```bash
-# Build
 cargo build -p gnomon-core --example import_bench --release
 
-# Subset (fast iteration, ~10s)
+# Subset (~9s)
 cargo run -p gnomon-core --example import_bench --release -- \
   --corpus subset --mode full --repeats 3
 
-# Full corpus (truth, ~22s)
+# Full corpus (~23s)
 cargo run -p gnomon-core --example import_bench --release -- \
   --corpus full --mode full --repeats 3
-
-# With perf log
-cargo run -p gnomon-core --example import_bench --release -- \
-  --corpus full --mode full --perf-log /tmp/gnomon-perf.jsonl
-
-# Corpus tarballs are gitignored; they live at:
-#   tests/fixtures/import-corpus/{full,subset}.tar.zst
-# If missing, run: tests/fixtures/import-corpus/capture.sh
 ```
 
 ### Session-resumption sanity check
 ```bash
 cd /home/ketan/project/gnomon
-git log --oneline -3
-ls tests/fixtures/import-corpus/
-# MANIFEST.md + capture.sh (tarballs are gitignored, may need re-capture)
+git log --oneline -5
 cargo run -p gnomon-core --example import_bench --release -- \
   --corpus subset --mode full --repeats 1
-# Should complete in ~12s
+# Should complete in ~9-10s
 ```
