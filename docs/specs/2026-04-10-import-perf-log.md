@@ -998,15 +998,16 @@ staging might help but adds ~1.5s of VACUUM cost at the end.
 
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-15 (Phase 2, iteration 13 complete)
-Current phase: Phase 2 — 13 iterations complete (7 KEPT, 6 REVERTED)
-All code is on `main`. Latest merge: iterations 10-13 logs (all REVERTED).
-Only iteration 9 (RETURNING id → last_insert_rowid) was KEPT this session.
+Last updated: 2026-04-15 (Phase 2, btree-ops analysis complete, new candidates D0-D5)
+Current phase: Phase 2 — 13 iterations complete (7 KEPT, 6 REVERTED), new candidate ranking
+All code is on `main`. Btree-ops analysis identified 46% of btree work as
+structurally eliminable (join-table denormalization). 10s target reassessed
+as plausibly reachable.
 
 ### How to resume
 1. `cd /home/ketan/project/gnomon`
 2. Read this log's Phase Log for context.
-3. Read `docs/specs/2026-04-10-import-perf-design.md` Sections 3–4 and 7–8.
+3. Read `docs/specs/2026-04-10-import-perf-design.md` **Section 13** (btree-ops analysis + new candidates).
 4. Continue at the "Next action" below.
 
 ### Iteration summary
@@ -1055,29 +1056,32 @@ Only iteration 9 (RETURNING id → last_insert_rowid) was KEPT this session.
 7. **Multi-row VALUES batching loses to `prepare_cached` single-row inserts** when batch sizes are small (~1.4 parts/message) and dynamic SQL prevents statement caching.
 8. **In-memory staging does not help** when the DB is on tmpfs and the bottleneck is CPU-bound btree work. VACUUM INTO adds 1.5s overhead.
 
-### 10s target assessment
+### 10s target assessment (revised 2026-04-15)
 
-The 10s target is **not achievable with SQLite** as the storage engine for this
-workload. The analysis:
+Previous assessment concluded 10s was unreachable with SQLite. A btree-ops
+analysis (design doc Section 13) reveals that `turn_message` and
+`action_message` join tables account for 46% of all btree operations. These
+tables are structurally unnecessary — each message belongs to exactly one
+turn and one action, so `turn_id`/`action_id` columns on `message` suffice.
+Adding deferred `message_part` persistence (16% of btree ops) and rollup
+deferral (3.6s), the 10s target is now plausibly reachable.
 
-- DB write phases total ~17.2s, all CPU-bound btree work
-- Non-DB phases (parse + scan_source + overhead) total ~6.3s, setting the floor
-- Even zero-cost writes would give ~6.3s — barely under 10s
-- Iterations 10-13 exhausted all remaining Tier B and C candidates
-- The `prepare_cached` single-row insert pattern is near-optimal for SQLite
+### Next action
 
-Reaching 10s would require a fundamentally different storage approach (DuckDB,
-columnar store) or deferring heavy tables (action, path_ref, rollups) to
-background processing after TUI opens.
+Run candidate D0 (zero-write diagnostic) to validate the btree-ops model,
+then proceed to D1 (denormalize join tables). See design doc Section 13 for
+full candidate ranking and implementation notes.
 
 ### Remaining unexplored candidates
 
 | rank | candidate | est. win | confidence | note |
 | --- | --- | --- | --- | --- |
-| 1 | **scan_source caching** | startup only, ~0.5s | high | warm startup |
-| 2 | **simd-json** | ~1-2s / ~8% | low | CPU parse phase |
-| 3 | **Skip/defer action+path_ref tables** | ~4.6s | medium | behavioral change |
-| 4 | **Background streaming import (C3)** | best startup | medium | UX change |
+| 0 | **D0: zero-write diagnostic** | (measurement only) | — | establishes CPU floor |
+| 1 | **D1: denormalize join tables** | ~4-5s / −20-23% | high | schema change, 46% btree ops eliminated |
+| 2 | **D2: defer message_part** | ~2-3s / −10-14% | medium | 16% btree ops eliminated, minor feature loss |
+| 3 | **D3: defer rollup computation** | ~3.6s / −17% | medium | TUI must handle missing rollups |
+| 4 | **D4: simd-json** | ~1s / −5% | low | parse phase only |
+| 5 | **D5: scan_source caching** | ~0.5s startup only | high | warm startup only |
 
 ### Bench harness
 ```bash

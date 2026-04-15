@@ -1,7 +1,7 @@
 # Import Performance Optimization — Design
 
 **Date:** 2026-04-10
-**Status:** Phase 2 checkpoint — Tier A exhausted, Tier B next. Merged to main 2026-04-13.
+**Status:** Phase 2 checkpoint — btree-ops analysis complete, schema-level candidates next. Merged to main 2026-04-15.
 **Running log:** [`2026-04-10-import-perf-log.md`](./2026-04-10-import-perf-log.md)
 
 ## 1. Goals & Non-Goals
@@ -125,7 +125,6 @@ This is the **starting** ranking. It will be re-ranked after every profile and s
 - Switching away from SQLite entirely.
 - Async/tokio rewrite. SQLite is sync-native; async gains nothing for this workload.
 - Writing a custom JSONL parser.
-- Schema denormalization before evidence that joins are the problem.
 - Caching parsed JSON to disk.
 
 ## 5. Corpus Snapshot
@@ -442,3 +441,154 @@ can happen without DB IDs. Only the persist step needs IDs.
 4. **Conversation/stream creation** (INSERT into conversation, stream tables) must happen before message INSERTs due to FK constraints. This is per-file and can be batched.
 5. **`import_chunk` processes files serially within a chunk transaction.** The parallelism should be at the file level within a chunk, or across chunks.
 6. **Error handling:** a parse failure in one file should not abort other files. Use `Result` collection and handle failures per-file as today (savepoint rollback).
+
+## 13. Checkpoint: Btree-Ops Analysis (2026-04-15)
+
+13 iterations complete (7 KEPT, 6 REVERTED). Cold full import: ~21.6s (down
+from 126.1s baseline, −83%). Previous assessment concluded the 10s target was
+unreachable with SQLite. A fresh analysis of btree operation volume by table
+reveals a large, previously overlooked optimization surface.
+
+### The hidden bottleneck: join-table btree operations
+
+Row counts and btree operations per table (full corpus, scaled from subset
+bench at 130K messages / 179K parts / 4.9K turns / 50K actions):
+
+| table | rows | btrees/row | total btree ops | % of total |
+| --- | ---: | ---: | ---: | ---: |
+| message | 295K | 5 (PK + 2 UNIQUE + 2 idx) | 1,475K | 29% |
+| **turn_message** | **295K** | **4 (hidden rowid + PK + 2 UNIQUE)** | **1,180K** | **23%** |
+| **action_message** | **295K** | **4 (hidden rowid + PK + 2 UNIQUE)** | **1,180K** | **23%** |
+| message_part | 412K | 2 (PK + UNIQUE) | 824K | 16% |
+| action | 114K | 3 | 342K | 7% |
+| other | ~50K | varies | ~100K | 2% |
+| **total** | | | **~5,100K** | |
+
+`turn_message` and `action_message` together account for **46% of all btree
+operations** — more than message and message_part combined. Each join table
+has a hidden rowid btree, a composite primary key btree, and two UNIQUE
+index btrees. That is 4 btrees maintained per row, ~295K rows each.
+
+### Why the join tables are structurally unnecessary
+
+Every TUI query that touches `action_message` uses it purely as a bridge:
+`action → action_message → message` to reach `model_name` or
+`message_path_ref`. The `ordinal_in_action` column is never read at query
+time. `turn_message` is similar — read only during import classification
+(`classify/mod.rs:307`), never by TUI queries.
+
+Both relationships are 1:1 from the message side: each message belongs to
+exactly one turn and exactly one action. This is a textbook denormalization
+opportunity.
+
+`message_part` is read by exactly one TUI query: `load_skill_transcript_evidence`
+(`query/mod.rs:1818`). Classification already receives parts in memory
+(iteration 5). `message_path_ref.message_part_id` is a nullable FK
+(`ON DELETE SET NULL`).
+
+### Revised 10s target assessment
+
+The previous assessment assumed btree operations were irreducible. The
+join-table analysis shows 46% of btree ops are structurally eliminable, and
+a further 16% (message_part) can be deferred. Combined with rollup deferral
+(3.6s) and simd-json (~1s), the 10s target is now plausibly reachable:
+
+| change | est. savings | cumulative wall |
+| --- | ---: | ---: |
+| current baseline | — | ~21.6s |
+| D1: denormalize join tables | ~4-5s | ~17s |
+| D2: defer message_part persistence | ~2-3s | ~14.5s |
+| D3: defer rollup computation | ~3.6s | ~11s |
+| D4: simd-json | ~1s | ~10s |
+
+### New candidate ranking (Phase 2, iteration 14+)
+
+The prior Tier A–C ranking is superseded by this re-analysis. The candidates
+below are ordered by expected impact and should be evaluated in sequence.
+Re-rank after each measurement as before.
+
+**D0. Zero-write diagnostic (not a candidate — a measurement).** Comment out
+all INSERT/UPDATE calls in normalize + build_actions + build_turns. Measure
+pure CPU processing time. This establishes the floor — the minimum wall time
+even with zero-cost DB writes — and validates that btree ops are where the
+remaining time goes. If the floor is >15s, the projection above is wrong and
+the bottleneck is elsewhere. If the floor is 4-6s, the projection is
+conservative and there is more room than estimated. Run once, log the number,
+discard the branch.
+
+**D1. Denormalize join tables into message table (est. ~4-5s, −20-23%).**
+Add `turn_id INTEGER REFERENCES turn(id)` and `action_id INTEGER REFERENCES
+action(id)` columns to `message`. Add `idx_message_action_id` for query-time
+lookups. Drop `turn_message` and `action_message` tables entirely.
+
+Pipeline change: during normalize, compute turn boundaries in memory first
+(already partially done — `build_turns` annotates `NormalizedMessage.turn_id`
+in-place), then INSERT messages with `turn_id` already set. During
+`build_actions`, UPDATE `message SET action_id = ?` per action group (~114K
+grouped UPDATEs instead of ~295K individual join-table INSERTs × 4 btrees
+each). TUI queries simplify: `JOIN action_message am ON am.action_id = a.id
+JOIN message m ON m.id = am.message_id` becomes `JOIN message m ON
+m.action_id = a.id`.
+
+Btree ops eliminated: ~2,360K (46%). Btree ops added: ~114K UPDATEs × ~2
+ops = ~228K. Net reduction: ~2,132K ops (42% of all btree work). Risk: low.
+Schema migration required but DB is disposable (reimport on schema bump).
+Requires updating TUI queries, classify/mod.rs reads, and
+import_corpus_integration tests.
+
+**D2. Defer message_part persistence (est. ~2-3s, −10-14%).** Skip
+`message_part` INSERTs during import. Classification already receives parts
+in memory (iteration 5). Set `message_path_ref.message_part_id = NULL` (FK
+is nullable, `ON DELETE SET NULL`). The `load_skill_transcript_evidence`
+query (`query/mod.rs:1818`) loses data — either accept this (minor feature)
+or defer part INSERTs to a background pass after TUI opens.
+
+Btree ops eliminated: 824K (16%). Risk: low if skill transcript evidence is
+acceptable to lose; medium if background deferral is needed.
+
+**D3. Defer rollup computation (est. ~3.6s, −17%).** `finalize_chunk +
+rollups` = 3.6s (15% of wall). Rollups are pre-aggregated tables for fast
+TUI browsing (`chunk_action_rollup`, `chunk_path_rollup`). Two options:
+
+- **D3a.** Compute on first TUI access (lazy). First TUI load is slower but
+  import wall time drops immediately.
+- **D3b.** Compute in a background thread after TUI opens. Import finishes
+  sooner, TUI shows data progressively.
+
+Note: iteration 11 tried moving rollups out of the per-chunk finalize
+transaction and saw no improvement because the total SQL work was the same.
+D3 is different: it defers rollups entirely out of the import path, either
+to read time or to a background worker. Risk: medium. Requires the TUI to
+handle missing rollup data gracefully (either block on first access or show
+a loading state).
+
+**D4. simd-json (est. ~1s, −5%).** Replace `serde_json` with `simd-json` or
+`sonic-rs` for JSONL parsing. The parse phase is ~2.9s (12% of wall) with
+rayon parallelism. SIMD-accelerated parsing could halve this. Risk: low-medium.
+Only worthwhile after D1-D3 land and parse becomes a larger fraction of the
+remaining wall time.
+
+**D5. scan_source caching (startup only, est. ~0.5s).** Cache the directory
+walk results from `scan_source` for warm-startup reimports. Does not affect
+cold full import. Risk: low.
+
+### Implementation notes for D1
+
+The schema change is a new migration. Key steps:
+
+1. Add `turn_id` and `action_id` nullable columns to `message`.
+2. Add `idx_message_action_id(action_id)` index.
+3. Drop `turn_message` and `action_message` tables.
+4. Update normalize pipeline: `build_turns` already annotates
+   `NormalizedMessage.turn_id` in memory. Pass this value through to
+   the message INSERT.
+5. Update `build_actions_in_tx_with_messages`: after inserting each action,
+   UPDATE the constituent messages with the action_id. Replace the
+   `action_message` INSERT loop.
+6. Update classify/mod.rs `load_messages`: remove the `LEFT JOIN
+   turn_message` (use `message.turn_id` directly).
+7. Update all TUI queries in `query/mod.rs` that join through
+   `action_message`: replace with `JOIN message m ON m.action_id = a.id`.
+8. Update `import_corpus_integration.rs` expected counts (turn_message and
+   action_message tables removed).
+9. Run quality gates + regression suite.
