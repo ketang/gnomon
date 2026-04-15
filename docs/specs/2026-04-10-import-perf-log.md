@@ -870,6 +870,41 @@ exhausted as a strategy.
 
 ---
 
+## 2026-04-15 — candidate 11: Defer rollups to post-import pass
+
+**Branch:** `import-perf-defer-rollups`
+**Hypothesis:** `rebuild_chunk_path_rollups` (1.7s) and `rebuild_chunk_action_rollups`
+(0.2s) run 162 times inside `finalize_chunk_import_core`, totaling ~1.9s. These
+rollups aggregate per-chunk data and are only read by the TUI after import completes.
+Moving rollup computation out of the per-chunk finalize into a single post-import
+pass eliminates per-chunk rollup overhead. Expected savings: ~1.8s.
+
+**Implementation:** Added `defer_rollups` flag to `ImportWorkerOptions`. When true,
+`finalize_chunk_import_core` skips rollup rebuilds. A new `rebuild_all_chunk_rollups`
+function runs all rollups in a single transaction after the import loop. Full import
+path defers; startup path keeps per-chunk rollups for TUI readiness.
+
+**Measurements:**
+
+Same-session interleaved comparison (3 repeats each, full corpus):
+
+| run | baseline (main) | iter 11 |
+| --- | ---: | ---: |
+| 1 | 24.2s | 25.1s |
+| 2 | 23.1s | 27.7s* |
+| 3 | 24.8s | 23.2s |
+| **best** | **23.1s** | **23.2s** |
+
+*System load outlier (extract time 6.87s vs normal ~4.5s).
+
+Row parity: **PASS** — all 9 non-record tables match baseline exactly.
+
+**Decision:** REVERTED — no measurable improvement. Deferring rollups moves the
+work to a different transaction but doesn't reduce total SQL work. The rollup
+cost is the same whether per-chunk or batched.
+
+---
+
 ## RESUME HERE (if session was reset, read this first)
 
 Last updated: 2026-04-15 (Phase 2, iteration 9 — RETURNING id → last_insert_rowid KEPT)
