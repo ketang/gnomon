@@ -951,6 +951,51 @@ is reused hundreds of thousands of times.
 
 ---
 
+## 2026-04-15 — candidate 13: In-memory staging DB + VACUUM INTO
+
+**Branch:** `import-perf-inmemory-staging`
+**Hypothesis:** Importing into a `:memory:` SQLite database eliminates file I/O,
+WAL journal overhead, and page cache management during bulk inserts. After import,
+`VACUUM INTO` persists the database in one pass. Expected savings: the difference
+between in-memory btree work and on-disk btree work.
+
+**Implementation:** Added `Database::load_into_memory` (backup API to copy on-disk
+DB into `:memory:`), `Database::vacuum_into` (VACUUM INTO with file cleanup), and
+`import_all_in_memory` function. Bench harness gets `--in-memory` flag. Also added
+`backup` feature to rusqlite.
+
+File refs: `db/mod.rs:37-85`, `chunk.rs:372-469`, `import_bench.rs:148-158`
+
+**Measurements:**
+
+Perf-log comparison (single run each, full corpus):
+
+| phase | baseline | in-memory | delta |
+| --- | ---: | ---: | ---: |
+| chunk (total) | 20170ms | 19468ms | −702ms |
+| normalize_jsonl | 7932ms | 9456ms | +1524ms |
+| build_actions | 4578ms | 5461ms | +883ms |
+| vacuum_into | — | 1461ms | +1461ms |
+| load_into_memory | — | 2ms | +2ms |
+| **wall** | **23671ms** | **24851ms** | **+1180ms** |
+
+No improvement. normalize_jsonl and build_actions are SLOWER in-memory (likely
+due to memory allocation pressure from the growing in-memory DB pages). VACUUM
+INTO adds 1.5s of unavoidable serialization cost.
+
+Row parity: **PASS** — all 9 non-record tables match baseline exactly.
+DB size: 409 MB (smaller than baseline 426 MB due to VACUUM compaction).
+
+**Decision:** REVERTED — no measurable improvement; slight regression.
+
+**Key finding #8:** In-memory staging does not help when the DB is already on
+tmpfs (bench) or when the bottleneck is CPU-bound btree work rather than I/O.
+The VACUUM INTO serialization cost (1.5s for 409 MB) offsets any savings from
+eliminating WAL/page-cache overhead. For production (disk-backed DB), in-memory
+staging might help but adds ~1.5s of VACUUM cost at the end.
+
+---
+
 ## RESUME HERE (if session was reset, read this first)
 
 Last updated: 2026-04-15 (Phase 2, iteration 9 — RETURNING id → last_insert_rowid KEPT)
