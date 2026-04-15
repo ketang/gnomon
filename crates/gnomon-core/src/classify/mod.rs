@@ -1172,16 +1172,15 @@ fn ensure_path_node(
             depth
         )
         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-        RETURNING id
         ",
     )
     .and_then(|mut stmt| {
-        stmt.query_row(
-            params![project_id, parent_id, name, full_path, node_kind, depth],
-            |row| row.get(0),
-        )
+        stmt.execute(params![
+            project_id, parent_id, name, full_path, node_kind, depth
+        ])
     })
-    .context("unable to insert path node")
+    .context("unable to insert path node")?;
+    Ok(conn.last_insert_rowid())
 }
 
 #[derive(Debug)]
@@ -1284,7 +1283,7 @@ fn persist_action(
     sequence_no: i64,
     group: ActionGroupDraft,
 ) -> Result<()> {
-    let action_id: i64 = conn.prepare_cached(
+    conn.prepare_cached(
         "
         INSERT INTO action (
             turn_id,
@@ -1305,9 +1304,8 @@ fn persist_action(
             message_count
         )
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'deterministic_v1', ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-        RETURNING id
         ",
-    )?.query_row(
+    )?.execute(
         params![
             turn_id,
             import_chunk_id,
@@ -1325,8 +1323,8 @@ fn persist_action(
             group.usage.output_tokens,
             group.message_ids.len() as i64,
         ],
-        |row| row.get(0),
     )?;
+    let action_id = conn.last_insert_rowid();
 
     for (ordinal, message_id) in group.message_ids.iter().enumerate() {
         conn.prepare_cached(
