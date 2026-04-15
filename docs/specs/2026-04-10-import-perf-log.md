@@ -823,6 +823,53 @@ and action_message as a follow-up iteration. The remaining normalize_jsonl cost
 
 ---
 
+## 2026-04-15 — candidate 10: Channel-based pipeline (overlap parse with write)
+
+**Branch:** `import-perf-channel-pipeline`
+**Hypothesis:** Currently each chunk does par_iter().collect() (barrier) then
+serial writes. Parse takes ~2.5s total (11% of chunk time) and is completely
+serialized before writing begins. By replacing the barrier with a channel-based
+producer-consumer pipeline, we can overlap parsing file N+1 with writing file N.
+The main thread writes results in order as they arrive from rayon workers.
+Expected savings: up to ~2.5s (~11% of wall time).
+
+**Implementation:** Replaced `par_iter().collect()` barrier with `mpsc::sync_channel`
+producer-consumer. Rayon workers parse files and send `(index, ParseResult)` to
+channel. Main thread receives and writes in order, buffering out-of-order results.
+File ref: `chunk.rs:958-1001`.
+
+**Measurements:**
+
+Same-session interleaved comparison (5 repeats each, full corpus):
+
+| run | baseline (main) | iter 10 |
+| --- | ---: | ---: |
+| 1 | 23.4s | 34.0s* |
+| 2 | 23.5s | 30.2s* |
+| 3 | 22.8s | 25.5s |
+| 4 | 23.4s | 23.0s |
+| 5 | 22.8s | 22.9s |
+| **best** | **22.8s** | **22.9s** |
+| **median** | **23.4s** | **25.5s** |
+
+*Runs 1-2 of channel pipeline were impacted by system load (baseline ran after
+load subsided and was stable).
+
+Best-of-5 numbers are identical: 22.8s vs 22.9s. No measurable improvement.
+
+Row parity: **PASS** — all 9 non-record tables match baseline exactly.
+
+**Decision:** REVERTED — no measurable improvement. The parse phase is only ~2.5s
+across 162 chunks (average ~15ms per chunk). Within each chunk, rayon finishes
+parsing before the writer has meaningful work to overlap with. The per-chunk
+parse time is too small relative to per-chunk write time for pipelining to help.
+
+**Next implied:** The remaining optimization opportunities are all in reducing
+the serial DB write cost or structural changes. Channel-based pipeline is
+exhausted as a strategy.
+
+---
+
 ## RESUME HERE (if session was reset, read this first)
 
 Last updated: 2026-04-15 (Phase 2, iteration 9 — RETURNING id → last_insert_rowid KEPT)
