@@ -2693,8 +2693,8 @@ impl<'conn> QueryEngine<'conn> {
             JOIN action a
             JOIN import_chunk ic ON ic.id = a.import_chunk_id
             JOIN project p ON p.id = ic.project_id
-            JOIN action_message am ON am.action_id = a.id
-            JOIN message_path_ref mpr ON mpr.message_id = am.message_id
+            JOIN message m ON m.action_id = a.id
+            JOIN message_path_ref mpr ON mpr.message_id = m.id
             JOIN path_node pn ON pn.id = mpr.path_node_id
             LEFT JOIN action_skill_attribution asa ON asa.action_id = a.id
             WHERE ic.state = 'complete'
@@ -4767,8 +4767,7 @@ fn build_scoped_action_facts_query(request: &BrowseRequest) -> Result<(String, V
         FROM action a
         JOIN import_chunk ic ON ic.id = a.import_chunk_id
         JOIN project p ON p.id = ic.project_id
-        LEFT JOIN action_message am ON am.action_id = a.id
-        LEFT JOIN message m ON m.id = am.message_id
+        LEFT JOIN message m ON m.action_id = a.id
         LEFT JOIN action_skill_attribution asa ON asa.action_id = a.id
         WHERE ic.state = 'complete'
           AND ic.publish_seq IS NOT NULL
@@ -4823,9 +4822,8 @@ fn build_scoped_action_facts_query(request: &BrowseRequest) -> Result<(String, V
             "
             AND EXISTS (
                 SELECT 1
-                FROM action_message am_filter
-                JOIN message m_filter ON m_filter.id = am_filter.message_id
-                WHERE am_filter.action_id = a.id
+                FROM message m_filter
+                WHERE m_filter.action_id = a.id
                   AND m_filter.model_name = ?
             )
             ",
@@ -4947,8 +4945,7 @@ fn build_scoped_path_facts_query(request: &BrowseRequest) -> Result<(String, Vec
         FROM action a
         JOIN import_chunk ic ON ic.id = a.import_chunk_id
         JOIN project p ON p.id = ic.project_id
-        JOIN action_message am ON am.action_id = a.id
-        JOIN message m ON m.id = am.message_id
+        JOIN message m ON m.action_id = a.id
         JOIN message_path_ref mpr ON mpr.message_id = m.id
         JOIN path_node pn ON pn.id = mpr.path_node_id
         LEFT JOIN action_skill_attribution asa ON asa.action_id = a.id
@@ -5195,8 +5192,7 @@ fn build_batched_path_facts_query(requests: &[BrowseRequest]) -> Result<(String,
         JOIN action a
         JOIN import_chunk ic ON ic.id = a.import_chunk_id
         JOIN project p ON p.id = ic.project_id
-        JOIN action_message am ON am.action_id = a.id
-        JOIN message m ON m.id = am.message_id
+        JOIN message m ON m.action_id = a.id
         JOIN message_path_ref mpr ON mpr.message_id = m.id
         JOIN path_node pn ON pn.id = mpr.path_node_id
         LEFT JOIN action_skill_attribution asa ON asa.action_id = a.id
@@ -7968,10 +7964,7 @@ mod tests {
         )?;
 
         conn.execute(
-            "
-            INSERT INTO turn_message (turn_id, message_id, ordinal_in_turn)
-            VALUES (?1, ?2, 0)
-            ",
+            "UPDATE message SET turn_id = ?1 WHERE id = ?2",
             params![turn_id, message_id],
         )?;
 
@@ -8015,10 +8008,7 @@ mod tests {
         )?;
 
         conn.execute(
-            "
-            INSERT INTO action_message (action_id, message_id, ordinal_in_action)
-            VALUES (?1, ?2, 0)
-            ",
+            "UPDATE message SET action_id = ?1 WHERE id = ?2",
             params![action_id, message_id],
         )?;
 

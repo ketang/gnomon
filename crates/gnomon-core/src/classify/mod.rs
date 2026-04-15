@@ -286,9 +286,9 @@ fn load_messages(conn: &Connection, conversation_id: i64) -> Result<Vec<LoadedMe
         "
         SELECT
             m.id,
-            tm.turn_id,
+            m.turn_id,
             t.sequence_no,
-            tm.ordinal_in_turn,
+            m.sequence_no,
             m.message_kind,
             m.created_at_utc,
             m.completed_at_utc,
@@ -304,8 +304,7 @@ fn load_messages(conn: &Connection, conversation_id: i64) -> Result<Vec<LoadedMe
             m.stream_id,
             m.sequence_no
         FROM message m
-        LEFT JOIN turn_message tm ON tm.message_id = m.id
-        LEFT JOIN turn t ON t.id = tm.turn_id
+        LEFT JOIN turn t ON t.id = m.turn_id
         LEFT JOIN message_part mp ON mp.message_id = m.id
         WHERE m.conversation_id = ?1
         ORDER BY m.sequence_no, mp.ordinal
@@ -1326,14 +1325,9 @@ fn persist_action(
     )?;
     let action_id = conn.last_insert_rowid();
 
-    for (ordinal, message_id) in group.message_ids.iter().enumerate() {
-        conn.prepare_cached(
-            "
-            INSERT INTO action_message (action_id, message_id, ordinal_in_action)
-            VALUES (?1, ?2, ?3)
-            ",
-        )?
-        .execute(params![action_id, message_id, ordinal as i64])?;
+    for message_id in &group.message_ids {
+        conn.prepare_cached("UPDATE message SET action_id = ?1 WHERE id = ?2")?
+            .execute(params![action_id, message_id])?;
     }
 
     if let Some(attribution) = group.skill_attribution() {

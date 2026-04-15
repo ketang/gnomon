@@ -84,8 +84,7 @@ const LOAD_CHUNK_PATH_FACTS_SQL: &str = "
     FROM action
     JOIN import_chunk ON import_chunk.id = action.import_chunk_id
     JOIN project ON project.id = import_chunk.project_id
-    JOIN action_message ON action_message.action_id = action.id
-    JOIN message ON message.id = action_message.message_id
+    JOIN message ON message.action_id = action.id
     JOIN message_path_ref ON message_path_ref.message_id = message.id
     JOIN path_node ON path_node.id = message_path_ref.path_node_id
     WHERE action.import_chunk_id = ?1

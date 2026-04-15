@@ -14,5 +14,8 @@ pub fn all() -> Migrations<'static> {
         M::up(include_str!(
             "migrations/0010_import_chunk_status_probe.sql"
         )),
+        M::up(include_str!(
+            "migrations/0011_denormalize_message_joins.sql"
+        )),
     ])
 }

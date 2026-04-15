@@ -1713,14 +1713,9 @@ fn persist_turn(
     ])?;
     let turn_id = conn.last_insert_rowid();
 
-    for (ordinal_in_turn, message_id) in turn.message_ids.iter().enumerate() {
-        conn.prepare_cached(
-            "
-            INSERT INTO turn_message (turn_id, message_id, ordinal_in_turn)
-            VALUES (?1, ?2, ?3)
-            ",
-        )?
-        .execute(params![turn_id, message_id, ordinal_in_turn as i64])?;
+    for message_id in &turn.message_ids {
+        conn.prepare_cached("UPDATE message SET turn_id = ?1 WHERE id = ?2")?
+            .execute(params![turn_id, message_id])?;
     }
 
     Ok((turn_id, next_turn_sequence_no))
