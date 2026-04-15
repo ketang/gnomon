@@ -1024,13 +1024,53 @@ Next implied: D1 (denormalize join tables). With 5.7s of SQL overhead and 46%
 
 ---
 
+## 2026-04-15 — D1: denormalize join tables (turn_message → message.turn_id, action_message → message.action_id)
+
+Branch: `import-perf-d1-denormalize-joins` (kept as reference, not merged)
+Hypothesis: Replacing 295K INSERT INTO turn_message + action_message with
+UPDATE message SET turn_id/action_id eliminates 46% of btree ops (2.36M),
+yielding ~4-5s savings on full corpus. Two variants tested: (a) one UPDATE per
+message, (b) one batch UPDATE per turn/action group (WHERE id IN ...).
+Implementation: New migration 0011_denormalize_message_joins.sql adds turn_id
+and action_id nullable columns to message, creates idx_message_turn_id and
+idx_message_action_id, drops turn_message and action_message tables.
+normalize.rs:persist_turn changed to UPDATE message SET turn_id. classify/
+mod.rs:persist_action changed to UPDATE message SET action_id. load_messages
+updated to read m.turn_id directly. Five JOIN rewrites in query/mod.rs.
+Measurements:
+  Subset baseline (D0 run):          8.51s avg
+  Subset D1 individual UPDATEs:      10.08s, 9.69s, 10.54s → avg 10.1s (+19%)
+  Subset D1 batched UPDATEs:         10.04s, 9.90s, 10.02s → avg 10.0s (+18%)
+  Row parity:                        PASS (7/7 integration tests)
+  DB size:                           152.57 MB (vs 160.70 MB baseline, −5%)
+Decision: REVERTED — both variants are regressions of ~1.5s (+18%)
+
+Key finding #9: The btree-ops COUNT model is correct (join tables do account
+for 46% of btree operations) but the cost model was wrong. Replacing join table
+INSERTs with UPDATEs on the message table is MORE expensive, not less, because:
+  (a) UPDATE requires search+modify (random write) vs INSERT's append-friendly
+      sequential write into compact new btrees.
+  (b) The message table is large and hot during import; its btrees require
+      deeper traversals than the smaller join table btrees.
+  (c) Batching (WHERE id IN ...) reduces SQL execution overhead but not btree
+      work, confirming the bottleneck is the per-row btree operation cost.
+The correct approach to eliminate join table overhead is to preset turn_id at
+message INSERT time (D1b), not to update it afterwards.
+Commit: bec34a7 (on branch import-perf-d1-denormalize-joins, not merged)
+Next implied: D3 (defer rollup entirely), D2 (skip message_part INSERTs —
+  pure INSERT elimination, avoids UPDATE pitfall), or D1b (preset turn_id
+  before initial message INSERT).
+
+---
+
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-15 (D0 complete — CPU floor measured; D1 next)
-Current phase: Phase 2 — D0 diagnostic complete, beginning D1 implementation
-All code is on `main`. D0 confirmed: SQL writes account for 67% of import wall
-time (subset). CPU floor = 2.82s. 10s target remains plausibly reachable.
-D1 branch `import-perf-d1-denormalize-joins` is being set up.
+Last updated: 2026-04-15 (D1 reverted; key finding: UPDATE > INSERT cost)
+Current phase: Phase 2 — D0 done, D1 reverted; candidates re-ranked
+All code is on `main`. D0: CPU floor = 2.82s (subset), SQL = 67% of wall.
+D1 failed: denormalize-via-UPDATE is a regression (+18%). Key finding #9
+added: UPDATE on existing table more expensive than INSERT into compact join
+tables. D3 (defer rollup entirely) is next candidate.
 
 ### How to resume
 1. `cd /home/ketan/project/gnomon`
@@ -1055,6 +1095,8 @@ D1 branch `import-perf-d1-denormalize-joins` is being set up.
 | 11 | Defer rollups to post-import | **REVERTED** | no improvement; same total SQL work |
 | 12 | Multi-row VALUES batching | **REVERTED** | 40% REGRESSION; dynamic SQL defeats prepare_cached |
 | 13 | In-memory staging + VACUUM INTO | **REVERTED** | no improvement; btree work is CPU-bound, not I/O |
+| D0 | Zero-write diagnostic | **N/A** | CPU floor = 2.82s (subset); SQL = 67% of wall |
+| D1 | Denormalize join tables via UPDATE | **REVERTED** | +18% REGRESSION; UPDATE > INSERT on existing table |
 
 ### Current best metrics (post iteration 13)
 | metric | value | vs original baseline | vs target |
@@ -1083,6 +1125,7 @@ D1 branch `import-perf-d1-denormalize-joins` is being set up.
 6. **`classify_message()` CPU is ~300ms total.** Parallelizing classification alone yields no measurable improvement.
 7. **Multi-row VALUES batching loses to `prepare_cached` single-row inserts** when batch sizes are small (~1.4 parts/message) and dynamic SQL prevents statement caching.
 8. **In-memory staging does not help** when the DB is on tmpfs and the bottleneck is CPU-bound btree work. VACUUM INTO adds 1.5s overhead.
+9. **UPDATE on existing table is MORE expensive than INSERT into dedicated join tables.** Even with batch WHERE id IN (...), replacing join table INSERTs with UPDATEs on the message table regresses by +18%. Search+modify (random write) is costlier than append-friendly INSERT into compact btrees. The correct join-table elimination path is to preset FKs at initial INSERT time (D1b), not to update afterwards.
 
 ### 10s target assessment (revised 2026-04-15, confirmed 2026-04-15 post-D0)
 
@@ -1100,17 +1143,17 @@ target, confirming the btree-ops model is not pessimistic.
 
 ### Next action
 
-Implement D1 (denormalize join tables). Branch `import-perf-d1-denormalize-joins`.
-See design doc Section 13 for implementation notes.
+D1 REVERTED (see log entry 2026-04-15 D1). UPDATE-on-existing-table is more
+expensive than INSERT into dedicated join tables. Re-ranked candidates below.
+Try D3 next (defer rollup entirely out of import path).
 
-### Remaining unexplored candidates
+### Remaining unexplored candidates (re-ranked post D1)
 
 | rank | candidate | est. win | confidence | note |
 | --- | --- | --- | --- | --- |
-| 0 | **D0: zero-write diagnostic** | (measurement only) | — | establishes CPU floor |
-| 1 | **D1: denormalize join tables** | ~4-5s / −20-23% | high | schema change, 46% btree ops eliminated |
-| 2 | **D2: defer message_part** | ~2-3s / −10-14% | medium | 16% btree ops eliminated, minor feature loss |
-| 3 | **D3: defer rollup computation** | ~3.6s / −17% | medium | TUI must handle missing rollups |
+| 1 | **D3: defer rollup computation** | ~3.6s / −17% full | medium | rollup 15% of wall; D3b (background) preferred |
+| 2 | **D2: defer message_part** | ~1-2s / −10-14% | medium | pure INSERT elimination, avoids UPDATE pitfall |
+| 3 | **D1b: tagged INSERT (preset turn_id)** | est. ~2-3s | medium | compute turns before INSERT; avoids UPDATE |
 | 4 | **D4: simd-json** | ~1s / −5% | low | parse phase only |
 | 5 | **D5: scan_source caching** | ~0.5s startup only | high | warm startup only |
 
