@@ -996,13 +996,41 @@ staging might help but adds ~1.5s of VACUUM cost at the end.
 
 ---
 
+## 2026-04-15 — D0: zero-write diagnostic (CPU floor measurement)
+
+Branch: `import-perf-d0-zero-write` (kept as reference, not merged)
+Hypothesis: The time remaining after zeroing all SQL writes is the minimum
+achievable wall time with SQLite. If the floor is 4-6s (for the full corpus),
+the btree-ops model (projecting 10s via D1-D4) is conservative and the 10s
+target is plausible. If the floor is >15s, the bottleneck is elsewhere.
+Implementation: Added `GNOMON_ZERO_WRITE=1` env-var gate (OnceLock-cached)
+to all INSERT/UPDATE/DELETE calls in `normalize.rs`, `chunk.rs`, and
+`classify/mod.rs`. Parse phase, JSONL extraction, in-memory turn grouping,
+and classification logic still execute.
+Measurements:
+  Subset baseline (confirmation):  8.54s, 8.38s, 8.60s → avg 8.51s
+  Subset zero-write (CPU floor):   2.91s, 2.76s, 2.78s → avg 2.82s
+  SQL write overhead (subset):     ~5.7s (67% of wall)
+  CPU floor (subset):              ~2.82s (33% of wall)
+  Row parity:                      N/A (diagnostic — zero-write produces empty DB)
+  Profile shift: All SQL write phases collapse to near-zero. Remaining ~2.8s
+    is scan_source + rayon JSONL parse + in-memory turn/action grouping.
+Decision: N/A (diagnostic only — establishes CPU floor)
+Commit: c8546fb (on branch import-perf-d0-zero-write)
+Next implied: D1 (denormalize join tables). With 5.7s of SQL overhead and 46%
+  of btree ops from join tables, D1 should save ~2.6s on subset (46% × 5.7s).
+  The CPU floor of 2.82s is well below the 10s target, confirming there is
+  room to land at 10s if D1+D2+D3 each deliver their projected savings.
+
+---
+
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-15 (Phase 2, btree-ops analysis complete, new candidates D0-D5)
-Current phase: Phase 2 — 13 iterations complete (7 KEPT, 6 REVERTED), new candidate ranking
-All code is on `main`. Btree-ops analysis identified 46% of btree work as
-structurally eliminable (join-table denormalization). 10s target reassessed
-as plausibly reachable.
+Last updated: 2026-04-15 (D0 complete — CPU floor measured; D1 next)
+Current phase: Phase 2 — D0 diagnostic complete, beginning D1 implementation
+All code is on `main`. D0 confirmed: SQL writes account for 67% of import wall
+time (subset). CPU floor = 2.82s. 10s target remains plausibly reachable.
+D1 branch `import-perf-d1-denormalize-joins` is being set up.
 
 ### How to resume
 1. `cd /home/ketan/project/gnomon`
@@ -1056,7 +1084,7 @@ as plausibly reachable.
 7. **Multi-row VALUES batching loses to `prepare_cached` single-row inserts** when batch sizes are small (~1.4 parts/message) and dynamic SQL prevents statement caching.
 8. **In-memory staging does not help** when the DB is on tmpfs and the bottleneck is CPU-bound btree work. VACUUM INTO adds 1.5s overhead.
 
-### 10s target assessment (revised 2026-04-15)
+### 10s target assessment (revised 2026-04-15, confirmed 2026-04-15 post-D0)
 
 Previous assessment concluded 10s was unreachable with SQLite. A btree-ops
 analysis (design doc Section 13) reveals that `turn_message` and
@@ -1066,11 +1094,14 @@ turn and one action, so `turn_id`/`action_id` columns on `message` suffice.
 Adding deferred `message_part` persistence (16% of btree ops) and rollup
 deferral (3.6s), the 10s target is now plausibly reachable.
 
+**D0 confirmation (2026-04-15):** CPU floor for subset corpus = 2.82s. SQL
+writes account for 67% of import wall time. The floor is well below the 10s
+target, confirming the btree-ops model is not pessimistic.
+
 ### Next action
 
-Run candidate D0 (zero-write diagnostic) to validate the btree-ops model,
-then proceed to D1 (denormalize join tables). See design doc Section 13 for
-full candidate ranking and implementation notes.
+Implement D1 (denormalize join tables). Branch `import-perf-d1-denormalize-joins`.
+See design doc Section 13 for implementation notes.
 
 ### Remaining unexplored candidates
 
