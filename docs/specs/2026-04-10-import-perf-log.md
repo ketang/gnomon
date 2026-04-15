@@ -702,11 +702,69 @@ Quality gates: `cargo fmt`, `clippy -D warnings`, `cargo test` — all pass (364
 
 ---
 
+## 2026-04-14 — candidate #1b: Parallel classify
+
+**Branch:** `import-perf-classify`
+**Hypothesis:** Moving `classify_message()` from the serial Phase 2 to the parallel
+Phase 1 (rayon) should reduce wall time by ~10–15% by parallelizing the CPU-bound
+classification work (~3–4s estimated) across cores.
+
+**Implementation:** Pre-classify during Phase 1 (parallel parse). Added
+`pre_classify_parsed_file` in chunk.rs that groups records by `external_id`, merges
+parts with dedup, builds `ClassifyInput` wrappers, and calls a new `pre_classify_message`
+function. Results are keyed by `external_id` in a HashMap on `ParsedFile`. In Phase 2,
+after `write_parsed_file_in_tx` assigns DB IDs, `resolve_pre_classifications` correlates
+via `NormalizedMessage.external_id` and maps part indices to real part IDs.
+`build_actions_in_tx_with_preclassified` skips `classify_message()` and uses pre-computed
+results instead. Files: classify/mod.rs (new types + pre_classify_message +
+build_actions_in_tx_with_preclassified), import/mod.rs (external_id on NormalizedMessage,
+HashMap on ParsedFile), import/chunk.rs (pre_classify_parsed_file,
+resolve_pre_classifications), import/normalize.rs (external_id in NormalizedMessage
+construction).
+
+**Measurements:**
+
+Subset (3 repeats each, interleaved same session):
+  Baseline (main):  8.9–9.3s
+  Branch:           8.9–9.7s
+  Delta:            within noise
+
+Full corpus (3 repeats each, interleaved same session):
+  Baseline (main):  24.2–24.8s
+  Branch:           24.4–24.6s
+  Delta:            within noise
+
+Row parity:  PASS (all 9 non-record tables identical)
+DB size:     425.58 MB (identical)
+
+Perf-log build_actions breakdown:
+  Baseline:  total=5452ms, avg=1.199ms/conversation
+  Branch:    total=5136ms, avg=1.129ms/conversation
+  Savings:   ~316ms total (~6% of build_actions, ~1.3% of wall)
+
+**Key finding:** The `classify_message()` CPU cost is ~300ms total across 4547
+conversations — far less than the 3–4s originally estimated. The build_actions phase
+(~5.5s) is dominated by DB persist operations (INSERT actions, INSERT path_refs,
+DELETE existing classification, UPDATE import_chunk). Moving ~300ms of CPU to the
+parallel phase produces no measurable wall-time improvement on this hardware.
+
+**Decision:** REVERTED — no measurable improvement; added complexity not justified.
+
+**Next implied:** The remaining build_actions cost is almost entirely DB persist.
+Further optimization of this phase requires reducing the number of DB operations
+(fewer actions/path_refs, batch inserts) or structural changes (Tier C). The
+next most promising candidate is **scan_source caching** (rank #3) for startup
+improvement, or a **fresh perf-log phase distribution** to identify where the
+uninstrumented ~9s overhead is hiding.
+
+---
+
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-14 (Phase 2, iteration 7 — skip record inserts KEPT)
-Current phase: Phase 2 — iteration 7 complete, ready for next candidate
+Last updated: 2026-04-15 (Phase 2, iteration 8 — parallel classify REVERTED)
+Current phase: Phase 2 — iteration 8 complete, ready for next candidate
 All code is on `main`. Latest merge: `c524747` (skip record inserts).
+Iteration 8 (parallel classify) REVERTED — no measurable improvement.
 No active worktrees — create a fresh feature branch for the next candidate.
 
 ### How to resume
@@ -727,24 +785,24 @@ No active worktrees — create a fresh feature branch for the next candidate.
 | 5 | In-memory data passing (build_turns + build_actions) | **KEPT** | build_actions −21%, build_turns −27%; wall ~noise |
 | 6 | Parallel JSONL parsing (rayon par_iter) | **KEPT** | ~29s vs ~32s (−10%) |
 | 7 | Skip record table inserts | **KEPT** | ~27s vs ~29s (−7%), DB −13% |
+| 8 | Parallel classify (pre-classify in rayon Phase 1) | **REVERTED** | ~300ms savings (1.3%), within noise |
 
-### Current best metrics (post skip-records)
+### Current best metrics (post iteration 8)
 | metric | value | vs original baseline | vs target |
 | --- | ---: | ---: | ---: |
-| Cold full import (session-local best) | ~27.2s | ~78% from 126.1s | ~2.7× to 10s target |
+| Cold full import (session-local best) | ~24.4s | ~81% from 126.1s | ~2.4× to 10s target |
 | Startup | ~2.29s | ~55% from ~5.1s baseline | ~2.3× to <1s target |
 
-### Current phase distribution (full corpus, post skip-records, ~27s wall)
+### Current phase distribution (full corpus, iteration 8 perf-log, ~25s wall)
 
 | phase | time | % of wall | note |
 | --- | ---: | ---: | --- |
-| normalize_jsonl.sql_ms | ~5s | ~19% | 295K messages + 412K parts only (no record inserts) |
-| build_actions | ~5.6s | ~21% | classification + action/path_ref inserts |
-| normalize_jsonl.parse_ms | ~0s | ~0% | parallelized in Phase 1 (rayon) |
-| scan_source | ~2.7s | ~10% | directory walk + VCS resolution |
-| finalize_chunk + rollups | ~3.2s | ~12% | path rollup is the expensive part |
-| build_turns | ~1.1s | ~4% | in-memory iteration, then inserts turns |
-| other (uninstrumented) | ~9s | ~33% | Vec assembly, parse phase wall, overhead |
+| normalize_jsonl | ~9.0s | ~36% | messages + parts INSERTs (295K + 412K) |
+| build_actions | ~5.5s | ~22% | ~300ms classify CPU + ~5.1s DB persist |
+| scan_source | ~2.8s | ~11% | directory walk + VCS resolution |
+| finalize_chunk + rollups | ~3.3s | ~13% | path rollup dominant |
+| build_turns | ~1.1s | ~4% | in-memory + DB persist |
+| other (uninstrumented) | ~3.3s | ~13% | overhead, Vec assembly |
 
 ### Key findings (cumulative)
 1. **Btree pages are cached.** With 64MB page cache + WAL, secondary index maintenance during inserts is essentially free.
@@ -752,35 +810,39 @@ No active worktrees — create a fresh feature branch for the next candidate.
 3. **In-memory data passing saves ~2s in build_actions + build_turns** but the Vec assembly overhead partially offsets gains. Primary value: **architectural prerequisite for parallelism**.
 4. **`RETURNING id` is expensive on high-frequency INSERTs.** 412K parts × ~6.8µs/row = 2.8s overhead. Use `last_insert_rowid()` instead.
 5. **Session-to-session variance is high (~30%)** on WSL2. Within-session relative comparisons are reliable.
+6. **`classify_message()` CPU is ~300ms total** (~6% of build_actions). The build_actions phase is ~95% DB persist. Parallelizing classification alone yields no measurable wall-time improvement.
 
 ### What must change to reach 10s
-The 10s target requires ~2.7× more speedup from ~27s. Remaining options:
+The 10s target requires ~2.4× more speedup from ~24s. Remaining options:
 
-**Next: Parallel classify (candidate #1b, Tier B):**
-- Extend rayon parallelism to the classification phase (build_actions)
-- Classification is ~5.6s, mostly CPU-bound (classify_message, path ref extraction)
-- Would require running classification on ParsedFile data before DB IDs are assigned
-- Expected: additional ~10–15% wall reduction
+**Fresh perf-log analysis:**
+- The uninstrumented overhead dropped from ~9s to ~3.3s between measurement sessions — likely session-to-session variance. A fresh profile would clarify the actual bottleneck breakdown.
 
 **Channel-based pipeline (follow-up to iteration 6):**
 - Replace barrier (`par_iter().collect()`) with producer-consumer channel
 - Overlap parsing file N+1 with writing file N
 - Expected: modest additional gain if parse and write phases are similarly sized
 
+**scan_source caching (rank #3):**
+- Primarily benefits startup latency, ~0.5s expected savings on full import
+
 **Structural changes (Tier C, requires approval):**
 - In-memory staging DB → `VACUUM INTO`
 - DuckDB or columnar store for analytical queries
+- Skip/reduce action + path_ref table writes (currently ~5s of persist)
 
-### Candidate ranking (updated after iteration 7)
+### Candidate ranking (updated after iteration 8)
 
 | rank | candidate | est. remaining win | confidence | tier |
 | --- | --- | --- | --- | --- |
-| 1 | ~~Parallel parse + classify~~ | **DONE** (iteration 6, parse only — ~10%) | — | — |
-| 1b | **Parallel classify** (extend rayon to classification phase) | 10–15% wall | medium | B |
+| 1 | ~~Parallel parse + classify~~ | **DONE** (iter 6 parse, iter 8 classify REVERTED) | — | — |
 | 2 | ~~In-memory data passing~~ | **DONE** (iteration 5) | — | — |
 | 3 | **scan_source caching** | startup floor only, ~0.5s | high for startup | A |
 | 4 | Faster JSON parser (simd-json) | ~2.4s / ~8% | low | B |
 | 5 | ~~Skip `record` table inserts~~ | **DONE** (iteration 7, −7% wall, −13% DB) | — | — |
+| 6 | **Channel-based pipeline** (overlap parse N+1 w/ write N) | unknown | medium | B |
+| 7 | **Reduce action/path_ref persist** (batch INSERTs, fewer rows) | ~2–3s | medium | B |
+| 8 | **In-memory staging + VACUUM INTO** | large but risky | low | C |
 
 ### Bench harness
 ```bash
