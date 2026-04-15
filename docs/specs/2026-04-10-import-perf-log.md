@@ -905,6 +905,52 @@ cost is the same whether per-chunk or batched.
 
 ---
 
+## 2026-04-15 — candidate 12: Multi-row VALUES batching for message_part
+
+**Branch:** `import-perf-batch-values`
+**Hypothesis:** The `message_part` table receives 412K individual INSERT
+statements. Each INSERT requires a separate SQLite VM step cycle and btree
+descent. By batching parts per-message into multi-row `INSERT INTO message_part
+VALUES (...), (...), ...` statements, we reduce per-row overhead. Average
+message has ~1.4 parts, but large messages can have 10-50+ parts. The batching
+benefit comes from fewer statement executions and better btree amortization.
+
+**Implementation:** Replaced per-part `insert_message_part` calls with
+`batch_insert_message_parts` that builds multi-row `VALUES` statements.
+Parts are collected per-message, inserted in one statement, IDs inferred
+from `last_insert_rowid()` range.
+
+**Measurements:**
+
+Full corpus (3 repeats):
+
+| run | baseline (main) | iter 12 |
+| --- | ---: | ---: |
+| 1 | ~23s | 31.9s |
+| 2 | ~23s | 35.2s |
+| 3 | ~23s | 32.7s |
+
+**Significant regression (~40% slower).** Root cause:
+1. Dynamic SQL strings cannot use `prepare_cached` — each batch has a different
+   placeholder count, requiring fresh statement compilation per message.
+2. `Box<dyn ToSql>` heap allocations add per-parameter overhead.
+3. Average ~1.4 parts/message means most batches are 1-2 rows — all overhead,
+   no savings. The `prepare_cached` single-row approach compiles once and reuses
+   for all 412K inserts.
+
+Row parity: PASS.
+
+**Decision:** REVERTED — significant regression. Multi-row VALUES batching
+loses to `prepare_cached` single-row inserts when batch sizes are small and
+statement variation prevents caching.
+
+**Key finding #7:** Multi-row VALUES batching is counterproductive for tables
+with small per-parent fan-out (~1.4 parts/message). The `prepare_cached`
+single-row pattern is near-optimal for SQLite when the same statement shape
+is reused hundreds of thousands of times.
+
+---
+
 ## RESUME HERE (if session was reset, read this first)
 
 Last updated: 2026-04-15 (Phase 2, iteration 9 — RETURNING id → last_insert_rowid KEPT)
