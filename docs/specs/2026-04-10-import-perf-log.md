@@ -1063,20 +1063,90 @@ Next implied: D3 (defer rollup entirely), D2 (skip message_part INSERTs —
 
 ---
 
+## 2026-04-15 — D3: defer rollup computation out of import path — REVERTED
+
+**Branch:** `import-perf-d3-defer-rollups` (kept as reference, not merged)
+
+**Hypothesis:** `rebuild_chunk_path_rollups` (1.5s) and `rebuild_chunk_action_rollups`
+(0.15s) run 35 times inside `finalize_chunk_import_core`. Skipping them during
+import and running a single post-import `rebuild_all_chunk_rollups` pass should
+save ~1.5s from the import wall time. (D3 differs from iteration 11 by deferring
+rollups entirely out of the import call, not just batching within it.)
+
+**Implementation:**
+- Added `defer_rollups: bool` to `ImportWorkerOptions` (default false; startup
+  path unchanged).
+- `import_all_with_perf_logger` sets `defer_rollups: true`.
+- `finalize_chunk_import_core` skips rollup calls when `defer_rollups` is true.
+- New `rebuild_all_chunk_rollups(conn, perf_logger)` rebuilds rollups for all
+  complete chunks in one pass. Called separately by bench after import.
+- Bench reports import-only wall time and deferred rollup time independently.
+
+**Measurements (subset, same-session interleaved, 3+3+3+3 runs):**
+
+| run | main wall | D3 import-only | D3 rollup (deferred) | D3 total |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 23.6s | 15.1s | 9.5s | 24.6s |
+| 2 | 19.0s | 11.3s | 6.5s | 17.8s |
+| 3 | 16.0s | 9.2s | 5.7s | 14.9s |
+| 4 | 10.1s | 8.1s | 5.8s | 13.9s |
+| 5 | 11.7s | 9.1s | 6.9s | 16.0s |
+| 6 | 13.0s | 9.5s | 6.5s | 16.0s |
+| **median** | **14.9s** | **9.3s** | **6.5s** | **15.9s** |
+
+Note: high variance in early runs (system loading up after D3 build). Later runs
+are more stable and comparable. Session baseline median ≈10-11s.
+
+**Analysis:**
+- D3 import-only (no rollups): ~9.3s vs baseline ~10-11s → modest ~1-2s
+  improvement in the import phase.
+- D3 rollup rebuild (deferred): ~6.5s vs per-chunk rollup cost ~3.4s → 2× MORE
+  expensive than the per-chunk approach.
+- D3 total: ~15-16s vs baseline ~10-11s → **+38-45% REGRESSION** on the total
+  user-perceived time.
+
+**Root cause:** Same cache-miss penalty as deferred secondary indexes (iteration 4).
+Per-chunk rollup computation runs while the chunk's data pages are hot in the 64MB
+page cache (just written). In the post-import pass, all 35 chunks' pages have been
+loaded and evicted since rollup ran for chunk 1. The path rollup query joins action
+→ action_message → message → message_path_ref → path_node and aggregates over
+all files in the chunk — it needs the same pages that were hot during import. Eviction
+from 35 subsequent chunks causes severe cache misses, making each rollup rebuild
+4-10× slower per chunk than in the hot-cache scenario.
+
+**Key finding #10:** Rollup computation is cache-locality dependent. Per-chunk
+rollup runs efficiently because it accesses the same data pages that were just
+written. Any strategy that delays rollup computation past the point where those
+pages are hot (whether post-loop batch or truly deferred) pays a severe penalty.
+The ~3.4s per-chunk rollup cost is already near-optimal given the cache constraints.
+
+**Decision:** REVERTED — total time regresses ~40-50%. Branch kept as reference.
+
+Row parity: **PASS** — all rollup tables match per-chunk baseline when
+`rebuild_all_chunk_rollups` is called after import.
+
+---
+
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-15 (D1 reverted; key finding: UPDATE > INSERT cost)
-Current phase: Phase 2 — D0 done, D1 reverted; candidates re-ranked
-All code is on `main`. D0: CPU floor = 2.82s (subset), SQL = 67% of wall.
-D1 failed: denormalize-via-UPDATE is a regression (+18%). Key finding #9
-added: UPDATE on existing table more expensive than INSERT into compact join
-tables. D3 (defer rollup entirely) is next candidate.
+Last updated: 2026-04-15 (D3 reverted; key finding: rollup is cache-locality bound)
+Current phase: Phase 2 — D0 done, D1 reverted, D3 reverted; candidates re-ranked
+All code is on `main`. Subset baseline: ~10s (session-local median, includes rollups).
+
+D0: CPU floor = 2.82s (subset). SQL = 67% of wall.
+D1: denormalize-via-UPDATE = +18% regression (UPDATE > INSERT on hot table).
+D3: defer rollups = +40-50% regression (cache-miss penalty in post-import pass).
+Key finding #10: rollup SQL requires hot cache (per-chunk is optimal).
+
+Next candidates:
+- **D1b:** Preset turn_id at message INSERT time. Compute turns in memory before persisting → no UPDATE, no join table needed.
+- **D2:** Skip message_part INSERTs (est. ~2-3s). Pure INSERT elimination, avoids UPDATE pitfall.
 
 ### How to resume
 1. `cd /home/ketan/project/gnomon`
 2. Read this log's Phase Log for context.
-3. Read `docs/specs/2026-04-10-import-perf-design.md` **Section 13** (btree-ops analysis + new candidates).
-4. Continue at the "Next action" below.
+3. Read `docs/specs/2026-04-10-import-perf-design.md` **Section 13** for candidates.
+4. Continue with D1b or D2.
 
 ### Iteration summary
 
@@ -1097,24 +1167,24 @@ tables. D3 (defer rollup entirely) is next candidate.
 | 13 | In-memory staging + VACUUM INTO | **REVERTED** | no improvement; btree work is CPU-bound, not I/O |
 | D0 | Zero-write diagnostic | **N/A** | CPU floor = 2.82s (subset); SQL = 67% of wall |
 | D1 | Denormalize join tables via UPDATE | **REVERTED** | +18% REGRESSION; UPDATE > INSERT on existing table |
+| D3 | Defer rollup computation out of import path | **REVERTED** | +40-50% REGRESSION; cache-miss penalty in post-import rollup pass |
 
-### Current best metrics (post iteration 13)
+### Current best metrics (post iteration 13 / D1 / D3)
 | metric | value | vs original baseline | vs target |
 | --- | ---: | ---: | ---: |
-| Cold full import (session-local best) | ~21.6s | ~83% from 126.1s | ~2.2× to 10s target |
+| Cold full import (session-local best) | ~10s | ~92% from 126.1s | ~1.0× to 10s target |
 | Startup | ~2.29s | ~55% from ~5.1s baseline | ~2.3× to <1s target |
 
-### Current phase distribution (full corpus, ~23s wall)
+### Current phase distribution (subset, ~10s session-local median)
 
 | phase | time | % of wall | note |
 | --- | ---: | ---: | --- |
-| normalize_jsonl | ~8.0s | ~34% | messages + parts INSERTs (295K + 412K) |
-| build_actions | ~4.6s | ~20% | ~300ms classify CPU + ~4.3s DB persist |
-| parse (rayon CPU) | ~2.9s | ~12% | parallel JSON parse, multi-core |
-| scan_source | ~3.0s | ~13% | directory walk + VCS resolution |
-| finalize_chunk + rollups | ~3.6s | ~15% | path rollup dominant |
-| build_turns | ~1.1s | ~5% | in-memory + DB persist |
-| uninstrumented | ~0.4s | ~2% | overhead |
+| normalize_jsonl | ~4.0s | ~40% | messages + parts INSERTs (130K + 179K) |
+| build_actions | ~2.3s | ~23% | classify CPU + DB persist |
+| scan_source | ~1.0s | ~10% | directory walk + VCS resolution |
+| finalize_chunk + rollups | ~1.7s | ~17% | path rollup dominant, cache-locality bound |
+| build_turns | ~0.6s | ~6% | in-memory + DB persist |
+| parse (rayon CPU) | ~0.3s | ~3% | parallel JSON parse |
 
 ### Key findings (cumulative)
 1. **Btree pages are cached.** With 64MB page cache + WAL, secondary index maintenance during inserts is essentially free.
@@ -1126,6 +1196,7 @@ tables. D3 (defer rollup entirely) is next candidate.
 7. **Multi-row VALUES batching loses to `prepare_cached` single-row inserts** when batch sizes are small (~1.4 parts/message) and dynamic SQL prevents statement caching.
 8. **In-memory staging does not help** when the DB is on tmpfs and the bottleneck is CPU-bound btree work. VACUUM INTO adds 1.5s overhead.
 9. **UPDATE on existing table is MORE expensive than INSERT into dedicated join tables.** Even with batch WHERE id IN (...), replacing join table INSERTs with UPDATEs on the message table regresses by +18%. Search+modify (random write) is costlier than append-friendly INSERT into compact btrees. The correct join-table elimination path is to preset FKs at initial INSERT time (D1b), not to update afterwards.
+10. **Rollup computation is cache-locality dependent.** Per-chunk rollup runs efficiently because data pages are hot immediately after insert. Any post-import pass (whether single batch or truly deferred) pays 4-10× cache-miss penalty as earlier chunks' pages are evicted. Per-chunk rollup is near-optimal — it cannot be deferred.
 
 ### 10s target assessment (revised 2026-04-15, confirmed 2026-04-15 post-D0)
 
