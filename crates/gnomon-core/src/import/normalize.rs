@@ -884,9 +884,8 @@ fn insert_history_event(
         )
     })?;
 
-    let history_event_id = conn
-        .prepare_cached(
-            "
+    conn.prepare_cached(
+        "
         INSERT INTO history_event (
             import_chunk_id,
             source_file_id,
@@ -901,33 +900,30 @@ fn insert_history_event(
             raw_json
         )
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-        RETURNING id
         ",
+    )
+    .and_then(|mut stmt| {
+        stmt.execute(params![
+            params.import_chunk_id,
+            params.source_file_id,
+            source_line_no,
+            optional_string(record.get("sessionId")),
+            optional_string(record.get("timestamp")),
+            optional_string(record.get("project")),
+            display_text,
+            pasted_contents_json,
+            input_kind.as_str(),
+            slash_command_name,
+            raw_json,
+        ])
+    })
+    .with_context(|| {
+        format!(
+            "unable to insert normalized history event on line {source_line_no} from {}",
+            params.path.display()
         )
-        .and_then(|mut stmt| {
-            stmt.query_row(
-                params![
-                    params.import_chunk_id,
-                    params.source_file_id,
-                    source_line_no,
-                    optional_string(record.get("sessionId")),
-                    optional_string(record.get("timestamp")),
-                    optional_string(record.get("project")),
-                    display_text,
-                    pasted_contents_json,
-                    input_kind.as_str(),
-                    slash_command_name,
-                    raw_json,
-                ],
-                |row| row.get::<_, i64>(0),
-            )
-        })
-        .with_context(|| {
-            format!(
-                "unable to insert normalized history event on line {source_line_no} from {}",
-                params.path.display()
-            )
-        })?;
+    })?;
+    let history_event_id = conn.last_insert_rowid();
 
     if let Some(invocation) = extract_skill_invocation(record) {
         insert_skill_invocation(conn, params, history_event_id, &invocation)?;
@@ -1145,9 +1141,8 @@ impl ImportState {
             conversation_external_id(session_id, self.params.source_file_id);
         let timestamp = extract_record_timestamp(record).map(ToOwned::to_owned);
 
-        let conversation_id = conn
-            .prepare_cached(
-                "
+        conn.prepare_cached(
+            "
                 INSERT INTO conversation (
                     project_id,
                     source_file_id,
@@ -1156,21 +1151,18 @@ impl ImportState {
                     ended_at_utc
                 )
                 VALUES (?1, ?2, ?3, ?4, ?4)
-                RETURNING id
                 ",
-            )
-            .and_then(|mut stmt| {
-                stmt.query_row(
-                    params![
-                        self.params.project_id,
-                        self.params.source_file_id,
-                        conversation_external_id,
-                        timestamp
-                    ],
-                    |row| row.get(0),
-                )
-            })
-            .context("unable to insert conversation for normalized file")?;
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
+                self.params.project_id,
+                self.params.source_file_id,
+                conversation_external_id,
+                timestamp
+            ])
+        })
+        .context("unable to insert conversation for normalized file")?;
+        let conversation_id = conn.last_insert_rowid();
 
         let stream_kind = if record
             .get("isSidechain")
@@ -1183,9 +1175,8 @@ impl ImportState {
         };
         let stream_external_id = record.get("agentId").and_then(Value::as_str);
 
-        let stream_id = conn
-            .prepare_cached(
-                "
+        conn.prepare_cached(
+            "
                 INSERT INTO stream (
                     conversation_id,
                     import_chunk_id,
@@ -1196,23 +1187,20 @@ impl ImportState {
                     closed_at_utc
                 )
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-                RETURNING id
                 ",
-            )
-            .and_then(|mut stmt| {
-                stmt.query_row(
-                    params![
-                        conversation_id,
-                        self.params.import_chunk_id,
-                        stream_external_id,
-                        stream_kind,
-                        PRIMARY_STREAM_SEQUENCE_NO,
-                        timestamp
-                    ],
-                    |row| row.get(0),
-                )
-            })
-            .context("unable to insert primary stream for normalized file")?;
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
+                conversation_id,
+                self.params.import_chunk_id,
+                stream_external_id,
+                stream_kind,
+                PRIMARY_STREAM_SEQUENCE_NO,
+                timestamp
+            ])
+        })
+        .context("unable to insert primary stream for normalized file")?;
+        let stream_id = conn.last_insert_rowid();
 
         self.conversation = Some(ConversationState {
             id: conversation_id,
@@ -1395,9 +1383,8 @@ impl ImportState {
             return Ok(());
         }
 
-        let message_id = conn
-            .prepare_cached(
-                "
+        conn.prepare_cached(
+            "
                 INSERT INTO message (
                     stream_id,
                     conversation_id,
@@ -1419,38 +1406,35 @@ impl ImportState {
                 VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
                 )
-                RETURNING id
                 ",
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
+                stream_id,
+                conversation_id,
+                self.params.import_chunk_id,
+                extracted.external_id,
+                extracted.role,
+                extracted.message_kind,
+                self.next_message_sequence_no,
+                extracted.recorded_at_utc,
+                extracted.usage.input_tokens,
+                extracted.usage.cache_creation_input_tokens,
+                extracted.usage.cache_read_input_tokens,
+                extracted.usage.output_tokens,
+                extracted.model_name,
+                extracted.stop_reason,
+                extracted.usage_source,
+            ])
+        })
+        .with_context(|| {
+            format!(
+                "unable to insert normalized message on line {} from {}",
+                extracted.source_line_no,
+                self.params.path.display()
             )
-            .and_then(|mut stmt| {
-                stmt.query_row(
-                    params![
-                        stream_id,
-                        conversation_id,
-                        self.params.import_chunk_id,
-                        extracted.external_id,
-                        extracted.role,
-                        extracted.message_kind,
-                        self.next_message_sequence_no,
-                        extracted.recorded_at_utc,
-                        extracted.usage.input_tokens,
-                        extracted.usage.cache_creation_input_tokens,
-                        extracted.usage.cache_read_input_tokens,
-                        extracted.usage.output_tokens,
-                        extracted.model_name,
-                        extracted.stop_reason,
-                        extracted.usage_source,
-                    ],
-                    |row| row.get(0),
-                )
-            })
-            .with_context(|| {
-                format!(
-                    "unable to insert normalized message on line {} from {}",
-                    extracted.source_line_no,
-                    self.params.path.display()
-                )
-            })?;
+        })?;
+        let message_id = conn.last_insert_rowid();
 
         let mut state = MessageState {
             id: message_id,
@@ -1696,9 +1680,8 @@ fn persist_turn(
         )?
         .query_row([conversation_id], |row| row.get(0))?;
 
-    let turn_id: i64 = conn
-        .prepare_cached(
-            "
+    conn.prepare_cached(
+        "
         INSERT INTO turn (
             stream_id,
             conversation_id,
@@ -1713,25 +1696,22 @@ fn persist_turn(
             output_tokens
         )
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-        RETURNING id
         ",
-        )?
-        .query_row(
-            params![
-                turn.stream_id,
-                conversation_id,
-                import_chunk_id,
-                turn.root_message_id,
-                next_turn_sequence_no,
-                turn.started_at_utc,
-                turn.ended_at_utc,
-                turn.usage.input_tokens,
-                turn.usage.cache_creation_input_tokens,
-                turn.usage.cache_read_input_tokens,
-                turn.usage.output_tokens,
-            ],
-            |row| row.get(0),
-        )?;
+    )?
+    .execute(params![
+        turn.stream_id,
+        conversation_id,
+        import_chunk_id,
+        turn.root_message_id,
+        next_turn_sequence_no,
+        turn.started_at_utc,
+        turn.ended_at_utc,
+        turn.usage.input_tokens,
+        turn.usage.cache_creation_input_tokens,
+        turn.usage.cache_read_input_tokens,
+        turn.usage.output_tokens,
+    ])?;
+    let turn_id = conn.last_insert_rowid();
 
     for (ordinal_in_turn, message_id) in turn.message_ids.iter().enumerate() {
         conn.prepare_cached(
