@@ -1095,6 +1095,7 @@ struct ImportState {
     stream: Option<StreamState>,
     buffered_records: Vec<BufferedRecord>,
     record_count: usize,
+    message_count: usize,
     next_record_sequence_no: i64,
     next_message_sequence_no: i64,
     message_states: HashMap<String, MessageState>,
@@ -1108,6 +1109,7 @@ impl ImportState {
             stream: None,
             buffered_records: Vec::new(),
             record_count: 0,
+            message_count: 0,
             next_record_sequence_no: 0,
             next_message_sequence_no: 0,
             message_states: HashMap::new(),
@@ -1303,6 +1305,7 @@ impl ImportState {
         // First occurrence: build a fresh MessageState (id = 0 until INSERT).
         let sequence_no = self.next_message_sequence_no;
         self.next_message_sequence_no += 1;
+        self.message_count += 1;
 
         let mut seen_part_keys = HashSet::new();
         let mut pending_parts = Vec::new();
@@ -1396,7 +1399,7 @@ impl ImportState {
             stmt.execute(params![
                 self.params.import_chunk_id,
                 self.record_count as i64,
-                self.message_states.len() as i64,
+                self.message_count as i64,
                 turn_count as i64
             ])
         })
@@ -1651,8 +1654,15 @@ fn persist_messages_with_turns(
 
     for &idx in &unassigned {
         let ms = &mut messages[idx];
-        ms.id =
-            insert_message_row(conn, conversation_id, params.import_chunk_id, ms, None, None, source_path)?;
+        ms.id = insert_message_row(
+            conn,
+            conversation_id,
+            params.import_chunk_id,
+            ms,
+            None,
+            None,
+            source_path,
+        )?;
         insert_pending_parts(conn, ms, source_path)?;
     }
 
@@ -1662,8 +1672,15 @@ fn persist_messages_with_turns(
         // a. INSERT root message (turn_id = NULL initially, FK not yet set).
         {
             let root = &mut messages[turn.root_idx];
-            root.id =
-                insert_message_row(conn, conversation_id, params.import_chunk_id, root, None, None, source_path)?;
+            root.id = insert_message_row(
+                conn,
+                conversation_id,
+                params.import_chunk_id,
+                root,
+                None,
+                None,
+                source_path,
+            )?;
             insert_pending_parts(conn, root, source_path)?;
         }
 
