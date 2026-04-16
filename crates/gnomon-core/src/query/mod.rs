@@ -7968,10 +7968,7 @@ mod tests {
         )?;
 
         conn.execute(
-            "
-            INSERT INTO turn_message (turn_id, message_id, ordinal_in_turn)
-            VALUES (?1, ?2, 0)
-            ",
+            "UPDATE message SET turn_id = ?1, ordinal_in_turn = 0 WHERE id = ?2",
             params![turn_id, message_id],
         )?;
 

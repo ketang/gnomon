@@ -117,7 +117,7 @@ pub const IMPORT_CHUNK_UNIT: &str = "project x day";
 /// The `record` table is no longer populated during import. All JSONL lines
 /// are still counted (`imported_record_count`) but individual records are not
 /// persisted. This eliminates ~490K INSERTs per full corpus import.
-pub const IMPORT_SCHEMA_VERSION: i64 = 5;
+pub const IMPORT_SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceFileKind {

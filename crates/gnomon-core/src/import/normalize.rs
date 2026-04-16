@@ -343,7 +343,7 @@ fn write_parsed_transcript_core(
         if state.conversation.is_none() {
             if extract_session_id(&record.value).is_some() {
                 state.initialize_context(conn, &record.value)?;
-                state.flush_buffered_records(conn)?;
+                state.flush_buffered_records()?;
             } else {
                 state.buffered_records.push(BufferedRecord {
                     source_line_no: record.source_line_no,
@@ -354,7 +354,7 @@ fn write_parsed_transcript_core(
             }
         }
 
-        state.process_record_from_parsed(conn, record)?;
+        state.process_record_from_parsed(record)?;
         breakdown.sql += sql_start.elapsed();
     }
 
@@ -370,41 +370,24 @@ fn write_parsed_transcript_core(
 
     if !state.buffered_records.is_empty() {
         let sql_start = Instant::now();
-        state.flush_buffered_records(conn)?;
+        state.flush_buffered_records()?;
         breakdown.sql += sql_start.elapsed();
     }
 
-    let mut normalized_messages: Vec<NormalizedMessage> = state
-        .message_states
-        .values()
-        .map(|ms| NormalizedMessage {
-            id: ms.id,
-            stream_id: ms.stream_id,
-            sequence_no: ms.sequence_no,
-            message_kind: ms.message_kind.clone(),
-            created_at_utc: ms.created_at_utc.clone(),
-            completed_at_utc: ms.completed_at_utc.clone(),
-            usage: ms.usage.clone(),
-            parts: ms.parts.clone(),
-            turn_id: None,
-            turn_sequence_no: None,
-            ordinal_in_turn: None,
-        })
-        .collect();
-    normalized_messages.sort_by_key(|m| (m.sequence_no, m.id));
-
     let mut turns_scope = PerfScope::new(params.perf_logger.clone(), "import.build_turns");
-    let turn_count = match state.build_turns(conn, &mut normalized_messages) {
-        Ok(count) => {
-            turns_scope.field("turn_count", count);
-            turns_scope.finish_ok();
-            count
-        }
-        Err(err) => {
-            turns_scope.finish_error(&err);
-            return Err(err);
-        }
-    };
+    let (normalized_messages, turn_count) =
+        match persist_messages_with_turns(conn, params, &mut state) {
+            Ok((msgs, count)) => {
+                turns_scope.field("turn_count", count);
+                turns_scope.finish_ok();
+                (msgs, count)
+            }
+            Err(err) => {
+                turns_scope.finish_error(&err);
+                return Err(err);
+            }
+        };
+
     let finish_start = Instant::now();
     state.finish_import(conn, turn_count)?;
     breakdown.finish_import += finish_start.elapsed();
@@ -426,7 +409,7 @@ fn write_parsed_transcript_core(
                     .ok_or_else(|| anyhow!("stream missing after import"))?,
             ),
             record_count: state.record_count,
-            message_count: state.message_states.len(),
+            message_count: normalized_messages.len(),
             turn_count,
             history_event_count: 0,
         }),
@@ -583,7 +566,7 @@ fn normalize_transcript_jsonl_file_core(
         if state.conversation.is_none() {
             if extract_session_id(&record).is_some() {
                 state.initialize_context(conn, &record)?;
-                state.flush_buffered_records(conn)?;
+                state.flush_buffered_records()?;
             } else {
                 state.buffered_records.push(BufferedRecord {
                     source_line_no: line_no as i64,
@@ -594,7 +577,7 @@ fn normalize_transcript_jsonl_file_core(
             }
         }
 
-        state.process_record(conn, record, line_no as i64)?;
+        state.process_record(record, line_no as i64)?;
         breakdown.sql += sql_start.elapsed();
     }
 
@@ -610,43 +593,24 @@ fn normalize_transcript_jsonl_file_core(
 
     if !state.buffered_records.is_empty() {
         let sql_start = Instant::now();
-        state.flush_buffered_records(conn)?;
+        state.flush_buffered_records()?;
         breakdown.sql += sql_start.elapsed();
     }
 
-    // Build in-memory message collection from import state, sorted by (sequence_no, id)
-    // to match the ORDER BY of the previous DB query.
-    let mut normalized_messages: Vec<NormalizedMessage> = state
-        .message_states
-        .values()
-        .map(|ms| NormalizedMessage {
-            id: ms.id,
-            stream_id: ms.stream_id,
-            sequence_no: ms.sequence_no,
-            message_kind: ms.message_kind.clone(),
-            created_at_utc: ms.created_at_utc.clone(),
-            completed_at_utc: ms.completed_at_utc.clone(),
-            usage: ms.usage.clone(),
-            parts: ms.parts.clone(),
-            turn_id: None,
-            turn_sequence_no: None,
-            ordinal_in_turn: None,
-        })
-        .collect();
-    normalized_messages.sort_by_key(|m| (m.sequence_no, m.id));
-
     let mut turns_scope = PerfScope::new(params.perf_logger.clone(), "import.build_turns");
-    let turn_count = match state.build_turns(conn, &mut normalized_messages) {
-        Ok(count) => {
-            turns_scope.field("turn_count", count);
-            turns_scope.finish_ok();
-            count
-        }
-        Err(err) => {
-            turns_scope.finish_error(&err);
-            return Err(err);
-        }
-    };
+    let (normalized_messages, turn_count) =
+        match persist_messages_with_turns(conn, params, &mut state) {
+            Ok((msgs, count)) => {
+                turns_scope.field("turn_count", count);
+                turns_scope.finish_ok();
+                (msgs, count)
+            }
+            Err(err) => {
+                turns_scope.finish_error(&err);
+                return Err(err);
+            }
+        };
+
     let finish_start = Instant::now();
     state.finish_import(conn, turn_count)?;
     breakdown.finish_import += finish_start.elapsed();
@@ -669,7 +633,7 @@ fn normalize_transcript_jsonl_file_core(
                     .ok_or_else(|| anyhow!("stream missing after import"))?,
             ),
             record_count: state.record_count,
-            message_count: state.message_states.len(),
+            message_count: normalized_messages.len(),
             turn_count,
             history_event_count: 0,
         }),
@@ -1095,17 +1059,33 @@ pub(super) struct ExtractedMessagePart {
 
 #[derive(Debug, Clone)]
 struct MessageState {
+    /// Database-assigned row ID; 0 until `persist_messages_with_turns` inserts
+    /// this message.
     id: i64,
     stream_id: i64,
     sequence_no: i64,
+    // Fields required for the INSERT INTO message statement.
+    external_id: String,
+    role: String,
     message_kind: String,
     created_at_utc: Option<String>,
     completed_at_utc: Option<String>,
     recorded_at_utc: Option<String>,
+    model_name: Option<String>,
+    stop_reason: Option<String>,
+    usage_source: Option<&'static str>,
     usage: Usage,
-    next_part_ordinal: i64,
+    source_line_no: i64,
+    // Part accumulator (pre-INSERT); converted to `parts` after INSERT.
     seen_part_keys: HashSet<String>,
+    pending_parts: Vec<ExtractedMessagePart>,
+    /// Populated by `persist_messages_with_turns` after the message part rows
+    /// are written; consumed by `build_actions`.
     parts: Vec<NormalizedPart>,
+    /// Set by `persist_messages_with_turns` once the message is assigned to a turn.
+    turn_id: Option<i64>,
+    turn_sequence_no: Option<i64>,
+    ordinal_in_turn: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -1216,20 +1196,15 @@ impl ImportState {
         Ok(())
     }
 
-    fn flush_buffered_records(&mut self, conn: &Connection) -> Result<()> {
+    fn flush_buffered_records(&mut self) -> Result<()> {
         let buffered_records = std::mem::take(&mut self.buffered_records);
         for record in buffered_records {
-            self.process_record(conn, record.value, record.source_line_no)?;
+            self.process_record(record.value, record.source_line_no)?;
         }
         Ok(())
     }
 
-    fn process_record(
-        &mut self,
-        conn: &Connection,
-        record: Value,
-        source_line_no: i64,
-    ) -> Result<()> {
+    fn process_record(&mut self, record: Value, source_line_no: i64) -> Result<()> {
         let conversation = self
             .conversation
             .as_mut()
@@ -1255,7 +1230,7 @@ impl ImportState {
         self.record_count += 1;
 
         if let Some(message) = extract_message(&record, source_line_no) {
-            self.upsert_message(conn, message)?;
+            self.upsert_message(message);
         }
 
         Ok(())
@@ -1263,11 +1238,7 @@ impl ImportState {
 
     /// Like [`process_record`] but uses pre-extracted fields from the parallel
     /// parse phase, avoiding redundant JSON traversal.
-    fn process_record_from_parsed(
-        &mut self,
-        conn: &Connection,
-        record: super::ParsedRecord,
-    ) -> Result<()> {
+    fn process_record_from_parsed(&mut self, record: super::ParsedRecord) -> Result<()> {
         let conversation = self
             .conversation
             .as_mut()
@@ -1292,61 +1263,21 @@ impl ImportState {
         self.record_count += 1;
 
         if let Some(message) = record.extracted_message {
-            self.upsert_message(conn, message)?;
+            self.upsert_message(message);
         }
 
         Ok(())
     }
 
-    fn upsert_message(&mut self, conn: &Connection, extracted: ExtractedMessage) -> Result<()> {
-        let conversation_id = self
-            .conversation
-            .as_ref()
-            .map(|conversation| conversation.id)
-            .ok_or_else(|| anyhow!("conversation state missing while inserting message"))?;
-        let stream_id = self
-            .stream
-            .as_ref()
-            .map(|stream| stream.id)
-            .ok_or_else(|| anyhow!("stream state missing while inserting message"))?;
+    /// Accumulate message state in memory.  No DB writes — the actual INSERT
+    /// is deferred to `persist_messages_with_turns`, which can supply `turn_id`
+    /// at INSERT time and avoid the join-table round-trip.
+    fn upsert_message(&mut self, extracted: ExtractedMessage) {
+        let stream_id = self.stream.as_ref().map(|s| s.id).unwrap_or(0);
 
         if let Some(state) = self.message_states.get_mut(&extracted.external_id) {
-            conn.prepare_cached(
-                "
-                UPDATE message
-                SET
-                    completed_at_utc = COALESCE(?2, completed_at_utc),
-                    model_name = COALESCE(?3, model_name),
-                    stop_reason = COALESCE(?4, stop_reason),
-                    usage_source = COALESCE(?5, usage_source),
-                    input_tokens = ?6,
-                    cache_creation_input_tokens = ?7,
-                    cache_read_input_tokens = ?8,
-                    output_tokens = ?9
-                WHERE id = ?1
-                ",
-            )
-            .and_then(|mut stmt| {
-                stmt.execute(params![
-                    state.id,
-                    extracted.recorded_at_utc,
-                    extracted.model_name,
-                    extracted.stop_reason,
-                    extracted.usage_source,
-                    extracted.usage.input_tokens,
-                    extracted.usage.cache_creation_input_tokens,
-                    extracted.usage.cache_read_input_tokens,
-                    extracted.usage.output_tokens,
-                ])
-            })
-            .with_context(|| {
-                format!(
-                    "unable to update normalized message on line {} from {}",
-                    extracted.source_line_no,
-                    self.params.path.display()
-                )
-            })?;
-
+            // Subsequent occurrence of the same message (streaming update):
+            // merge final-value fields in memory only.
             state.recorded_at_utc = extracted
                 .recorded_at_utc
                 .clone()
@@ -1355,184 +1286,57 @@ impl ImportState {
                 .recorded_at_utc
                 .clone()
                 .or_else(|| state.completed_at_utc.clone());
+            state.model_name = state.model_name.take().or(extracted.model_name);
+            state.stop_reason = state.stop_reason.take().or(extracted.stop_reason);
+            state.usage_source = state.usage_source.or(extracted.usage_source);
             if extracted.usage.has_any() {
-                state.usage = extracted.usage.clone();
+                state.usage = extracted.usage;
             }
-
             for part in extracted.parts {
                 if state.seen_part_keys.insert(part.dedupe_key.clone()) {
-                    let part_id = insert_message_part(
-                        conn,
-                        state.id,
-                        state.next_part_ordinal,
-                        &part,
-                        extracted.source_line_no,
-                        &self.params.path,
-                    )?;
-                    state.parts.push(NormalizedPart {
-                        id: part_id,
-                        part_kind: part.part_kind.clone(),
-                        tool_name: part.tool_name.clone(),
-                        tool_call_id: part.tool_call_id.clone(),
-                        metadata_json: part.metadata_json.clone(),
-                    });
-                    state.next_part_ordinal += 1;
+                    state.pending_parts.push(part);
                 }
             }
-
-            return Ok(());
+            return;
         }
 
-        conn.prepare_cached(
-            "
-                INSERT INTO message (
-                    stream_id,
-                    conversation_id,
-                    import_chunk_id,
-                    external_id,
-                    role,
-                    message_kind,
-                    sequence_no,
-                    created_at_utc,
-                    completed_at_utc,
-                    input_tokens,
-                    cache_creation_input_tokens,
-                    cache_read_input_tokens,
-                    output_tokens,
-                    model_name,
-                    stop_reason,
-                    usage_source
-                )
-                VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
-                )
-                ",
-        )
-        .and_then(|mut stmt| {
-            stmt.execute(params![
-                stream_id,
-                conversation_id,
-                self.params.import_chunk_id,
-                extracted.external_id,
-                extracted.role,
-                extracted.message_kind,
-                self.next_message_sequence_no,
-                extracted.recorded_at_utc,
-                extracted.usage.input_tokens,
-                extracted.usage.cache_creation_input_tokens,
-                extracted.usage.cache_read_input_tokens,
-                extracted.usage.output_tokens,
-                extracted.model_name,
-                extracted.stop_reason,
-                extracted.usage_source,
-            ])
-        })
-        .with_context(|| {
-            format!(
-                "unable to insert normalized message on line {} from {}",
-                extracted.source_line_no,
-                self.params.path.display()
-            )
-        })?;
-        let message_id = conn.last_insert_rowid();
-
-        let mut state = MessageState {
-            id: message_id,
-            stream_id,
-            sequence_no: self.next_message_sequence_no,
-            message_kind: extracted.message_kind.to_string(),
-            created_at_utc: extracted.recorded_at_utc.clone(),
-            completed_at_utc: extracted.recorded_at_utc.clone(),
-            recorded_at_utc: extracted.recorded_at_utc.clone(),
-            usage: extracted.usage.clone(),
-            next_part_ordinal: 0,
-            seen_part_keys: HashSet::new(),
-            parts: Vec::new(),
-        };
+        // First occurrence: build a fresh MessageState (id = 0 until INSERT).
+        let sequence_no = self.next_message_sequence_no;
         self.next_message_sequence_no += 1;
 
+        let mut seen_part_keys = HashSet::new();
+        let mut pending_parts = Vec::new();
         for part in extracted.parts {
-            if state.seen_part_keys.insert(part.dedupe_key.clone()) {
-                let part_id = insert_message_part(
-                    conn,
-                    state.id,
-                    state.next_part_ordinal,
-                    &part,
-                    extracted.source_line_no,
-                    &self.params.path,
-                )?;
-                state.parts.push(NormalizedPart {
-                    id: part_id,
-                    part_kind: part.part_kind.clone(),
-                    tool_name: part.tool_name.clone(),
-                    tool_call_id: part.tool_call_id.clone(),
-                    metadata_json: part.metadata_json.clone(),
-                });
-                state.next_part_ordinal += 1;
+            if seen_part_keys.insert(part.dedupe_key.clone()) {
+                pending_parts.push(part);
             }
         }
 
-        self.message_states.insert(extracted.external_id, state);
-        Ok(())
-    }
-
-    fn build_turns(&self, conn: &Connection, messages: &mut [NormalizedMessage]) -> Result<usize> {
-        let conversation_id = self
-            .conversation
-            .as_ref()
-            .map(|conversation| conversation.id)
-            .ok_or_else(|| anyhow!("conversation state missing while building turns"))?;
-
-        let mut turn_count = 0usize;
-        let mut current_turn: Option<TurnDraft> = None;
-        let mut current_turn_msg_indices: Vec<usize> = Vec::new();
-        let msg_len = messages.len();
-
-        for idx in 0..msg_len {
-            let candidate = TurnCandidateMessage {
-                id: messages[idx].id,
-                stream_id: messages[idx].stream_id,
-                message_kind: messages[idx].message_kind.clone(),
-                created_at_utc: messages[idx].created_at_utc.clone(),
-                completed_at_utc: messages[idx].completed_at_utc.clone(),
-                usage: messages[idx].usage.clone(),
-            };
-
-            if candidate.message_kind == "user_prompt" {
-                if let Some(turn) = current_turn.take() {
-                    let (turn_id, turn_seq) =
-                        persist_turn(conn, conversation_id, self.params.import_chunk_id, turn)?;
-                    for (ordinal, &msg_idx) in current_turn_msg_indices.iter().enumerate() {
-                        messages[msg_idx].turn_id = Some(turn_id);
-                        messages[msg_idx].turn_sequence_no = Some(turn_seq);
-                        messages[msg_idx].ordinal_in_turn = Some(ordinal as i64);
-                    }
-                    turn_count += 1;
-                }
-                current_turn_msg_indices.clear();
-                current_turn = Some(TurnDraft::new(candidate));
-                current_turn_msg_indices.push(idx);
-                continue;
-            }
-
-            if let Some(turn) = current_turn.as_mut() {
-                turn.push(candidate);
-                current_turn_msg_indices.push(idx);
-            }
-        }
-
-        if let Some(turn) = current_turn.take() {
-            let (turn_id, turn_seq) =
-                persist_turn(conn, conversation_id, self.params.import_chunk_id, turn)?;
-            for (ordinal, &msg_idx) in current_turn_msg_indices.iter().enumerate() {
-                messages[msg_idx].turn_id = Some(turn_id);
-                messages[msg_idx].turn_sequence_no = Some(turn_seq);
-                messages[msg_idx].ordinal_in_turn = Some(ordinal as i64);
-            }
-            turn_count += 1;
-        }
-
-        Ok(turn_count)
+        self.message_states.insert(
+            extracted.external_id.clone(),
+            MessageState {
+                id: 0,
+                stream_id,
+                sequence_no,
+                external_id: extracted.external_id,
+                role: extracted.role.to_string(),
+                message_kind: extracted.message_kind.to_string(),
+                created_at_utc: extracted.recorded_at_utc.clone(),
+                completed_at_utc: extracted.recorded_at_utc.clone(),
+                recorded_at_utc: extracted.recorded_at_utc,
+                model_name: extracted.model_name,
+                stop_reason: extracted.stop_reason,
+                usage_source: extracted.usage_source,
+                usage: extracted.usage,
+                source_line_no: extracted.source_line_no,
+                seen_part_keys,
+                pending_parts,
+                parts: Vec::new(),
+                turn_id: None,
+                turn_sequence_no: None,
+                ordinal_in_turn: None,
+            },
+        );
     }
 
     fn finish_import(&self, conn: &Connection, turn_count: usize) -> Result<()> {
@@ -1602,84 +1406,69 @@ impl ImportState {
     }
 }
 
-#[derive(Debug)]
-struct TurnCandidateMessage {
-    id: i64,
-    stream_id: i64,
-    message_kind: String,
-    created_at_utc: Option<String>,
-    completed_at_utc: Option<String>,
-    usage: Usage,
-}
-
+/// Aggregated turn-level data accumulated during in-memory turn grouping.
 #[derive(Debug)]
 struct TurnDraft {
     stream_id: i64,
-    root_message_id: i64,
     started_at_utc: Option<String>,
     ended_at_utc: Option<String>,
     usage: Usage,
-    message_ids: Vec<i64>,
 }
 
 impl TurnDraft {
-    fn new(message: TurnCandidateMessage) -> Self {
-        let timestamp = message
+    fn new_from_state(ms: &MessageState) -> Self {
+        let timestamp = ms
             .created_at_utc
             .clone()
-            .or_else(|| message.completed_at_utc.clone());
-
+            .or_else(|| ms.completed_at_utc.clone());
         Self {
-            stream_id: message.stream_id,
-            root_message_id: message.id,
+            stream_id: ms.stream_id,
             started_at_utc: timestamp.clone(),
-            ended_at_utc: message.completed_at_utc.clone().or(timestamp),
-            usage: message.usage,
-            message_ids: vec![message.id],
+            ended_at_utc: ms.completed_at_utc.clone().or(timestamp),
+            usage: ms.usage.clone(),
         }
     }
 
-    fn push(&mut self, message: TurnCandidateMessage) {
-        let start = message
+    fn push_from_state(&mut self, ms: &MessageState) {
+        let start = ms
             .created_at_utc
             .clone()
-            .or_else(|| message.completed_at_utc.clone());
-        let end = message.completed_at_utc.clone().or(start.clone());
+            .or_else(|| ms.completed_at_utc.clone());
+        let end = ms.completed_at_utc.clone().or_else(|| start.clone());
 
         update_bounds(&mut self.started_at_utc, &mut self.ended_at_utc, &start);
         update_end(&mut self.ended_at_utc, &end);
 
-        Usage::add_field(&mut self.usage.input_tokens, message.usage.input_tokens);
+        Usage::add_field(&mut self.usage.input_tokens, ms.usage.input_tokens);
         Usage::add_field(
             &mut self.usage.cache_creation_input_tokens,
-            message.usage.cache_creation_input_tokens,
+            ms.usage.cache_creation_input_tokens,
         );
         Usage::add_field(
             &mut self.usage.cache_read_input_tokens,
-            message.usage.cache_read_input_tokens,
+            ms.usage.cache_read_input_tokens,
         );
-        Usage::add_field(&mut self.usage.output_tokens, message.usage.output_tokens);
-
-        self.message_ids.push(message.id);
+        Usage::add_field(&mut self.usage.output_tokens, ms.usage.output_tokens);
     }
 }
 
-fn persist_turn(
+/// A turn computed in memory, referencing indices into a sorted message slice.
+struct TurnAssignment {
+    /// Index of the root (first/user-prompt) message.
+    root_idx: usize,
+    /// Indices of all messages in this turn, root first, in sequence_no order.
+    member_idxs: Vec<usize>,
+    draft: TurnDraft,
+}
+
+fn insert_turn_row(
     conn: &Connection,
     conversation_id: i64,
     import_chunk_id: i64,
-    turn: TurnDraft,
-) -> Result<(i64, i64)> {
-    let next_turn_sequence_no: i64 = conn
-        .prepare_cached(
-            "
-        SELECT COALESCE(MAX(sequence_no), -1) + 1
-        FROM turn
-        WHERE conversation_id = ?1
-        ",
-        )?
-        .query_row([conversation_id], |row| row.get(0))?;
-
+    sequence_no: i64,
+    root_message_id: i64,
+    draft: &TurnDraft,
+) -> Result<i64> {
     conn.prepare_cached(
         "
         INSERT INTO turn (
@@ -1699,31 +1488,248 @@ fn persist_turn(
         ",
     )?
     .execute(params![
-        turn.stream_id,
+        draft.stream_id,
         conversation_id,
         import_chunk_id,
-        turn.root_message_id,
-        next_turn_sequence_no,
-        turn.started_at_utc,
-        turn.ended_at_utc,
-        turn.usage.input_tokens,
-        turn.usage.cache_creation_input_tokens,
-        turn.usage.cache_read_input_tokens,
-        turn.usage.output_tokens,
+        root_message_id,
+        sequence_no,
+        draft.started_at_utc,
+        draft.ended_at_utc,
+        draft.usage.input_tokens,
+        draft.usage.cache_creation_input_tokens,
+        draft.usage.cache_read_input_tokens,
+        draft.usage.output_tokens,
     ])?;
-    let turn_id = conn.last_insert_rowid();
+    Ok(conn.last_insert_rowid())
+}
 
-    for (ordinal_in_turn, message_id) in turn.message_ids.iter().enumerate() {
-        conn.prepare_cached(
-            "
-            INSERT INTO turn_message (turn_id, message_id, ordinal_in_turn)
-            VALUES (?1, ?2, ?3)
-            ",
-        )?
-        .execute(params![turn_id, message_id, ordinal_in_turn as i64])?;
+/// INSERT a single message row and return its DB-assigned id.
+fn insert_message_row(
+    conn: &Connection,
+    conversation_id: i64,
+    import_chunk_id: i64,
+    ms: &MessageState,
+    turn_id: Option<i64>,
+    ordinal_in_turn: Option<i64>,
+    source_path: &Path,
+) -> Result<i64> {
+    conn.prepare_cached(
+        "
+        INSERT INTO message (
+            stream_id,
+            conversation_id,
+            import_chunk_id,
+            external_id,
+            role,
+            message_kind,
+            sequence_no,
+            created_at_utc,
+            completed_at_utc,
+            model_name,
+            stop_reason,
+            usage_source,
+            input_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            output_tokens,
+            turn_id,
+            ordinal_in_turn
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+        ",
+    )
+    .and_then(|mut stmt| {
+        stmt.execute(params![
+            ms.stream_id,
+            conversation_id,
+            import_chunk_id,
+            ms.external_id,
+            ms.role,
+            ms.message_kind,
+            ms.sequence_no,
+            ms.created_at_utc,
+            ms.completed_at_utc,
+            ms.model_name,
+            ms.stop_reason,
+            ms.usage_source,
+            ms.usage.input_tokens,
+            ms.usage.cache_creation_input_tokens,
+            ms.usage.cache_read_input_tokens,
+            ms.usage.output_tokens,
+            turn_id,
+            ordinal_in_turn,
+        ])
+    })
+    .with_context(|| {
+        format!(
+            "unable to insert normalized message on line {} from {} (external_id={})",
+            ms.source_line_no,
+            source_path.display(),
+            ms.external_id,
+        )
+    })?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// INSERT pending parts for a message (already inserted) and populate `ms.parts`.
+fn insert_pending_parts(
+    conn: &Connection,
+    ms: &mut MessageState,
+    source_path: &Path,
+) -> Result<()> {
+    for (ordinal, part) in ms.pending_parts.iter().enumerate() {
+        let part_id = insert_message_part(
+            conn,
+            ms.id,
+            ordinal as i64,
+            part,
+            ms.source_line_no,
+            source_path,
+        )?;
+        ms.parts.push(NormalizedPart {
+            id: part_id,
+            part_kind: part.part_kind.clone(),
+            tool_name: part.tool_name.clone(),
+            tool_call_id: part.tool_call_id.clone(),
+            metadata_json: part.metadata_json.clone(),
+        });
+    }
+    ms.pending_parts.clear();
+    Ok(())
+}
+
+/// Group messages into turns in memory, INSERT all messages and turns in the
+/// correct order (root first, then turn row, then UPDATE root's turn_id, then
+/// remaining members), and return the final sorted `NormalizedMessage` list.
+///
+/// This is the core of the D1b optimisation: `turn_id` is set at INSERT time
+/// for all non-root messages, and only N_turns UPDATEs are needed for the root
+/// messages (instead of N_messages turn_message INSERTs in the old schema).
+fn persist_messages_with_turns(
+    conn: &Connection,
+    params: &NormalizeJsonlFileParams,
+    state: &mut ImportState,
+) -> Result<(Vec<NormalizedMessage>, usize)> {
+    let conversation_id = state
+        .conversation
+        .as_ref()
+        .ok_or_else(|| anyhow!("conversation missing during persist_messages_with_turns"))?
+        .id;
+
+    // Collect and sort messages by sequence_no (stable ordering).
+    let mut messages: Vec<MessageState> = state.message_states.drain().map(|(_, v)| v).collect();
+    messages.sort_by_key(|m| m.sequence_no);
+
+    // Group into turns: a new turn starts whenever message_kind == "user_prompt".
+    let mut turns: Vec<TurnAssignment> = Vec::new();
+    let mut unassigned: Vec<usize> = Vec::new();
+    let mut current_turn: Option<TurnAssignment> = None;
+
+    for (idx, ms) in messages.iter().enumerate() {
+        if ms.message_kind == "user_prompt" {
+            if let Some(finished) = current_turn.take() {
+                turns.push(finished);
+            }
+            current_turn = Some(TurnAssignment {
+                root_idx: idx,
+                member_idxs: vec![idx],
+                draft: TurnDraft::new_from_state(ms),
+            });
+        } else if let Some(ref mut turn) = current_turn {
+            turn.member_idxs.push(idx);
+            turn.draft.push_from_state(ms);
+        } else {
+            unassigned.push(idx);
+        }
+    }
+    if let Some(finished) = current_turn {
+        turns.push(finished);
     }
 
-    Ok((turn_id, next_turn_sequence_no))
+    // INSERT unassigned messages (no turn membership).
+    let source_path = &params.path;
+
+    for &idx in &unassigned {
+        let ms = &mut messages[idx];
+        ms.id =
+            insert_message_row(conn, conversation_id, params.import_chunk_id, ms, None, None, source_path)?;
+        insert_pending_parts(conn, ms, source_path)?;
+    }
+
+    // INSERT each turn: root message → turn row → UPDATE root → member messages.
+    let mut next_turn_sequence_no: i64 = 0;
+    for turn in &turns {
+        // a. INSERT root message (turn_id = NULL initially, FK not yet set).
+        {
+            let root = &mut messages[turn.root_idx];
+            root.id =
+                insert_message_row(conn, conversation_id, params.import_chunk_id, root, None, None, source_path)?;
+            insert_pending_parts(conn, root, source_path)?;
+        }
+
+        // b. INSERT turn row referencing the root message.
+        let root_id = messages[turn.root_idx].id;
+        let turn_id = insert_turn_row(
+            conn,
+            conversation_id,
+            params.import_chunk_id,
+            next_turn_sequence_no,
+            root_id,
+            &turn.draft,
+        )?;
+        next_turn_sequence_no += 1;
+
+        // c. UPDATE root message to set turn_id and ordinal_in_turn = 0.
+        conn.prepare_cached("UPDATE message SET turn_id = ?1, ordinal_in_turn = 0 WHERE id = ?2")?
+            .execute(params![turn_id, root_id])
+            .context("unable to set turn_id on root message")?;
+        {
+            let root = &mut messages[turn.root_idx];
+            root.turn_id = Some(turn_id);
+            root.turn_sequence_no = Some(next_turn_sequence_no - 1);
+            root.ordinal_in_turn = Some(0);
+        }
+
+        // d. INSERT remaining turn members with turn_id already set.
+        for (ordinal, &idx) in turn.member_idxs.iter().enumerate().skip(1) {
+            let ordinal_i64 = ordinal as i64;
+            let ms = &mut messages[idx];
+            ms.id = insert_message_row(
+                conn,
+                conversation_id,
+                params.import_chunk_id,
+                ms,
+                Some(turn_id),
+                Some(ordinal_i64),
+                source_path,
+            )?;
+            insert_pending_parts(conn, ms, source_path)?;
+            ms.turn_id = Some(turn_id);
+            ms.turn_sequence_no = Some(next_turn_sequence_no - 1);
+            ms.ordinal_in_turn = Some(ordinal_i64);
+        }
+    }
+
+    // Build the final NormalizedMessage list, sorted by (sequence_no, id).
+    let mut normalized: Vec<NormalizedMessage> = messages
+        .iter()
+        .map(|ms| NormalizedMessage {
+            id: ms.id,
+            stream_id: ms.stream_id,
+            sequence_no: ms.sequence_no,
+            message_kind: ms.message_kind.clone(),
+            created_at_utc: ms.created_at_utc.clone(),
+            completed_at_utc: ms.completed_at_utc.clone(),
+            usage: ms.usage.clone(),
+            parts: ms.parts.clone(),
+            turn_id: ms.turn_id,
+            turn_sequence_no: ms.turn_sequence_no,
+            ordinal_in_turn: ms.ordinal_in_turn,
+        })
+        .collect();
+    normalized.sort_by_key(|m| (m.sequence_no, m.id));
+
+    Ok((normalized, turns.len()))
 }
 
 fn insert_message_part(
