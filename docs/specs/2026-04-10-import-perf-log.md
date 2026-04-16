@@ -1245,27 +1245,86 @@ import_corpus_integration -- --include-ignored` before being declared complete.
 
 ---
 
+## 2026-04-15 — D2: defer message_part INSERTs to post-normalize pass — REVERTED
+
+**Branch:** `import-perf-d2`
+**Hypothesis:** Deferring all `INSERT INTO message_part` calls to a single
+sequential pass after all message rows are inserted would reduce btree op
+interleaving, yielding ~1-2s improvement on subset.
+
+**Implementation:** Removed the three inline `insert_pending_parts` calls from
+`persist_messages_with_turns` (after unassigned message INSERT, after root
+message INSERT, and after each turn-member message INSERT). Added a single
+deferred loop after all message INSERTs:
+
+```rust
+for ms in &mut messages {
+    insert_pending_parts(conn, ms, source_path)?;
+}
+```
+
+**Measurements (subset, same session):**
+
+| run | main wall | D2 wall |
+| --- | ---: | ---: |
+| 1 | 10.889s | 24.947s (cold — integration test + build still running) |
+| 2 | 11.099s | 18.822s |
+| 3 | 10.439s | 18.706s |
+| **warm median** | **10.9s** | **18.7s** |
+
+**Delta: +71% REGRESSION** — D2 is ~1.7× slower than main on subset.
+
+**Analysis:** The deferred approach triggers a SQLite FK verification penalty.
+`PRAGMA foreign_keys = ON` is set globally. Each `INSERT INTO message_part`
+causes SQLite to look up `message.id` to verify the `message_id` FK. In the
+inline path (D1b), this lookup always hits a hot page: the parent message row
+was just inserted one statement earlier. In D2, all 130K message rows are
+inserted before any part is written. By the time the deferred pass begins,
+the message btree's page ordering has shifted — even though the 64MB page
+cache is large enough to hold all message pages (~26MB), the FK lookup access
+pattern changes from purely sequential to random-within-range, interacting
+poorly with SQLite's internal btree read-ahead.
+
+`PRAGMA foreign_keys` cannot be toggled inside an active savepoint (the parts
+are inserted within the per-file savepoint), so there is no simple workaround.
+
+**Quality gates:** All pass. `cargo test --workspace` (142 tests ok), 7/7
+integration tests ok, `cargo clippy` clean.
+
+**Decision:** REVERTED — +71% regression far exceeds the threshold.
+
+Key finding #12: **Deferring child-table INSERTs past parent-table INSERTs
+causes SQLite FK verification cache misses.** The inline pattern (parent INSERT
+immediately followed by child INSERTs) keeps FK lookup pages hot. Any
+batching strategy that separates parent and child inserts by more than a few
+rows will pay a similar penalty with `PRAGMA foreign_keys = ON`.
+
+---
+
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-15 (D1b fix landed; integration test suite added to quality gates)
-Current phase: Phase 2 — D0 done, D1 reverted, D3 reverted, D1b kept + bugfixed; ready for D2
-All code is on `main`. Subset baseline: ~8.3s (post-D1b session-local median).
+Last updated: 2026-04-15 (D2 reverted — +71% regression)
+Current phase: Phase 2 — D0 done, D1 reverted, D3 reverted, D1b kept, D2 reverted
+All code is on `main`. Subset baseline: ~10.9s (this session; post-D1b ~8.3s in prior session).
 
 D0: CPU floor = 2.82s (subset). SQL = 67% of wall.
 D1: denormalize-via-UPDATE = +18% regression (UPDATE > INSERT on hot table).
 D3: defer rollups = +40-50% regression (cache-miss penalty in post-import pass).
 D1b: −6% subset / −1% full; turn_message eliminated. Bug: imported_message_count written as 0 — fixed.
+D2: defer message_part INSERTs = +71% REGRESSION (FK verification cache-miss penalty).
 Key finding #10: rollup SQL requires hot cache (per-chunk is optimal).
+Key finding #12: deferring child INSERTs past parent INSERTs causes FK verification cache misses.
 
 Next candidates:
-- **D2:** Skip message_part INSERTs (est. ~1-2s). Pure INSERT elimination, avoids UPDATE pitfall.
 - **D2b:** Denormalize action_message (same pattern as D1b; likely within noise).
+- **D4:** simd-json parsing (~1s / −5%).
+- **D5:** scan_source caching (~0.5s startup only).
 
 ### How to resume
 1. `cd /home/ketan/project/gnomon`
 2. Read this log's Phase Log for context.
 3. Read `docs/specs/2026-04-10-import-perf-design.md` **Section 13** for candidates.
-4. Continue with D2 (defer message_part INSERTs).
+4. Try D2b (denormalize action_message via preset FK at INSERT time, same as D1b).
 
 ### Iteration summary
 
@@ -1288,6 +1347,7 @@ Next candidates:
 | D1 | Denormalize join tables via UPDATE | **REVERTED** | +18% REGRESSION; UPDATE > INSERT on existing table |
 | D3 | Defer rollup computation out of import path | **REVERTED** | +40-50% REGRESSION; cache-miss penalty in post-import rollup pass |
 | D1b | Preset turn_id at message INSERT (deferred grouping) | **KEPT** | −6% subset / −1% full; turn_message eliminated |
+| D2 | Defer message_part INSERTs to post-normalize pass | **REVERTED** | +71% REGRESSION; SQLite FK verification cache misses when child inserts are batched after parent inserts |
 
 ### Current best metrics (post D1b)
 | metric | value | vs original baseline | vs target |
@@ -1318,6 +1378,7 @@ Next candidates:
 9. **UPDATE on existing table is MORE expensive than INSERT into dedicated join tables.** Even with batch WHERE id IN (...), replacing join table INSERTs with UPDATEs on the message table regresses by +18%. Search+modify (random write) is costlier than append-friendly INSERT into compact btrees. The correct join-table elimination path is to preset FKs at initial INSERT time (D1b), not to update afterwards.
 10. **Rollup computation is cache-locality dependent.** Per-chunk rollup runs efficiently because data pages are hot immediately after insert. Any post-import pass (whether single batch or truly deferred) pays 4-10× cache-miss penalty as earlier chunks' pages are evicted. Per-chunk rollup is near-optimal — it cannot be deferred.
 11. **Compact join-table btree ops are cheap.** `turn_message` rows are tiny (3 INTEGER cols) and the table fits in cache — each insert is fast. Eliminating 295K × 3 btree ops saves ~0.6s subset (−6%) but is within noise on full corpus. The btree-count model overestimates wall-time impact for small, compact tables.
+12. **Deferring child-table INSERTs past parent INSERTs causes SQLite FK verification cache misses.** With `PRAGMA foreign_keys = ON`, each child INSERT triggers a lookup in the parent table to verify the FK. The inline pattern (parent INSERT immediately followed by child INSERTs) keeps FK lookup pages hot. Batching all parent rows first, then all child rows, means each FK lookup on a child INSERT may need to fetch a page that's no longer hot — despite the 64MB cache being nominally large enough. D2 (deferring 179K message_part rows after 130K message rows) caused +71% regression. The `PRAGMA foreign_keys` flag cannot be toggled inside an active savepoint, so there is no easy workaround. The correct strategy for table elimination is the D1b pattern: preset FKs at INSERT time rather than deferring any parent-child relationship across bulk insert boundaries.
 
 ### 10s target assessment (revised 2026-04-15, post-D1b)
 
@@ -1326,29 +1387,29 @@ subset, ~0.2s full (within noise). Smaller than predicted — compact join table
 are cheap to insert into. The `action_message` table follows the same pattern
 but may be similarly cheap.
 
-Next most promising: **D2 (defer message_part)** — 412K rows × 2 btrees = 824K
-btree ops. message_part rows are larger (8 columns) so per-op cost is likely
-higher. If savings are proportional to row size, D2 should yield 2-4× more than D1b.
+D2 (deferred message_part inserts) regressed +71% — SQLite FK verification
+cache-miss penalty. Deferring parent-child inserts across a bulk boundary is
+not viable with `PRAGMA foreign_keys = ON`.
 
 ### Next action
 
-D1b KEPT. Try D2 next: defer message_part inserts to a post-normalize phase,
-eliminating the 412K × 2-btree overhead entirely from the normalize hot path.
+D2 REVERTED. Try D2b (denormalize action_message — same D1b pattern: preset
+FK at INSERT time, eliminating a join table). Expected savings: ~0.5s or less
+(similar to D1b; action_message has similar row characteristics to turn_message).
 
-### Remaining unexplored candidates (re-ranked post D1b)
+### Remaining unexplored candidates (re-ranked post D2)
 
 | rank | candidate | est. win | confidence | note |
 | --- | --- | --- | --- | --- |
-| 1 | **D2: defer message_part** | ~1-2s / −10-14% | medium | larger rows than turn_message; pure INSERT elimination |
-| 2 | **D2b: denormalize action_message** | est. ~0.5s | low | same pattern as D1b; may be within noise |
-| 3 | **D4: simd-json** | ~1s / −5% | low | parse phase only |
-| 4 | **D5: scan_source caching** | ~0.5s startup only | high | warm startup only |
+| 1 | **D2b: denormalize action_message** | est. ~0.5s | low | same pattern as D1b; may be within noise — join table, similar row count |
+| 2 | **D4: simd-json** | ~1s / −5% | low | parse phase only |
+| 3 | **D5: scan_source caching** | ~0.5s startup only | high | warm startup only |
 
 ### Bench harness
 ```bash
 cargo build -p gnomon-core --example import_bench --release
 
-# Subset (~8.3s post-D1b)
+# Subset (~10.9s session-local median post-D2 revert; ~8.3s in D1b session)
 cargo run -p gnomon-core --example import_bench --release -- \
   --corpus subset --mode full --repeats 3
 
