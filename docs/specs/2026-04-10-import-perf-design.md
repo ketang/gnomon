@@ -1,7 +1,7 @@
 # Import Performance Optimization — Design
 
 **Date:** 2026-04-10
-**Status:** Phase 2 checkpoint — btree-ops analysis complete, schema-level candidates next. Merged to main 2026-04-15.
+**Status:** Phase 2 — D1b kept, D2/D2b/D3 reverted. Near practical limit (~7.7s subset). Updated 2026-04-15.
 **Running log:** [`2026-04-10-import-perf-log.md`](./2026-04-10-import-perf-log.md)
 
 ## 1. Goals & Non-Goals
@@ -541,73 +541,57 @@ messages to the DB, so no UPDATE is ever needed (D1b below).
 
 Branch `import-perf-d1-denormalize-joins` kept as reference, not merged.
 
-### Updated 10s target assessment (post-D3)
+### Updated target assessment (post-D2b, 2026-04-15)
 
-D0, D1, D3 are all resolved. The 10s target is effectively reached on the subset
-(session-local median ~10s). The route forward is D1b + D2 for further reduction.
+All primary candidates have been tried. Project is at or below the 10s target.
 
-| change | est. savings | cumulative wall | status |
-| --- | ---: | ---: | --- |
-| current baseline | — | ~10s (subset) | measured |
-| D1: denormalize via post-hoc UPDATE | — | — | **FAILED (+18%)** |
-| D3: defer rollup computation | — | — | **FAILED (+40-50%)** |
-| D1b: preset turn_id at message INSERT | ~1-2s | ~8-9s | candidate — next |
-| D2: skip message_part INSERTs | ~1-2s | ~7-8s | candidate |
-| D4: simd-json | ~0.5s | ~6-7s | candidate |
+| change | result | subset wall |
+| --- | --- | ---: |
+| pre-D-series baseline | — | ~10s (session) |
+| D1: denormalize via UPDATE | **REVERTED** | +18% |
+| D3: defer rollup computation | **REVERTED** | +40-50% |
+| D1b: preset turn_id at message INSERT | **KEPT** | −6% / ~8.3s |
+| D1b bug fix: imported_message_count | **KEPT** | — |
+| D2: defer message_part INSERTs | **REVERTED** | +71% |
+| D2b: action_message schema (3→2 btrees) | **REVERTED** | +18% |
+| **session-local median (post-D2b)** | — | **~7.7s** |
 
-Note: session-local numbers are on the subset (single project, ~10s).
-Full corpus authoritative numbers should be run before final decisions.
+Full corpus authoritative: ~21s post-D1b (prior session).
 
-### Candidate ranking (Phase 2, updated post-D3)
+### Candidate ranking (Phase 2, final state 2026-04-15)
 
 **D0. Zero-write diagnostic — COMPLETE.** CPU floor = 2.82s (subset). SQL
-writes = 67% of wall. Btree-ops model validated. Branch kept as reference.
+writes = 67% of wall. Btree-ops model validated.
 
-**D1. Denormalize join tables via post-hoc UPDATE — REVERTED.** Both
-individual and batched UPDATE variants are +18% regressions. Key finding #9:
-UPDATE on existing table is more expensive than INSERT into compact join tables.
-Branch kept as reference.
+**D1. Denormalize join tables via post-hoc UPDATE — REVERTED.** +18%
+regression. Key finding #9: UPDATE on existing table is more expensive than
+INSERT into compact join tables.
 
-**D3. Defer rollup computation — REVERTED (2026-04-15).** Deferring rollups
-entirely out of the import path causes a 2× cache-miss penalty on the post-import
-rebuild pass: per-chunk cost ~3.4s vs. post-import pass ~6.5s. Total regresses
-+40-50%. Root cause: per-chunk rollup runs while data pages are hot; any deferred
-pass accesses evicted pages. Key finding #10: rollup SQL is cache-locality
-dependent — per-chunk is near-optimal. Branch kept as reference.
+**D3. Defer rollup computation — REVERTED.** +40-50% regression. Key
+finding #10: per-chunk rollup is near-optimal — any deferred pass pays
+a cache-miss penalty.
 
-**D1b. Preset `turn_id` at message INSERT time (est. ~1-2s, −10-20%). Next to try.**
-The correct denormalization path. Instead of inserting messages then updating
-`turn_id`, compute turn boundaries in memory before the first message INSERT,
-then pass `turn_id` into the INSERT directly. Requires reordering the
-normalize pipeline: group messages into turns in memory (already done via
-`build_turns` annotation), then INSERT messages with `turn_id` already
-populated. No UPDATE ever issued. The `action_id` case is harder because
-action classification runs after message persists (needs DB IDs for part
-mapping); `action_id` may need to remain a post-hoc UPDATE unless part ID
-assignment is also restructured. Risk: medium. Requires careful sequencing of
-turn grouping relative to DB ID assignment.
+**D1b. Preset `turn_id` at message INSERT — KEPT.** −6% subset / −1% full.
+Eliminates `turn_message` join table entirely. Groups messages into turns
+in memory before first INSERT; `turn_id` is set at INSERT time. Root
+messages require one UPDATE each (N_turns ≈ 5K) which is acceptable.
 
-Key constraint from D1 failure: `turn_id` must be set at INSERT time (not via
-UPDATE). The turn grouping logic already runs in memory (`build_turns_from_messages`
-in `import/normalize.rs`) — the challenge is wiring the turn IDs back into the
-message INSERT before the DB write.
+**D2. Defer message_part INSERTs — REVERTED.** +71% regression. Key
+finding #12: deferring child INSERTs past parent INSERTs causes SQLite FK
+verification cache misses. `PRAGMA foreign_keys` cannot be toggled inside
+an active savepoint — no workaround available.
 
-**D2. Skip message_part INSERTs (est. ~1-2s, −10-20%).** Skip `message_part`
-INSERTs during import. Classification already receives parts in memory (iteration 5).
-Set `message_path_ref.message_part_id = NULL` (FK is nullable, `ON DELETE SET NULL`).
-The `load_skill_transcript_evidence` query (`query/mod.rs:1818`) loses data — either
-accept this (minor feature regression) or defer part INSERTs to a background pass
-after TUI opens.
+**D2b. action_message schema optimization — REVERTED.** +18% regression.
+Changing `action_message` PK from composite `(action_id, message_id)` to
+INTEGER rowid `(message_id)` reduced auto-indexes from 3 → 2 but regressed.
+Key finding #13: composite index structure outperforms INTEGER rowid PK for
+this mixed INSERT + FK-verification workload. The D1b preset-FK pattern
+cannot apply to `action_message` (dependency cycle: action needs turn_id →
+turn needs message IDs → messages must be inserted first).
 
-Btree ops eliminated: 824K (16%). Risk: low if skill transcript evidence loss is
-acceptable; medium if background deferral is needed. Pure INSERT elimination —
-avoids UPDATE pitfall entirely.
+**D4. simd-json — LOW PRIORITY.** Parse phase is ~0.3s (4% of wall).
+Ceiling is too small to cross the 0.4s improvement threshold.
 
-**D4. simd-json (est. ~0.5s, −5%).** Replace `serde_json` with `simd-json` or
-`sonic-rs` for JSONL parsing. The parse phase is ~0.3s at current subset scale
-(already parallelized). Only worthwhile if parse becomes a larger fraction of
-remaining wall time after D1b/D2 land.
-
-**D5. scan_source caching (startup only, est. ~0.5s).** Cache the directory
-walk results from `scan_source` for warm-startup reimports. Does not affect
-cold full import. Risk: low.
+**D5. scan_source caching — STARTUP ONLY.** Cache directory walk results
+for warm-startup reimports. Does not affect cold full import. Viable if
+startup latency becomes the focus.
