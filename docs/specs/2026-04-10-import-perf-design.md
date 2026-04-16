@@ -541,33 +541,41 @@ messages to the DB, so no UPDATE is ever needed (D1b below).
 
 Branch `import-perf-d1-denormalize-joins` kept as reference, not merged.
 
-### Updated 10s target assessment
+### Updated 10s target assessment (post-D3)
 
-D0 confirmed the floor. D1 failure invalidated the post-hoc UPDATE path.
-The projection table is updated with measured results and a revised route:
+D0, D1, D3 are all resolved. The 10s target is effectively reached on the subset
+(session-local median ~10s). The route forward is D1b + D2 for further reduction.
 
 | change | est. savings | cumulative wall | status |
 | --- | ---: | ---: | --- |
-| current baseline | — | ~21.6s | measured |
+| current baseline | — | ~10s (subset) | measured |
 | D1: denormalize via post-hoc UPDATE | — | — | **FAILED (+18%)** |
-| D1b: preset turn_id at message INSERT | ~3-4s | ~18s | candidate |
-| D2: defer message_part persistence | ~2-3s | ~15s | candidate |
-| D3: defer rollup computation | ~3.6s | ~11s | candidate |
-| D4: simd-json | ~1s | ~10s | candidate |
+| D3: defer rollup computation | — | — | **FAILED (+40-50%)** |
+| D1b: preset turn_id at message INSERT | ~1-2s | ~8-9s | candidate — next |
+| D2: skip message_part INSERTs | ~1-2s | ~7-8s | candidate |
+| D4: simd-json | ~0.5s | ~6-7s | candidate |
 
-### Candidate ranking (Phase 2, iteration 14+, updated post-D1)
+Note: session-local numbers are on the subset (single project, ~10s).
+Full corpus authoritative numbers should be run before final decisions.
 
-Re-ranked after D1 failure. D1b is new. D3 is next because it avoids the
-UPDATE pitfall entirely (defers work, not restructures it).
+### Candidate ranking (Phase 2, updated post-D3)
 
 **D0. Zero-write diagnostic — COMPLETE.** CPU floor = 2.82s (subset). SQL
 writes = 67% of wall. Btree-ops model validated. Branch kept as reference.
 
 **D1. Denormalize join tables via post-hoc UPDATE — REVERTED.** Both
-individual and batched UPDATE variants are +18% regressions. See key finding
-#9 above. Branch kept as reference.
+individual and batched UPDATE variants are +18% regressions. Key finding #9:
+UPDATE on existing table is more expensive than INSERT into compact join tables.
+Branch kept as reference.
 
-**D1b. Preset `turn_id` at message INSERT time (est. ~3-4s, −14-19%).**
+**D3. Defer rollup computation — REVERTED (2026-04-15).** Deferring rollups
+entirely out of the import path causes a 2× cache-miss penalty on the post-import
+rebuild pass: per-chunk cost ~3.4s vs. post-import pass ~6.5s. Total regresses
++40-50%. Root cause: per-chunk rollup runs while data pages are hot; any deferred
+pass accesses evicted pages. Key finding #10: rollup SQL is cache-locality
+dependent — per-chunk is near-optimal. Branch kept as reference.
+
+**D1b. Preset `turn_id` at message INSERT time (est. ~1-2s, −10-20%). Next to try.**
 The correct denormalization path. Instead of inserting messages then updating
 `turn_id`, compute turn boundaries in memory before the first message INSERT,
 then pass `turn_id` into the INSERT directly. Requires reordering the
@@ -579,37 +587,26 @@ mapping); `action_id` may need to remain a post-hoc UPDATE unless part ID
 assignment is also restructured. Risk: medium. Requires careful sequencing of
 turn grouping relative to DB ID assignment.
 
-**D3. Defer rollup computation (est. ~3.6s, −17%).** `finalize_chunk +
-rollups` = 3.6s (15% of wall). Rollups are pre-aggregated tables for fast
-TUI browsing (`chunk_action_rollup`, `chunk_path_rollup`). Two options:
+Key constraint from D1 failure: `turn_id` must be set at INSERT time (not via
+UPDATE). The turn grouping logic already runs in memory (`build_turns_from_messages`
+in `import/normalize.rs`) — the challenge is wiring the turn IDs back into the
+message INSERT before the DB write.
 
-- **D3a.** Compute on first TUI access (lazy). First TUI load is slower but
-  import wall time drops immediately.
-- **D3b.** Compute in a background thread after TUI opens. Import finishes
-  sooner, TUI shows data progressively.
+**D2. Skip message_part INSERTs (est. ~1-2s, −10-20%).** Skip `message_part`
+INSERTs during import. Classification already receives parts in memory (iteration 5).
+Set `message_path_ref.message_part_id = NULL` (FK is nullable, `ON DELETE SET NULL`).
+The `load_skill_transcript_evidence` query (`query/mod.rs:1818`) loses data — either
+accept this (minor feature regression) or defer part INSERTs to a background pass
+after TUI opens.
 
-Note: iteration 11 tried moving rollups out of the per-chunk finalize
-transaction and saw no improvement because the total SQL work was the same.
-D3 is different: it defers rollups entirely out of the import path, either
-to read time or to a background worker. Risk: medium. Requires the TUI to
-handle missing rollup data gracefully (either block on first access or show
-a loading state). **Next to try.**
+Btree ops eliminated: 824K (16%). Risk: low if skill transcript evidence loss is
+acceptable; medium if background deferral is needed. Pure INSERT elimination —
+avoids UPDATE pitfall entirely.
 
-**D2. Defer message_part persistence (est. ~2-3s, −10-14%).** Skip
-`message_part` INSERTs during import. Classification already receives parts
-in memory (iteration 5). Set `message_path_ref.message_part_id = NULL` (FK
-is nullable, `ON DELETE SET NULL`). The `load_skill_transcript_evidence`
-query (`query/mod.rs:1818`) loses data — either accept this (minor feature)
-or defer part INSERTs to a background pass after TUI opens.
-
-Btree ops eliminated: 824K (16%). Risk: low if skill transcript evidence is
-acceptable to lose; medium if background deferral is needed.
-
-**D4. simd-json (est. ~1s, −5%).** Replace `serde_json` with `simd-json` or
-`sonic-rs` for JSONL parsing. The parse phase is ~2.9s (12% of wall) with
-rayon parallelism. SIMD-accelerated parsing could halve this. Risk: low-medium.
-Only worthwhile after D1b/D2/D3 land and parse becomes a larger fraction of
-the remaining wall time.
+**D4. simd-json (est. ~0.5s, −5%).** Replace `serde_json` with `simd-json` or
+`sonic-rs` for JSONL parsing. The parse phase is ~0.3s at current subset scale
+(already parallelized). Only worthwhile if parse becomes a larger fraction of
+remaining wall time after D1b/D2 land.
 
 **D5. scan_source caching (startup only, est. ~0.5s).** Cache the directory
 walk results from `scan_source` for warm-startup reimports. Does not affect
