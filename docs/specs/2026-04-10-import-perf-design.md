@@ -1,7 +1,7 @@
 # Import Performance Optimization — Design
 
 **Date:** 2026-04-10
-**Status:** Phase 2 — D1b kept, D2/D2b/D3 reverted. Near practical limit (~7.7s subset). Updated 2026-04-15.
+**Status:** Phase 3 planning — pragma hardening + sharding candidates. Updated 2026-04-16.
 **Running log:** [`2026-04-10-import-perf-log.md`](./2026-04-10-import-perf-log.md)
 
 ## 1. Goals & Non-Goals
@@ -68,10 +68,9 @@ Enters only after the Phase 1 gate opens. One iteration:
 3. Implement the candidate.
 4. Run the harness: subset first (fast feedback), then full (truth). Capture deltas vs. the current best.
 5. Verify parity: row counts per table match the baseline database; spot-check representative queries for identical results.
-6. Run the corpus-backed ingestion regression suite: `cargo test --package gnomon-core --test import_corpus_integration -- --ignored`. All 7 tests must pass. This catches semantic regressions (wrong row counts, broken reimport idempotency, startup-import ordering violations) that the performance harness and row-parity spot-checks do not cover.
-7. Write a log entry covering hypothesis, measurements, kept/reverted decision, rationale, and implied next candidate.
-8. **If kept:** summarize for the user, request commit approval, commit on approval, merge the candidate branch into the long-lived `import-perf` branch, re-profile, re-rank candidates.
-9. **If reverted:** log the result, leave the worktree alone, pick the next candidate.
+6. Write a log entry covering hypothesis, measurements, kept/reverted decision, rationale, and implied next candidate.
+7. **If kept:** summarize for the user, request commit approval, commit on approval, merge the candidate branch into the long-lived `import-perf` branch, re-profile, re-rank candidates.
+8. **If reverted:** log the result, leave the worktree alone, pick the next candidate.
 
 ### Soft checkpoints
 
@@ -125,6 +124,7 @@ This is the **starting** ranking. It will be re-ranked after every profile and s
 - Switching away from SQLite entirely.
 - Async/tokio rewrite. SQLite is sync-native; async gains nothing for this workload.
 - Writing a custom JSONL parser.
+- Schema denormalization before evidence that joins are the problem.
 - Caching parsed JSON to disk.
 
 ## 5. Corpus Snapshot
@@ -240,7 +240,7 @@ Next implied: <next candidate and why>
 - Log-only updates (committed directly).
 - Profile artifacts and flamegraphs (committed as part of their log entry).
 
-**Quality gates before every commit prompt.** `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo build --workspace`, and `cargo test --package gnomon-core --test import_corpus_integration -- --ignored` all pass. If any fail, the assistant fixes first, surfaces the fix, and only then re-prompts. Hooks are never skipped.
+**Quality gates before every commit prompt.** `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo build --workspace` all pass. If any fail, the assistant fixes first, surfaces the fix, and only then re-prompts. Hooks are never skipped.
 
 **Merge to main.** Never automatic. At stopping time, or on explicit request, the assistant summarizes the cumulative delta and proposes the merge. The user approves or defers.
 
@@ -590,8 +590,297 @@ cannot apply to `action_message` (dependency cycle: action needs turn_id →
 turn needs message IDs → messages must be inserted first).
 
 **D4. simd-json — LOW PRIORITY.** Parse phase is ~0.3s (4% of wall).
-Ceiling is too small to cross the 0.4s improvement threshold.
+Ceiling is too small to matter before structural SQL changes.
 
-**D5. scan_source caching — STARTUP ONLY.** Cache directory walk results
-for warm-startup reimports. Does not affect cold full import. Viable if
-startup latency becomes the focus.
+**D5. scan_source delta cache + parallelism — STARTUP ONLY.** Reuse
+stored manifest/project identity when `mtime + size + import schema
+version` are unchanged, parallelize first-record `cwd` extraction, and
+memoize `cwd -> ResolvedProject`. This targets warm startup rather than
+cold full import.
+
+**D6. path_node memoization — UNTRIED.** `persist_path_refs` still
+resolves `path_node` chains through repeated point lookups/inserts. A
+per-project cache keyed by canonical full path could remove many hot-loop
+btree probes.
+
+**D7. inline rollup materialization — UNTRIED.** D3 proved that deferring
+rollups is worse. A different idea is to accumulate chunk rollups during
+classification/write, eliminating the reread in `rollup.rs` rather than
+moving it later.
+
+**D8. finer-grained invalidation than project x day — WARM-START
+STRUCTURAL.** The current import plan reimports a whole day chunk when any
+file in that day changes. If warm-start latency becomes the goal, this is
+a larger lever than parser swaps.
+
+## 14. Phase 3: Pragma Hardening + Sharded Import (2026-04-16)
+
+19 iterations complete (9 KEPT, 10 REVERTED). Full corpus cold import:
+~21s median (post-D1b). Subset: ~7.7s median. CPU floor (D0): 2.82s
+(subset). The single-threaded SQLite write path is near its practical limit.
+
+Three categories of work remain: (E) low-risk pragma changes that haven't
+been tried, (F) parallel write via per-project database sharding, and
+(G) structural reductions in import-side rereads/reprobes.
+
+### E. Pragma hardening (untried)
+
+These pragmas were listed in Section 4 (A2b) but never implemented. No
+worktree exists for any of them.
+
+**E1. `PRAGMA foreign_keys = OFF` on the import connection.**
+
+Every child-table INSERT triggers a btree lookup on the parent table's PK
+index to verify FK integrity. Estimated FK verification lookups across a
+full cold import:
+
+| child table | rows | FK checks/row | total lookups |
+| --- | ---: | ---: | ---: |
+| message_part | 412K | 1 (message) | 412K |
+| message | 295K | 3 (stream, conversation, import_chunk) | 885K |
+| action | 121K | 2 (turn, import_chunk) | 242K |
+| action_message | 121K | 2 (action, message) | 242K |
+| message_path_ref | ~200K | 3 (message, message_part, path_node) | ~600K |
+| turn | 13K | 3 (stream, conversation, import_chunk) | 39K |
+| other | ~50K | varies | ~100K |
+| **total** | | | **~2.5M** |
+
+Each lookup is a btree search on the parent table's PK. At 0.5–2µs each
+(pages are hot), the total FK overhead is 1.3–5.0s.
+
+The data is inserted in guaranteed parent-before-child order by
+construction. Setting `foreign_keys = OFF` at connection open time
+(`db/mod.rs:139`) eliminates all FK verification during import. A
+`PRAGMA foreign_key_check` validation pass can run post-import if desired.
+
+This also re-opens the D2 hypothesis. The +71% regression in D2 was
+entirely caused by FK verification cache misses when child INSERTs were
+deferred past parent INSERTs. With FK checks disabled, the underlying
+question — whether batching all `message_part` INSERTs into a single pass
+reduces btree interleaving — can be measured cleanly.
+
+Key distinction from D2: the D2 log concluded "PRAGMA foreign_keys cannot
+be toggled inside an active savepoint, so there is no simple workaround."
+That is true for mid-transaction toggling. But E1 sets FK=OFF at connection
+open time, before any transaction. The savepoint limitation is irrelevant.
+
+Risk: very low. Import data comes from a trusted source (parsed JSONL).
+Referential integrity is guaranteed by insert ordering.
+
+**E2. `PRAGMA locking_mode = EXCLUSIVE`.**
+
+Avoids acquiring and releasing shared locks on every read/write operation.
+The import connection is the sole writer; no concurrent readers are needed
+during bulk import. Estimated savings: 0.3–0.5s.
+
+Risk: near zero. Only affects the import connection; read-only connections
+for the TUI use a separate `Database` handle.
+
+**E3. `PRAGMA wal_autocheckpoint = 0` + manual checkpoint.**
+
+Disables automatic WAL consolidation during import. The WAL grows unbounded
+until a manual `PRAGMA wal_checkpoint(TRUNCATE)` at the end. Prevents mid-
+import WAL checkpoint stalls.
+
+Risk: low. The WAL file grows to ~DB size during import. On tmpfs (bench)
+this is free; on a real disk it uses proportional extra space temporarily.
+
+**E1+E2+E3 combined estimate:** 2–4s savings on full corpus. Low effort,
+no schema or read-path changes. Should be measured as a single candidate
+(they are independent pragmas with no interaction).
+
+### F. Parallel import via per-project database sharding
+
+The only remaining path to break the single-writer bottleneck. One SQLite
+file per project, written in parallel, then either merged or queried via
+ATTACH. The D0 diagnostic confirms the CPU floor (2.82s subset ≈ ~5.6s
+full corpus) leaves room: if write time drops from ~14s to ~4s via 6-core
+parallelism, total cold import lands at ~10s.
+
+#### F1. Cross-project query audit
+
+The TUI's query layer (`query/mod.rs`) was audited for cross-project
+dependencies. Five categories:
+
+**Category 1 — Truly global (no project filter possible):**
+- `latest_snapshot_bounds()`: `MAX(publish_seq)` across all chunks. Trivial
+  to compute from per-shard MAX values.
+- `snapshot_coverage_summary()`: `COUNT(DISTINCT project_id)`, `SUM(turns)`,
+  `SUM(conversations)`. Straightforward aggregation across shards, except
+  `COUNT(DISTINCT chunk_day_local)` requires cross-shard dedup.
+- `filter_options()`: enumerates all projects, categories, actions, model
+  names. Must union DISTINCT values from all shards.
+
+**Category 2 — Per-project when filtered (the common drill-down case):**
+- `browse()` / `browse_many()`: sunburst data. Root view is cross-project;
+  drill-down is single-project. The TUI's most common use case (drill into
+  a project) would be single-shard.
+- `opportunities_report()`: optional `project_id` filter.
+- Rollup queries: already scoped to `import_chunk_id` (= project × day).
+
+**Category 3 — Session-based (no project_id in schema):**
+- `history_events()`: `history_event` table has no `project_id` column.
+  Must scan all shards to find events for a session.
+- `skill_invocations()` / `skills_report()`: keyed by session, not
+  project. Optional join to `conversation` for project context.
+
+#### F2. Sharding strategies
+
+Three viable approaches, in order of increasing architectural risk:
+
+**F2a. Parallel import → sequential merge (safest).**
+
+Import phase: one SQLite file per project (or project group), written in
+parallel by a rayon thread pool. Each writer owns its connection and applies
+the same `import_chunk` pipeline as today.
+
+Merge phase: after all parallel imports complete, bulk-copy rows from each
+shard into the single production database using `ATTACH` + `INSERT INTO
+target SELECT * FROM shard.table`. This is a sequential scan of each shard
+— no per-row Rust overhead, no btree randomness.
+
+Read path: unchanged. The production database is a single file as today.
+
+Trade-offs:
+- (+) Zero read-path changes. TUI code untouched.
+- (+) Merge is cheap: `INSERT...SELECT` from ATTACH'd databases is I/O-
+  bound sequential scan, not CPU-bound btree traversal. ~2–3s for 425MB.
+- (+) FK checks happen in the final DB if desired.
+- (−) Peak disk usage: ~2× during merge (shards + final DB).
+- (−) Merge step is sequential. Total = parallel_import + merge.
+- (−) Must handle schema migration on each shard identically.
+
+Estimated timeline: parallel_import ~3–4s + merge ~2–3s = **~5–7s write
+phase** vs ~14s today, plus ~5.6s CPU floor = **~11–13s total**. Close to
+10s; pragma hardening (E1–E3) could close the gap.
+
+**F2b. Permanent per-project files + ATTACH for reads.**
+
+Each project lives in its own `.sqlite3` file permanently. The read path
+uses `ATTACH` to open all project databases, then queries use cross-
+database table references (`project_a.message`, `project_b.message`).
+
+Trade-offs:
+- (+) No merge step. Import finishes as soon as the last shard completes.
+- (+) Adding/removing a project is instant (just add/remove a file).
+- (−) SQLite ATTACH limit: default 10, configurable up to 125 with
+  `SQLITE_MAX_ATTACHED`. At 31 projects this requires compile-time config
+  of the bundled libsqlite3-sys.
+- (−) Cross-database query planner may be less efficient.
+- (−) Every TUI query must be rewritten with cross-DB table prefixes or
+  use a UNION ALL view layer.
+- (−) `history_event` and `skill_invocation` need a `project_id` column
+  or a separate global metadata database.
+
+**F2c. Per-project files + materialized global metadata.**
+
+Permanent per-project shards for the heavy tables (message, message_part,
+action, turn, etc.). A small global metadata database stores pre-computed
+cross-project aggregates: project list, filter options, snapshot bounds,
+global rollups.
+
+Trade-offs:
+- (+) Cleanest long-term architecture. Each shard is self-contained.
+- (+) Global metadata DB is small and cheap to rebuild after import.
+- (+) TUI root view reads the metadata DB; drill-down opens one shard.
+- (−) Most complex. Requires a metadata materialization step.
+- (−) Session-based tables (history_event, skill_invocation) need routing
+  to either a specific shard or the global DB.
+
+#### F3. Recommended approach
+
+**Phase 3a: E1+E2+E3 pragma hardening.** Low risk, fast to implement and
+measure. If it saves 2–4s, full corpus drops from ~21s to ~17–19s.
+
+**Phase 3b: F2a parallel-import-then-merge.** Implement if pragma hardening
+alone doesn't reach 10s. The merge approach has zero read-path risk and can
+be measured independently of the pragma changes.
+
+### G. Additional structural candidates (untried)
+
+These do not replace E or F. They are the remaining ideas that still
+appear materially different from the reverted D-series experiments.
+
+**G1. scan_source delta cache + parallel header extraction.**
+
+`discover_source_files()` and `extract_cwd()` still rescan/open every
+candidate JSONL file on startup. Cache `cwd`, project resolution, and
+manifest metadata for unchanged files; parallelize first-record reads for
+misses.
+
+Impact: warm startup only. Probably the best remaining startup-specific
+lever.
+
+**G2. Import-local path_node memoization.**
+
+`persist_path_refs()` -> `ensure_path_node_chain()` still performs repeated
+`SELECT`/`INSERT` work per path component. A per-project
+`HashMap<canonical_path, path_node_id>` or component cache could turn many
+repeated chains into O(1) lookups.
+
+Impact: cold import and warm startup. Targets a still-hot DB write path
+without schema churn.
+
+**G3. Inline rollup materialization instead of deferred rebuild.**
+
+Current `rebuild_chunk_*_rollups()` rereads action/path facts after
+classification. D3 showed that moving the same SQL later is worse. A better
+experiment is to materialize the chunk aggregates directly while
+actions/path refs are already in memory.
+
+Impact: cold import. Medium risk: changes importer/write-path logic but can
+preserve the read schema.
+
+**G4. Finer-grained invalidation than whole chunk.**
+
+`build_import_plan()` invalidates an entire `project x day` chunk when one
+source file changes. That is simple and correct, but it forces avoidable
+warm-start work. A file-level or conversation-range invalidation scheme may
+matter more than micro-optimizing parser or SQLite settings for startup.
+
+Impact: warm startup. Highest product/logic risk of the G group.
+
+If the goal remains pure cold-import wall time and E under-delivers, F2a is
+still the only remaining idea with a clear multi-second ceiling. If the
+goal shifts toward warm startup, G1/G4 are more relevant than F2a.
+
+**Phase 3c (optional): F2b or F2c permanent sharding.** Only if F2a's merge
+step proves to be the bottleneck AND the read path needs to scale to
+hundreds of projects. Not recommended for the current 31-project corpus.
+
+#### F4. Implementation sketch for F2a
+
+```
+import_all_sharded(conn, db_path, source_root):
+  1. scan_source_manifest(conn, source_root)  [existing, ~3s]
+  2. build_import_plan(conn)                   [existing]
+  3. Group prepared_chunks by project_id
+  4. For each project group, in parallel (rayon):
+       a. Create a temp SQLite file: /tmp/gnomon-shard-{project_id}.sqlite3
+       b. Apply migrations (schema must match production DB)
+       c. Configure connection: FK=OFF, EXCLUSIVE, wal_autocheckpoint=0
+       d. Copy relevant project/source_file/import_chunk rows from main DB
+       e. Run import_chunk() for each chunk in the group
+       f. Signal completion
+  5. Sequential merge:
+       for each shard file:
+         ATTACH shard AS src
+         INSERT INTO message SELECT * FROM src.message
+         INSERT INTO message_part SELECT * FROM src.message_part
+         ... (all tables)
+         DETACH src
+  6. Rebuild rollups on the merged DB
+  7. Clean up shard files
+```
+
+Key constraint: step 5's `INSERT...SELECT` must handle ID conflicts.
+Options: (a) pre-assign non-overlapping ID ranges per shard, (b) use
+rowid-preserving copy (shard rowids don't overlap if each shard starts
+from a fresh DB), or (c) let the merge DB auto-assign new rowids and
+fix FK references in a post-pass.
+
+Option (b) is simplest: each shard is a fresh DB, so rowids start at 1.
+The merge step must remap shard-local rowids to globally unique IDs.
+Pre-assigning ID ranges (option a) avoids remapping: shard N starts
+message rowids at `N * 10_000_000`, ensuring no overlap. This trades
+some ID space for zero post-merge fixup.
