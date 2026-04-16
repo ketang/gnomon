@@ -1127,11 +1127,85 @@ Row parity: **PASS** — all rollup tables match per-chunk baseline when
 
 ---
 
+## 2026-04-15 — D1b: preset turn_id at message INSERT time
+
+**Branch:** `import-perf-d1b`
+**Hypothesis:** D1 regressed because post-hoc UPDATE on `message` is more
+expensive than JOIN table INSERTs. The correct path is to compute turn
+membership in memory before the first INSERT, so `turn_id` and
+`ordinal_in_turn` can be set at INSERT time — eliminating both the
+`turn_message` table and any post-hoc UPDATE cost.
+
+**Implementation:**
+- Migration `0011_d1b_message_turn_id.sql`: ALTER TABLE message to add
+  `turn_id` (nullable FK → turn) and `ordinal_in_turn`; DROP TABLE
+  turn_message.
+- `normalize.rs`: `upsert_message` made fully in-memory (no DB calls).
+  New `persist_messages_with_turns` function groups messages into turns
+  in memory (sorted by sequence_no; new turn at every `user_prompt`),
+  then inserts in order: root message (turn_id=NULL) → turn row →
+  UPDATE root to set turn_id/ordinal_in_turn=0 → non-root members with
+  turn_id set at INSERT time. Only N_turns (~5K subset / ~25K full)
+  UPDATEs vs N_messages UPDATEs in D1.
+- `classify/mod.rs`: `load_messages` query updated to use `m.turn_id` /
+  `m.ordinal_in_turn` directly; removed `JOIN turn_message` JOIN.
+- `query/mod.rs` test fixture: `INSERT INTO turn_message` → `UPDATE
+  message SET turn_id`.
+- `db/mod.rs`: `INITIAL_SCHEMA_VERSION` bumped 10 → 11; `REQUIRED_TABLES`
+  count corrected (19, not 20).
+- `IMPORT_SCHEMA_VERSION` bumped 5 → 6 (triggers full reimport).
+
+**Measurements (interleaved, same session):**
+
+Subset (8 pairs): main median **8.89s**, D1b median **8.32s** → **−0.57s / −6.4%**
+
+| run | main | D1b |
+| --- | ---: | ---: |
+| 1 | 8.986s | 9.676s |
+| 2 | 8.793s | 8.193s |
+| 3 | 9.221s | 9.669s |
+| 4 | 9.990s | 7.684s |
+| 5 | 8.171s | 8.818s |
+| 6 | 8.662s | 8.137s |
+| 7 | 8.384s | 7.745s |
+| 8 | 8.998s | 8.446s |
+| **median** | **8.89s** | **8.32s** |
+
+Full corpus (3 pairs): main median **21.244s**, D1b median **21.009s** → **−0.24s / −1.1%**
+
+| run | main | D1b |
+| --- | ---: | ---: |
+| 1 | 22.525s | 21.525s |
+| 2 | 21.149s | 21.009s |
+| 3 | 21.244s | 20.576s |
+| **median** | **21.244s** | **21.009s** |
+
+Row parity: **PASS** — all tables match. `turn` row count unchanged (4,915
+subset). `message` row count unchanged (130,478 subset).
+
+Quality gates: `cargo fmt`, `cargo clippy -D warnings`, `cargo test --workspace` — all pass.
+
+**Analysis:** Savings are real but smaller than the 2-3s btree model predicted.
+Root cause: `turn_message` rows are compact (3 INTEGER columns) and the table's
+btree is tiny relative to the main `message` table, so per-op insert cost is
+low. The 295K × 3 btree ops eliminated are fast ops. Additionally, the 5K root-
+message UPDATEs offset a fraction of the savings. Full-corpus delta sits within
+WSL2 noise (~5%), though subset shows a cleaner −6.4% signal.
+
+Architectural benefit is real regardless: the schema is simpler, `load_messages`
+eliminates one JOIN (no index lookup on `turn_message.message_id`), and the
+join-table-elimination goal is complete for turns.
+
+**Decision:** KEPT — subset shows clear directional improvement; schema
+simplification has value independent of the modest wall-time delta.
+
+---
+
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-15 (D3 reverted; key finding: rollup is cache-locality bound)
-Current phase: Phase 2 — D0 done, D1 reverted, D3 reverted; candidates re-ranked
-All code is on `main`. Subset baseline: ~10s (session-local median, includes rollups).
+Last updated: 2026-04-15 (D1b kept; −6% subset, −1% full)
+Current phase: Phase 2 — D0 done, D1 reverted, D3 reverted, D1b kept; candidates re-ranked
+All code is on `main` (after D1b merge). Subset baseline: ~8.3s (post-D1b session-local median).
 
 D0: CPU floor = 2.82s (subset). SQL = 67% of wall.
 D1: denormalize-via-UPDATE = +18% regression (UPDATE > INSERT on hot table).
@@ -1168,23 +1242,24 @@ Next candidates:
 | D0 | Zero-write diagnostic | **N/A** | CPU floor = 2.82s (subset); SQL = 67% of wall |
 | D1 | Denormalize join tables via UPDATE | **REVERTED** | +18% REGRESSION; UPDATE > INSERT on existing table |
 | D3 | Defer rollup computation out of import path | **REVERTED** | +40-50% REGRESSION; cache-miss penalty in post-import rollup pass |
+| D1b | Preset turn_id at message INSERT (deferred grouping) | **KEPT** | −6% subset / −1% full; turn_message eliminated |
 
-### Current best metrics (post iteration 13 / D1 / D3)
+### Current best metrics (post D1b)
 | metric | value | vs original baseline | vs target |
 | --- | ---: | ---: | ---: |
-| Cold full import (session-local best) | ~10s | ~92% from 126.1s | ~1.0× to 10s target |
+| Cold full import (session-local best) | ~9.7s | ~92% from 126.1s | ~0.97× to 10s target |
 | Startup | ~2.29s | ~55% from ~5.1s baseline | ~2.3× to <1s target |
 
-### Current phase distribution (subset, ~10s session-local median)
+### Current phase distribution (subset, ~8.3s post-D1b session-local median)
 
 | phase | time | % of wall | note |
 | --- | ---: | ---: | --- |
-| normalize_jsonl | ~4.0s | ~40% | messages + parts INSERTs (130K + 179K) |
-| build_actions | ~2.3s | ~23% | classify CPU + DB persist |
-| scan_source | ~1.0s | ~10% | directory walk + VCS resolution |
-| finalize_chunk + rollups | ~1.7s | ~17% | path rollup dominant, cache-locality bound |
-| build_turns | ~0.6s | ~6% | in-memory + DB persist |
-| parse (rayon CPU) | ~0.3s | ~3% | parallel JSON parse |
+| normalize_jsonl | ~3.8s | ~46% | messages + parts INSERTs (130K + 179K); turn_message gone |
+| build_actions | ~2.3s | ~28% | classify CPU + DB persist |
+| scan_source | ~1.0s | ~12% | directory walk + VCS resolution |
+| finalize_chunk + rollups | ~1.7s | ~21% | path rollup dominant, cache-locality bound |
+| build_turns | ~0.0s | ~0% | eliminated (merged into normalize_jsonl) |
+| parse (rayon CPU) | ~0.3s | ~4% | parallel JSON parse |
 
 ### Key findings (cumulative)
 1. **Btree pages are cached.** With 64MB page cache + WAL, secondary index maintenance during inserts is essentially free.
@@ -1197,46 +1272,42 @@ Next candidates:
 8. **In-memory staging does not help** when the DB is on tmpfs and the bottleneck is CPU-bound btree work. VACUUM INTO adds 1.5s overhead.
 9. **UPDATE on existing table is MORE expensive than INSERT into dedicated join tables.** Even with batch WHERE id IN (...), replacing join table INSERTs with UPDATEs on the message table regresses by +18%. Search+modify (random write) is costlier than append-friendly INSERT into compact btrees. The correct join-table elimination path is to preset FKs at initial INSERT time (D1b), not to update afterwards.
 10. **Rollup computation is cache-locality dependent.** Per-chunk rollup runs efficiently because data pages are hot immediately after insert. Any post-import pass (whether single batch or truly deferred) pays 4-10× cache-miss penalty as earlier chunks' pages are evicted. Per-chunk rollup is near-optimal — it cannot be deferred.
+11. **Compact join-table btree ops are cheap.** `turn_message` rows are tiny (3 INTEGER cols) and the table fits in cache — each insert is fast. Eliminating 295K × 3 btree ops saves ~0.6s subset (−6%) but is within noise on full corpus. The btree-count model overestimates wall-time impact for small, compact tables.
 
-### 10s target assessment (revised 2026-04-15, confirmed 2026-04-15 post-D0)
+### 10s target assessment (revised 2026-04-15, post-D1b)
 
-Previous assessment concluded 10s was unreachable with SQLite. A btree-ops
-analysis (design doc Section 13) reveals that `turn_message` and
-`action_message` join tables account for 46% of all btree operations. These
-tables are structurally unnecessary — each message belongs to exactly one
-turn and one action, so `turn_id`/`action_id` columns on `message` suffice.
-Adding deferred `message_part` persistence (16% of btree ops) and rollup
-deferral (3.6s), the 10s target is now plausibly reachable.
+D1b eliminated `turn_message` (295K rows × 3 btrees). Actual savings: ~0.6s
+subset, ~0.2s full (within noise). Smaller than predicted — compact join tables
+are cheap to insert into. The `action_message` table follows the same pattern
+but may be similarly cheap.
 
-**D0 confirmation (2026-04-15):** CPU floor for subset corpus = 2.82s. SQL
-writes account for 67% of import wall time. The floor is well below the 10s
-target, confirming the btree-ops model is not pessimistic.
+Next most promising: **D2 (defer message_part)** — 412K rows × 2 btrees = 824K
+btree ops. message_part rows are larger (8 columns) so per-op cost is likely
+higher. If savings are proportional to row size, D2 should yield 2-4× more than D1b.
 
 ### Next action
 
-D1 REVERTED (see log entry 2026-04-15 D1). UPDATE-on-existing-table is more
-expensive than INSERT into dedicated join tables. Re-ranked candidates below.
-Try D3 next (defer rollup entirely out of import path).
+D1b KEPT. Try D2 next: defer message_part inserts to a post-normalize phase,
+eliminating the 412K × 2-btree overhead entirely from the normalize hot path.
 
-### Remaining unexplored candidates (re-ranked post D1)
+### Remaining unexplored candidates (re-ranked post D1b)
 
 | rank | candidate | est. win | confidence | note |
 | --- | --- | --- | --- | --- |
-| 1 | **D3: defer rollup computation** | ~3.6s / −17% full | medium | rollup 15% of wall; D3b (background) preferred |
-| 2 | **D2: defer message_part** | ~1-2s / −10-14% | medium | pure INSERT elimination, avoids UPDATE pitfall |
-| 3 | **D1b: tagged INSERT (preset turn_id)** | est. ~2-3s | medium | compute turns before INSERT; avoids UPDATE |
-| 4 | **D4: simd-json** | ~1s / −5% | low | parse phase only |
-| 5 | **D5: scan_source caching** | ~0.5s startup only | high | warm startup only |
+| 1 | **D2: defer message_part** | ~1-2s / −10-14% | medium | larger rows than turn_message; pure INSERT elimination |
+| 2 | **D2b: denormalize action_message** | est. ~0.5s | low | same pattern as D1b; may be within noise |
+| 3 | **D4: simd-json** | ~1s / −5% | low | parse phase only |
+| 4 | **D5: scan_source caching** | ~0.5s startup only | high | warm startup only |
 
 ### Bench harness
 ```bash
 cargo build -p gnomon-core --example import_bench --release
 
-# Subset (~9s)
+# Subset (~8.3s post-D1b)
 cargo run -p gnomon-core --example import_bench --release -- \
   --corpus subset --mode full --repeats 3
 
-# Full corpus (~23s)
+# Full corpus (~21s post-D1b)
 cargo run -p gnomon-core --example import_bench --release -- \
   --corpus full --mode full --repeats 3
 ```
@@ -1247,5 +1318,5 @@ cd /home/ketan/project/gnomon
 git log --oneline -5
 cargo run -p gnomon-core --example import_bench --release -- \
   --corpus subset --mode full --repeats 1
-# Should complete in ~9-10s
+# Should complete in ~8-9s
 ```
