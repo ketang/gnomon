@@ -1301,30 +1301,86 @@ rows will pay a similar penalty with `PRAGMA foreign_keys = ON`.
 
 ---
 
+## 2026-04-15 — D2b: action_message schema optimization (3 → 2 btrees) — REVERTED
+
+**Branch:** `import-perf-d2b`
+**Hypothesis:** Changing `action_message` PRIMARY KEY from composite
+`(action_id, message_id)` to singleton `(message_id)` eliminates one of the
+three auto-indexes, reducing btree ops from 3 → 2 per INSERT (130K rows ×
+1 fewer btree = 130K ops saved). All query and cascade patterns remain covered:
+`UNIQUE(action_id, ordinal_in_action)` covers action lookups and cascade DELETE
+from action; `PRIMARY KEY (message_id)` = INTEGER rowid covers message lookups
+and cascade DELETE from message.
+
+**Analysis of D1b-style approach:** The canonical D1b approach — preset
+`action_id` at message INSERT time — is blocked by a dependency cycle: action
+rows require `turn_id` (turn must exist), turns require message IDs (messages
+must be inserted first), so `action_id` cannot be set at message INSERT time.
+The UPDATE-after-action-INSERT alternative would likely regress like D1 (+18%).
+The schema optimization (3→2 btrees) was the cleanest available approach.
+
+**action_message distribution (subset corpus):**
+- 130,475 rows across 50,463 actions (avg 2.59 messages/action)
+- 19,827 single-message actions (39.3%)
+- 19,003 two-message actions (37.7%)
+
+**Measurements (subset, same session, D2b first then main):**
+
+| run | D2b wall | main wall |
+| --- | ---: | ---: |
+| 1 | 10.682s | 8.575s |
+| 2 | 9.260s | 7.844s |
+| 3 | 8.893s | 7.499s |
+| **warm median** | **9.08s** | **7.67s** |
+
+**Delta: +18% REGRESSION** — D2b is ~1.4s slower than main on subset.
+
+**Analysis:** Reducing from 3 → 2 auto-indexes regressed rather than improved.
+Possible mechanism: the old composite PK `(action_id, message_id)` and separate
+`UNIQUE(message_id)` index combination may have better cache characteristics for
+the mix of INSERT and FK-verification operations. With INTEGER PRIMARY KEY =
+rowid, the FK uniqueness check uses the table's own btree rather than a compact
+separate index, which may cause more cache pressure during the dense action
+classification phase. Exact mechanism uncertain — the measurement is unambiguous.
+
+**Quality gates:** All pass. 7/7 integration tests ok. Code reverted to main state.
+
+**Decision:** REVERTED — +18% regression.
+
+Key finding #13: **Reducing action_message auto-indexes from 3→2 by changing
+PK from composite (action_id, message_id) to INTEGER rowid (message_id)
+regresses +18%. The old composite PK + UNIQUE(message_id) index structure is
+faster in practice despite the higher index count, likely due to cache behavior
+during mixed INSERT + FK verification workloads.**
+
+---
+
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-15 (D2 reverted — +71% regression)
-Current phase: Phase 2 — D0 done, D1 reverted, D3 reverted, D1b kept, D2 reverted
-All code is on `main`. Subset baseline: ~10.9s (this session; post-D1b ~8.3s in prior session).
+Last updated: 2026-04-15 (D2b reverted — +18% regression)
+Current phase: Phase 2 — D0 done, D1 reverted, D3 reverted, D1b kept, D2 reverted, D2b reverted
+All code is on `main`. Subset session-local median: ~7.67s (post-D2b session).
 
 D0: CPU floor = 2.82s (subset). SQL = 67% of wall.
 D1: denormalize-via-UPDATE = +18% regression (UPDATE > INSERT on hot table).
 D3: defer rollups = +40-50% regression (cache-miss penalty in post-import pass).
 D1b: −6% subset / −1% full; turn_message eliminated. Bug: imported_message_count written as 0 — fixed.
 D2: defer message_part INSERTs = +71% REGRESSION (FK verification cache-miss penalty).
+D2b: action_message schema (3→2 btrees) = +18% REGRESSION (composite PK + UNIQUE index faster than INTEGER PRIMARY KEY rowid in practice).
 Key finding #10: rollup SQL requires hot cache (per-chunk is optimal).
 Key finding #12: deferring child INSERTs past parent INSERTs causes FK verification cache misses.
+Key finding #13: reducing action_message PK to INTEGER rowid regresses — composite index structure is faster.
 
 Next candidates:
-- **D2b:** Denormalize action_message (same pattern as D1b; likely within noise).
-- **D4:** simd-json parsing (~1s / −5%).
-- **D5:** scan_source caching (~0.5s startup only).
+- **D4:** simd-json parsing (parse phase is ~0.3s — ceiling is modest).
+- **D5:** scan_source caching (~0.5s startup only, not full import).
+- No strong candidates remain. Project may be near practical limit.
 
 ### How to resume
 1. `cd /home/ketan/project/gnomon`
 2. Read this log's Phase Log for context.
-3. Read `docs/specs/2026-04-10-import-perf-design.md` **Section 13** for candidates.
-4. Try D2b (denormalize action_message via preset FK at INSERT time, same as D1b).
+3. Assess whether D4 or D5 is worth attempting given the ~7.7s session median.
+4. Consider declaring the perf project complete at current state.
 
 ### Iteration summary
 
@@ -1348,6 +1404,7 @@ Next candidates:
 | D3 | Defer rollup computation out of import path | **REVERTED** | +40-50% REGRESSION; cache-miss penalty in post-import rollup pass |
 | D1b | Preset turn_id at message INSERT (deferred grouping) | **KEPT** | −6% subset / −1% full; turn_message eliminated |
 | D2 | Defer message_part INSERTs to post-normalize pass | **REVERTED** | +71% REGRESSION; SQLite FK verification cache misses when child inserts are batched after parent inserts |
+| D2b | action_message schema: 3→2 btrees via INTEGER PRIMARY KEY | **REVERTED** | +18% REGRESSION; composite PK + UNIQUE(message_id) faster than INTEGER rowid PK in practice |
 
 ### Current best metrics (post D1b)
 | metric | value | vs original baseline | vs target |
@@ -1379,13 +1436,14 @@ Next candidates:
 10. **Rollup computation is cache-locality dependent.** Per-chunk rollup runs efficiently because data pages are hot immediately after insert. Any post-import pass (whether single batch or truly deferred) pays 4-10× cache-miss penalty as earlier chunks' pages are evicted. Per-chunk rollup is near-optimal — it cannot be deferred.
 11. **Compact join-table btree ops are cheap.** `turn_message` rows are tiny (3 INTEGER cols) and the table fits in cache — each insert is fast. Eliminating 295K × 3 btree ops saves ~0.6s subset (−6%) but is within noise on full corpus. The btree-count model overestimates wall-time impact for small, compact tables.
 12. **Deferring child-table INSERTs past parent INSERTs causes SQLite FK verification cache misses.** With `PRAGMA foreign_keys = ON`, each child INSERT triggers a lookup in the parent table to verify the FK. The inline pattern (parent INSERT immediately followed by child INSERTs) keeps FK lookup pages hot. Batching all parent rows first, then all child rows, means each FK lookup on a child INSERT may need to fetch a page that's no longer hot — despite the 64MB cache being nominally large enough. D2 (deferring 179K message_part rows after 130K message rows) caused +71% regression. The `PRAGMA foreign_keys` flag cannot be toggled inside an active savepoint, so there is no easy workaround. The correct strategy for table elimination is the D1b pattern: preset FKs at INSERT time rather than deferring any parent-child relationship across bulk insert boundaries.
+13. **Reducing action_message auto-indexes from 3→2 by changing PK to INTEGER rowid regresses +18%.** The old composite PK `(action_id, message_id)` + `UNIQUE(action_id, ordinal_in_action)` + `UNIQUE(message_id)` structure (3 auto-indexes + 1 rowid btree = 4 total) is faster in practice than `PRIMARY KEY(message_id)` (rowid) + `UNIQUE(action_id, ordinal_in_action)` (2 total). The composite index structure is better suited to the mixed INSERT + FK-verification workload, possibly because the compact separate `UNIQUE(message_id)` index caches more efficiently than using the full table btree for the same lookups.
 
-### 10s target assessment (revised 2026-04-15, post-D1b)
+### 10s target assessment (revised 2026-04-15, post-D2b)
 
-D1b eliminated `turn_message` (295K rows × 3 btrees). Actual savings: ~0.6s
-subset, ~0.2s full (within noise). Smaller than predicted — compact join tables
-are cheap to insert into. The `action_message` table follows the same pattern
-but may be similarly cheap.
+D1b eliminated `turn_message`. D2 and D2b both regressed. The `action_message`
+optimization path is exhausted: neither deferred inserts (D2) nor schema
+restructuring (D2b) improved performance. The D1b "preset FK at INSERT" pattern
+cannot apply to action_message due to the turn dependency cycle.
 
 D2 (deferred message_part inserts) regressed +71% — SQLite FK verification
 cache-miss penalty. Deferring parent-child inserts across a bulk boundary is
@@ -1397,19 +1455,19 @@ D2 REVERTED. Try D2b (denormalize action_message — same D1b pattern: preset
 FK at INSERT time, eliminating a join table). Expected savings: ~0.5s or less
 (similar to D1b; action_message has similar row characteristics to turn_message).
 
-### Remaining unexplored candidates (re-ranked post D2)
+### Remaining unexplored candidates (re-ranked post D2b)
 
 | rank | candidate | est. win | confidence | note |
 | --- | --- | --- | --- | --- |
-| 1 | **D2b: denormalize action_message** | est. ~0.5s | low | same pattern as D1b; may be within noise — join table, similar row count |
-| 2 | **D4: simd-json** | ~1s / −5% | low | parse phase only |
-| 3 | **D5: scan_source caching** | ~0.5s startup only | high | warm startup only |
+| 1 | **D4: simd-json** | <0.3s | very low | parse phase is only ~0.3s / 4% — ceiling is tiny |
+| 2 | **D5: scan_source caching** | ~0.5s startup only | high | warm startup only, not full import |
+| — | **D2b (all variants)** | — | EXHAUSTED | dependency cycle blocks preset; schema changes regress |
 
 ### Bench harness
 ```bash
 cargo build -p gnomon-core --example import_bench --release
 
-# Subset (~10.9s session-local median post-D2 revert; ~8.3s in D1b session)
+# Subset (~7.7s session-local median post-D2b session; ~8.3s in D1b session)
 cargo run -p gnomon-core --example import_bench --release -- \
   --corpus subset --mode full --repeats 3
 
