@@ -69,6 +69,25 @@ If CLI behavior changed, also smoke-test:
 cargo run -p gnomon -- --help
 ```
 
+### Import integration tests (required for perf optimization passes)
+
+Before declaring any import performance optimization pass complete, you MUST
+also run the full integration test suite:
+
+```bash
+cargo test -p gnomon-core --test import_corpus_integration -- --include-ignored
+```
+
+These tests are `#[ignore]`-tagged (they require local corpus fixture tarballs)
+and are **not** included in `cargo test --workspace`. They verify end-to-end
+import correctness, including aggregated counts written to `import_chunk`. A
+change that passes unit tests but corrupts `imported_message_count` (e.g., by
+reading a drained HashMap) will only be caught here.
+
+Fixture tarballs live under `tests/fixtures/import-corpus/` in the primary
+checkout or any worktree where they have previously been copied. Copy them into
+your worktree if they are missing before running these tests.
+
 ## Documentation
 
 - Keep `README.md` updated when build, run, config, or workspace-shape behavior
