@@ -69,6 +69,11 @@ Enters only after the Phase 1 gate opens. One iteration:
 4. Run the harness: subset first (fast feedback), then full (truth). Capture deltas vs. the current best.
 5. Verify parity: row counts per table match the baseline database; spot-check representative queries for identical results.
 6. Write a log entry covering hypothesis, measurements, kept/reverted decision, rationale, and implied next candidate.
+   - Every experiment result must end with a `Next-session prompt` block
+     that can be pasted into a fresh agent session.
+   - The prompt must name the active branch and linked worktree, the exact
+     docs to read first, the experiment just completed, the measured result,
+     and the next ranked experiment to run.
 7. **If kept:** summarize for the user, request commit approval, commit on approval, merge the candidate branch into the long-lived `import-perf` branch, re-profile, re-rank candidates.
 8. **If reverted:** log the result, leave the worktree alone, pick the next candidate.
 
@@ -266,7 +271,22 @@ Any one of the following ends the Phase 2 loop:
 3. Propose a merge path — either "ready to merge `import-perf` into `main`" or "leave branch alive for next session."
 4. Wait for the user's decision.
 
-**Cross-session continuity.** The running log plus Resume Block is the entire handoff. A fresh session reads it and resumes. The Phase 1 gate is passed once per project and stays passed across sessions unless:
+**Cross-session continuity.** The running log plus Resume Block is the
+entire handoff. A fresh session reads it and resumes. In addition, after
+reporting each experiment result the assistant must produce a ready-to-paste
+`Next-session prompt` for the next fresh-session agent. The prompt is not a
+summary blob; it is an explicit instruction to continue work from the
+current branch/worktree and should include:
+- current branch name
+- current linked worktree path
+- exact docs to read first
+- experiment just completed and kept/reverted decision
+- key measured result or regression
+- next ranked experiment to run
+- instruction to update the running log and then emit a new `Next-session prompt`
+
+The Phase 1 gate is passed once per project and stays passed across
+sessions unless:
 - The corpus snapshot is regenerated (manifest SHA changed) → re-baseline.
 - Hardware or filesystem changed → re-baseline.
 - A major upstream change lands on `main` and is merged into `import-perf` → re-baseline.
