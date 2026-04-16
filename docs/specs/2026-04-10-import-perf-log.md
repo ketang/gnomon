@@ -1070,6 +1070,56 @@ See design doc Section 14 for full details.
    G for warm startup or importer-side rereads; F2a for cold-import
    wall-time ceiling.
 
+### Next-session prompt template
+
+After reporting the result of any experiment, end the update with a
+ready-to-paste prompt for the next fresh-session agent. Use this shape:
+
+```text
+Continue import-perf work in the linked worktree
+/home/ketan/project/gnomon/.worktrees/import-perf on branch `import-perf`.
+
+Before changing code, read:
+1. docs/specs/2026-04-10-import-perf-log.md
+2. docs/specs/2026-04-10-import-perf-design.md
+
+The last completed experiment was <candidate name>. Result: <KEPT/REVERTED>
+with <key metric/result>.
+
+The next experiment to run is <candidate name> because <reason>.
+
+After you run it, update the running log with hypothesis, measurements,
+decision, rationale, and implied next candidate, then end your report with
+an updated next-session prompt for the following phase of work.
+```
+
+### Next-session prompt for the current state
+
+```text
+Continue import-perf work in the linked worktree
+/home/ketan/project/gnomon/.worktrees/import-perf on branch `import-perf`.
+
+Before changing code, read:
+1. docs/specs/2026-04-10-import-perf-log.md
+2. docs/specs/2026-04-10-import-perf-design.md
+
+The last completed experiment phase was Phase 3 planning. Result: the
+remaining work is now organized into three tracks:
+- E: pragma hardening (`foreign_keys=OFF`, `locking_mode=EXCLUSIVE`,
+  `wal_autocheckpoint=0`)
+- F: parallel import -> sequential merge
+- G: structural reductions (`scan_source` delta cache + parallelism,
+  `path_node` memoization, inline rollup materialization, finer-grained
+  invalidation)
+
+The next experiment to run is E1+E2+E3 pragma hardening because it is the
+lowest-risk cold-import candidate with the clearest multi-second ceiling.
+
+After you run it, update the running log with hypothesis, measurements,
+decision, rationale, and implied next candidate, then end your report with
+an updated next-session prompt for the following phase of work.
+```
+
 ### Iteration summary
 
 | # | Candidate | Result | Delta |
