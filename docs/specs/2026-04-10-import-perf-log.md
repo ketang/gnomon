@@ -1201,26 +1201,71 @@ simplification has value independent of the modest wall-time delta.
 
 ---
 
+## 2026-04-15 — D1b bug fix: imported_message_count written as 0
+
+### Root cause
+
+`ImportState::finish_import` computed `imported_message_count` as
+`self.message_states.len()`. But `persist_messages_with_turns` — which runs
+before `finish_import` — drains the HashMap via `.drain()`. After drain,
+`len()` == 0, so the `import_chunk` row was silently written with
+`imported_message_count = 0`.
+
+The bug was invisible to unit tests (none assert the `import_chunk` counter
+directly) and to `cargo test --workspace` (integration tests are `#[ignore]`).
+It was only caught when the full integration suite was run explicitly.
+
+### Fix
+
+Added a `message_count: usize` field to `ImportState`, incremented on the
+first occurrence of each `external_id` in `upsert_message`. `finish_import`
+now reads `self.message_count` instead of `self.message_states.len()`.
+
+### Integration test results (post-fix)
+
+```
+running 7 tests
+test subset_corpus_import_all_matches_expected_database_shape ... ok
+test subset_corpus_recent_first_startup_import_defers_every_chunk_and_reaches_same_final_state ... ok
+test subset_corpus_with_one_recent_file_imports_recent_chunk_before_opening ... ok
+test subset_corpus_reimport_is_a_no_op_when_files_are_unchanged ... ok
+test subset_corpus_reimports_only_the_touched_chunk_when_a_file_mtime_changes ... ok
+test subset_corpus_keeps_prior_rows_when_a_reimported_file_turns_malformed_and_recovers_after_restore ... ok
+test full_corpus_import_all_matches_expected_database_shape ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured
+```
+
+### Process fix
+
+Added the import integration test suite to `CLAUDE.md` quality gates with an
+explicit note that `cargo test --workspace` does not include these tests. Any
+future perf optimization pass must run `cargo test -p gnomon-core --test
+import_corpus_integration -- --include-ignored` before being declared complete.
+
+---
+
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-15 (D1b kept; −6% subset, −1% full)
-Current phase: Phase 2 — D0 done, D1 reverted, D3 reverted, D1b kept; candidates re-ranked
-All code is on `main` (after D1b merge). Subset baseline: ~8.3s (post-D1b session-local median).
+Last updated: 2026-04-15 (D1b fix landed; integration test suite added to quality gates)
+Current phase: Phase 2 — D0 done, D1 reverted, D3 reverted, D1b kept + bugfixed; ready for D2
+All code is on `main`. Subset baseline: ~8.3s (post-D1b session-local median).
 
 D0: CPU floor = 2.82s (subset). SQL = 67% of wall.
 D1: denormalize-via-UPDATE = +18% regression (UPDATE > INSERT on hot table).
 D3: defer rollups = +40-50% regression (cache-miss penalty in post-import pass).
+D1b: −6% subset / −1% full; turn_message eliminated. Bug: imported_message_count written as 0 — fixed.
 Key finding #10: rollup SQL requires hot cache (per-chunk is optimal).
 
 Next candidates:
-- **D1b:** Preset turn_id at message INSERT time. Compute turns in memory before persisting → no UPDATE, no join table needed.
-- **D2:** Skip message_part INSERTs (est. ~2-3s). Pure INSERT elimination, avoids UPDATE pitfall.
+- **D2:** Skip message_part INSERTs (est. ~1-2s). Pure INSERT elimination, avoids UPDATE pitfall.
+- **D2b:** Denormalize action_message (same pattern as D1b; likely within noise).
 
 ### How to resume
 1. `cd /home/ketan/project/gnomon`
 2. Read this log's Phase Log for context.
 3. Read `docs/specs/2026-04-10-import-perf-design.md` **Section 13** for candidates.
-4. Continue with D1b or D2.
+4. Continue with D2 (defer message_part INSERTs).
 
 ### Iteration summary
 
