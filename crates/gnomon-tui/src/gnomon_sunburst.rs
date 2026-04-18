@@ -50,35 +50,6 @@ pub(crate) fn build_sunburst_model(
         })
         .unwrap_or_else(|| "selected: none".to_string());
 
-    #[cfg(debug_assertions)]
-    {
-        let ancestor_count = if has_ancestors {
-            layers.len().saturating_sub(descendant_layers.len())
-        } else {
-            0
-        };
-        eprintln!(
-            "[sunburst] layers={} ancestors={} has_ancestors={} has_selection={} visible_rows={} descendants={}",
-            layers.len(),
-            ancestor_count,
-            has_ancestors,
-            has_selection,
-            visible_rows.len(),
-            descendant_layers.len(),
-        );
-        for (i, layer) in layers.iter().enumerate() {
-            let selected_idx = layer.segments.iter().position(|s| s.is_selected);
-            eprintln!(
-                "[sunburst]   layer[{}]: start={:.3} sweep={:.3} segments={} selected_idx={:?}",
-                i,
-                layer.span.start,
-                layer.span.sweep,
-                layer.segments.len(),
-                selected_idx,
-            );
-        }
-    }
-
     SunburstModel {
         center: SunburstCenter {
             scope_label,
@@ -135,5 +106,27 @@ fn sunburst_bucket(row: &RollupRow) -> SunburstBucket {
             RollupRowKind::Action => SunburstBucket::Unclassified,
             RollupRowKind::Directory | RollupRowKind::File => SunburstBucket::Project,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn module_does_not_write_directly_to_terminal_streams() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/gnomon_sunburst.rs"
+        ));
+        let stdout_macro = ["print", "ln!("].concat();
+        let stderr_macro = ["eprint", "ln!("].concat();
+
+        assert!(
+            !source.contains(&stdout_macro),
+            "sunburst model code must not write directly to stdout"
+        );
+        assert!(
+            !source.contains(&stderr_macro),
+            "sunburst model code must not write directly to stderr"
+        );
     }
 }
