@@ -8,24 +8,19 @@ use crate::classify::{BuildActionsParams, build_actions_in_tx_with_messages};
 use crate::db::Database;
 use crate::perf::{PerfLogger, PerfScope};
 use crate::query::SnapshotBounds;
-use crate::rollup::{
-    clear_chunk_action_rollups, clear_chunk_path_rollups, rebuild_chunk_action_rollups,
-    rebuild_chunk_path_rollups,
-};
+use crate::rollup::{rebuild_chunk_action_rollups, rebuild_chunk_path_rollups};
 use anyhow::{Context, Result, anyhow};
 use jiff::{Timestamp, ToSpan, tz::TimeZone};
-use rusqlite::{Connection, Transaction, params};
-
-use rayon::prelude::*;
+use rusqlite::{Connection, params};
 
 use super::{
     IMPORT_SCHEMA_VERSION, NormalizeImportWarning, NormalizeJsonlFileOutcome,
     NormalizeJsonlFileParams, ParseResult, STARTUP_IMPORT_WINDOW_HOURS, STARTUP_OPEN_DEADLINE_SECS,
     SourceFileKind, normalize::parse_jsonl_file, normalize::write_parsed_file_in_tx,
 };
+use rayon::prelude::*;
 
 const IMPORTER_THREAD_NAME: &str = "gnomon-importer";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupOpenReason {
     Last24hReady,
@@ -130,7 +125,8 @@ struct ChunkCandidate {
     project_id: i64,
     project_key: String,
     chunk_day_local: String,
-    source_files: Vec<ChunkSourceFile>,
+    import_source_files: Vec<ChunkSourceFile>,
+    remove_only_source_files: Vec<ChunkSourceFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,7 +135,8 @@ struct PreparedChunk {
     project_id: i64,
     project_key: String,
     chunk_day_local: String,
-    source_files: Vec<ChunkSourceFile>,
+    import_source_files: Vec<ChunkSourceFile>,
+    remove_only_source_files: Vec<ChunkSourceFile>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +174,19 @@ struct SourceFileRow {
     imported_size_bytes: Option<i64>,
     imported_modified_at_utc: Option<String>,
     imported_schema_version: Option<i64>,
+}
+
+#[derive(Debug)]
+struct PendingChunkRebuildRow {
+    project_id: i64,
+    project_key: String,
+    chunk_day_local: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ChunkChangeSet {
+    import_source_files: Vec<ChunkSourceFile>,
+    remove_only_source_files: Vec<ChunkSourceFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,6 +300,7 @@ pub fn import_all_with_perf_logger(
     source_root: &Path,
     perf_logger: Option<PerfLogger>,
 ) -> Result<ImportExecutionReport> {
+    let mut import_scope = PerfScope::new(perf_logger.clone(), "import.total");
     let now = Timestamp::now();
     let time_zone = TimeZone::system();
 
@@ -339,7 +350,14 @@ pub fn import_all_with_perf_logger(
     };
 
     for chunk in &prepared.startup_chunks {
-        import_chunk(&mut database, source_root, chunk, &options).with_context(|| {
+        import_chunk(
+            &mut database,
+            source_root,
+            chunk,
+            ImportPhase::Startup,
+            &options,
+        )
+        .with_context(|| {
             format!(
                 "unable to import startup chunk {}:{}",
                 chunk.project_key, chunk.chunk_day_local
@@ -349,24 +367,36 @@ pub fn import_all_with_perf_logger(
 
     let mut deferred_failures = Vec::new();
     for chunk in &prepared.deferred_chunks {
-        if let Err(err) =
-            import_chunk(&mut database, source_root, chunk, &options).with_context(|| {
-                format!(
-                    "unable to import deferred chunk {}:{}",
-                    chunk.project_key, chunk.chunk_day_local
-                )
-            })
-        {
+        if let Err(err) = import_chunk(
+            &mut database,
+            source_root,
+            chunk,
+            ImportPhase::Deferred,
+            &options,
+        )
+        .with_context(|| {
+            format!(
+                "unable to import deferred chunk {}:{}",
+                chunk.project_key, chunk.chunk_day_local
+            )
+        }) {
             deferred_failures.push(compact_status_text(format!("{err:#}")));
         }
     }
 
-    Ok(ImportExecutionReport {
+    let report = ImportExecutionReport {
         startup_chunk_count: prepared.startup_chunks.len(),
         deferred_chunk_count: prepared.deferred_chunks.len(),
         deferred_failure_count: deferred_failures.len(),
         deferred_failure_summary: summarize_deferred_failures(&deferred_failures),
-    })
+    };
+
+    import_scope.field("startup_chunk_count", report.startup_chunk_count);
+    import_scope.field("deferred_chunk_count", report.deferred_chunk_count);
+    import_scope.field("deferred_failure_count", report.deferred_failure_count);
+    import_scope.finish_ok();
+
+    Ok(report)
 }
 
 fn start_startup_import_with_options(
@@ -380,8 +410,9 @@ fn start_startup_import_with_options(
 ) -> Result<StartupImport> {
     let now = Timestamp::now();
     let time_zone = TimeZone::system();
+    let perf_logger = worker_options.perf_logger.clone();
 
-    let mut plan_scope = PerfScope::new(worker_options.perf_logger.clone(), "import.build_plan");
+    let mut plan_scope = PerfScope::new(perf_logger.clone(), "import.build_plan");
     let plan = match build_import_plan(conn, now, &time_zone) {
         Ok(plan) => {
             plan_scope.field("startup_chunks", plan.startup_chunks.len());
@@ -395,8 +426,7 @@ fn start_startup_import_with_options(
         }
     };
 
-    let mut prepare_scope =
-        PerfScope::new(worker_options.perf_logger.clone(), "import.prepare_plan");
+    let mut prepare_scope = PerfScope::new(perf_logger.clone(), "import.prepare_plan");
     let prepared = match prepare_import_plan(conn, &plan) {
         Ok(prepared) => {
             prepare_scope.field("startup_chunks", prepared.startup_chunks.len());
@@ -410,9 +440,21 @@ fn start_startup_import_with_options(
         }
     };
 
+    let snapshot_scope = PerfScope::new(perf_logger.clone(), "import.load_snapshot");
+    let current_snapshot = match SnapshotBounds::load(conn) {
+        Ok(snapshot) => {
+            snapshot_scope.finish_ok();
+            snapshot
+        }
+        Err(err) => {
+            snapshot_scope.finish_error(&err);
+            return Err(err);
+        }
+    };
+
     if prepared.is_empty() {
         return Ok(StartupImport {
-            snapshot: SnapshotBounds::load(conn)?,
+            snapshot: current_snapshot,
             open_reason: match import_mode {
                 StartupImportMode::RecentFirst => StartupOpenReason::Last24hReady,
                 StartupImportMode::Full => StartupOpenReason::FullImportReady,
@@ -430,7 +472,6 @@ fn start_startup_import_with_options(
     let source_root = source_root.to_path_buf();
     let prepared_for_worker = prepared.clone();
     let sender_for_worker = sender;
-
     let worker = match thread::Builder::new()
         .name(IMPORTER_THREAD_NAME.to_string())
         .spawn(move || {
@@ -485,8 +526,21 @@ fn start_startup_import_with_options(
                 }
             };
 
+            let snapshot_scope =
+                PerfScope::new(perf_logger.clone(), "import.load_snapshot_after_wait");
+            let snapshot = match SnapshotBounds::load(conn) {
+                Ok(snapshot) => {
+                    snapshot_scope.finish_ok();
+                    snapshot
+                }
+                Err(err) => {
+                    snapshot_scope.finish_error(&err);
+                    return Err(err);
+                }
+            };
+
             Ok(StartupImport {
-                snapshot: SnapshotBounds::load(conn)?,
+                snapshot,
                 open_reason,
                 startup_status_message,
                 deferred_status_message: None,
@@ -528,8 +582,20 @@ fn start_startup_import_with_options(
 
             join_worker(Some(worker))?;
 
+            let snapshot_scope = PerfScope::new(perf_logger, "import.load_snapshot_after_wait");
+            let snapshot = match SnapshotBounds::load(conn) {
+                Ok(snapshot) => {
+                    snapshot_scope.finish_ok();
+                    snapshot
+                }
+                Err(err) => {
+                    snapshot_scope.finish_error(&err);
+                    return Err(err);
+                }
+            };
+
             Ok(StartupImport {
-                snapshot: SnapshotBounds::load(conn)?,
+                snapshot,
                 open_reason: StartupOpenReason::FullImportReady,
                 startup_status_message,
                 deferred_status_message,
@@ -547,10 +613,10 @@ fn build_import_plan(
     time_zone: &TimeZone,
 ) -> Result<ImportPlan> {
     let source_files = load_source_files(conn)?;
+    let pending_chunk_rebuilds = load_pending_chunk_rebuilds(conn)?;
     let startup_days = startup_days(now, time_zone)?;
 
-    let mut current_files_by_chunk = BTreeMap::<ChunkDescriptor, Vec<ChunkSourceFile>>::new();
-    let mut selected_chunks = BTreeSet::<ChunkDescriptor>::new();
+    let mut chunk_changes = BTreeMap::<ChunkDescriptor, ChunkChangeSet>::new();
 
     for row in source_files {
         let current_timestamp = current_chunk_timestamp(&row);
@@ -560,47 +626,64 @@ fn build_import_plan(
             project_key: row.project_key.clone(),
             chunk_day_local: current_day.clone(),
         };
-        current_files_by_chunk
-            .entry(descriptor.clone())
-            .or_default()
-            .push(ChunkSourceFile {
-                source_file_id: row.source_file_id,
-                relative_path: row.relative_path.clone(),
-                source_kind: SourceFileKind::from_db_value(&row.source_kind)
-                    .ok_or_else(|| anyhow!("unknown source file kind {}", row.source_kind))?,
-            });
+        let source_file = ChunkSourceFile {
+            source_file_id: row.source_file_id,
+            relative_path: row.relative_path.clone(),
+            source_kind: SourceFileKind::from_db_value(&row.source_kind)
+                .ok_or_else(|| anyhow!("unknown source file kind {}", row.source_kind))?,
+        };
+        let imported_day = imported_chunk_day_local(&row, time_zone)?;
 
         if source_file_needs_import(&row) {
-            selected_chunks.insert(descriptor.clone());
+            chunk_changes
+                .entry(descriptor.clone())
+                .or_default()
+                .import_source_files
+                .push(source_file.clone());
 
-            if let Some(imported_modified_at_utc) = row.imported_modified_at_utc.as_deref() {
-                let imported_day =
-                    local_day_for_utc_timestamp(imported_modified_at_utc, time_zone)?;
-                if imported_day != current_day {
-                    selected_chunks.insert(ChunkDescriptor {
+            if let Some(imported_day) = imported_day.as_deref()
+                && imported_day != current_day
+            {
+                chunk_changes
+                    .entry(ChunkDescriptor {
                         project_id: row.project_id,
                         project_key: row.project_key.clone(),
-                        chunk_day_local: imported_day,
-                    });
-                }
+                        chunk_day_local: imported_day.to_string(),
+                    })
+                    .or_default()
+                    .remove_only_source_files
+                    .push(source_file);
             }
         }
+    }
+
+    for pending in pending_chunk_rebuilds {
+        chunk_changes
+            .entry(ChunkDescriptor {
+                project_id: pending.project_id,
+                project_key: pending.project_key,
+                chunk_day_local: pending.chunk_day_local,
+            })
+            .or_default();
     }
 
     let mut startup_candidates = Vec::new();
     let mut deferred_candidates = Vec::new();
 
-    for descriptor in selected_chunks {
-        let mut source_files = current_files_by_chunk
-            .remove(&descriptor)
-            .unwrap_or_default();
-        source_files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    for (descriptor, mut changes) in chunk_changes {
+        changes
+            .import_source_files
+            .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        changes
+            .remove_only_source_files
+            .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
 
         let chunk = ChunkCandidate {
             project_id: descriptor.project_id,
             project_key: descriptor.project_key,
             chunk_day_local: descriptor.chunk_day_local,
-            source_files,
+            import_source_files: changes.import_source_files,
+            remove_only_source_files: changes.remove_only_source_files,
         };
 
         if startup_days.contains(&chunk.chunk_day_local) {
@@ -614,6 +697,13 @@ fn build_import_plan(
         startup_chunks: round_robin_chunks(startup_candidates),
         deferred_chunks: round_robin_chunks(deferred_candidates),
     })
+}
+
+fn imported_chunk_day_local(row: &SourceFileRow, time_zone: &TimeZone) -> Result<Option<String>> {
+    row.imported_modified_at_utc
+        .as_deref()
+        .map(|timestamp| local_day_for_utc_timestamp(timestamp, time_zone))
+        .transpose()
 }
 
 fn load_source_files(conn: &Connection) -> Result<Vec<SourceFileRow>> {
@@ -659,6 +749,35 @@ fn load_source_files(conn: &Connection) -> Result<Vec<SourceFileRow>> {
 
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .context("unable to decode source file import planning rows")
+}
+
+fn load_pending_chunk_rebuilds(conn: &Connection) -> Result<Vec<PendingChunkRebuildRow>> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT
+                pending_chunk_rebuild.project_id,
+                project.canonical_key,
+                pending_chunk_rebuild.chunk_day_local
+            FROM pending_chunk_rebuild
+            JOIN project ON project.id = pending_chunk_rebuild.project_id
+            ORDER BY project.canonical_key, pending_chunk_rebuild.chunk_day_local
+            ",
+        )
+        .context("unable to prepare pending chunk rebuild query")?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(PendingChunkRebuildRow {
+                project_id: row.get(0)?,
+                project_key: row.get(1)?,
+                chunk_day_local: row.get(2)?,
+            })
+        })
+        .context("unable to enumerate pending chunk rebuild rows")?;
+
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("unable to decode pending chunk rebuild rows")
 }
 
 fn current_chunk_timestamp(row: &SourceFileRow) -> &str {
@@ -799,7 +918,8 @@ fn prepare_chunk(
         project_id: chunk.project_id,
         project_key: chunk.project_key.clone(),
         chunk_day_local: chunk.chunk_day_local.clone(),
-        source_files: chunk.source_files.clone(),
+        import_source_files: chunk.import_source_files.clone(),
+        remove_only_source_files: chunk.remove_only_source_files.clone(),
     })
 }
 
@@ -839,8 +959,19 @@ fn run_import_worker(
     sender: mpsc::Sender<StartupWorkerEvent>,
     options: &ImportWorkerOptions,
 ) -> Result<()> {
-    let mut database =
-        Database::open(db_path).with_context(|| format!("unable to open {}", db_path.display()))?;
+    let mut worker_scope = PerfScope::new(options.perf_logger.clone(), "import.worker_total");
+    let open_scope = PerfScope::new(options.perf_logger.clone(), "import.open_database");
+    let mut database = match Database::open(db_path) {
+        Ok(database) => {
+            open_scope.finish_ok();
+            database
+        }
+        Err(err) => {
+            open_scope.finish_error(&err);
+            worker_scope.finish_error(&err);
+            return Err(err).with_context(|| format!("unable to open {}", db_path.display()));
+        }
+    };
     let mut startup_failures = Vec::new();
     let mut deferred_failures = Vec::new();
 
@@ -858,7 +989,13 @@ fn run_import_worker(
             plan.startup_chunks.len(),
             chunk,
         );
-        if let Err(err) = import_chunk(&mut database, source_root, chunk, options) {
+        if let Err(err) = import_chunk(
+            &mut database,
+            source_root,
+            chunk,
+            ImportPhase::Startup,
+            options,
+        ) {
             startup_failures.push(compact_status_text(format!("{err:#}")));
         }
     }
@@ -877,7 +1014,13 @@ fn run_import_worker(
             plan.deferred_chunks.len(),
             chunk,
         );
-        if let Err(err) = import_chunk(&mut database, source_root, chunk, options) {
+        if let Err(err) = import_chunk(
+            &mut database,
+            source_root,
+            chunk,
+            ImportPhase::Deferred,
+            options,
+        ) {
             deferred_failures.push(compact_status_text(format!("{err:#}")));
         }
     }
@@ -887,11 +1030,13 @@ fn run_import_worker(
             deferred_status_message: summarize_deferred_failures(&deferred_failures),
         });
     }
+    worker_scope.field("startup_failure_count", startup_failures.len());
+    worker_scope.field("deferred_failure_count", deferred_failures.len());
+    worker_scope.finish_ok();
     let _ = sender.send(StartupWorkerEvent::Finished);
 
     Ok(())
 }
-
 fn send_progress(
     sender: &mpsc::Sender<StartupWorkerEvent>,
     label: &'static str,
@@ -936,9 +1081,14 @@ fn import_chunk(
     database: &mut Database,
     source_root: &Path,
     chunk: &PreparedChunk,
+    phase: ImportPhase,
     options: &ImportWorkerOptions,
 ) -> Result<()> {
-    begin_chunk_import(database.connection_mut(), chunk)?;
+    begin_chunk_import(
+        database.connection_mut(),
+        chunk,
+        options.perf_logger.clone(),
+    )?;
 
     if options.per_chunk_delay > Duration::ZERO {
         thread::sleep(options.per_chunk_delay);
@@ -947,7 +1097,16 @@ fn import_chunk(
     let mut scope = PerfScope::new(options.perf_logger.clone(), "import.chunk");
     scope.field("project_key", chunk.project_key.as_str());
     scope.field("chunk_day_local", chunk.chunk_day_local.as_str());
-    scope.field("source_file_count", chunk.source_files.len());
+    scope.field(
+        "source_file_count",
+        chunk.import_source_files.len() + chunk.remove_only_source_files.len(),
+    );
+    scope.field("import_source_file_count", chunk.import_source_files.len());
+    scope.field(
+        "remove_only_source_file_count",
+        chunk.remove_only_source_files.len(),
+    );
+    scope.field("phase", phase.as_str());
 
     let import_result = (|| {
         let mut tx = database
@@ -955,19 +1114,50 @@ fn import_chunk(
             .transaction()
             .context("unable to start chunk-level import transaction")?;
 
+        for source_file in &chunk.remove_only_source_files {
+            purge_source_file_from_chunk(&tx, chunk.import_chunk_id, source_file.source_file_id)?;
+        }
+
         // Phase 1: Parse all JSONL files in parallel (CPU-only, no DB access).
         // rayon's par_iter preserves input ordering in the collected Vec.
+        let mut parse_scope = PerfScope::new(options.perf_logger.clone(), "import.parse_phase");
         let parsed_files: Vec<ParseResult> = chunk
-            .source_files
+            .import_source_files
             .par_iter()
             .map(|source_file| {
                 let path = source_root.join(&source_file.relative_path);
                 parse_jsonl_file(&path, source_file.source_kind)
             })
             .collect();
+        let mut parsed_file_count = 0usize;
+        let mut warning_file_count = 0usize;
+        let mut sessionless_metadata_file_count = 0usize;
+        let mut parsed_record_count = 0usize;
+        for parse_result in &parsed_files {
+            match parse_result {
+                ParseResult::Parsed(parsed_file) => {
+                    parsed_file_count += 1;
+                    parsed_record_count += parsed_file.records.len();
+                }
+                ParseResult::Warning(_) => {
+                    warning_file_count += 1;
+                }
+                ParseResult::SessionlessMetadata => {
+                    sessionless_metadata_file_count += 1;
+                }
+            }
+        }
+        parse_scope.field("parsed_file_count", parsed_file_count);
+        parse_scope.field("warning_file_count", warning_file_count);
+        parse_scope.field(
+            "sessionless_metadata_file_count",
+            sessionless_metadata_file_count,
+        );
+        parse_scope.field("parsed_record_count", parsed_record_count);
+        parse_scope.finish_ok();
 
         // Phase 2: Write pre-parsed data to DB serially (single writer).
-        for (source_file, parse_result) in chunk.source_files.iter().zip(parsed_files) {
+        for (source_file, parse_result) in chunk.import_source_files.iter().zip(parsed_files) {
             match parse_result {
                 ParseResult::Warning(warning) => {
                     insert_import_warning(
@@ -981,9 +1171,19 @@ fn import_chunk(
                     // Nothing to write — file had no session ID and contained
                     // only metadata records. Create + immediately release a
                     // savepoint so the per-file purge still runs.
-                    let sp = tx
-                        .savepoint()
-                        .context("unable to create per-file savepoint")?;
+                    let mut savepoint_open_scope =
+                        PerfScope::new(options.perf_logger.clone(), "import.savepoint_open");
+                    savepoint_open_scope.field("source_file_id", source_file.source_file_id);
+                    let sp = match tx.savepoint() {
+                        Ok(sp) => {
+                            savepoint_open_scope.finish_ok();
+                            sp
+                        }
+                        Err(err) => {
+                            savepoint_open_scope.finish_error(&err);
+                            return Err(err).context("unable to create per-file savepoint");
+                        }
+                    };
                     let params = NormalizeJsonlFileParams {
                         project_id: chunk.project_id,
                         source_file_id: source_file.source_file_id,
@@ -992,13 +1192,31 @@ fn import_chunk(
                         perf_logger: options.perf_logger.clone(),
                     };
                     super::normalize::purge_existing_import(&sp, &params)?;
-                    sp.commit()
-                        .context("unable to release per-file savepoint")?;
+                    let mut savepoint_release_scope =
+                        PerfScope::new(options.perf_logger.clone(), "import.savepoint_release");
+                    savepoint_release_scope.field("source_file_id", source_file.source_file_id);
+                    match sp.commit() {
+                        Ok(()) => savepoint_release_scope.finish_ok(),
+                        Err(err) => {
+                            savepoint_release_scope.finish_error(&err);
+                            return Err(err).context("unable to release per-file savepoint");
+                        }
+                    }
                 }
                 ParseResult::Parsed(parsed_file) => {
-                    let sp = tx
-                        .savepoint()
-                        .context("unable to create per-file savepoint")?;
+                    let mut savepoint_open_scope =
+                        PerfScope::new(options.perf_logger.clone(), "import.savepoint_open");
+                    savepoint_open_scope.field("source_file_id", source_file.source_file_id);
+                    let sp = match tx.savepoint() {
+                        Ok(sp) => {
+                            savepoint_open_scope.finish_ok();
+                            sp
+                        }
+                        Err(err) => {
+                            savepoint_open_scope.finish_error(&err);
+                            return Err(err).context("unable to create per-file savepoint");
+                        }
+                    };
                     let params = NormalizeJsonlFileParams {
                         project_id: chunk.project_id,
                         source_file_id: source_file.source_file_id,
@@ -1034,15 +1252,46 @@ fn import_chunk(
                                     )
                                 })?;
                             }
-                            sp.commit()
-                                .context("unable to release per-file savepoint")?;
+                            let mut savepoint_release_scope = PerfScope::new(
+                                options.perf_logger.clone(),
+                                "import.savepoint_release",
+                            );
+                            savepoint_release_scope
+                                .field("source_file_id", source_file.source_file_id);
+                            match sp.commit() {
+                                Ok(()) => savepoint_release_scope.finish_ok(),
+                                Err(err) => {
+                                    savepoint_release_scope.finish_error(&err);
+                                    return Err(err)
+                                        .context("unable to release per-file savepoint");
+                                }
+                            }
                         }
                         NormalizeJsonlFileOutcome::Skipped => {
-                            sp.commit()
-                                .context("unable to release per-file savepoint")?;
+                            let mut savepoint_release_scope = PerfScope::new(
+                                options.perf_logger.clone(),
+                                "import.savepoint_release",
+                            );
+                            savepoint_release_scope
+                                .field("source_file_id", source_file.source_file_id);
+                            match sp.commit() {
+                                Ok(()) => savepoint_release_scope.finish_ok(),
+                                Err(err) => {
+                                    savepoint_release_scope.finish_error(&err);
+                                    return Err(err)
+                                        .context("unable to release per-file savepoint");
+                                }
+                            }
                         }
                         NormalizeJsonlFileOutcome::Warning(warning) => {
+                            let mut savepoint_rollback_scope = PerfScope::new(
+                                options.perf_logger.clone(),
+                                "import.savepoint_rollback",
+                            );
+                            savepoint_rollback_scope
+                                .field("source_file_id", source_file.source_file_id);
                             drop(sp);
+                            savepoint_rollback_scope.finish_ok();
                             insert_import_warning(
                                 &tx,
                                 chunk.import_chunk_id,
@@ -1058,15 +1307,22 @@ fn import_chunk(
         let mut finalize_scope =
             PerfScope::new(options.perf_logger.clone(), "import.finalize_chunk");
         finalize_scope.field("import_chunk_id", chunk.import_chunk_id);
-        let finalize_result = finalize_chunk_import_core(&tx, chunk, options.perf_logger.clone());
+        let finalize_result = finalize_chunk_import_core(&tx, chunk, options);
         match &finalize_result {
             Ok(()) => finalize_scope.finish_ok(),
             Err(err) => finalize_scope.finish_error(err),
         }
         finalize_result?;
 
-        tx.commit()
-            .context("unable to commit chunk-level import transaction")?;
+        let mut commit_scope = PerfScope::new(options.perf_logger.clone(), "import.chunk_commit");
+        commit_scope.field("import_chunk_id", chunk.import_chunk_id);
+        match tx.commit() {
+            Ok(()) => commit_scope.finish_ok(),
+            Err(err) => {
+                commit_scope.finish_error(&err);
+                return Err(err).context("unable to commit chunk-level import transaction");
+            }
+        }
         Ok(())
     })();
 
@@ -1085,11 +1341,16 @@ fn import_chunk(
     Ok(())
 }
 
-fn begin_chunk_import(conn: &mut Connection, chunk: &PreparedChunk) -> Result<()> {
+fn begin_chunk_import(
+    conn: &mut Connection,
+    chunk: &PreparedChunk,
+    perf_logger: Option<PerfLogger>,
+) -> Result<()> {
+    let mut begin_scope = PerfScope::new(perf_logger, "import.begin_chunk");
+    begin_scope.field("import_chunk_id", chunk.import_chunk_id);
     let tx = conn
         .transaction()
         .context("unable to start an import chunk transaction")?;
-    purge_chunk_data(&tx, chunk.import_chunk_id)?;
     tx.execute(
         "
         UPDATE import_chunk
@@ -1114,41 +1375,13 @@ fn begin_chunk_import(conn: &mut Connection, chunk: &PreparedChunk) -> Result<()
             chunk.project_key, chunk.chunk_day_local
         )
     })?;
-    tx.commit()
-        .context("unable to commit import chunk startup transaction")?;
-    Ok(())
-}
-
-fn purge_chunk_data(tx: &Transaction<'_>, import_chunk_id: i64) -> Result<()> {
-    tx.execute(
-        "DELETE FROM import_warning WHERE import_chunk_id = ?1",
-        [import_chunk_id],
-    )
-    .context("unable to clear prior chunk warnings")?;
-    clear_chunk_action_rollups(tx, import_chunk_id)?;
-    clear_chunk_path_rollups(tx, import_chunk_id)?;
-
-    tx.execute(
-        "
-        DELETE FROM conversation
-        WHERE id IN (
-            SELECT DISTINCT conversation_id
-            FROM stream
-            WHERE import_chunk_id = ?1
-            UNION
-            SELECT DISTINCT conversation_id
-            FROM message
-            WHERE import_chunk_id = ?1
-            UNION
-            SELECT DISTINCT conversation_id
-            FROM turn
-            WHERE import_chunk_id = ?1
-        )
-        ",
-        [import_chunk_id],
-    )
-    .context("unable to clear prior conversation state for import chunk")?;
-
+    match tx.commit() {
+        Ok(()) => begin_scope.finish_ok(),
+        Err(err) => {
+            begin_scope.finish_error(&err);
+            return Err(err).context("unable to commit import chunk startup transaction");
+        }
+    }
     Ok(())
 }
 
@@ -1176,12 +1409,69 @@ fn insert_import_warning(
     Ok(())
 }
 
+fn purge_source_file_from_chunk(
+    conn: &Connection,
+    import_chunk_id: i64,
+    source_file_id: i64,
+) -> Result<()> {
+    conn.prepare_cached(
+        "
+        DELETE FROM conversation
+        WHERE source_file_id = ?1
+          AND id IN (
+              SELECT DISTINCT conversation_id
+              FROM stream
+              WHERE import_chunk_id = ?2
+              UNION
+              SELECT DISTINCT conversation_id
+              FROM message
+              WHERE import_chunk_id = ?2
+              UNION
+              SELECT DISTINCT conversation_id
+              FROM turn
+              WHERE import_chunk_id = ?2
+          )
+        ",
+    )
+    .and_then(|mut stmt| stmt.execute(params![source_file_id, import_chunk_id]))
+    .context("unable to purge chunk-scoped conversation state for source file")?;
+
+    conn.prepare_cached(
+        "
+        DELETE FROM history_event
+        WHERE source_file_id = ?1 AND import_chunk_id = ?2
+        ",
+    )
+    .and_then(|mut stmt| stmt.execute(params![source_file_id, import_chunk_id]))
+    .context("unable to purge chunk-scoped history events for source file")?;
+
+    conn.prepare_cached(
+        "
+        DELETE FROM skill_invocation
+        WHERE source_file_id = ?1 AND import_chunk_id = ?2
+        ",
+    )
+    .and_then(|mut stmt| stmt.execute(params![source_file_id, import_chunk_id]))
+    .context("unable to purge chunk-scoped skill invocations for source file")?;
+
+    conn.prepare_cached(
+        "
+        DELETE FROM import_warning
+        WHERE import_chunk_id = ?1 AND source_file_id = ?2
+        ",
+    )
+    .and_then(|mut stmt| stmt.execute(params![import_chunk_id, source_file_id]))
+    .context("unable to purge chunk-scoped import warnings for source file")?;
+
+    Ok(())
+}
+
 fn finalize_chunk_import_core(
     conn: &Connection,
     chunk: &PreparedChunk,
-    perf_logger: Option<PerfLogger>,
+    options: &ImportWorkerOptions,
 ) -> Result<()> {
-    for source_file in &chunk.source_files {
+    for source_file in &chunk.import_source_files {
         conn.execute(
             "
             UPDATE source_file
@@ -1201,9 +1491,83 @@ fn finalize_chunk_import_core(
         })?;
     }
 
-    rebuild_chunk_action_rollups(conn, chunk.import_chunk_id, perf_logger.clone())?;
-    rebuild_chunk_path_rollups(conn, chunk.import_chunk_id, perf_logger.clone())?;
+    recompute_chunk_counts(conn, chunk.import_chunk_id)?;
+    rebuild_chunk_action_rollups(conn, chunk.import_chunk_id, options.perf_logger.clone())?;
+    rebuild_chunk_path_rollups(conn, chunk.import_chunk_id, options.perf_logger.clone())?;
+    clear_pending_chunk_rebuild(conn, chunk.project_id, &chunk.chunk_day_local)?;
 
+    publish_import_chunk(conn, chunk)?;
+
+    Ok(())
+}
+
+fn recompute_chunk_counts(conn: &Connection, import_chunk_id: i64) -> Result<()> {
+    conn.execute(
+        "
+        UPDATE import_chunk
+        SET
+            imported_record_count = (
+                SELECT COUNT(*)
+                FROM history_event
+                WHERE import_chunk_id = ?1
+            ),
+            imported_message_count = (
+                SELECT COUNT(*)
+                FROM message
+                WHERE import_chunk_id = ?1
+            ),
+            imported_action_count = (
+                SELECT COUNT(*)
+                FROM action
+                WHERE import_chunk_id = ?1
+            ),
+            imported_conversation_count = (
+                SELECT COUNT(*)
+                FROM conversation
+                WHERE id IN (
+                    SELECT DISTINCT conversation_id
+                    FROM stream
+                    WHERE import_chunk_id = ?1
+                    UNION
+                    SELECT DISTINCT conversation_id
+                    FROM message
+                    WHERE import_chunk_id = ?1
+                    UNION
+                    SELECT DISTINCT conversation_id
+                    FROM turn
+                    WHERE import_chunk_id = ?1
+                )
+            ),
+            imported_turn_count = (
+                SELECT COUNT(*)
+                FROM turn
+                WHERE import_chunk_id = ?1
+            )
+        WHERE id = ?1
+        ",
+        [import_chunk_id],
+    )
+    .context("unable to recompute chunk counts")?;
+    Ok(())
+}
+
+fn clear_pending_chunk_rebuild(
+    conn: &Connection,
+    project_id: i64,
+    chunk_day_local: &str,
+) -> Result<()> {
+    conn.execute(
+        "
+        DELETE FROM pending_chunk_rebuild
+        WHERE project_id = ?1 AND chunk_day_local = ?2
+        ",
+        params![project_id, chunk_day_local],
+    )
+    .context("unable to clear pending chunk rebuild rows")?;
+    Ok(())
+}
+
+fn publish_import_chunk(conn: &Connection, chunk: &PreparedChunk) -> Result<()> {
     let next_publish_seq: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(publish_seq), 0) + 1 FROM import_chunk",
@@ -1268,8 +1632,10 @@ fn join_worker(worker: Option<JoinHandle<Result<()>>>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
+    use std::thread;
     use std::time::Duration;
 
     use anyhow::{Context, Result};
@@ -1282,6 +1648,8 @@ mod tests {
         build_import_plan, import_all, start_startup_import_with_options,
     };
     use crate::db::Database;
+    use crate::import::scan_source_manifest;
+    use crate::query::SnapshotBounds;
 
     const WAIT_TIMEOUT_MS: u64 = 5;
     const WORKER_DELAY_MS: u64 = 50;
@@ -1362,10 +1730,64 @@ mod tests {
 
         let yesterday_chunk = &plan.startup_chunks[2];
         assert_eq!(yesterday_chunk.chunk_day_local, "2026-03-25");
-        assert_eq!(yesterday_chunk.source_files.len(), 1);
+        assert_eq!(yesterday_chunk.import_source_files.len(), 1);
+        assert!(yesterday_chunk.remove_only_source_files.is_empty());
         assert_eq!(
-            yesterday_chunk.source_files[0].relative_path,
+            yesterday_chunk.import_source_files[0].relative_path,
             "a/yesterday.jsonl"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn import_plan_marks_old_chunk_for_remove_only_when_file_moves_days() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let tz = TimeZone::get("America/Chicago")?;
+        let now: Timestamp = "2026-03-26T18:00:00Z".parse()?;
+
+        let project_id = insert_project(db.connection_mut(), "git:/projects/move", "move")?;
+        let source_file_id = insert_source_file(
+            db.connection_mut(),
+            project_id,
+            "move/session.jsonl",
+            "2026-03-26T12:00:00Z",
+        )?;
+        db.connection_mut().execute(
+            "
+            UPDATE source_file
+            SET
+                imported_size_bytes = size_bytes,
+                imported_modified_at_utc = '2026-03-25T04:00:00Z',
+                imported_schema_version = ?2
+            WHERE id = ?1
+            ",
+            params![source_file_id, crate::import::IMPORT_SCHEMA_VERSION],
+        )?;
+
+        let plan = build_import_plan(db.connection(), now, &tz)?;
+        assert_eq!(plan.startup_chunks.len(), 1);
+        assert_eq!(plan.deferred_chunks.len(), 1);
+
+        let current_chunk = plan
+            .startup_chunks
+            .iter()
+            .find(|chunk| chunk.chunk_day_local == "2026-03-26")
+            .expect("current-day chunk should exist");
+        assert_eq!(current_chunk.import_source_files.len(), 1);
+        assert!(current_chunk.remove_only_source_files.is_empty());
+
+        let old_chunk = plan
+            .deferred_chunks
+            .iter()
+            .find(|chunk| chunk.chunk_day_local == "2026-03-24")
+            .expect("old imported-day chunk should exist");
+        assert!(old_chunk.import_source_files.is_empty());
+        assert_eq!(old_chunk.remove_only_source_files.len(), 1);
+        assert_eq!(
+            old_chunk.remove_only_source_files[0].relative_path,
+            "move/session.jsonl"
         );
 
         Ok(())
@@ -1937,6 +2359,59 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn import_all_preserves_unchanged_file_state_within_a_changed_day_chunk() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root)?;
+
+        let first_relative_path = "same-day/first.jsonl";
+        let second_relative_path = "same-day/second.jsonl";
+        let first_path = source_root.join(first_relative_path);
+        let second_path = source_root.join(second_relative_path);
+        let _ = write_session_fixture_with_cwd(&first_path, "session-first", &project_root)?;
+        let _ = write_session_fixture_with_cwd(&second_path, "session-second", &project_root)?;
+
+        let mut db = Database::open(&db_path)?;
+        scan_source_manifest(&mut db, &source_root)?;
+        let initial_report = import_all(db.connection(), &db_path, &source_root)?;
+        assert_eq!(initial_report.startup_chunk_count, 1);
+
+        let original_ids = conversation_ids_by_relative_path(db.connection())?;
+        let original_first = original_ids
+            .get(first_relative_path)
+            .copied()
+            .expect("first file conversation should exist");
+        let original_second = original_ids
+            .get(second_relative_path)
+            .copied()
+            .expect("second file conversation should exist");
+
+        thread::sleep(Duration::from_millis(1100));
+        let _ =
+            write_session_fixture_with_cwd(&first_path, "session-first-updated", &project_root)?;
+
+        scan_source_manifest(&mut db, &source_root)?;
+        let second_report = import_all(db.connection(), &db_path, &source_root)?;
+        assert_eq!(second_report.startup_chunk_count, 1);
+
+        let updated_ids = conversation_ids_by_relative_path(db.connection())?;
+        assert_ne!(
+            updated_ids.get(first_relative_path).copied(),
+            Some(original_first),
+            "changed file should be reimported"
+        );
+        assert_eq!(
+            updated_ids.get(second_relative_path).copied(),
+            Some(original_second),
+            "unchanged file should keep its conversation row"
+        );
+
+        Ok(())
+    }
+
     fn insert_project(
         conn: &mut Connection,
         canonical_key: &str,
@@ -2018,6 +2493,27 @@ mod tests {
         i64::try_from(content.len()).context("fixture size exceeded i64")
     }
 
+    fn write_action_fixture(path: &Path, session_id: &str, cwd: &Path) -> Result<i64> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let project_file = cwd.join("src").join("main.rs");
+        let content = format!(
+            concat!(
+                "{{\"type\":\"user\",\"uuid\":\"{session_id}-user\",\"timestamp\":\"2026-03-26T10:00:00Z\",\"sessionId\":\"{session_id}\",\"cwd\":\"{cwd}\",\"message\":{{\"role\":\"user\",\"content\":\"Inspect the project\"}}}}\n",
+                "{{\"type\":\"assistant\",\"uuid\":\"{session_id}-assistant\",\"timestamp\":\"2026-03-26T10:00:01Z\",\"sessionId\":\"{session_id}\",\"message\":{{\"id\":\"msg-{session_id}\",\"role\":\"assistant\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu-{session_id}\",\"name\":\"Read\",\"input\":{{\"file_path\":\"{project_file}\"}}}},{{\"type\":\"text\",\"text\":\"Reading the file\"}}],\"usage\":{{\"input_tokens\":3,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":1}},\"model\":\"claude-haiku\",\"stop_reason\":\"tool_use\"}}}}\n",
+                "{{\"type\":\"user\",\"uuid\":\"{session_id}-tool-result\",\"timestamp\":\"2026-03-26T10:00:02Z\",\"sessionId\":\"{session_id}\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"toolu-{session_id}\",\"content\":\"fn main() {{}}\",\"is_error\":false}}]}}}}\n"
+            ),
+            session_id = session_id,
+            cwd = cwd.display(),
+            project_file = project_file.display(),
+        );
+
+        fs::write(path, &content).with_context(|| format!("unable to write {}", path.display()))?;
+        i64::try_from(content.len()).context("fixture size exceeded i64")
+    }
+
     fn write_malformed_session_fixture(path: &Path, session_id: &str) -> Result<i64> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -2033,5 +2529,37 @@ mod tests {
 
         fs::write(path, &content).with_context(|| format!("unable to write {}", path.display()))?;
         i64::try_from(content.len()).context("fixture size exceeded i64")
+    }
+
+    fn write_session_fixture_with_cwd(path: &Path, session_id: &str, cwd: &Path) -> Result<i64> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let content = format!(
+            concat!(
+                "{{\"type\":\"user\",\"uuid\":\"{session_id}-user\",\"timestamp\":\"2026-03-26T10:00:00Z\",\"sessionId\":\"{session_id}\",\"cwd\":\"{cwd}\",\"message\":{{\"role\":\"user\",\"content\":\"Inspect the project\"}}}}\n",
+                "{{\"type\":\"assistant\",\"uuid\":\"{session_id}-assistant\",\"timestamp\":\"2026-03-26T10:00:01Z\",\"sessionId\":\"{session_id}\",\"message\":{{\"id\":\"msg-{session_id}\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"Working on it\"}}],\"usage\":{{\"input_tokens\":3,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":1}},\"model\":\"claude-haiku\",\"stop_reason\":\"end_turn\"}}}}\n"
+            ),
+            session_id = session_id,
+            cwd = cwd.display(),
+        );
+
+        fs::write(path, &content).with_context(|| format!("unable to write {}", path.display()))?;
+        i64::try_from(content.len()).context("fixture size exceeded i64")
+    }
+
+    fn conversation_ids_by_relative_path(conn: &Connection) -> Result<BTreeMap<String, i64>> {
+        let mut stmt = conn.prepare(
+            "
+            SELECT source_file.relative_path, conversation.id
+            FROM conversation
+            JOIN source_file ON source_file.id = conversation.source_file_id
+            ORDER BY source_file.relative_path
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<BTreeMap<_, _>>>()
+            .context("unable to collect conversation ids by relative path")
     }
 }

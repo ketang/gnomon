@@ -1,8 +1,25 @@
 # Import Performance Optimization — Design
 
 **Date:** 2026-04-10
-**Status:** Phase 3 planning — pragma hardening + sharding candidates. Updated 2026-04-16.
+**Status:** Startup close-out — G1/G4 kept endpoint, S1 reverted. Updated 2026-04-17.
 **Running log:** [`2026-04-10-import-perf-log.md`](./2026-04-10-import-perf-log.md)
+
+## 0. Current Decision Summary
+
+- **Product-preserving startup work stops at G1/G4.** The kept path is the
+  persisted `scan_source` cache plus file-granular invalidation inside the
+  existing chunk model.
+- **Warm-start targets are met on the authoritative full-corpus harness.**
+  No-delta warm startup is **0.230s median** and one-file delta startup is
+  **0.541s median**.
+- **Parser micro-optimization is closed out.** S1 (`simd-json`) regressed warm
+  startup, delta startup, and cold full import versus the kept G1/G4 state.
+- **Cold full import remains materially above target.** The best kept
+  product-preserving result is still **20.599s** on the full corpus, above the
+  **10s** acceptable target.
+- **Further import-perf work, if resumed, should move to a different decision
+  surface:** a new cold-import architecture or an explicit product-semantic
+  trade around what is considered ready at open.
 
 ## 1. Goals & Non-Goals
 
@@ -578,7 +595,7 @@ All primary candidates have been tried. Project is at or below the 10s target.
 
 Full corpus authoritative: ~21s post-D1b (prior session).
 
-### Candidate ranking (Phase 2, final state 2026-04-15)
+### Candidate ranking (close-out state 2026-04-17)
 
 **D0. Zero-write diagnostic — COMPLETE.** CPU floor = 2.82s (subset). SQL
 writes = 67% of wall. Btree-ops model validated.
@@ -609,29 +626,67 @@ this mixed INSERT + FK-verification workload. The D1b preset-FK pattern
 cannot apply to `action_message` (dependency cycle: action needs turn_id →
 turn needs message IDs → messages must be inserted first).
 
-**D4. simd-json — LOW PRIORITY.** Parse phase is ~0.3s (4% of wall).
-Ceiling is too small to matter before structural SQL changes.
+**E. Pragma hardening (`foreign_keys=OFF`, `locking_mode=EXCLUSIVE`,
+`wal_autocheckpoint=0`) — REVERTED.** The authoritative full-corpus run
+regressed to **27.1s median**. `foreign_keys=OFF` removed `commit_ms` on one
+isolated run, but the bundle did not produce a stable wall-time win.
 
-**D5. scan_source delta cache + parallelism — STARTUP ONLY.** Reuse
-stored manifest/project identity when `mtime + size + import schema
-version` are unchanged, parallelize first-record `cwd` extraction, and
-memoize `cwd -> ResolvedProject`. This targets warm startup rather than
-cold full import.
+**F2a. Parallel import -> sequential merge — REVERTED.** Improved the
+single-project subset but regressed the full corpus (**24.563s** vs
+**20.599s** serial). Shard fan-out plus merge/checkpoint costs dominated at
+scale.
 
-**D6. path_node memoization — UNTRIED.** `persist_path_refs` still
-resolves `path_node` chains through repeated point lookups/inserts. A
-per-project cache keyed by canonical full path could remove many hot-loop
-btree probes.
+**G1. scan_source delta cache + parallel header extraction — KEPT.** The
+policy-aware persisted scan cache solved the no-delta warm-start path on the
+full corpus (**0.230s median**) without changing startup semantics.
 
-**D7. inline rollup materialization — UNTRIED.** D3 proved that deferring
-rollups is worse. A different idea is to accumulate chunk rollups during
-classification/write, eliminating the reread in `rollup.rs` rather than
-moving it later.
+**G2. Import-local path_node memoization — REVERTED.** The subset improved,
+but the full corpus regressed (**24.553s** vs **20.599s**). Repeated
+path-node lookups are not the dominant remaining cold-import cost.
 
-**D8. finer-grained invalidation than project x day — WARM-START
-STRUCTURAL.** The current import plan reimports a whole day chunk when any
-file in that day changes. If warm-start latency becomes the goal, this is
-a larger lever than parser swaps.
+**G3. Inline rollup materialization — REVERTED.** The hot-cache reread in the
+existing rebuild pass is cheaper than carrying rollup aggregation inside the
+write path (**26.573s** full vs **20.599s** baseline).
+
+**G4. File-granular invalidation within day chunks — KEPT.** One-file delta
+startup on the full corpus dropped to **0.541s median** without changing row
+parity or the meaning of "ready".
+
+**C3. Background streaming import — REVERTED.** Startup-open wall fell to
+~**0.613s** on the full corpus, but only by opening before any startup chunk
+had published, which makes the initial snapshot empty or stale.
+
+**H1. Defer startup action/path-derived tables until after open —
+REVERTED.** One-file delta startup improved to ~**0.428s**, but action/path
+views lagged the opened snapshot until a later publish.
+
+**H2. Warm-only streaming gate — REVERTED.** One-file delta startup improved
+to ~**0.227s**, but only by keeping the previous publish visible until
+refresh.
+
+**S1. `simd-json` line parsing — REVERTED.** Full-corpus medians regressed in
+all measured modes versus G1/G4: **0.280s** warm startup vs **0.230s**,
+**0.665s** delta startup vs **0.541s**, and **27.229s** cold full import vs
+**20.599s**.
+
+### Startup endpoint
+
+G1 and G4 are the endpoint for startup-preserving work in the current product
+model:
+
+- They meet the agreed startup targets on the authoritative full-corpus
+  harness.
+- They preserve the existing semantics that the opened snapshot reflects the
+  just-imported startup slice.
+- The follow-on startup experiments that beat G1/G4 on raw startup-open wall
+  (C3, H1, H2) all did so by weakening snapshot freshness or completeness at
+  open.
+- The only remaining startup-preserving parser experiment (S1) regressed
+  outright.
+
+The practical conclusion is that further startup gains now require either a
+product decision or a fundamentally different cold-import architecture. They do
+not require more parser or manifest micro-tuning under the current semantics.
 
 ## 14. Phase 3: Pragma Hardening + Sharded Import (2026-04-16)
 
@@ -860,9 +915,9 @@ matter more than micro-optimizing parser or SQLite settings for startup.
 
 Impact: warm startup. Highest product/logic risk of the G group.
 
-If the goal remains pure cold-import wall time and E under-delivers, F2a is
-still the only remaining idea with a clear multi-second ceiling. If the
-goal shifts toward warm startup, G1/G4 are more relevant than F2a.
+This ranking is now historical. G1/G4 solved the startup track without product
+semantics changes, and the remaining work is no longer a startup-candidate
+ranking problem. It is a broader architectural or product decision.
 
 **Phase 3c (optional): F2b or F2c permanent sharding.** Only if F2a's merge
 step proves to be the bottleneck AND the read path needs to scale to
