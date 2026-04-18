@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use glob::Pattern;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{db, dirs};
 
@@ -61,7 +61,7 @@ struct SourceConfig {
     root: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProjectIdentityPolicy {
     #[serde(default = "default_true")]
     pub stale_claude_worktree_recovery: bool,
@@ -78,14 +78,14 @@ impl Default for ProjectIdentityPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectFilterAction {
     Include,
     Exclude,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectFilterMatchOn {
     RawCwd,
@@ -93,7 +93,7 @@ pub enum ProjectFilterMatchOn {
     IdentityReason,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProjectFilterRule {
     pub action: ProjectFilterAction,
     pub match_on: ProjectFilterMatchOn,

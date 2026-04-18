@@ -8,6 +8,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
@@ -17,7 +18,7 @@ use gnomon_core::import::{
     StartupImportMode, import_all_with_perf_logger, scan_source_manifest_with_perf_logger,
     start_startup_import_with_perf_logger,
 };
-use gnomon_core::perf::PerfLogger;
+use gnomon_core::perf::{PerfLogFormat, PerfLogGranularity, PerfLogger, PerfLoggerConfig};
 use rusqlite::Connection;
 use tempfile::TempDir;
 
@@ -31,6 +32,8 @@ enum CorpusChoice {
 enum ModeChoice {
     Full,
     Startup,
+    WarmStartup,
+    DeltaStartup,
 }
 
 #[derive(Parser, Debug)]
@@ -51,6 +54,8 @@ struct Args {
     #[arg(long)]
     keep_db: bool,
 }
+
+const BENCH_PERF_LOG_MAX_BYTES: u64 = 200 * 1024 * 1024;
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -93,8 +98,16 @@ fn run_once(
 
     let perf_logger = match perf_log {
         Some(path) => Some(
-            PerfLogger::open_jsonl(path)
-                .with_context(|| format!("unable to open perf log at {}", path.display()))?,
+            PerfLogger::open_with_config(
+                path,
+                PerfLoggerConfig {
+                    format: PerfLogFormat::Jsonl,
+                    granularity: PerfLogGranularity::Verbose,
+                    max_bytes: BENCH_PERF_LOG_MAX_BYTES,
+                    ..PerfLoggerConfig::default()
+                },
+            )
+            .with_context(|| format!("unable to open perf log at {}", path.display()))?,
         ),
         None => None,
     };
@@ -132,6 +145,7 @@ fn run_once(
     );
 
     let import_start = Instant::now();
+    let mut measured_start = None;
 
     match mode {
         ModeChoice::Full => {
@@ -169,9 +183,95 @@ fn run_once(
             .context("start_startup_import_with_perf_logger failed")?;
             drop(startup);
         }
+        ModeChoice::WarmStartup => {
+            {
+                let mut database = Database::open(&db_path)
+                    .with_context(|| format!("unable to open db at {}", db_path.display()))?;
+                scan_source_manifest_with_perf_logger(
+                    &mut database,
+                    &source_root,
+                    perf_logger.clone(),
+                )
+                .context("warm-startup prefill source scan failed")?;
+                let report = import_all_with_perf_logger(
+                    database.connection(),
+                    &db_path,
+                    &source_root,
+                    perf_logger.clone(),
+                )
+                .context("warm-startup prefill import failed")?;
+                println!(
+                    "warm-startup prefill: startup chunks={}, deferred chunks={}, deferred failures={}",
+                    report.startup_chunk_count,
+                    report.deferred_chunk_count,
+                    report.deferred_failure_count,
+                );
+            }
+
+            measured_start = Some(Instant::now());
+            let mut database = Database::open(&db_path)
+                .with_context(|| format!("unable to reopen db at {}", db_path.display()))?;
+            scan_source_manifest_with_perf_logger(&mut database, &source_root, perf_logger.clone())
+                .context("warm-startup measured source scan failed")?;
+            let startup = start_startup_import_with_perf_logger(
+                database.connection(),
+                &db_path,
+                &source_root,
+                StartupImportMode::RecentFirst,
+                perf_logger,
+                |_| {},
+            )
+            .context("warm-startup measured import failed")?;
+            drop(startup);
+        }
+        ModeChoice::DeltaStartup => {
+            let mutated_relative_path = {
+                let mut database = Database::open(&db_path)
+                    .with_context(|| format!("unable to open db at {}", db_path.display()))?;
+                scan_source_manifest_with_perf_logger(
+                    &mut database,
+                    &source_root,
+                    perf_logger.clone(),
+                )
+                .context("delta-startup prefill source scan failed")?;
+                let report = import_all_with_perf_logger(
+                    database.connection(),
+                    &db_path,
+                    &source_root,
+                    perf_logger.clone(),
+                )
+                .context("delta-startup prefill import failed")?;
+                println!(
+                    "delta-startup prefill: startup chunks={}, deferred chunks={}, deferred failures={}",
+                    report.startup_chunk_count,
+                    report.deferred_chunk_count,
+                    report.deferred_failure_count,
+                );
+                choose_delta_mutation_relative_path(database.connection())?
+            };
+
+            let mutated_file = touch_one_jsonl_file(&source_root, &mutated_relative_path)?;
+            println!("delta-startup mutated: {}", mutated_file.display());
+
+            measured_start = Some(Instant::now());
+            let mut database = Database::open(&db_path)
+                .with_context(|| format!("unable to reopen db at {}", db_path.display()))?;
+            scan_source_manifest_with_perf_logger(&mut database, &source_root, perf_logger.clone())
+                .context("delta-startup measured source scan failed")?;
+            let startup = start_startup_import_with_perf_logger(
+                database.connection(),
+                &db_path,
+                &source_root,
+                StartupImportMode::RecentFirst,
+                perf_logger,
+                |_| {},
+            )
+            .context("delta-startup measured import failed")?;
+            drop(startup);
+        }
     }
 
-    let import_elapsed = import_start.elapsed();
+    let import_elapsed = measured_start.unwrap_or(import_start).elapsed();
 
     let row_counts = count_rows(&db_path)?;
     let db_bytes = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
@@ -219,6 +319,31 @@ fn total_jsonl_bytes(root: &Path) -> Result<u64> {
         }
     }
     Ok(total)
+}
+
+fn choose_delta_mutation_relative_path(conn: &Connection) -> Result<String> {
+    conn.query_row(
+        "
+        SELECT source_file.relative_path
+        FROM conversation
+        JOIN source_file ON source_file.id = conversation.source_file_id
+        ORDER BY source_file.relative_path
+        LIMIT 1
+        ",
+        [],
+        |row| row.get(0),
+    )
+    .context("unable to select a conversation-backed source file for delta mutation")
+}
+
+fn touch_one_jsonl_file(root: &Path, relative_path: &str) -> Result<PathBuf> {
+    thread::sleep(std::time::Duration::from_millis(1100));
+    let path = root.join(relative_path);
+    let contents = fs::read(&path)
+        .with_context(|| format!("unable to read {} for mutation", path.display()))?;
+    fs::write(&path, contents)
+        .with_context(|| format!("unable to rewrite {} for mutation", path.display()))?;
+    Ok(path)
 }
 
 fn count_rows(db_path: &Path) -> Result<Vec<(String, i64)>> {

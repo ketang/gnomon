@@ -996,370 +996,630 @@ staging might help but adds ~1.5s of VACUUM cost at the end.
 
 ---
 
-## 2026-04-15 — D0: zero-write diagnostic (CPU floor measurement)
+## 2026-04-16 — candidate E1+E2+E3: Pragma hardening
 
-Branch: `import-perf-d0-zero-write` (kept as reference, not merged)
-Hypothesis: The time remaining after zeroing all SQL writes is the minimum
-achievable wall time with SQLite. If the floor is 4-6s (for the full corpus),
-the btree-ops model (projecting 10s via D1-D4) is conservative and the 10s
-target is plausible. If the floor is >15s, the bottleneck is elsewhere.
-Implementation: Added `GNOMON_ZERO_WRITE=1` env-var gate (OnceLock-cached)
-to all INSERT/UPDATE/DELETE calls in `normalize.rs`, `chunk.rs`, and
-`classify/mod.rs`. Parse phase, JSONL extraction, in-memory turn grouping,
-and classification logic still execute.
-Measurements:
-  Subset baseline (confirmation):  8.54s, 8.38s, 8.60s → avg 8.51s
-  Subset zero-write (CPU floor):   2.91s, 2.76s, 2.78s → avg 2.82s
-  SQL write overhead (subset):     ~5.7s (67% of wall)
-  CPU floor (subset):              ~2.82s (33% of wall)
-  Row parity:                      N/A (diagnostic — zero-write produces empty DB)
-  Profile shift: All SQL write phases collapse to near-zero. Remaining ~2.8s
-    is scan_source + rayon JSONL parse + in-memory turn/action grouping.
-Decision: N/A (diagnostic only — establishes CPU floor)
-Commit: c8546fb (on branch import-perf-d0-zero-write)
-Next implied: D1 (denormalize join tables). With 5.7s of SQL overhead and 46%
-  of btree ops from join tables, D1 should save ~2.6s on subset (46% × 5.7s).
-  The CPU floor of 2.82s is well below the 10s target, confirming there is
-  room to land at 10s if D1+D2+D3 each deliver their projected savings.
+**Branch:** `import-perf`
+**Hypothesis:** Disabling FK verification (`foreign_keys=OFF`), taking an
+exclusive writer lock (`locking_mode=EXCLUSIVE`), and disabling auto-checkpoint
+(`wal_autocheckpoint=0` with a manual `wal_checkpoint(TRUNCATE)` after import)
+should reduce cold full-import wall time by ~2–4s without changing schema or
+read-path behavior.
 
----
+**Implementation:** Added importer-specific SQLite connection profiles in
+`crates/gnomon-core/src/db/mod.rs`. Background startup imports now open with
+`foreign_keys=OFF` and `wal_autocheckpoint=0`; foreground full import reuses
+the caller's `Database` handle and applies `foreign_keys=OFF`,
+`locking_mode=EXCLUSIVE`, and `wal_autocheckpoint=0` before chunk execution.
+Manual WAL checkpointing was added after import completion in
+`crates/gnomon-core/src/import/chunk.rs`. The foreground `import_all` path was
+refactored to accept `&mut Database` so `locking_mode=EXCLUSIVE` does not
+deadlock against the previous dual-connection planner/writer topology. Call
+sites and integration tests were updated accordingly.
 
-## 2026-04-15 — D1: denormalize join tables (turn_message → message.turn_id, action_message → message.action_id)
+**Measurements:**
 
-Branch: `import-perf-d1-denormalize-joins` (kept as reference, not merged)
-Hypothesis: Replacing 295K INSERT INTO turn_message + action_message with
-UPDATE message SET turn_id/action_id eliminates 46% of btree ops (2.36M),
-yielding ~4-5s savings on full corpus. Two variants tested: (a) one UPDATE per
-message, (b) one batch UPDATE per turn/action group (WHERE id IN ...).
-Implementation: New migration 0011_denormalize_message_joins.sql adds turn_id
-and action_id nullable columns to message, creates idx_message_turn_id and
-idx_message_action_id, drops turn_message and action_message tables.
-normalize.rs:persist_turn changed to UPDATE message SET turn_id. classify/
-mod.rs:persist_action changed to UPDATE message SET action_id. load_messages
-updated to read m.turn_id directly. Five JOIN rewrites in query/mod.rs.
-Measurements:
-  Subset baseline (D0 run):          8.51s avg
-  Subset D1 individual UPDATEs:      10.08s, 9.69s, 10.54s → avg 10.1s (+19%)
-  Subset D1 batched UPDATEs:         10.04s, 9.90s, 10.02s → avg 10.0s (+18%)
-  Row parity:                        PASS (7/7 integration tests)
-  DB size:                           152.57 MB (vs 160.70 MB baseline, −5%)
-Decision: REVERTED — both variants are regressions of ~1.5s (+18%)
+Full corpus, full mode (3 repeats, same session):
 
-Key finding #9: The btree-ops COUNT model is correct (join tables do account
-for 46% of btree operations) but the cost model was wrong. Replacing join table
-INSERTs with UPDATEs on the message table is MORE expensive, not less, because:
-  (a) UPDATE requires search+modify (random write) vs INSERT's append-friendly
-      sequential write into compact new btrees.
-  (b) The message table is large and hot during import; its btrees require
-      deeper traversals than the smaller join table btrees.
-  (c) Batching (WHERE id IN ...) reduces SQL execution overhead but not btree
-      work, confirming the bottleneck is the per-row btree operation cost.
-The correct approach to eliminate join table overhead is to preset turn_id at
-message INSERT time (D1b), not to update it afterwards.
-Commit: bec34a7 (on branch import-perf-d1-denormalize-joins, not merged)
-Next implied: D3 (defer rollup entirely), D2 (skip message_part INSERTs —
-  pure INSERT elimination, avoids UPDATE pitfall), or D1b (preset turn_id
-  before initial message INSERT).
+| run | E1+E2+E3 |
+| --- | ---: |
+| 1 | 28.4s |
+| 2 | 26.5s |
+| 3 | 27.1s |
+| **median** | **27.1s** |
+| **best** | **26.5s** |
 
----
+Comparison point: current pre-E session-local best was ~21.6s. On the
+authoritative 3-repeat run, E1+E2+E3 regressed by **~5.5s / ~25%**.
 
-## 2026-04-15 — D3: defer rollup computation out of import path — REVERTED
+Perf-log follow-up (single isolated run, full corpus):
+- wall: **21.0s**
+- `scan_source`: **2407ms**
+- `normalize_jsonl`: **7178ms**
+  - `sql_ms`: **5170ms**
+  - `purge_ms`: **224ms**
+  - `finish_import_ms`: **184ms**
+  - **`commit_ms`: `0.0ms`**
+- `build_actions`: **4260ms**
+- `build_turns`: **872ms**
+- `finalize_chunk`: **2009ms**
+  - `rebuild_path_rollups`: **1777ms**
+  - `rebuild_action_rollups`: **195ms**
 
-**Branch:** `import-perf-d3-defer-rollups` (kept as reference, not merged)
+Row parity: **PASS** — full-corpus row counts matched the pre-E shape exactly
+(`project=31`, `source_file=4548`, `import_chunk=162`, `conversation=4547`,
+`stream=4547`, `message=294995`, `message_part=411842`, `turn=13363`,
+`action=120922`, `record=0`). DB size remained **425.58 MB**.
 
-**Hypothesis:** `rebuild_chunk_path_rollups` (1.5s) and `rebuild_chunk_action_rollups`
-(0.15s) run 35 times inside `finalize_chunk_import_core`. Skipping them during
-import and running a single post-import `rebuild_all_chunk_rollups` pass should
-save ~1.5s from the import wall time. (D3 differs from iteration 11 by deferring
-rollups entirely out of the import call, not just batching within it.)
+**Decision:** REVERTED — the bundle did not produce a repeatable win. The
+isolated perf-log run was promising, but the 3-repeat benchmark regressed badly
+enough that this candidate is not defensible as a kept change.
 
-**Implementation:**
-- Added `defer_rollups: bool` to `ImportWorkerOptions` (default false; startup
-  path unchanged).
-- `import_all_with_perf_logger` sets `defer_rollups: true`.
-- `finalize_chunk_import_core` skips rollup calls when `defer_rollups` is true.
-- New `rebuild_all_chunk_rollups(conn, perf_logger)` rebuilds rollups for all
-  complete chunks in one pass. Called separately by bench after import.
-- Bench reports import-only wall time and deferred rollup time independently.
+**Rationale:** Two distinct findings emerged:
+1. `foreign_keys=OFF` appears to remove the old commit stall entirely
+   (`commit_ms = 0` on the perf-log run), so the hypothesis was not directionally
+   wrong.
+2. `locking_mode=EXCLUSIVE` is topology-sensitive. The original full-import path
+   deadlocked because it planned on one SQLite connection and wrote on another.
+   Fixing that required a single-connection foreground refactor. The startup
+   worker cannot safely use the same exclusive mode because it intentionally
+   coexists with an open reader/TUI connection.
 
-**Measurements (subset, same-session interleaved, 3+3+3+3 runs):**
+Given the benchmark variance and the architectural caveat on E2, this bundle is
+not reliable enough to keep. If pragma work is revisited later, it should be as
+**E1+E3 only** or as part of the sharded merge path, not as a standalone kept
+optimization.
 
-| run | main wall | D3 import-only | D3 rollup (deferred) | D3 total |
-| --- | ---: | ---: | ---: | ---: |
-| 1 | 23.6s | 15.1s | 9.5s | 24.6s |
-| 2 | 19.0s | 11.3s | 6.5s | 17.8s |
-| 3 | 16.0s | 9.2s | 5.7s | 14.9s |
-| 4 | 10.1s | 8.1s | 5.8s | 13.9s |
-| 5 | 11.7s | 9.1s | 6.9s | 16.0s |
-| 6 | 13.0s | 9.5s | 6.5s | 16.0s |
-| **median** | **14.9s** | **9.3s** | **6.5s** | **15.9s** |
+**Key finding #14:** `locking_mode=EXCLUSIVE` is incompatible with the existing
+dual-connection import topology. It can only be tested cleanly on a
+single-connection foreground import path and is not a drop-in setting for the
+background startup importer.
 
-Note: high variance in early runs (system loading up after D3 build). Later runs
-are more stable and comparable. Session baseline median ≈10-11s.
+**Key finding #15:** `foreign_keys=OFF` can erase commit cost on an isolated
+run, but the full pragma bundle still failed to deliver a stable wall-time win.
+The remaining cold-import problem is still dominated by overall serial write
+volume, not just fsync/FK overhead.
 
-**Analysis:**
-- D3 import-only (no rollups): ~9.3s vs baseline ~10-11s → modest ~1-2s
-  improvement in the import phase.
-- D3 rollup rebuild (deferred): ~6.5s vs per-chunk rollup cost ~3.4s → 2× MORE
-  expensive than the per-chunk approach.
-- D3 total: ~15-16s vs baseline ~10-11s → **+38-45% REGRESSION** on the total
-  user-perceived time.
-
-**Root cause:** Same cache-miss penalty as deferred secondary indexes (iteration 4).
-Per-chunk rollup computation runs while the chunk's data pages are hot in the 64MB
-page cache (just written). In the post-import pass, all 35 chunks' pages have been
-loaded and evicted since rollup ran for chunk 1. The path rollup query joins action
-→ action_message → message → message_path_ref → path_node and aggregates over
-all files in the chunk — it needs the same pages that were hot during import. Eviction
-from 35 subsequent chunks causes severe cache misses, making each rollup rebuild
-4-10× slower per chunk than in the hot-cache scenario.
-
-**Key finding #10:** Rollup computation is cache-locality dependent. Per-chunk
-rollup runs efficiently because it accesses the same data pages that were just
-written. Any strategy that delays rollup computation past the point where those
-pages are hot (whether post-loop batch or truly deferred) pays a severe penalty.
-The ~3.4s per-chunk rollup cost is already near-optimal given the cache constraints.
-
-**Decision:** REVERTED — total time regresses ~40-50%. Branch kept as reference.
-
-Row parity: **PASS** — all rollup tables match per-chunk baseline when
-`rebuild_all_chunk_rollups` is called after import.
+**Next implied:** **F2a: parallel import -> sequential merge.** E was the
+lowest-risk cold-import candidate and did not move the 10s target reliably. The
+remaining candidate with a clear multi-second ceiling is parallel write via
+per-project shards followed by a sequential merge into the single production DB.
 
 ---
 
-## 2026-04-15 — D1b: preset turn_id at message INSERT time
+## 2026-04-16 — timing coverage hardening
 
-**Branch:** `import-perf-d1b`
-**Hypothesis:** D1 regressed because post-hoc UPDATE on `message` is more
-expensive than JOIN table INSERTs. The correct path is to compute turn
-membership in memory before the first INSERT, so `turn_id` and
-`ordinal_in_turn` can be set at INSERT time — eliminating both the
-`turn_message` table and any post-hoc UPDATE cost.
+**Branch:** `import-perf`
+**Hypothesis:** The E1+E2+E3 result was not interpretable enough because the
+perf log still had blind spots. Specifically, the end-of-import manual WAL
+checkpoint was uninstrumented, the foreground import path reused the old
+`import.open_database` label for connection reconfiguration, chunk-local parse
+time was unlabeled after the rayon split, and the benchmark harness's default
+10 MiB perf-log cap was truncating fully-instrumented full-corpus runs.
 
-**Implementation:**
-- Migration `0011_d1b_message_turn_id.sql`: ALTER TABLE message to add
-  `turn_id` (nullable FK → turn) and `ordinal_in_turn`; DROP TABLE
-  turn_message.
-- `normalize.rs`: `upsert_message` made fully in-memory (no DB calls).
-  New `persist_messages_with_turns` function groups messages into turns
-  in memory (sorted by sequence_no; new turn at every `user_prompt`),
-  then inserts in order: root message (turn_id=NULL) → turn row →
-  UPDATE root to set turn_id/ordinal_in_turn=0 → non-root members with
-  turn_id set at INSERT time. Only N_turns (~5K subset / ~25K full)
-  UPDATEs vs N_messages UPDATEs in D1.
-- `classify/mod.rs`: `load_messages` query updated to use `m.turn_id` /
-  `m.ordinal_in_turn` directly; removed `JOIN turn_message` JOIN.
-- `query/mod.rs` test fixture: `INSERT INTO turn_message` → `UPDATE
-  message SET turn_id`.
-- `db/mod.rs`: `INITIAL_SCHEMA_VERSION` bumped 10 → 11; `REQUIRED_TABLES`
-  count corrected (19, not 20).
-- `IMPORT_SCHEMA_VERSION` bumped 5 → 6 (triggers full reimport).
+**Implementation:** Added timing coverage for:
+- `import.total`
+- `import.configure_connection`
+- `import.checkpoint_wal`
+- `import.begin_chunk`
+- `import.parse_phase`
+- `import.chunk_commit`
+- `import.savepoint_open`
+- `import.savepoint_release`
+- `import.savepoint_rollback`
 
-**Measurements (interleaved, same session):**
+Also split `build_actions` into internal subspans:
+- `import.build_actions.load_context`
+- `import.build_actions.purge_existing`
+- `import.build_actions.load_messages`
+- `import.build_actions.build_tool_lookup`
+- `import.build_actions.group_turns`
+- `import.build_actions.classify_messages`
+- `import.build_actions.persist_path_refs`
+- `import.build_actions.persist_actions`
+- `import.build_actions.update_chunk_count`
 
-Subset (8 pairs): main median **8.89s**, D1b median **8.32s** → **−0.57s / −6.4%**
+Finally, `crates/gnomon-core/examples/import_bench.rs` now opens JSONL perf logs
+with a 200 MiB cap so full-corpus verbose runs are not truncated.
 
-| run | main | D1b |
-| --- | ---: | ---: |
-| 1 | 8.986s | 9.676s |
-| 2 | 8.793s | 8.193s |
-| 3 | 9.221s | 9.669s |
-| 4 | 9.990s | 7.684s |
-| 5 | 8.171s | 8.818s |
-| 6 | 8.662s | 8.137s |
-| 7 | 8.384s | 7.745s |
-| 8 | 8.998s | 8.446s |
-| **median** | **8.89s** | **8.32s** |
+**Measurements:** Clean full-corpus coverage run (single run, full mode):
+- wall: **26.193s**
+- `import.total`: **23906ms**
+- `import.scan_source`: **2212ms**
+- `import.build_plan`: **5ms**
+- `import.prepare_plan`: **15ms**
+- `import.configure_connection`: **619ms**
+- `import.begin_chunk`: **139ms**
+- `import.parse_phase`: **1630ms**
+- `import.chunk`: **19281ms**
+- `import.normalize_jsonl`: **8348ms**
+  - `sql_ms`: **5908ms**
+  - `purge_ms`: **284ms**
+  - `finish_import_ms`: **231ms**
+  - `commit_ms`: **0ms**
+- `import.build_actions`: **5210ms**
+  - `load_context`: **260ms**
+  - `purge_existing`: **310ms**
+  - `load_messages`: not emitted on the in-memory import path
+  - `build_tool_lookup`: **307ms**
+  - `group_turns`: **14ms**
+  - `classify_messages`: **3435ms**
+  - `persist_path_refs`: **3481ms**
+  - `persist_actions`: **3506ms**
+  - `update_chunk_count`: **361ms**
+- `import.finalize_chunk`: **2165ms**
+  - `rebuild_path_rollups`: **1900ms**
+  - `rebuild_action_rollups`: **213ms**
+- `import.chunk_commit`: **1595ms**
+- `import.checkpoint_wal`: **3843ms**
+- `import.savepoint_open`: **10ms**
+- `import.savepoint_release`: **149ms**
 
-Full corpus (3 pairs): main median **21.244s**, D1b median **21.009s** → **−0.24s / −1.1%**
+**Decision:** KEPT as instrumentation. This is not a product optimization; it is
+measurement hardening so subsequent experiments are diagnosable.
 
-| run | main | D1b |
-| --- | ---: | ---: |
-| 1 | 22.525s | 21.525s |
-| 2 | 21.149s | 21.009s |
-| 3 | 21.244s | 20.576s |
-| **median** | **21.244s** | **21.009s** |
+**Rationale:** The earlier ambiguity is now resolved:
+1. The "missing time" from E1+E2+E3 was primarily **`import.checkpoint_wal`**
+   rather than unexplained work elsewhere. `commit_ms` moved to ~0, but the
+   WAL checkpoint absorbed multi-second cost at the end of import.
+2. Savepoint lifecycle overhead is negligible (`~159ms` total across 4547 files)
+   and can be ruled out as a material bottleneck.
+3. Chunk-local parse time is real but small (`~1.6s` total), so parse remains a
+   secondary lever.
+4. The fully split `build_actions` subspans are informative but **not
+   additive**: `classify_messages`, `persist_path_refs`, and `persist_actions`
+   overlap structurally because the current implementation does those steps
+   interleaved inside the same per-message loop.
 
-Row parity: **PASS** — all tables match. `turn` row count unchanged (4,915
-subset). `message` row count unchanged (130,478 subset).
+**Key finding #16:** The end-of-import manual WAL checkpoint is the largest
+newly-attributed blind spot. In the fully instrumented run it cost **3.84s**,
+which explains why `commit_ms` could drop to zero without producing a stable
+end-to-end wall-time win.
 
-Quality gates: `cargo fmt`, `cargo clippy -D warnings`, `cargo test --workspace` — all pass.
+**Key finding #17:** Savepoint overhead is negligible. `import.savepoint_open`
++ `import.savepoint_release` is ~159ms across the entire full corpus and is not
+worth targeting.
 
-**Analysis:** Savings are real but smaller than the 2-3s btree model predicted.
-Root cause: `turn_message` rows are compact (3 INTEGER columns) and the table's
-btree is tiny relative to the main `message` table, so per-op insert cost is
-low. The 295K × 3 btree ops eliminated are fast ops. Additionally, the 5K root-
-message UPDATEs offset a fraction of the savings. Full-corpus delta sits within
-WSL2 noise (~5%), though subset shows a cleaner −6.4% signal.
+**Key finding #18:** Full-corpus verbose perf runs were previously being
+truncated by the benchmark harness's 10 MiB log cap. The harness now preserves
+complete logs for future coverage-heavy experiments.
 
-Architectural benefit is real regardless: the schema is simpler, `load_messages`
-eliminates one JOIN (no index lookup on `turn_message.message_id`), and the
-join-table-elimination goal is complete for turns.
-
-**Decision:** KEPT — subset shows clear directional improvement; schema
-simplification has value independent of the modest wall-time delta.
-
----
-
-## 2026-04-15 — D1b bug fix: imported_message_count written as 0
-
-### Root cause
-
-`ImportState::finish_import` computed `imported_message_count` as
-`self.message_states.len()`. But `persist_messages_with_turns` — which runs
-before `finish_import` — drains the HashMap via `.drain()`. After drain,
-`len()` == 0, so the `import_chunk` row was silently written with
-`imported_message_count = 0`.
-
-The bug was invisible to unit tests (none assert the `import_chunk` counter
-directly) and to `cargo test --workspace` (integration tests are `#[ignore]`).
-It was only caught when the full integration suite was run explicitly.
-
-### Fix
-
-Added a `message_count: usize` field to `ImportState`, incremented on the
-first occurrence of each `external_id` in `upsert_message`. `finish_import`
-now reads `self.message_count` instead of `self.message_states.len()`.
-
-### Integration test results (post-fix)
-
-```
-running 7 tests
-test subset_corpus_import_all_matches_expected_database_shape ... ok
-test subset_corpus_recent_first_startup_import_defers_every_chunk_and_reaches_same_final_state ... ok
-test subset_corpus_with_one_recent_file_imports_recent_chunk_before_opening ... ok
-test subset_corpus_reimport_is_a_no_op_when_files_are_unchanged ... ok
-test subset_corpus_reimports_only_the_touched_chunk_when_a_file_mtime_changes ... ok
-test subset_corpus_keeps_prior_rows_when_a_reimported_file_turns_malformed_and_recovers_after_restore ... ok
-test full_corpus_import_all_matches_expected_database_shape ... ok
-
-test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured
-```
-
-### Process fix
-
-Added the import integration test suite to `CLAUDE.md` quality gates with an
-explicit note that `cargo test --workspace` does not include these tests. Any
-future perf optimization pass must run `cargo test -p gnomon-core --test
-import_corpus_integration -- --include-ignored` before being declared complete.
+**Next implied:** F2a remains the next cold-import experiment. The importer is
+now instrumented well enough to evaluate parallel shard import and sequential
+merge without hand-waving about where the time moved.
 
 ---
 
-## 2026-04-15 — D2: defer message_part INSERTs to post-normalize pass — REVERTED
+## 2026-04-16 — F2a parallel import -> sequential merge
 
-**Branch:** `import-perf-d2`
-**Hypothesis:** Deferring all `INSERT INTO message_part` calls to a single
-sequential pass after all message rows are inserted would reduce btree op
-interleaving, yielding ~1-2s improvement on subset.
+**Branch:** `import-perf`
+**Hypothesis:** Per-project shard databases would let the importer parallelize
+the remaining serial SQLite write volume without changing the production read
+path. The expected shape was: import each project's chunks into its own temp
+SQLite in parallel, then merge those shard DBs sequentially into one target DB.
+If the parallel write phase collapsed toward the existing parse floor and the
+merge stayed under a few seconds, this was the last plausible cold-import
+candidate with a multi-second ceiling toward the 10s target.
 
-**Implementation:** Removed the three inline `insert_pending_parts` calls from
-`persist_messages_with_turns` (after unassigned message INSERT, after root
-message INSERT, and after each turn-member message INSERT). Added a single
-deferred loop after all message INSERTs:
+**Implementation:** Added a benchmark-only sharded import path:
+- plan chunks once on the main DB, then group prepared chunks by `project_id`
+- seed one temp shard DB per project with the required `project`,
+  `source_file`, and `import_chunk` metadata
+- import each project's chunks against its shard DB in parallel
+- merge shard tables back into the target DB sequentially with reserved rowid
+  offsets, then reassign global `publish_seq`
+- expose the path through `import_bench --strategy sharded`
 
-```rust
-for ms in &mut messages {
-    insert_pending_parts(conn, ms, source_path)?;
-}
-```
+The product path is unchanged. This was an experiment harness for measuring the
+parallel import + sequential merge topology only.
 
-**Measurements (subset, same session):**
+**Measurements:**
 
-| run | main wall | D2 wall |
-| --- | ---: | ---: |
-| 1 | 10.889s | 24.947s (cold — integration test + build still running) |
-| 2 | 11.099s | 18.822s |
-| 3 | 10.439s | 18.706s |
-| **warm median** | **10.9s** | **18.7s** |
+Subset corpus, full mode, single run:
+- serial wall: **12.632s**
+- sharded wall: **10.466s**
+- delta: **-2.166s / -17.1%**
+- row parity: **PASS**
+  (`project=1`, `source_file=1649`, `import_chunk=35`, `conversation=1648`,
+  `stream=1648`, `message=130478`, `message_part=179412`, `turn=4915`,
+  `action=50463`, `record=0`)
+- DB size: **160.62 MB serial** vs **160.70 MB sharded**
 
-**Delta: +71% REGRESSION** — D2 is ~1.7× slower than main on subset.
+Full corpus, full mode, authoritative single-run comparison:
+- serial wall: **20.599s**
+- sharded wall: **24.563s**
+- sharded perf-log wall: **24.070s**
+- delta vs serial: **+3.47s to +3.96s / +16.8% to +19.2%**
+- row parity: **PASS**
+  (`project=31`, `source_file=4548`, `import_chunk=162`, `conversation=4547`,
+  `stream=4547`, `message=294995`, `message_part=411842`, `turn=13363`,
+  `action=120922`, `record=0`)
+- DB size: **425.74 MB serial** vs **425.50 MB sharded**
 
-**Analysis:** The deferred approach triggers a SQLite FK verification penalty.
-`PRAGMA foreign_keys = ON` is set globally. Each `INSERT INTO message_part`
-causes SQLite to look up `message.id` to verify the `message_id` FK. In the
-inline path (D1b), this lookup always hits a hot page: the parent message row
-was just inserted one statement earlier. In D2, all 130K message rows are
-inserted before any part is written. By the time the deferred pass begins,
-the message btree's page ordering has shifted — even though the 64MB page
-cache is large enough to hold all message pages (~26MB), the FK lookup access
-pattern changes from purely sequential to random-within-range, interacting
-poorly with SQLite's internal btree read-ahead.
+Sharded perf-log attribution (full corpus):
+- `import.scan_source`: **2085ms**
+- `import.shard_setup`: **866ms**
+- `import.shard_import_parallel`: **14407ms**
+- cumulative `import.shard_import`: **30131ms** across 31 projects
+- `import.shard_merge_total`: **3341ms**
+- cumulative `import.checkpoint_wal`: **6171ms** across 32 databases
+- `import.reassign_publish_seq`: **5ms**
 
-`PRAGMA foreign_keys` cannot be toggled inside an active savepoint (the parts
-are inserted within the per-file savepoint), so there is no simple workaround.
+Largest individual merges were concentrated in the biggest projects:
+- one project merge at **1543ms**
+- one project merge at **1295ms**
+- one project merge at **232ms**
+- the remaining project merges were small
 
-**Quality gates:** All pass. `cargo test --workspace` (142 tests ok), 7/7
-integration tests ok, `cargo clippy` clean.
+**Decision:** REVERTED. F2a preserves exact row counts and helps on the single-
+project subset, but it regresses the only authoritative metric: full-corpus
+cold import wall time.
 
-**Decision:** REVERTED — +71% regression far exceeds the threshold.
+**Rationale:** The perf log makes the failure mode explicit:
+1. Parallel shard import does reduce the write wall inside the shard stage
+   (`import.shard_import_parallel` at ~14.4s), but not enough to outrun the
+   cost of creating, checkpointing, and later merging 31 shard databases.
+2. Sequential merge alone costs ~3.3s on the full corpus, which is already a
+   large fraction of the serial path's total remaining gap.
+3. Cumulative checkpoint cost grows to ~6.2s because each shard pays its own
+   WAL/commit lifecycle before the target DB pays it again.
+4. The subset win was misleading because the subset contains only one project,
+   so it avoided the full-corpus fan-out and most of the sequential merge tax.
 
-Key finding #12: **Deferring child-table INSERTs past parent-table INSERTs
-causes SQLite FK verification cache misses.** The inline pattern (parent INSERT
-immediately followed by child INSERTs) keeps FK lookup pages hot. Any
-batching strategy that separates parent and child inserts by more than a few
-rows will pay a similar penalty with `PRAGMA foreign_keys = ON`.
+This means the F-track topology does not beat a well-tuned single SQLite on the
+full corpus. The remaining cold-import problem is not "lack of project-level
+parallelism" in isolation; it is the overhead of maintaining and reconciling
+many SQLite files.
+
+**Key finding #19:** F2a can look good on a single-project subset and still
+lose on the full corpus. Cross-project fan-out and merge costs dominate once
+the shard count grows.
+
+**Key finding #20:** Repeated WAL lifecycle costs matter at shard scale. The
+sharded full-corpus run paid ~6.2s of cumulative checkpoint time across 32
+databases, which erased the benefit of the shorter per-shard write phase.
+
+**Next implied:** **G2 path_node memoization** is now the best remaining
+cold-import candidate. E and F were the only candidates with an obvious
+multi-second ceiling; both failed. The next defensible cold-import lever is the
+import-local `path_node` reduction work because it is low-risk, product-safe,
+and targets a still-hot write-side path without introducing merge topology or
+read-path churn.
 
 ---
 
-## 2026-04-15 — D2b: action_message schema optimization (3 → 2 btrees) — REVERTED
+## 2026-04-16 — G2 path_node memoization
 
-**Branch:** `import-perf-d2b`
-**Hypothesis:** Changing `action_message` PRIMARY KEY from composite
-`(action_id, message_id)` to singleton `(message_id)` eliminates one of the
-three auto-indexes, reducing btree ops from 3 → 2 per INSERT (130K rows ×
-1 fewer btree = 130K ops saved). All query and cascade patterns remain covered:
-`UNIQUE(action_id, ordinal_in_action)` covers action lookups and cascade DELETE
-from action; `PRIMARY KEY (message_id)` = INTEGER rowid covers message lookups
-and cascade DELETE from message.
+**Branch:** `import-perf`
+**Hypothesis:** `persist_path_refs()` still walks the same
+`ensure_path_node_chain() -> ensure_path_node()` path for repeated file paths.
+An import-local memoization table keyed by canonical full path might collapse a
+meaningful share of the repeated `SELECT id FROM path_node ...` lookups into
+cheap in-memory hits, especially on the large single-project subset where path
+prefix reuse is high.
 
-**Analysis of D1b-style approach:** The canonical D1b approach — preset
-`action_id` at message INSERT time — is blocked by a dependency cycle: action
-rows require `turn_id` (turn must exist), turns require message IDs (messages
-must be inserted first), so `action_id` cannot be set at message INSERT time.
-The UPDATE-after-action-INSERT alternative would likely regress like D1 (+18%).
-The schema optimization (3→2 btrees) was the cleanest available approach.
+**Implementation:** Added a transient importer-local cache from `full_path` to
+`path_node.id` and threaded it through the `build_actions` write path so
+multiple conversations imported in the same chunk could reuse resolved path
+nodes without extra SQLite lookups. No schema or read-path changes.
 
-**action_message distribution (subset corpus):**
-- 130,475 rows across 50,463 actions (avg 2.59 messages/action)
-- 19,827 single-message actions (39.3%)
-- 19,003 two-message actions (37.7%)
+**Measurements:**
 
-**Measurements (subset, same session, D2b first then main):**
+Subset corpus, full mode, single run:
+- wall: **7.743s**
+- row parity: **PASS**
+  (`project=1`, `source_file=1649`, `import_chunk=35`, `conversation=1648`,
+  `stream=1648`, `message=130478`, `message_part=179412`, `turn=4915`,
+  `action=50463`, `record=0`)
+- DB size: **160.70 MB**
 
-| run | D2b wall | main wall |
-| --- | ---: | ---: |
-| 1 | 10.682s | 8.575s |
-| 2 | 9.260s | 7.844s |
-| 3 | 8.893s | 7.499s |
-| **warm median** | **9.08s** | **7.67s** |
+Full corpus, full mode, authoritative single run:
+- serial wall to beat: **20.599s**
+- G2 wall: **24.553s**
+- delta vs serial: **+3.954s / +19.2%**
+- row parity: **PASS**
+  (`project=31`, `source_file=4548`, `import_chunk=162`, `conversation=4547`,
+  `stream=4547`, `message=294995`, `message_part=411842`, `turn=13363`,
+  `action=120922`, `record=0`)
+- DB size: **425.74 MB**
 
-**Delta: +18% REGRESSION** — D2b is ~1.4s slower than main on subset.
+**Decision:** REVERTED. G2 preserves exact row counts and looks attractive on
+the subset, but it materially regresses the authoritative full-corpus cold
+import benchmark.
 
-**Analysis:** Reducing from 3 → 2 auto-indexes regressed rather than improved.
-Possible mechanism: the old composite PK `(action_id, message_id)` and separate
-`UNIQUE(message_id)` index combination may have better cache characteristics for
-the mix of INSERT and FK-verification operations. With INTEGER PRIMARY KEY =
-rowid, the FK uniqueness check uses the table's own btree rather than a compact
-separate index, which may cause more cache pressure during the dense action
-classification phase. Exact mechanism uncertain — the measurement is unambiguous.
+**Rationale:** The cache reduced enough repeated work inside the single-project
+subset to produce a fast directional result, but that locality did not survive
+the full-corpus shape. With 31 projects and 162 chunks, the importer still
+spends most of its time on the underlying path/action writes rather than on the
+`path_node` lookup overhead alone. G2 therefore joins E and F in the category
+of experiments that can look promising on a directional run yet fail the only
+metric that matters.
 
-**Quality gates:** All pass. 7/7 integration tests ok. Code reverted to main state.
+**Key finding #21:** Import-local `path_node` memoization has strong locality on
+the single-project subset but does not translate into a full-corpus wall-time
+win. The remaining cold-import bottleneck is larger than repeated path-node
+lookups alone.
 
-**Decision:** REVERTED — +18% regression.
+**Next implied:** **G3 inline rollup materialization** is now the next
+defensible cold-import candidate. G2 was the last low-risk write-side reduction
+without topology changes; if cold-import work continues, the remaining
+experiment needs to attack the reread/rebuild cost in rollups directly. If the
+goal shifts to startup latency instead, G1 and G4 remain the strongest warm-
+start candidates.
 
-Key finding #13: **Reducing action_message auto-indexes from 3→2 by changing
-PK from composite (action_id, message_id) to INTEGER rowid (message_id)
-regresses +18%. The old composite PK + UNIQUE(message_id) index structure is
-faster in practice despite the higher index count, likely due to cache behavior
-during mixed INSERT + FK verification workloads.**
+---
+
+## 2026-04-16 — G3 inline rollup materialization
+
+**Branch:** `import-perf`
+**Hypothesis:** The remaining cold-import reread is concentrated in
+`rebuild_chunk_path_rollups()` plus the smaller action-rollup rebuild. If the
+import path materializes those chunk rollups while classification already has
+the normalized messages, grouped action descriptors, and explicit file refs in
+memory, the importer should be able to remove the finalize-time reread entirely
+and shave roughly the old rollup cost from cold full import without changing
+the read schema.
+
+**Implementation:** Added a temporary chunk-local rollup accumulator and wired
+`build_actions_in_tx_with_messages()` to feed it during classification, then
+changed chunk finalization to flush those in-memory rollup rows instead of
+calling the existing SQL rebuild helpers. A dedicated parity test compared the
+inline rollups against the old rebuild path on the same imported fixture before
+benchmarking. After measurement, the code changes were reverted because the
+benchmark regressed.
+
+**Measurements:**
+
+Subset corpus, full mode, single run:
+- wall: **12.221s**
+- row parity: **PASS**
+  (`project=1`, `source_file=1649`, `import_chunk=35`, `conversation=1648`,
+  `stream=1648`, `message=130478`, `message_part=179412`, `turn=4915`,
+  `action=50463`, `record=0`)
+- DB size: **160.83 MB**
+
+Full corpus, full mode, authoritative single run:
+- serial wall to beat: **20.599s**
+- G3 wall: **26.573s**
+- delta vs serial: **+5.974s / +29.0%**
+- row parity: **PASS**
+  (`project=31`, `source_file=4548`, `import_chunk=162`, `conversation=4547`,
+  `stream=4547`, `message=294995`, `message_part=411842`, `turn=13363`,
+  `action=120922`, `record=0`)
+- DB size: **426.00 MB**
+
+**Decision:** REVERTED. G3 preserves exact row counts but materially regresses
+both the single-project subset and the authoritative full-corpus cold-import
+benchmark.
+
+**Rationale:** The finalize-time SQL reread looked wasteful in isolation, but
+the existing rollup rebuild runs against a hot cache after the write phase. By
+moving rollup materialization into classification, G3 pushed extra Rust-side
+aggregation and per-path fan-out bookkeeping into the already hot write path.
+That additional synchronous work cost more than the old reread it removed.
+G3 therefore reinforces the earlier D3 result from the opposite direction:
+chunk rollups want a hot-cache post-write rebuild rather than more importer-side
+work inside classification.
+
+**Key finding #22:** Inline rollup materialization is slower than the existing
+chunk rollup reread. The remaining rollup rebuild cost is smaller than the
+extra per-message and per-path bookkeeping required to materialize those rows in
+the hot write path.
+
+**Next implied:** **G1 scan_source delta cache + parallel header extraction** is
+now the next sensible experiment. G3 exhausted the last remaining
+product-preserving cold-import structural candidate; the remaining leverage is
+in startup latency (`scan_source` / invalidation) unless the project is willing
+to pursue behavior-changing options such as deferring heavy tables or background
+streaming import.
+
+---
+
+## 2026-04-16 — G4 finer-grained invalidation than whole `project x day` chunks
+
+**Branch:** `import-perf`
+**Hypothesis:** Once G1 removes almost all no-delta startup work, the remaining
+warm-startup cost is self-inflicted chunk replay: a single changed file still
+causes the importer to purge and rebuild the entire `project x day` chunk. If
+the planner can distinguish changed files from unchanged siblings and the
+executor can purge only the affected file-backed rows while recomputing chunk
+rollups/counts afterward, changed-file startup should fall from multi-chunk
+replay toward "one changed file + one old-day cleanup chunk" cost without
+changing query results.
+
+**Implementation:** Added a new `pending_chunk_rebuild` table to remember old
+chunk days that must be revisited after a file moves or disappears. The planner
+now emits per-chunk change sets with separate `import_source_files` and
+`remove_only_source_files` lists instead of treating any dirty file as "rebuild
+the whole day." Chunk execution no longer purges the entire day up front.
+Instead it:
+1. purges only the changed file's prior rows from the target chunk before
+   rewriting that file,
+2. runs remove-only chunks for prior day membership or deleted files,
+3. recomputes per-chunk counts and rollups after the selective purge/write, and
+4. clears any satisfied `pending_chunk_rebuild` rows.
+
+The bench harness also gained a `delta-startup` mode. Its measured pass now
+bumps `mtime` by rewriting the same bytes, rather than appending a newline, so
+the benchmark exercises a real one-file delta instead of a warning-only parse
+artifact.
+
+**Measurements:**
+
+Subset corpus, `delta-startup`, 3 repeats:
+
+| run | wall |
+| --- | ---: |
+| 1 | 0.391s |
+| 2 | 0.244s |
+| 3 | 0.161s |
+| **median** | **0.244s** |
+
+Full corpus, `delta-startup`, 3 repeats:
+
+| run | wall |
+| --- | ---: |
+| 1 | 0.541s |
+| 2 | 0.555s |
+| 3 | 0.453s |
+| **median** | **0.541s** |
+
+Perf-log follow-up, full corpus `delta-startup` (single corrected measured pass):
+- end-to-end measured wall: **0.394s**
+- `import.scan_source`: **191.389ms**
+  - `collect_candidates`: **38.479ms**
+  - `load_cache`: **7.071ms**
+  - `resolve_cache_misses`: **0.591ms**
+  - `persist_scan_source_cache`: **90.244ms**
+  - `cache_hit_count`: **4547**
+  - `cache_miss_count`: **1**
+  - `updated_source_files`: **1**
+- `import.build_plan`: **4.577ms**
+- `import.prepare_plan`: **0.274ms**
+- startup chunk (`1` changed file on the new day): **194.333ms**
+  - `parsed_file_count`: **1**
+  - `parsed_record_count`: **39**
+  - `normalize_jsonl.purge_ms`: **190.628ms**
+- deferred remove-only chunk (old day membership cleanup): **3.483ms**
+- `import.worker_total`: **198.638ms**
+
+Row parity: **PASS** — authoritative full-corpus `delta-startup` runs retained
+the established row counts (`project=31`, `source_file=4548`, `import_chunk=163`,
+`conversation=4547`, `stream=4547`, `message=294995`, `message_part=411842`,
+`turn=13363`, `action=120922`, `record=0`). The extra `import_chunk` row is the
+expected one-file delta replay chunk created after the measured mutation. Full
+DB size remained ~**429.7 MB**.
+
+Focused verification:
+- `cargo test -p gnomon-core import::chunk -- --nocapture` — PASS
+- `cargo test -p gnomon-core import::source -- --nocapture` — PASS
+- `cargo test -p gnomon-core` — PASS (`191 passed, 8 ignored`)
+
+**Decision:** **KEPT.** G4 turns changed-file warm startup from whole-day replay
+into a true file-scoped delta path. The authoritative full corpus now measures
+at **0.541s median** for a one-file delta, while retaining exact row parity.
+
+**Rationale:** G1 solved the no-delta case, but startup still paid for coarse
+chunk invalidation whenever any file changed. G4 removes that structural waste:
+the measured pass touched exactly one imported file on the new day, rebuilt the
+old day in a fast remove-only chunk, and left unchanged siblings untouched. The
+perf log also shows what now dominates the changed-file path: selective purge of
+the changed file's prior rows (~191ms), not scan or planning. That is a much
+smaller and more truthful steady-state cost than replaying an entire day chunk.
+
+**Key finding #25:** File-granular invalidation is enough to keep changed-file
+warm startup in the sub-second range on the authoritative full corpus. The
+remaining steady-state cost is mostly row purge/rewrite for the changed file,
+not chunk scheduling or sibling reimport.
+
+**Key finding #26:** Once G1 and G4 are both in place, the startup-oriented
+structural work is largely exhausted. Remaining meaningful wins now require
+behavior-changing choices such as deferring heavy derived tables or opening the
+UI before background import finishes.
+
+**Next implied:** **C3 background streaming import** is now the next sensible
+experiment if the goal is further startup/user-perceived latency improvement.
+G1 and G4 solved no-delta and one-file-delta warm startup without changing
+product behavior; the remaining leverage is to change when heavy import work
+blocks the UI, not to keep shrinking planner granularity.
+
+## 2026-04-17 — candidate C3: background streaming import
+
+**Branch:** `import-perf`
+**Hypothesis:** Opening the TUI immediately on the current published snapshot
+while import continues in the background should remove nearly all remaining
+startup blocking. Warm startup should stay near the G1 floor, and one-file delta
+startup should fall well below the current G4 median because the changed chunk
+no longer blocks open.
+
+**Implementation:** Prototyped a streaming startup gate in the importer so the
+default startup path returned immediately after plan preparation and worker
+spawn, instead of waiting for the startup window to settle. The visible
+snapshot stayed pinned and still required manual refresh, so the experiment was
+strictly about when the TUI opened, not about auto-applying live updates.
+
+**Measurements:**
+
+Subset corpus, `startup`, 1 repeat:
+
+| run | wall |
+| --- | ---: |
+| 1 | 1.094s |
+
+Full corpus, `startup`, 3 repeats:
+
+| run | wall |
+| --- | ---: |
+| 1 | 0.629s |
+| 2 | 0.530s |
+| 3 | 0.613s |
+| **median** | **0.613s** |
+
+Observed startup-shape change on the full corpus:
+- startup returned before any import chunks published
+- row counts at benchmark exit were still bootstrap-only:
+  `project=31`, `source_file=4548`, `import_chunk=162`,
+  `conversation=0`, `stream=0`, `message=0`, `message_part=0`,
+  `turn=0`, `action=0`, `record=0`
+- DB size at benchmark exit was only **5.47 MB**
+
+Full corpus, `warm-startup`, 3 repeats:
+
+| run | wall |
+| --- | ---: |
+| 1 | 0.233s |
+| 2 | 0.231s |
+| 3 | 0.250s |
+| **median** | **0.233s** |
+
+Full corpus, `delta-startup`, 3 repeats:
+
+| run | wall |
+| --- | ---: |
+| 1 | 0.284s |
+| 2 | 0.242s |
+| 3 | 0.215s |
+| **median** | **0.242s** |
+
+Focused verification while the prototype was present:
+- `cargo test -p gnomon-core startup_streaming_opens_immediately_and_finishes_in_background` — PASS
+- `cargo test -p gnomon-tui streaming_refresh_copy` — PASS
+
+**Decision:** **REVERTED.** The startup-speed win is real, but the experiment
+breaks the current product contract by opening on an empty or stale snapshot.
+On a cold/full-corpus startup, the UI would open in ~**0.61s** while still
+showing zero imported conversations until the user manually refreshed later.
+
+**Rationale:** C3 proves that the remaining startup wall is mostly optional UI
+blocking, not mandatory import work. But the current `v1` design says startup
+imports the last 24 hours before opening, or times out after 10 seconds. This
+prototype violates that contract in the worst possible case: first launch on an
+empty DB opens into an empty view even though importable data exists. That is a
+meaningful product change, not just a perf optimization, so it should not land
+without an explicit product decision and accompanying design update.
+
+**Key finding #27:** C3 can cut authoritative full-corpus cold startup-open
+wall time to roughly **0.53-0.63s median** by eliminating startup-window
+blocking entirely.
+
+**Key finding #28:** The price of C3 is not correctness but initial coverage:
+the first visible snapshot can be empty or stale, so the user sees less data at
+open time and must refresh manually to pick up the published chunks.
+
+**Next implied:** If the startup contract stays unchanged, **skip/defer
+action+path_ref tables** is now the next ranked experiment. C3 demonstrated the
+mechanical ceiling for "open sooner", but it did so only by relaxing the agreed
+visibility semantics.
 
 ---
 
 ## RESUME HERE (if session was reset, read this first)
 
-Last updated: 2026-04-15 (D2b reverted — +18% regression)
-Current phase: Phase 2 — D0 done, D1 reverted, D3 reverted, D1b kept, D2 reverted, D2b reverted
-All code is on `main`. Subset session-local median: ~7.67s (post-D2b session).
+Last updated: 2026-04-17 (C3 evaluated, reverted)
+Current phase: Phase 3 — behavior-changing startup experiment evaluated; remaining work is either deeper product change or cold-import deferral
+Current branch/worktree: `import-perf` at `/home/ketan/project/gnomon/.worktrees/import-perf`
+Current best full-corpus metric is now **20.599s** (serial full-corpus run
+captured while evaluating F2a). Subset session-local median remains ~7.67s
+(post-D2b session).
 
 D0: CPU floor = 2.82s (subset). SQL = 67% of wall.
 D1: denormalize-via-UPDATE = +18% regression (UPDATE > INSERT on hot table).
@@ -1370,17 +1630,465 @@ D2b: action_message schema (3→2 btrees) = +18% REGRESSION (composite PK + UNIQ
 Key finding #10: rollup SQL requires hot cache (per-chunk is optimal).
 Key finding #12: deferring child INSERTs past parent INSERTs causes FK verification cache misses.
 Key finding #13: reducing action_message PK to INTEGER rowid regresses — composite index structure is faster.
+Key finding #14: `locking_mode=EXCLUSIVE` requires a single writer connection and is incompatible with the old dual-connection import path.
+Key finding #15: `foreign_keys=OFF` can zero `commit_ms`, but E1+E2+E3 still failed to produce a stable full-corpus wall-time win.
+Key finding #16: the end-of-import WAL checkpoint is a real multi-second cost (~3.8s in the fully instrumented run).
+Key finding #17: savepoint lifecycle overhead is negligible (~159ms across the full corpus).
+Key finding #18: the benchmark harness needed a larger perf-log cap to keep full-corpus verbose traces complete.
+Key finding #19: F2a can win on a single-project subset and still regress on the full corpus because shard fan-out and merge costs dominate at scale.
+Key finding #20: sharded import paid ~6.2s of cumulative checkpoint time across 32 databases; repeated WAL lifecycle cost erased the benefit of the shorter parallel write phase.
+Key finding #21: import-local `path_node` memoization helps on the single-project subset but still loses on the full corpus; repeated path-node lookups are not the dominant remaining cold-import cost.
+Key finding #22: inline rollup materialization regresses; the hot-cache reread is cheaper than pushing rollup aggregation into the classifier/write path.
+Key finding #23: a policy-aware persisted scan cache is enough to push no-delta full-corpus warm startup to ~230ms.
+Key finding #24: after G1, no-delta warm startup is mostly directory walk + cache reconciliation, not import work.
+Key finding #25: file-granular invalidation keeps one-file delta warm startup in the ~0.4-0.5s range on the full corpus.
+Key finding #26: after G1+G4, further meaningful startup wins require behavior changes, not finer structural invalidation.
+Key finding #27: C3 can drive cold startup-open wall time to ~0.6s on the full corpus by opening before any chunks publish.
+Key finding #28: that C3 win comes from serving an empty/stale initial snapshot, so it is a product trade, not a free perf gain.
 
-Next candidates:
-- **D4:** simd-json parsing (parse phase is ~0.3s — ceiling is modest).
-- **D5:** scan_source caching (~0.5s startup only, not full import).
-- No strong candidates remain. Project may be near practical limit.
+## 2026-04-16 — candidate G1: scan_source delta cache + parallel header extraction
+
+**Branch:** `import-perf`
+**Hypothesis:** Reusing cached `scan_source` results for unchanged files and
+parallelizing first-record header extraction for cache misses should collapse
+warm-startup scan time from the current multi-second floor to well under the
+`<1s` target, with no product behavior change. Cold full import should stay
+roughly flat or improve slightly because the first scan still benefits from
+parallel header extraction.
+
+**Implementation:** Added a new SQLite table `scan_source_cache` keyed by
+`(source_root_path, policy_fingerprint, source_kind, relative_path)`. Each row
+stores the file metadata used for invalidation (`modified_at_utc`, `size_bytes`)
+plus the resolved scan outcome: `raw_cwd_path`, warnings JSON, exclusion flag,
+and the fully resolved project identity payload. `scan_source_manifest_with_policy`
+now fingerprints `ProjectIdentityPolicy + project_filters`, loads matching cache
+rows, reuses unchanged results without reopening the JSONL file, and resolves
+cache misses in parallel with a shared `cwd -> ResolvedProject` memo. The cache
+is reconciled in the same transaction as the manifest update so stale rows are
+removed deterministically. The benchmark harness gained a `warm-startup` mode
+that prefills the DB once, then measures only the second startup pass against a
+fully populated DB and scan cache.
+
+**Measurements:**
+
+Subset corpus, `warm-startup`, 3 repeats:
+
+| run | wall |
+| --- | ---: |
+| 1 | 0.083s |
+| 2 | 0.079s |
+| 3 | 0.086s |
+| **median** | **0.083s** |
+
+Full corpus, `warm-startup`, 3 repeats:
+
+| run | wall |
+| --- | ---: |
+| 1 | 0.231s |
+| 2 | 0.230s |
+| 3 | 0.227s |
+| **median** | **0.230s** |
+
+Perf-log follow-up, full corpus `warm-startup` (single measured pass):
+- `import.scan_source`: **179.562ms**
+  - `collect_candidates`: **40.307ms**
+  - `load_cache`: **7.467ms**
+  - `resolve_cache_misses`: **0.003ms**
+  - `persist_scan_source_cache`: **79.374ms**
+  - `cache_hit_count`: **4548**
+  - `cache_miss_count`: **0**
+- `import.build_plan`: **4.634ms**
+- `import.prepare_plan`: **0.001ms**
+- `import.load_snapshot`: **0.087ms**
+- end-to-end measured wall: **0.217s**
+
+Cold full-import control, full corpus `full` mode (single run, non-authoritative):
+- wall: **18.731s**
+- comparison point: current serial reference is **20.599s**
+- interpretation: no evidence of a cold-path regression; any cold-path win from
+  G1 should still be treated as directional until repeated under the normal
+  full-import benchmark cadence.
+
+Row parity: **PASS** — subset/full warm-startup and the cold full-import
+control all produced the established authoritative row counts
+(`project=31`, `source_file=4548`, `import_chunk=162`, `conversation=4547`,
+`stream=4547`, `message=294995`, `message_part=411842`, `turn=13363`,
+`action=120922`, `record=0` on full corpus). Full DB size remained
+**429.69 MB**.
+
+**Decision:** **KEPT.** G1 reaches the startup stretch target on the
+authoritative full corpus (`0.230s` median vs `300ms` stretch) and drives the
+single-project subset to `83ms`. The measured warm-startup pass is a true
+no-delta path: all `4548` files hit the scan cache, `prepare_plan` is
+effectively zero, and startup opens from the existing snapshot immediately.
+
+**Rationale:** This is the first experiment to directly solve the remaining
+user-facing startup problem instead of chasing diminishing cold-import wins.
+The perf log confirms the mechanism is working exactly as intended:
+1. The first scan on a fresh corpus still parallelizes the miss path and
+   repopulates cache rows.
+2. The measured warm-startup pass avoids file reads entirely (`0` misses).
+3. `scan_source` now costs ~180-200ms on the full corpus instead of multiple
+   seconds.
+4. The residual wall is now dominated by directory walk + cache reconciliation,
+   not header parsing or plan preparation.
+
+**Key finding #23:** A policy-aware persisted scan cache is enough to move
+full-corpus warm startup into the stretch-target range without touching the
+import schema or read path.
+
+**Key finding #24:** After G1, warm startup is no longer bottlenecked by
+`prepare_plan` or import work. The remaining steady-state cost is mostly the
+directory walk plus reconciling the cache rows for unchanged files.
+
+**Next implied:** **G4 finer-grained invalidation than `project x day` chunks**
+if the user wants to optimize warm startup when *some* files changed. G1 solves
+the no-delta warm-startup path; the remaining startup/product opportunity is to
+avoid scheduling and replaying whole chunk days when only a small number of
+source files changed. If behavior-changing work is out of scope, the perf
+project can reasonably stop here.
+
+### Phase 3 plan (2026-04-16)
+
+This plan section captured the post-D-series experiment queue before E and F
+were executed. As of the current session state, E, F, G2, and G3 have all been
+tried and reverted. The remaining work in this document is primarily startup
+oriented (G1/G4) unless the project chooses a behavior-changing cold-import
+strategy.
+
+**E1+E2+E3: Pragma hardening (untried, low risk)**
+- `PRAGMA foreign_keys = OFF` on the import connection (set at connection
+  open time, not mid-transaction — avoids the savepoint limitation that
+  blocked D2). Eliminates ~2.5M FK verification btree lookups. Est. 2–4s.
+- `PRAGMA locking_mode = EXCLUSIVE` on the import connection. Est. 0.3–0.5s.
+- `PRAGMA wal_autocheckpoint = 0` + manual checkpoint post-import. Est. 0.3–0.5s.
+- Total estimate: 2–4s. Zero schema or read-path changes.
+- Also re-opens D2 (deferred message_part): the +71% regression was
+  entirely FK verification cache misses. With FK=OFF, the D2 hypothesis
+  can be tested cleanly.
+
+**F2a: Parallel import → sequential merge (if E doesn't reach 10s)**
+- Import: one temp SQLite per project, written in parallel via rayon.
+- Merge: `ATTACH` + `INSERT INTO target SELECT * FROM shard.table` per
+  shard. Sequential scan, no per-row Rust overhead.
+- Read path unchanged (single production DB).
+- Estimated: parallel_import ~3–4s + merge ~2–3s = ~5–7s write phase.
+- Cross-project query audit completed: root browse and filter_options()
+  are the only cross-project queries; all drill-down is per-project.
+  `history_event` and `skill_invocation` lack project_id (needs schema
+  fix if switching to permanent sharding, but irrelevant for F2a since
+  the merge produces a single DB).
+- ID conflict resolution: pre-assign non-overlapping rowid ranges per
+  shard (shard N starts at N × 10_000_000). Zero post-merge fixup.
+
+**G: Structural reductions (current status)**
+- `scan_source` delta cache keyed by `(mtime, size, import schema version)`,
+  plus parallel header extraction and memoized `cwd -> ResolvedProject`.
+  Startup only, but stronger than "cache directory walk" alone.
+- Inline rollup materialization during classification/write. **Tried and
+  reverted in G3.** Distinct from D3: the goal was to eliminate the reread in
+  `rollup.rs`, not defer it.
+- Finer-grained invalidation than whole `project x day` chunks. This is
+  mostly a warm-start product/architecture lever rather than a cold-import
+  optimization.
+
+See design doc Section 14 for full details.
 
 ### How to resume
 1. `cd /home/ketan/project/gnomon`
-2. Read this log's Phase Log for context.
-3. Assess whether D4 or D5 is worth attempting given the ~7.7s session median.
-4. Consider declaring the perf project complete at current state.
+2. Read this log's Phase Log and the RESUME HERE block.
+3. Read design doc Section 14 for G1–G4 details.
+4. Read the 2026-04-16 G4 entry above before changing code.
+5. Only continue if the user explicitly wants behavior-changing follow-up work
+   such as C3/background import or deferring heavy derived tables.
+
+### Next-session prompt template
+
+After reporting the result of any experiment, end the update with a
+ready-to-paste prompt for the next fresh-session agent. Use this shape:
+
+```text
+Continue import-perf work in the linked worktree
+/home/ketan/project/gnomon/.worktrees/import-perf on branch `import-perf`.
+
+Before changing code, read:
+1. docs/specs/2026-04-10-import-perf-log.md
+2. docs/specs/2026-04-10-import-perf-design.md
+
+The last completed experiment was <candidate name>. Result: <KEPT/REVERTED>
+with <key metric/result>.
+
+The next experiment to run is <candidate name> because <reason>.
+
+After you run it, update the running log with hypothesis, measurements,
+decision, rationale, and implied next candidate, then end your report with
+an updated next-session prompt for the following phase of work.
+```
+
+## 2026-04-17 — candidate H1: defer startup action+path_ref tables until after open
+
+**Branch:** `import-perf`
+**Hypothesis:** If startup imports publish the changed startup chunk
+immediately after normalize + turn persistence, then defer `build_actions`,
+`message_path_ref`, and the action/path rollup rebuilds to a second background
+pass, one-file `delta-startup` should improve materially without repeating
+C3's "open on empty or stale snapshot before publish" behavior. Warm no-delta
+startup should stay flat because it does no chunk work.
+
+**Implementation:** Added a startup-only experimental path in
+`crates/gnomon-core/src/import/chunk.rs`, gated by
+`GNOMON_DEFER_STARTUP_DERIVED_TABLES=1`. Startup chunks now skip
+`build_actions_in_tx_with_messages` during the initial import pass, publish as
+`complete` after normalize/turns/count recomputation, record a
+`pending_chunk_rebuild` row instead of rebuilding action/path rollups inline,
+then run a second background pass labeled `finalizing startup derived data`
+that rebuilds actions from persisted messages, rebuilds both rollup tables,
+clears the pending row, and republishes the chunk with a new `publish_seq`.
+
+A focused regression test,
+`startup_import_can_defer_startup_derived_tables_until_after_open`, verifies
+the observable behavior: the startup-open snapshot has zero action/path-derived
+rows for the changed chunk, and the background pass restores them afterward.
+
+**Measurements:**
+
+Full corpus, `delta-startup`, 3 repeats, `GNOMON_DEFER_STARTUP_DERIVED_TABLES=1`:
+
+| run | wall |
+| --- | ---: |
+| 1 | 0.484s |
+| 2 | 0.428s |
+| 3 | 0.393s |
+| **median** | **0.428s** |
+
+Comparison point: current kept product-preserving delta-startup result is G4 at
+**0.541s median** on the full corpus. H1 improved initial open by **~113ms
+(-21%)**.
+
+Subset, `delta-startup`, 3 repeats:
+
+| run | wall |
+| --- | ---: |
+| 1 | 0.117s |
+| 2 | 0.138s |
+| 3 | 0.142s |
+| **median** | **0.138s** |
+
+Comparison point: current kept subset delta-startup result is G4 at **0.244s
+median**. H1 improved the subset by **~106ms (-43%)**.
+
+Full corpus, `warm-startup`, 3 repeats:
+
+| run | wall |
+| --- | ---: |
+| 1 | 0.221s |
+| 2 | 0.236s |
+| 3 | 0.231s |
+| **median** | **0.231s** |
+
+Warm no-delta startup remained flat vs. G1/G4's existing **0.230s median**.
+
+Perf-log follow-up (`delta-startup`, full corpus, 1 repeat):
+- wall: **0.400s**
+- `import.scan_source` total: **553.713ms** across prefill + measured scan
+- measured `import.rebuild_deferred_chunk_derived_tables`: **2.195s**
+- measured `import.build_actions` inside the deferred pass: **4.317s** total
+  across the prefill import plus the one changed-chunk rebuild
+
+Row parity after the background pass: **PASS**
+- full-corpus measured DB row counts still converged to
+  `project=31`, `source_file=4548`, `import_chunk=163`, `conversation=4547`,
+  `stream=4547`, `record=0`, `message=294995`, `message_part=411842`,
+  `turn=13363`, `action=120922`
+- targeted regression test confirms `pending_chunk_rebuild` is empty after the
+  second pass
+
+**Decision:** REVERTED for product semantics. The startup-open metric improved
+meaningfully, but the opened snapshot is only authoritative for raw transcript
+tables. Action-derived and path-derived views for the changed startup chunk are
+temporarily empty/stale until the second pass republishes the chunk.
+
+**Rationale:** H1 is a strictly narrower trade than C3:
+- unlike C3, the UI opens only after a fresh startup chunk publish, so the user
+  does not land on an entirely empty or globally stale snapshot
+- unlike G4, the initial opened snapshot is still internally inconsistent:
+  message/turn tables are fresh, but action/path-derived queries lag behind
+
+That mismatch is material enough that the experiment needs explicit product
+approval before it could be kept. The measured win is real, but it is not a
+free optimization.
+
+**Key finding #29:** Deferring startup-only `build_actions` +
+`message_path_ref` + rollup rebuilds can cut authoritative full-corpus
+one-file `delta-startup` from **0.541s → 0.428s median** without regressing the
+warm no-delta case.
+
+**Key finding #30:** That H1 win comes from publishing a partially-derived
+startup snapshot: raw transcript state is fresh at open, but action/path views
+for the changed chunk are only repaired in a second background publish roughly
+**2.2s** later on the benchmark host.
+
+**Next implied:** If startup-perf exploration continues, the remaining choices
+are all explicit trade-offs:
+- **Hybrid warm-only streaming gate** if the user wants to keep pushing startup
+  open time with controlled snapshot staleness rules
+- **simd-json** only if the goal is to exhaust the last low-confidence
+  product-preserving micro-optimization, with the expectation of a sub-100ms
+  win at best
+
+## 2026-04-17 — candidate H2: hybrid warm-only streaming gate
+
+**Branch:** `import-perf`
+**Hypothesis:** If startup keeps the existing published snapshot visible and
+returns immediately only when that snapshot already has imported coverage,
+one-file `delta-startup` should fall toward the C3 ceiling without repeating
+the empty-DB failure mode. Warm no-delta startup should remain effectively
+flat, and bootstrap startup should still wait for the first startup-window
+publish because there is no visible data to stream from.
+
+**Implementation:** Added a second startup-only experimental gate in
+`crates/gnomon-core/src/import/chunk.rs`, exposed via
+`GNOMON_WARM_ONLY_STREAMING_GATE=1`. `start_startup_import_with_options()` now
+captures the pre-worker snapshot before spawning the background importer. In
+`RecentFirst` mode it returns immediately with
+`StartupOpenReason::WarmSnapshotReady` only when that pre-worker snapshot has
+visible imported coverage (`session_count > 0 || turn_count > 0`) and there is
+startup work pending. Bootstrap startup still waits on the normal readiness
+signal. Added focused regression tests:
+- `warm_only_streaming_gate_opens_on_existing_snapshot_while_startup_import_continues`
+- `warm_only_streaming_gate_does_not_open_bootstrap_startup_early`
+- `cargo test -p gnomon-tui warm_snapshot_streaming`
+
+**Measurements:**
+
+Full corpus, `warm-startup`, 3 repeats, `GNOMON_WARM_ONLY_STREAMING_GATE=1`:
+
+| run | wall |
+| --- | ---: |
+| 1 | 0.231s |
+| 2 | 0.243s |
+| 3 | 0.221s |
+| **median** | **0.231s** |
+
+Comparison point: current kept product-preserving full-corpus
+`warm-startup` remains G1/G4 at **0.230s median**. H2 is effectively flat in
+the no-delta case because there is no startup work to hide after the prefill.
+
+Full corpus, `delta-startup`, 3 repeats:
+
+| run | wall |
+| --- | ---: |
+| 1 | 0.212s |
+| 2 | 0.227s |
+| 3 | 0.236s |
+| **median** | **0.227s** |
+
+Comparison point: current kept product-preserving full-corpus
+`delta-startup` result is G4 at **0.541s median**. H2 improved initial open by
+**~314ms (-58%)**. It also beat H1's partially-derived snapshot result
+(**0.428s median**) because it no longer waits for any changed startup chunk to
+publish before opening.
+
+Subset, `warm-startup`, 3 repeats:
+
+| run | wall |
+| --- | ---: |
+| 1 | 0.155s |
+| 2 | 0.096s |
+| 3 | 0.095s |
+| **median** | **0.096s** |
+
+Comparison point: current kept subset `warm-startup` is G1 at **0.083s
+median**. H2 stayed in the same range, with the small regression consistent
+with run-to-run noise on the subset harness.
+
+Subset, `delta-startup`, 3 repeats:
+
+| run | wall |
+| --- | ---: |
+| 1 | 0.099s |
+| 2 | 0.083s |
+| 3 | 0.087s |
+| **median** | **0.087s** |
+
+Comparison point: current kept subset `delta-startup` result is G4 at
+**0.244s median**. H2 improved initial open by **~157ms (-64%)**.
+
+Observed snapshot shape at benchmark exit:
+- full-corpus `delta-startup` still showed the prefill-visible data shape at
+  open time: `project=31`, `source_file=4548`, `import_chunk=163`,
+  `conversation=4547`, `stream=4547`, `record=0`, `message=294995`,
+  `message_part=411842`, `turn=13363`, `action=120922`
+- subset `delta-startup` likewise stayed on the prefill-visible snapshot:
+  `project=1`, `source_file=1649`, `import_chunk=36`, `conversation=1648`,
+  `stream=1648`, `record=0`, `message=130478`, `message_part=179412`,
+  `turn=4915`, `action=50463`
+- on 2026-04-17, empty-DB `startup` against the frozen corpus no longer
+  exercised a meaningful cold-start window because the corpus had aged out of
+  the 24-hour startup range. The bootstrap guard is covered instead by the
+  focused regression test above.
+
+**Decision:** REVERTED for product semantics. H2 is the fastest startup-open
+trade explored so far on a warm corpus, but it intentionally opens on a stale
+previous snapshot and leaves the just-changed startup chunk invisible until the
+background import finishes and the user refreshes.
+
+**Rationale:** H2 is the broadest "open sooner" trade that still avoids C3's
+empty bootstrap failure:
+- unlike C3, bootstrap startup does not open on an empty view; it still waits
+  for the first startup-window publish when there is no visible data yet
+- unlike H1, H2 does not open on a partially-derived changed chunk; it opens on
+  the fully authoritative previous snapshot
+- unlike G4, the opened snapshot is knowingly stale for the changed startup
+  chunk, so the improvement is purchased entirely by relaxing freshness at open
+
+That is still a product decision, not a free optimization. The measured win is
+real, but it comes from serving the previous snapshot longer.
+
+**Key finding #31:** A warm-only streaming gate can cut authoritative
+full-corpus one-file `delta-startup` from **0.541s → 0.227s median** by
+opening on the last published snapshot while the changed startup chunk imports
+in the background.
+
+**Key finding #32:** The hybrid gate avoids C3's empty-bootstrap failure, but
+the price is explicit staleness: the opened snapshot remains fully authoritative
+for the previous publish, not for the just-changed startup window, until the
+user refreshes after background import completes.
+
+**Next implied:** Startup-perf exploration is functionally exhausted unless the
+user wants either:
+- **simd-json** as the last product-preserving micro-experiment, with an
+  expected ceiling below **100ms**
+- **stop here**, because G1/G4 already beat the warm-start targets without
+  changing startup semantics
+
+### Next-session prompt for the current state
+
+```text
+Continue import-perf work in the linked worktree
+/home/ketan/project/gnomon/.worktrees/import-perf on branch `import-perf`.
+
+Before changing code, read:
+1. docs/specs/2026-04-10-import-perf-log.md
+2. docs/specs/2026-04-10-import-perf-design.md
+
+The last completed experiment was H2 hybrid warm-only streaming gate.
+Result: REVERTED. It improved authoritative full-corpus one-file
+`delta-startup` wall time to `0.227s` median from G4's `0.541s`, and
+left warm no-delta startup effectively flat at `0.231s` median, but
+only by opening on the last published snapshot while the changed
+startup chunk remained stale until background import completed and the
+user refreshed.
+
+The next experiment to run, if startup-perf exploration continues and
+must stay product-preserving, is `simd-json`; expected upside is below
+`100ms`. Otherwise stop the startup exploration here and treat G1/G4 as
+the kept endpoint.
+
+After you run it, update the running log with hypothesis, measurements,
+decision, rationale, and implied next candidate, then end your report with
+an updated next-session prompt for the following phase of work.
+```
 
 ### Iteration summary
 
@@ -1399,29 +2107,35 @@ Next candidates:
 | 11 | Defer rollups to post-import | **REVERTED** | no improvement; same total SQL work |
 | 12 | Multi-row VALUES batching | **REVERTED** | 40% REGRESSION; dynamic SQL defeats prepare_cached |
 | 13 | In-memory staging + VACUUM INTO | **REVERTED** | no improvement; btree work is CPU-bound, not I/O |
-| D0 | Zero-write diagnostic | **N/A** | CPU floor = 2.82s (subset); SQL = 67% of wall |
-| D1 | Denormalize join tables via UPDATE | **REVERTED** | +18% REGRESSION; UPDATE > INSERT on existing table |
-| D3 | Defer rollup computation out of import path | **REVERTED** | +40-50% REGRESSION; cache-miss penalty in post-import rollup pass |
-| D1b | Preset turn_id at message INSERT (deferred grouping) | **KEPT** | −6% subset / −1% full; turn_message eliminated |
-| D2 | Defer message_part INSERTs to post-normalize pass | **REVERTED** | +71% REGRESSION; SQLite FK verification cache misses when child inserts are batched after parent inserts |
-| D2b | action_message schema: 3→2 btrees via INTEGER PRIMARY KEY | **REVERTED** | +18% REGRESSION; composite PK + UNIQUE(message_id) faster than INTEGER rowid PK in practice |
+| E | Pragma hardening (`foreign_keys=OFF`, `locking_mode=EXCLUSIVE`, `wal_autocheckpoint=0`) | **REVERTED** | 27.1s median on full corpus; no repeatable win |
+| T | Timing coverage hardening | **KEPT** | attributed checkpoint/savepoint/parse costs; no product behavior change |
+| F | Parallel import -> sequential merge | **REVERTED** | 24.563s full vs 20.599s serial; subset win did not scale |
+| G2 | Path-node memoization | **REVERTED** | 24.553s full vs 20.599s serial; subset win did not scale |
+| G3 | Inline rollup materialization | **REVERTED** | 26.573s full vs 20.599s serial; removing the reread cost more than it saved |
+| G1 | Scan-source delta cache + parallel header extraction | **KEPT** | warm startup 0.230s median full / 0.083s median subset |
+| G4 | File-granular invalidation within day chunks | **KEPT** | delta-startup 0.541s median full / 0.244s median subset |
+| C3 | Background streaming import | **REVERTED** | startup-open 0.613s median full / delta-startup 0.242s median full, but visible snapshot can be empty/stale |
+| H1 | Defer startup action+path_ref tables until after open | **REVERTED** | delta-startup 0.428s median full / 0.138s median subset, but action/path views lag the opened snapshot |
+| H2 | Hybrid warm-only streaming gate | **REVERTED** | delta-startup 0.227s median full / 0.087s median subset, but the opened snapshot stays on the previous publish until refresh |
 
-### Current best metrics (post D1b)
+### Current best metrics (post G4)
 | metric | value | vs original baseline | vs target |
 | --- | ---: | ---: | ---: |
-| Cold full import (session-local best) | ~9.7s | ~92% from 126.1s | ~0.97× to 10s target |
-| Startup | ~2.29s | ~55% from ~5.1s baseline | ~2.3× to <1s target |
+| Cold full import (session-local best) | **20.599s** | ~84% from 126.1s | ~2.1× to 10s target |
+| Warm startup (authoritative full corpus median) | **0.230s** | ~95% from ~5.1s empty-DB baseline | **beats 300ms stretch** |
+| Warm startup, one-file delta (authoritative full corpus median) | **0.541s** | ~89% from ~5.1s empty-DB baseline | **beats <1s target** |
 
-### Current phase distribution (subset, ~8.3s post-D1b session-local median)
+### Current phase distribution (full corpus, ~23s wall)
 
 | phase | time | % of wall | note |
 | --- | ---: | ---: | --- |
-| normalize_jsonl | ~3.8s | ~46% | messages + parts INSERTs (130K + 179K); turn_message gone |
-| build_actions | ~2.3s | ~28% | classify CPU + DB persist |
-| scan_source | ~1.0s | ~12% | directory walk + VCS resolution |
-| finalize_chunk + rollups | ~1.7s | ~21% | path rollup dominant, cache-locality bound |
-| build_turns | ~0.0s | ~0% | eliminated (merged into normalize_jsonl) |
-| parse (rayon CPU) | ~0.3s | ~4% | parallel JSON parse |
+| normalize_jsonl | ~8.0s | ~34% | messages + parts INSERTs (295K + 412K) |
+| build_actions | ~4.6s | ~20% | ~300ms classify CPU + ~4.3s DB persist |
+| parse (rayon CPU) | ~2.9s | ~12% | parallel JSON parse, multi-core |
+| scan_source | ~3.0s | ~13% | directory walk + VCS resolution |
+| finalize_chunk + rollups | ~3.6s | ~15% | path rollup dominant |
+| build_turns | ~1.1s | ~5% | in-memory + DB persist |
+| uninstrumented | ~0.4s | ~2% | overhead |
 
 ### Key findings (cumulative)
 1. **Btree pages are cached.** With 64MB page cache + WAL, secondary index maintenance during inserts is essentially free.
@@ -1432,48 +2146,82 @@ Next candidates:
 6. **`classify_message()` CPU is ~300ms total.** Parallelizing classification alone yields no measurable improvement.
 7. **Multi-row VALUES batching loses to `prepare_cached` single-row inserts** when batch sizes are small (~1.4 parts/message) and dynamic SQL prevents statement caching.
 8. **In-memory staging does not help** when the DB is on tmpfs and the bottleneck is CPU-bound btree work. VACUUM INTO adds 1.5s overhead.
-9. **UPDATE on existing table is MORE expensive than INSERT into dedicated join tables.** Even with batch WHERE id IN (...), replacing join table INSERTs with UPDATEs on the message table regresses by +18%. Search+modify (random write) is costlier than append-friendly INSERT into compact btrees. The correct join-table elimination path is to preset FKs at initial INSERT time (D1b), not to update afterwards.
-10. **Rollup computation is cache-locality dependent.** Per-chunk rollup runs efficiently because data pages are hot immediately after insert. Any post-import pass (whether single batch or truly deferred) pays 4-10× cache-miss penalty as earlier chunks' pages are evicted. Per-chunk rollup is near-optimal — it cannot be deferred.
-11. **Compact join-table btree ops are cheap.** `turn_message` rows are tiny (3 INTEGER cols) and the table fits in cache — each insert is fast. Eliminating 295K × 3 btree ops saves ~0.6s subset (−6%) but is within noise on full corpus. The btree-count model overestimates wall-time impact for small, compact tables.
-12. **Deferring child-table INSERTs past parent INSERTs causes SQLite FK verification cache misses.** With `PRAGMA foreign_keys = ON`, each child INSERT triggers a lookup in the parent table to verify the FK. The inline pattern (parent INSERT immediately followed by child INSERTs) keeps FK lookup pages hot. Batching all parent rows first, then all child rows, means each FK lookup on a child INSERT may need to fetch a page that's no longer hot — despite the 64MB cache being nominally large enough. D2 (deferring 179K message_part rows after 130K message rows) caused +71% regression. The `PRAGMA foreign_keys` flag cannot be toggled inside an active savepoint, so there is no easy workaround. The correct strategy for table elimination is the D1b pattern: preset FKs at INSERT time rather than deferring any parent-child relationship across bulk insert boundaries.
-13. **Reducing action_message auto-indexes from 3→2 by changing PK to INTEGER rowid regresses +18%.** The old composite PK `(action_id, message_id)` + `UNIQUE(action_id, ordinal_in_action)` + `UNIQUE(message_id)` structure (3 auto-indexes + 1 rowid btree = 4 total) is faster in practice than `PRIMARY KEY(message_id)` (rowid) + `UNIQUE(action_id, ordinal_in_action)` (2 total). The composite index structure is better suited to the mixed INSERT + FK-verification workload, possibly because the compact separate `UNIQUE(message_id)` index caches more efficiently than using the full table btree for the same lookups.
+9. **Subset locality can still lie.** Both F2a and G2 improved the single-
+project subset while regressing the authoritative full-corpus run.
+10. **Inline rollup materialization also loses.** The hot-cache rollup reread is cheaper than carrying per-message and per-path aggregation inside the write path.
+11. **Warm startup is solved for the no-delta case.** G1 reduced authoritative
+full-corpus warm startup to ~230ms with 4548/4548 scan-cache hits.
+12. **Changed-file warm startup is also solved at the structural level.** G4 reduced authoritative full-corpus one-file delta startup to ~541ms median without changing row parity.
+13. **Deferring startup-only derived tables works, but it changes what "ready"
+means.** H1 improved one-file delta startup to ~428ms median, but only by
+letting the opened snapshot lag on action/path-derived views until a second
+publish finishes ~2.2s later.
+14. **Warm-only streaming is the fastest startup-open trade tried.** H2 reduced
+full-corpus one-file delta startup to ~227ms median, but only by keeping the
+previous publish visible until the user refreshes.
 
-### 10s target assessment (revised 2026-04-15, post-D2b)
+### 10s target assessment
 
-D1b eliminated `turn_message`. D2 and D2b both regressed. The `action_message`
-optimization path is exhausted: neither deferred inserts (D2) nor schema
-restructuring (D2b) improved performance. The D1b "preset FK at INSERT" pattern
-cannot apply to action_message due to the turn dependency cycle.
+The 10s target is **not achievable with SQLite** as the storage engine for this
+workload. The analysis:
 
-D2 (deferred message_part inserts) regressed +71% — SQLite FK verification
-cache-miss penalty. Deferring parent-child inserts across a bulk boundary is
-not viable with `PRAGMA foreign_keys = ON`.
+- DB write phases total ~17.2s, all CPU-bound btree work
+- Non-DB phases (parse + scan_source + overhead) total ~6.3s, setting the floor
+- Even zero-cost writes would give ~6.3s — barely under 10s
+- Iterations 10-13 plus G2/G3 exhausted the remaining product-preserving cold-import candidates
+- The `prepare_cached` single-row insert pattern is near-optimal for SQLite
 
-### Next action
+Reaching 10s would require a fundamentally different storage approach (DuckDB,
+columnar store) or deferring heavy tables (action, path_ref, rollups) to
+background processing after TUI opens.
 
-D2 REVERTED. Try D2b (denormalize action_message — same D1b pattern: preset
-FK at INSERT time, eliminating a join table). Expected savings: ~0.5s or less
-(similar to D1b; action_message has similar row characteristics to turn_message).
-
-### Remaining unexplored candidates (re-ranked post D2b)
+### Remaining unexplored candidates
 
 | rank | candidate | est. win | confidence | note |
 | --- | --- | --- | --- | --- |
-| 1 | **D4: simd-json** | <0.3s | very low | parse phase is only ~0.3s / 4% — ceiling is tiny |
-| 2 | **D5: scan_source caching** | ~0.5s startup only | high | warm startup only, not full import |
-| — | **D2b (all variants)** | — | EXHAUSTED | dependency cycle blocks preset; schema changes regress |
+| 1 | **Cold-import architecture beyond the current SQLite write path** | multi-second cold only | medium | required if the 10s cold-import target remains active |
+| 2 | **Explicit startup-semantic tradeoffs** | sub-0.25s startup-open | medium | already demonstrated by C3/H1/H2, but changes what "ready" means |
+| 3 | **Stop here** | — | high | G1/G4 already beat the warm-start targets without changing startup semantics |
+
+### Startup close-out
+
+Product-preserving startup exploration is complete.
+
+- **Kept endpoint:** G1 + G4
+- **Authoritative full-corpus medians:** `warm-startup = 0.230s`,
+  `delta-startup = 0.541s`
+- **Stretch/acceptable targets:** both satisfied without changing startup
+  freshness semantics
+- **Terminating experiment:** S1 `simd-json` line parsing, **REVERTED**
+
+The branch now has a clear boundary:
+
+- Do not run more startup-preserving parser or manifest micro-experiments
+  unless new evidence materially changes the parse ceiling.
+- Treat C3/H1/H2 as explored product trades, not as hidden optimizations still
+  waiting to be productized.
+- Treat the remaining open question as broader import-perf strategy, not
+  startup tuning.
 
 ### Bench harness
 ```bash
 cargo build -p gnomon-core --example import_bench --release
 
-# Subset (~7.7s session-local median post-D2b session; ~8.3s in D1b session)
+# Subset cold full import (~9s)
 cargo run -p gnomon-core --example import_bench --release -- \
   --corpus subset --mode full --repeats 3
 
-# Full corpus (~21s post-D1b)
+# Full corpus cold full import (~20-23s)
 cargo run -p gnomon-core --example import_bench --release -- \
   --corpus full --mode full --repeats 3
+
+# Full corpus warm startup (~0.23s measured pass after a one-time prefill)
+cargo run -p gnomon-core --example import_bench --release -- \
+  --corpus full --mode warm-startup --repeats 3
+
+# Full corpus one-file delta startup (~0.45-0.55s median after one measured mutation)
+cargo run -p gnomon-core --example import_bench --release -- \
+  --corpus full --mode delta-startup --repeats 3
 ```
 
 ### Session-resumption sanity check
@@ -1481,6 +2229,125 @@ cargo run -p gnomon-core --example import_bench --release -- \
 cd /home/ketan/project/gnomon
 git log --oneline -5
 cargo run -p gnomon-core --example import_bench --release -- \
-  --corpus subset --mode full --repeats 1
-# Should complete in ~8-9s
+  --corpus subset --mode warm-startup --repeats 1
+# Measured pass should complete in ~0.08-0.09s after the prefill
+
+cargo run -p gnomon-core --example import_bench --release -- \
+  --corpus subset --mode delta-startup --repeats 1
+# Measured pass should complete in ~0.16-0.39s after the prefill + one-file mtime bump
+```
+
+### 2026-04-17 — Experiment S1: `simd-json` line parsing
+
+**Hypothesis:** Replace the hot JSONL `serde_json::from_str()` boundaries with
+`simd-json` while preserving the same importer semantics and row shape. The
+expected ceiling was small: below **100ms** on startup paths and below **1s**
+on cold full import, because parse already sits below the dominant SQLite write
+costs.
+
+**Implementation tried:** Added `simd-json 0.17.0` and changed the source-scan
+header extraction plus transcript/history JSONL normalization loops to read
+mutable byte lines via `BufRead::read_until(b'\n', ...)`, then deserialize via
+`simd_json::serde::from_slice()` into the existing `serde_json::Value` and
+`SourceRecordHeader` shapes.
+
+**Measurements:** full corpus, release build, 3 repeats each.
+
+Warm `warm-startup`:
+
+| run | wall |
+| --- | ---: |
+| 1 | 0.262s |
+| 2 | 0.280s |
+| 3 | 0.286s |
+| **median** | **0.280s** |
+
+Comparison point: kept G1/G4 warm startup is **0.230s median**. `simd-json`
+was **~22% slower**.
+
+Warm `delta-startup`:
+
+| run | wall |
+| --- | ---: |
+| 1 | 0.602s |
+| 2 | 0.665s |
+| 3 | 1.974s |
+| **median** | **0.665s** |
+
+Comparison point: kept G4 one-file delta startup is **0.541s median**.
+`simd-json` was **~23% slower**, with one severe outlier run.
+
+Cold full import:
+
+| run | wall |
+| --- | ---: |
+| 1 | 35.143s |
+| 2 | 27.229s |
+| 3 | 24.880s |
+| **median** | **27.229s** |
+
+Comparison point: current kept cold full-import result is **20.599s**.
+`simd-json` was **~32% slower**.
+
+Row counts remained unchanged on the measured runs:
+- warm startup: `project=31`, `source_file=4548`, `import_chunk=162`,
+  `conversation=4547`, `stream=4547`, `record=0`, `message=294995`,
+  `message_part=411842`, `turn=13363`, `action=120922`
+- delta startup: `project=31`, `source_file=4548`, `import_chunk=163`,
+  `conversation=4547`, `stream=4547`, `record=0`, `message=294995`,
+  `message_part=411842`, `turn=13363`, `action=120922`
+- cold full import: `project=31`, `source_file=4548`, `import_chunk=162`,
+  `conversation=4547`, `stream=4547`, `record=0`, `message=294995`,
+  `message_part=411842`, `turn=13363`, `action=120922`
+
+**Decision:** REVERTED.
+
+**Rationale:** This workload does not benefit from the `simd-json` swap in its
+current form. Deserializing through `simd_json::serde` into the existing
+`serde_json::Value` contract plus the byte-oriented line handling was slower
+than the baseline `serde_json::from_str()` path, and the parse phase is too
+small a share of the remaining wall time to justify further product-preserving
+parser micro-tuning.
+
+**Implied next candidate:** Stop the startup exploration here and treat
+**G1/G4** as the kept endpoint. If import-perf work continues, the next phase
+should shift to a broader decision surface than startup-preserving parser work:
+either close out the startup findings and move to cold-import architecture
+choices, or explicitly revisit product-semantic tradeoffs such as deferred
+derived tables / stale-at-open behavior.
+
+**Validation after revert:**
+- `cargo fmt --all`
+- `cargo test -p gnomon-core`
+
+### Next-session prompt for the following phase
+
+```text
+Continue import-perf work in the linked worktree
+/home/ketan/project/gnomon/.worktrees/import-perf on branch `import-perf`.
+
+Before changing code, read:
+1. docs/specs/2026-04-10-import-perf-log.md
+2. docs/specs/2026-04-10-import-perf-design.md
+
+The last completed experiment was S1 `simd-json` line parsing.
+Result: REVERTED. On the authoritative full-corpus harness it regressed all
+measured modes versus the kept G1/G4 state:
+- `warm-startup`: `0.280s` median vs `0.230s`
+- `delta-startup`: `0.665s` median vs `0.541s`
+- cold full import: `27.229s` median vs `20.599s`
+
+Startup exploration should stop here. Treat G1/G4 as the kept endpoint for
+product-preserving startup work.
+
+The next phase is to close out startup exploration and decide what broader
+import-perf work is worth doing next. Focus on one of:
+1. documenting the final startup findings and tightening the design/log summary
+   around G1/G4 as the endpoint, or
+2. evaluating broader post-startup directions such as cold-import architecture
+   changes beyond SQLite, or explicitly product-semantic tradeoffs that were
+   previously rejected for startup freshness reasons.
+
+Do not run more startup-preserving parser micro-experiments unless new evidence
+changes the parse ceiling materially.
 ```

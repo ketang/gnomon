@@ -45,16 +45,54 @@ fn build_actions_core(
     conn: &Connection,
     params: &BuildActionsParams,
 ) -> Result<BuildActionsResult> {
-    let Some(context) = load_conversation_context(conn, params.conversation_id)? else {
+    let context_scope = PerfScope::new(
+        params.perf_logger.clone(),
+        "import.build_actions.load_context",
+    );
+    let context = match load_conversation_context(conn, params.conversation_id) {
+        Ok(context) => {
+            context_scope.finish_ok();
+            context
+        }
+        Err(err) => {
+            context_scope.finish_error(&err);
+            return Err(err);
+        }
+    };
+    let Some(context) = context else {
         return Ok(BuildActionsResult {
             action_count: 0,
             path_ref_count: 0,
         });
     };
 
-    purge_existing_classification(conn, params.conversation_id)?;
-    let messages = load_messages(conn, params.conversation_id)?;
-    classify_and_persist_actions(conn, &context, &messages)
+    let purge_scope = PerfScope::new(
+        params.perf_logger.clone(),
+        "import.build_actions.purge_existing",
+    );
+    match purge_existing_classification(conn, params.conversation_id) {
+        Ok(()) => purge_scope.finish_ok(),
+        Err(err) => {
+            purge_scope.finish_error(&err);
+            return Err(err);
+        }
+    }
+    let mut load_messages_scope = PerfScope::new(
+        params.perf_logger.clone(),
+        "import.build_actions.load_messages",
+    );
+    let messages = match load_messages(conn, params.conversation_id) {
+        Ok(messages) => {
+            load_messages_scope.field("message_count", messages.len());
+            load_messages_scope.finish_ok();
+            messages
+        }
+        Err(err) => {
+            load_messages_scope.finish_error(&err);
+            return Err(err);
+        }
+    };
+    classify_and_persist_actions(conn, &context, &messages, params.perf_logger.clone())
 }
 
 fn build_actions_core_with_messages(
@@ -62,27 +100,58 @@ fn build_actions_core_with_messages(
     params: &BuildActionsParams,
     messages: Vec<LoadedMessage>,
 ) -> Result<BuildActionsResult> {
-    let Some(context) = load_conversation_context(conn, params.conversation_id)? else {
+    let context_scope = PerfScope::new(
+        params.perf_logger.clone(),
+        "import.build_actions.load_context",
+    );
+    let context = match load_conversation_context(conn, params.conversation_id) {
+        Ok(context) => {
+            context_scope.finish_ok();
+            context
+        }
+        Err(err) => {
+            context_scope.finish_error(&err);
+            return Err(err);
+        }
+    };
+    let Some(context) = context else {
         return Ok(BuildActionsResult {
             action_count: 0,
             path_ref_count: 0,
         });
     };
 
-    purge_existing_classification(conn, params.conversation_id)?;
-    classify_and_persist_actions(conn, &context, &messages)
+    let purge_scope = PerfScope::new(
+        params.perf_logger.clone(),
+        "import.build_actions.purge_existing",
+    );
+    match purge_existing_classification(conn, params.conversation_id) {
+        Ok(()) => purge_scope.finish_ok(),
+        Err(err) => {
+            purge_scope.finish_error(&err);
+            return Err(err);
+        }
+    }
+    classify_and_persist_actions(conn, &context, &messages, params.perf_logger.clone())
 }
 
 fn classify_and_persist_actions(
     conn: &Connection,
     context: &ConversationContext,
     messages: &[LoadedMessage],
+    perf_logger: Option<PerfLogger>,
 ) -> Result<BuildActionsResult> {
+    let lookup_scope = PerfScope::new(
+        perf_logger.clone(),
+        "import.build_actions.build_tool_lookup",
+    );
     let tool_use_lookup = build_tool_use_lookup(messages);
+    lookup_scope.finish_ok();
 
     let mut actions_written = 0usize;
     let mut path_refs_written = 0usize;
 
+    let mut turns_scope = PerfScope::new(perf_logger.clone(), "import.build_actions.group_turns");
     let mut turns: BTreeMap<i64, Vec<&LoadedMessage>> = BTreeMap::new();
     for message in messages {
         if let Some(turn_sequence_no) = message.turn_sequence_no {
@@ -93,20 +162,34 @@ fn classify_and_persist_actions(
     for messages_in_turn in turns.values_mut() {
         messages_in_turn.sort_by_key(|message| message.ordinal_in_turn.unwrap_or(i64::MAX));
     }
+    turns_scope.field("turn_count", turns.len());
+    turns_scope.finish_ok();
 
+    let mut classify_scope = PerfScope::new(
+        perf_logger.clone(),
+        "import.build_actions.classify_messages",
+    );
+    let mut persist_path_refs_scope = PerfScope::new(
+        perf_logger.clone(),
+        "import.build_actions.persist_path_refs",
+    );
+    let mut persist_actions_scope =
+        PerfScope::new(perf_logger.clone(), "import.build_actions.persist_actions");
     for messages_in_turn in turns.values() {
         let mut next_action_sequence_no = 0i64;
         let mut current_group: Option<ActionGroupDraft> = None;
 
         for message in messages_in_turn {
             let classification = classify_message(message, &tool_use_lookup);
-            path_refs_written += persist_path_refs(
+            let inserted_path_refs = persist_path_refs(
                 conn,
                 context.project_id,
                 &context.project_root,
                 message.id,
                 &classification.path_refs,
             )?;
+            path_refs_written += inserted_path_refs;
+            persist_path_refs_scope.field("path_ref_count", path_refs_written);
 
             if let Some(group) = current_group.as_mut() {
                 if group.descriptor == classification.descriptor {
@@ -122,6 +205,7 @@ fn classify_and_persist_actions(
                     current_group.take().expect("action group present"),
                 )?;
                 actions_written += 1;
+                persist_actions_scope.field("action_count", actions_written);
                 next_action_sequence_no += 1;
             }
 
@@ -139,11 +223,20 @@ fn classify_and_persist_actions(
                 group,
             )?;
             actions_written += 1;
+            persist_actions_scope.field("action_count", actions_written);
         }
     }
+    classify_scope.field("message_count", messages.len());
+    classify_scope.finish_ok();
+    persist_path_refs_scope.field("path_ref_count", path_refs_written);
+    persist_path_refs_scope.finish_ok();
+    persist_actions_scope.field("action_count", actions_written);
+    persist_actions_scope.finish_ok();
 
-    conn.prepare_cached(
-        "
+    let update_chunk_scope = PerfScope::new(perf_logger, "import.build_actions.update_chunk_count");
+    match conn
+        .prepare_cached(
+            "
         UPDATE import_chunk
         SET imported_action_count = (
             SELECT COUNT(*)
@@ -152,9 +245,15 @@ fn classify_and_persist_actions(
         )
         WHERE id = ?1
         ",
-    )
-    .and_then(|mut stmt| stmt.execute([context.import_chunk_id]))
-    .context("unable to update import chunk action count")?;
+        )
+        .and_then(|mut stmt| stmt.execute([context.import_chunk_id]))
+    {
+        Ok(_) => update_chunk_scope.finish_ok(),
+        Err(err) => {
+            update_chunk_scope.finish_error(&err);
+            return Err(err).context("unable to update import chunk action count");
+        }
+    }
 
     Ok(BuildActionsResult {
         action_count: actions_written,
@@ -1076,7 +1175,6 @@ fn persist_path_refs(
 
     Ok(inserted)
 }
-
 fn ensure_path_node_chain(
     conn: &Connection,
     project_id: i64,
