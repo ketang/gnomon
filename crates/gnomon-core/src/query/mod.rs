@@ -1482,7 +1482,7 @@ impl<'conn> QueryEngine<'conn> {
                     c.project_id,
                     p.display_name,
                     c.title,
-                    substr(c.external_id, instr(c.external_id, ':session:') + 9) AS session_id
+                    c.shared_session_id AS session_id
                 FROM conversation c
                 JOIN source_file sf
                     ON sf.id = c.source_file_id
@@ -1496,7 +1496,7 @@ impl<'conn> QueryEngine<'conn> {
                 WHERE cic.state = 'complete'
                   AND cic.publish_seq IS NOT NULL
                   AND cic.publish_seq <= ?1
-                  AND instr(c.external_id, ':session:') > 0
+                  AND c.shared_session_id IS NOT NULL
             ),
             conversation_metrics AS (
                 SELECT
@@ -1739,7 +1739,7 @@ impl<'conn> QueryEngine<'conn> {
                     c.title,
                     c.project_id,
                     p.display_name,
-                    substr(c.external_id, instr(c.external_id, ':session:') + 9) AS session_id
+                    c.shared_session_id AS session_id
                 FROM conversation c
                 JOIN source_file sf
                     ON sf.id = c.source_file_id
@@ -1753,7 +1753,7 @@ impl<'conn> QueryEngine<'conn> {
                 WHERE cic.state = 'complete'
                   AND cic.publish_seq IS NOT NULL
                   AND cic.publish_seq <= ?1
-                  AND instr(c.external_id, ':session:') > 0
+                  AND c.shared_session_id IS NOT NULL
             ) c
                 ON c.session_id = si.session_id
             WHERE sic.state = 'complete'
@@ -1796,7 +1796,7 @@ impl<'conn> QueryEngine<'conn> {
             .context("snapshot publish_seq overflowed i64")?;
         let sql = "
             SELECT
-                substr(c.external_id, instr(c.external_id, ':session:') + 9) AS session_id,
+                c.shared_session_id AS session_id,
                 c.id,
                 c.project_id,
                 p.display_name,
@@ -1819,7 +1819,7 @@ impl<'conn> QueryEngine<'conn> {
                 ON mp.message_id = m.id
             JOIN project p
                 ON p.id = c.project_id
-            WHERE instr(c.external_id, ':session:') > 0
+            WHERE c.shared_session_id IS NOT NULL
               AND (
                   mp.text_value IS NOT NULL
                   OR mp.metadata_json IS NOT NULL
@@ -5834,15 +5834,14 @@ mod tests {
         conn.execute(
             "
             UPDATE conversation
-            SET external_id = ?2
+            SET shared_session_id = ?2,
+                external_id = ?3
             WHERE id = ?1
             ",
             params![
                 matched_conversation_id,
-                format!(
-                    "source-file:{}:session:matched-session",
-                    matched_transcript_source_file_id
-                )
+                "matched-session",
+                format!("opaque-conversation-{matched_transcript_source_file_id}")
             ],
         )?;
 
@@ -5994,12 +5993,14 @@ mod tests {
         conn.execute(
             "
             UPDATE conversation
-            SET external_id = ?2
+            SET shared_session_id = ?2,
+                external_id = ?3
             WHERE id = ?1
             ",
             params![
                 inferred_conversation_id,
-                format!("source-file:{inferred_source_file_id}:session:reviewer-confirmed")
+                "reviewer-confirmed",
+                format!("opaque-conversation-{inferred_source_file_id}")
             ],
         )?;
         conn.execute(
@@ -6130,34 +6131,40 @@ mod tests {
         conn.execute(
             "
             UPDATE conversation
-            SET external_id = ?2
+            SET shared_session_id = ?2,
+                external_id = ?3
             WHERE id = ?1
             ",
             params![
                 project_a_session_1,
-                format!("source-file:{source_file_a_1}:session:planner-a1")
+                "planner-a1",
+                format!("opaque-conversation-{source_file_a_1}")
             ],
         )?;
         conn.execute(
             "
             UPDATE conversation
-            SET external_id = ?2
+            SET shared_session_id = ?2,
+                external_id = ?3
             WHERE id = ?1
             ",
             params![
                 project_a_session_2,
-                format!("source-file:{source_file_a_2}:session:shared-a2")
+                "shared-a2",
+                format!("opaque-conversation-{source_file_a_2}")
             ],
         )?;
         conn.execute(
             "
             UPDATE conversation
-            SET external_id = ?2
+            SET shared_session_id = ?2,
+                external_id = ?3
             WHERE id = ?1
             ",
             params![
                 project_b_session_1,
-                format!("source-file:{source_file_b_1}:session:reviewer-b1")
+                "reviewer-b1",
+                format!("opaque-conversation-{source_file_b_1}")
             ],
         )?;
 

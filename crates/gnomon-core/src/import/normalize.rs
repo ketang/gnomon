@@ -1172,17 +1172,19 @@ impl ImportState {
                 INSERT INTO conversation (
                     project_id,
                     source_file_id,
+                    shared_session_id,
                     external_id,
                     started_at_utc,
                     ended_at_utc
                 )
-                VALUES (?1, ?2, ?3, ?4, ?4)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?5)
                 ",
         )
         .and_then(|mut stmt| {
             stmt.execute(params![
                 self.params.project_id,
                 self.params.source_file_id,
+                session_id,
                 conversation_external_id,
                 timestamp
             ])
@@ -2425,6 +2427,7 @@ mod tests {
                 id INTEGER PRIMARY KEY,
                 project_id INTEGER NOT NULL,
                 source_file_id INTEGER NOT NULL,
+                shared_session_id TEXT,
                 external_id TEXT,
                 title TEXT,
                 started_at_utc TEXT,
@@ -2664,27 +2667,31 @@ mod tests {
             panic!("second fixture should import");
         };
 
-        let conversations: Vec<(i64, i64, String)> = {
+        let conversations: Vec<(i64, i64, String, String)> = {
             let mut stmt = db.connection().prepare(
                 "
-                SELECT id, source_file_id, external_id
+                SELECT id, source_file_id, shared_session_id, external_id
                 FROM conversation
                 ORDER BY source_file_id
                 ",
             )?;
-            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
 
         assert_eq!(first_result.conversation_id, Some(conversations[0].0));
         assert_eq!(second_result.conversation_id, Some(conversations[1].0));
         assert_eq!(conversations.len(), 2);
+        assert_eq!(conversations[0].2, "session-1");
+        assert_eq!(conversations[1].2, "session-1");
         assert_eq!(
-            conversations[0].2,
+            conversations[0].3,
             format!("source-file:{}:session:session-1", first_ids.source_file_id)
         );
         assert_eq!(
-            conversations[1].2,
+            conversations[1].3,
             format!(
                 "source-file:{}:session:session-1",
                 second_ids.source_file_id
