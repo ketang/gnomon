@@ -221,14 +221,27 @@ Implementation: Add `lto = "thin"` to `[profile.release]` in Cargo.toml. Build w
 `RUSTFLAGS="-Cprofile-generate=/tmp/pgo-data"`, run bench to collect profiles, merge with
 `llvm-profdata merge`, rebuild with `RUSTFLAGS="-Cprofile-use=/tmp/pgo-merged.profdata"`.
 Measurements:
-  Subset:       
-  Full:         
-  Row parity:   
-  Profile shift: 
-Decision: PENDING
+  Subset (LTO-only):   6.016s → 6.002s (−0.2%; noise); runs: 5.604, 6.002, 5.547, 6.540, 6.376
+  Subset (LTO+PGO):    6.016s → 5.810s (−3.4%; marginal); runs: 5.922, 5.810, 5.674, 5.292, 6.078
+  Full (LTO-only):     15.949s → 16.080s (+0.8%; noise/regression); runs: 16.080, 16.034, 16.459
+  Full (LTO+PGO):      15.949s → 15.032s (−5.7%); runs: 15.032, 14.605, 16.695
+  A6 baseline (this session, for comparison):
+    Subset: runs: 5.690, 6.152, 6.069, 5.706, 6.016 → median 6.016s
+    Full:   runs: 15.329, 16.779, 15.949 → median 15.949s
+  Row parity:   not checked — reverted (no code path changes, only Cargo.toml build flag)
+  Profile shift: LTO-only builds take 2–3× longer (2m 23s vs ~1m release build)
+Decision: REVERTED
 Commit:
-Key finding:
-Next implied:
+Key finding: `lto = "thin"` in Cargo.toml provides no measurable import throughput improvement
+(LTO-only full corpus regresses slightly: +0.8%; within noise). PGO on top of LTO delivers a
+real 5.7% full corpus gain (15.032s vs 15.949s), but PGO requires a non-standard build workflow
+(profile-generate → run → merge → profile-use) that cannot be committed — normal `cargo build
+--release` uses only LTO, which provides zero benefit for this workload. The improvement is
+entirely in branches/inlining that PGO targets but LTO alone cannot reach. Additionally, LTO
+significantly increases release build time (~2-3× longer), which is unacceptable overhead for
+zero committed throughput gain. PGO is preserved as a documented build technique if a one-off
+faster binary is needed, but it does not belong in the committed profile.
+Next implied: A7 (`jwalk` parallel directory walk) — scan_source phase, moderate effort, 0.2-0.5s expected.
 
 ---
 
@@ -237,18 +250,19 @@ Next implied:
 Phase: Phase 4
 Long-lived branch: `import-perf-p4`
 Long-lived worktree: `.worktrees/import-perf-p4`
-Last completed: A6 — KEPT (−19.7% subset, −15.8% full; struct-based serde)
-Next action: Run A2 (LTO + PGO). Create import-perf-p4-a2 branch + worktree, implement, measure.
-Current best (subset): 5.259s median (−38.0% from 8.487s baseline)
-Current best (full): 15.144s median (−20.2% from 18.969s baseline)
+Last completed: A2 — REVERTED (LTO-only: 0% gain; LTO+PGO: 5.7% full but not committable)
+Next action: Run A7 (`jwalk` parallel directory walk). Create import-perf-p4-a7 branch + worktree
+  from import-perf-p4, symlink corpus fixtures, implement per plan Section 1, measure.
+Current best (subset): 5.259s median (−38.0% from 8.487s baseline; A6 original measurement)
+Current best (full): 15.144s median (−20.2% from 18.969s baseline; A6 original measurement)
 Target: 10s full corpus
 In-flight uncommitted state: none
 
 Candidate ranking (live — re-rank after each result):
-1. A2 — LTO + PGO — free binary-level gain now parse phase is leaner (5–15% total wall)
-2. A7 — `jwalk` parallel directory walk — scan_source reduction (0.2–0.5s)
-3. A8 — path_node chunk-level cache (across files in chunk) — classify phase reduction (0.3–1.0s)
-4. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker
-NOTE: B1 (`:memory:` staging), B2 (parallel memory DBs) — DISCARD. In-memory SQLite is slower
-  than WAL+mmap due to MEMORY journal mode + malloc page fragmentation. A1 (page_size 8K),
-  A4 (EXCLUSIVE locking), A5 (wal_autocheckpoint=0) also removed — all counterproductive.
+1. A7 — `jwalk` parallel directory walk — scan_source reduction (0.2–0.5s), low effort
+2. A8 — path_node chunk-level cache (across files in chunk) — classify phase (0.3–1.0s)
+3. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker
+NOTE: A2 (LTO+PGO) — DISCARD. LTO alone is no-op; PGO provides 5.7% but requires non-committable
+  build workflow. Not worth complexity for <6% gain.
+NOTE: B1 (`:memory:` staging), B2 (parallel memory DBs) — DISCARD. In-memory SQLite is 4× slower.
+NOTE: A1 (page_size 8K), A4 (EXCLUSIVE locking), A5 (wal_autocheckpoint=0) — DISCARD.
