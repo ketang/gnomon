@@ -1243,11 +1243,17 @@ impl App {
     }
 
     fn render_table(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let visible_columns = active_columns(
-            area.width,
-            self.ui_state.lens,
-            &self.ui_state.enabled_columns,
-        );
+        let has_rtk = rows_have_rtk_data(&self.raw_rows);
+        let effective_columns: Vec<OptionalColumn> = self
+            .ui_state
+            .enabled_columns
+            .iter()
+            .filter(|c| {
+                has_rtk || !matches!(c, OptionalColumn::RtkSaved | OptionalColumn::GrossWithRtk)
+            })
+            .cloned()
+            .collect();
+        let visible_columns = active_columns(area.width, self.ui_state.lens, &effective_columns);
 
         let header = Row::new(
             visible_columns
@@ -5377,6 +5383,8 @@ enum OptionalColumn {
     OppPromptYield,
     OppSearchChurn,
     OppToolResultBloat,
+    RtkSaved,
+    GrossWithRtk,
 }
 
 impl OptionalColumn {
@@ -5401,6 +5409,8 @@ impl OptionalColumn {
             Self::OppPromptYield => 16,
             Self::OppSearchChurn => 17,
             Self::OppToolResultBloat => 18,
+            Self::RtkSaved => 19,
+            Self::GrossWithRtk => 20,
         }
     }
 
@@ -5425,6 +5435,8 @@ impl OptionalColumn {
             Self::OppPromptYield => "yield",
             Self::OppSearchChurn => "srch",
             Self::OppToolResultBloat => "bloat",
+            Self::RtkSaved => "rtk saved",
+            Self::GrossWithRtk => "gross+rtk",
         }
     }
 }
@@ -5522,6 +5534,8 @@ fn default_enabled_columns() -> Vec<OptionalColumn> {
         OptionalColumn::GrossInput,
         OptionalColumn::Output,
         OptionalColumn::Items,
+        OptionalColumn::RtkSaved,
+        OptionalColumn::GrossWithRtk,
     ]
 }
 
@@ -5695,6 +5709,16 @@ fn optional_column_spec(column: &OptionalColumn) -> ColumnSpec {
             title: "bloat".to_string(),
             constraint: Constraint::Length(8),
         },
+        OptionalColumn::RtkSaved => ColumnSpec {
+            key: ColumnKey::Optional(OptionalColumn::RtkSaved),
+            title: "rtk saved".to_string(),
+            constraint: Constraint::Length(10),
+        },
+        OptionalColumn::GrossWithRtk => ColumnSpec {
+            key: ColumnKey::Optional(OptionalColumn::GrossWithRtk),
+            title: "gross+rtk".to_string(),
+            constraint: Constraint::Length(10),
+        },
     }
 }
 
@@ -5759,6 +5783,12 @@ fn render_column_value(column: ColumnKey, row: &RollupRow, lens: MetricLens) -> 
         ColumnKey::Optional(OptionalColumn::OppToolResultBloat) => {
             format_category_score(&row.opportunities, OpportunityCategory::ToolResultBloat)
         }
+        ColumnKey::Optional(OptionalColumn::RtkSaved) => {
+            format_metric(row.metrics.rtk_saved_tokens)
+        }
+        ColumnKey::Optional(OptionalColumn::GrossWithRtk) => {
+            format_metric(row.metrics.gross_input + row.metrics.rtk_saved_tokens)
+        }
     }
 }
 
@@ -5778,6 +5808,10 @@ fn format_category_score(
             }
         })
         .unwrap_or_default()
+}
+
+fn rows_have_rtk_data(rows: &[RollupRow]) -> bool {
+    rows.iter().any(|r| r.metrics.rtk_saved_tokens > 0.0)
 }
 
 fn render_tree_label(row: &TreeRow) -> String {
@@ -10926,5 +10960,18 @@ mod tests {
         let loaded = PersistedUiState::load(&path)?.context("missing")?;
         assert_eq!(loaded.opportunity_filter, None);
         Ok(())
+    }
+
+    #[test]
+    fn rtk_columns_hidden_when_no_rtk_data() {
+        let rows: Vec<RollupRow> = vec![];
+        assert!(!rows_have_rtk_data(&rows));
+    }
+
+    #[test]
+    fn rtk_columns_shown_when_rtk_data_present() {
+        let mut row = sample_row("src", None);
+        row.metrics.rtk_saved_tokens = 500.0;
+        assert!(rows_have_rtk_data(&[row]));
     }
 }
