@@ -34,6 +34,17 @@ impl Database {
         Ok(Self { conn })
     }
 
+    pub fn open_for_import(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let mut conn = Connection::open(path)
+            .with_context(|| format!("unable to open sqlite database at {}", path.display()))?;
+
+        configure_import_connection(&mut conn)?;
+        apply_migrations(&mut conn)?;
+
+        Ok(Self { conn })
+    }
+
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -144,6 +155,24 @@ fn configure_read_write_connection(conn: &mut Connection) -> Result<()> {
         ",
     )
     .context("unable to configure sqlite connection pragmas")?;
+
+    Ok(())
+}
+
+fn configure_import_connection(conn: &mut Connection) -> Result<()> {
+    conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)
+        .context("unable to configure sqlite busy timeout")?;
+    conn.execute_batch(
+        "
+        PRAGMA journal_mode = WAL;
+        PRAGMA foreign_keys = OFF;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA cache_size = -64000;
+        PRAGMA mmap_size = 268435456;
+        PRAGMA temp_store = MEMORY;
+        ",
+    )
+    .context("unable to configure sqlite import connection pragmas")?;
 
     Ok(())
 }
