@@ -187,14 +187,23 @@ Implementation: Add `RawSourceRecord` + `RawMessage` + `RawSnapshot` in `normali
 to take `&RawSourceRecord`. Update `ParsedRecord` (in `mod.rs`) to carry pre-extracted scalar fields
 instead of `serde_json::Value`. Update write phase to use pre-extracted fields.
 Measurements:
-  Subset:       <pending>
-  Full:         <pending>
-  Row parity:   <pending>
-  Profile shift: <pending>
-Decision: PENDING
+  Subset:       6.543s → 5.259s (−19.7%); runs: 5.790, 5.259, 5.014, 5.025, 5.528
+  Full:         17.982s → 15.144s (−15.8%); runs: 15.602, 13.363, 15.144
+  Row parity:   PASS (project:31, source_file:4548, import_chunk:162, conversation:4547,
+                stream:4547, message:294995, message_part:411842, turn:13363, action:120922)
+  Profile shift: parse phase allocation eliminated for all ~295k transcript records;
+                 message sub-object HashMap also eliminated per record
+Decision: KEPT
 Commit:
-Key finding: <pending>
-Next implied: <pending>
+Key finding: Replacing `serde_json::Value` deserialization with `RawSourceRecord` +
+`RawMessage` typed structs in the parallel parse path eliminates top-level and message
+HashMap allocations (~590k total for the subset corpus) and skips unknown-field string
+allocations (cwd, userType, version, gitBranch, parentUuid). Subset gain is ~1.3s (−20%),
+full corpus ~2.8s (−16%). The expected 0.5–1.5s estimate was conservative — allocation
+reduction at this scale has higher throughput impact than predicted.
+Integration tests: same 1 passed / 6 failed as p4 baseline (pre-existing bug in
+recompute_chunk_counts using history_event COUNT, unrelated to this change).
+Next implied: A2 (LTO + PGO) — binary-level optimization now that parse phase is leaner.
 
 ---
 
@@ -203,21 +212,18 @@ Next implied: <pending>
 Phase: Phase 4
 Long-lived branch: `import-perf-p4`
 Long-lived worktree: `.worktrees/import-perf-p4`
-Last completed: B1 — REVERTED (+276% regression on subset; `:memory:` DB 4× slower than WAL+mmap)
-Next action: Run candidate A6: struct-based serde (replace `serde_json::Value` in normalize.rs).
-  Parse phase is ~5s/run (~19% of total wall). A typed RawSourceRecord struct should cut it 2–4×.
-  Create branch import-perf-p4-a6 and worktree .worktrees/import-perf-p4-a6 from import-perf-p4.
-Current best (subset): 6.543s median (−22.9% from 8.487s baseline)
-Current best (full): 17.982s median (−5.2% from 18.969s baseline)
+Last completed: A6 — KEPT (−19.7% subset, −15.8% full; struct-based serde)
+Next action: Commit A6 on candidate branch, merge into import-perf-p4, then run A2 (LTO + PGO).
+Current best (subset): 5.259s median (−38.0% from 8.487s baseline)
+Current best (full): 15.144s median (−20.2% from 18.969s baseline)
 Target: 10s full corpus
-In-flight uncommitted state: none
+In-flight uncommitted state: A6 implemented, not yet committed
 
 Candidate ranking (live — re-rank after each result):
-1. A6 — Struct-based serde (replace `serde_json::Value`) — parse phase 5s/run, 2–4× speedup possible
-2. A2 — LTO + PGO — free binary-level gain (5–15% total wall)
-3. A7 — `jwalk` parallel directory walk — scan_source reduction (0.2–0.5s)
-4. A8 — path_node chunk-level cache (across files in chunk) — classify phase reduction (0.3–1.0s)
-5. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker
+1. A2 — LTO + PGO — free binary-level gain now parse phase is leaner (5–15% total wall)
+2. A7 — `jwalk` parallel directory walk — scan_source reduction (0.2–0.5s)
+3. A8 — path_node chunk-level cache (across files in chunk) — classify phase reduction (0.3–1.0s)
+4. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker
 NOTE: B1 (`:memory:` staging), B2 (parallel memory DBs) — DISCARD. In-memory SQLite is slower
   than WAL+mmap due to MEMORY journal mode + malloc page fragmentation. A1 (page_size 8K),
   A4 (EXCLUSIVE locking), A5 (wal_autocheckpoint=0) also removed — all counterproductive.
