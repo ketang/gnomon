@@ -30,24 +30,33 @@
 
 ## 2026-04-18 — candidate A3: `PRAGMA foreign_keys = OFF` on import connection
 
-Branch: import-perf-p4/a3-fk-off
+Branch: import-perf-p4-a3
 Worktree: .worktrees/import-perf-p4-a3
 Hypothesis: FK verification adds ~2.5M btree lookups per full import. The import pipeline
 inserts in guaranteed parent-before-child order, so FK enforcement is redundant overhead.
 Disabling it on the import connection alone (not the read-write connection) should eliminate
 those lookups with zero correctness risk.
-Implementation: Split `configure_read_write_connection` in `crates/gnomon-core/src/db/mod.rs`
-into two functions: the existing one (no change to FK behavior) and a new
-`configure_import_connection` that additionally executes `PRAGMA foreign_keys = OFF;`.
+Implementation: Added `Database::open_for_import` in `crates/gnomon-core/src/db/mod.rs` (calls
+new `configure_import_connection` which uses `PRAGMA foreign_keys = OFF` instead of `= ON`).
+Changed both import entrypoints in `import/chunk.rs` (lines 336, 964) to use `open_for_import`.
+Also added `gnomon db check` subcommand (PRAGMA integrity_check + foreign_key_check).
+Fixed 3 pre-existing clippy warnings (unused import, dead code, clone-to-from_ref).
 Measurements:
-  Subset:       *(pending)*
-  Full:         *(pending)*
-  Row parity:   *(pending)*
-  Profile shift: *(pending)*
-Decision: PENDING
-Commit: *(pending)*
-Key finding: *(pending)*
-Next implied: *(pending)*
+  Subset:       8.487s → 6.543s (−22.9%); runs: 6.543, 6.644, 6.723, 6.501, 6.263
+  Full:         18.969s → 17.982s (−5.2%); runs: 16.344, 17.982, 18.063
+  Row parity:   PASS (project:31, source_file:4548, import_chunk:162, conversation:4547,
+                stream:4547, message:294995, message_part:411842, turn:13363, action:120922)
+  Profile shift: subset wall dropped ~1.9s; full corpus ~1.0s
+Decision: KEPT
+Commit: 0a0a6ce
+Key finding: FK enforcement was significant per-row overhead — disabling it on the import
+connection (guaranteed parent-before-child order) gives a clean win with no correctness risk.
+Subset improvement (~23%) is larger than full corpus (~5%) likely because the subset's single
+large project has denser FK relationships per chunk than the 31-project full corpus.
+Also discovered and documented: integration tests have 6 pre-existing failures
+(imported_record_count_sum = 0) because recompute_chunk_counts uses COUNT(*) FROM history_event,
+which is 0 for transcript imports — separate pre-existing bug, not caused by this change.
+Next implied: A4 (PRAGMA locking_mode = EXCLUSIVE alone) — further decompose E-bundle.
 
 ---
 
@@ -56,22 +65,21 @@ Next implied: *(pending)*
 Phase: Phase 4
 Long-lived branch: `import-perf-p4`
 Long-lived worktree: `.worktrees/import-perf-p4`
-Last completed: *(none — A3 in flight)*
-Next action: Implement A3 in `.worktrees/import-perf-p4-a3`, measure, verify parity, decide.
-Current best (subset): 8.487s median (Phase 4 baseline)
-Current best (full): 18.969s median (Phase 4 baseline)
+Last completed: A3 — KEPT (0a0a6ce)
+Next action: Run candidate A4: PRAGMA locking_mode = EXCLUSIVE on import connection alone.
+Current best (subset): 6.543s median (−22.9% from 8.487s baseline)
+Current best (full): 17.982s median (−5.2% from 18.969s baseline)
 Target: 10s full corpus
-In-flight uncommitted state: A3 skeleton committed to import-perf-p4; candidate branch + worktree not yet created
+In-flight uncommitted state: none
 
 Candidate ranking (live — re-rank after each result):
-1. A3 — `PRAGMA foreign_keys = OFF` (import connection only) — in flight
-2. B1 — `:memory:` staging DB → `VACUUM INTO` — biggest potential single-candidate win
+1. A4 — `PRAGMA locking_mode = EXCLUSIVE` alone — decompose E-bundle, untested solo
+2. A5 — `PRAGMA wal_autocheckpoint = 0` + manual checkpoint — decompose E-bundle
 3. A1 — SQLite page size 8K/16K — never measured, low risk
-4. A4 — `PRAGMA locking_mode = EXCLUSIVE` alone — decompose E-bundle
-5. A5 — `PRAGMA wal_autocheckpoint = 0` + manual checkpoint — decompose E-bundle
-6. A6 — Struct-based serde (replace `serde_json::Value`) — parse phase reduction
-7. A2 — LTO + PGO — free binary-level gain
-8. A7 — `jwalk` parallel directory walk — scan_source reduction
-9. A8 — path_node chunk-level cache (across files in chunk) — classify phase reduction
-10. B2 — Parallel per-chunk `:memory:` DBs + merge (requires B1 KEPT first)
-11. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker
+4. B1 — `:memory:` staging DB → `VACUUM INTO` — biggest potential single-candidate win
+5. A6 — Struct-based serde (replace `serde_json::Value`) — parse phase reduction
+6. A2 — LTO + PGO — free binary-level gain
+7. A7 — `jwalk` parallel directory walk — scan_source reduction
+8. A8 — path_node chunk-level cache (across files in chunk) — classify phase reduction
+9. B2 — Parallel per-chunk `:memory:` DBs + merge (requires B1 KEPT first)
+10. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker
