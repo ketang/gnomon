@@ -2641,10 +2641,57 @@ mod tests {
             },
         )?;
         assert_eq!(counts.0, 5);
-        assert_eq!(counts.1, 1);
+        assert_eq!(counts.1, 2);
         assert_eq!(counts.2, 1);
         assert_eq!(counts.3, 1);
         assert_eq!(counts.4, 9);
+
+        let codex_shared_counts: (i64, i64, i64, i64) = db.connection().query_row(
+            "
+            SELECT
+                (SELECT COUNT(*)
+                 FROM conversation c
+                 JOIN source_file sf ON sf.id = c.source_file_id
+                 WHERE sf.source_provider = 'codex' AND sf.source_kind = 'rollout'),
+                (SELECT COUNT(*)
+                 FROM message m
+                 JOIN conversation c ON c.id = m.conversation_id
+                 JOIN source_file sf ON sf.id = c.source_file_id
+                 WHERE sf.source_provider = 'codex' AND sf.source_kind = 'rollout'),
+                (SELECT COUNT(*)
+                 FROM turn t
+                 JOIN conversation c ON c.id = t.conversation_id
+                 JOIN source_file sf ON sf.id = c.source_file_id
+                 WHERE sf.source_provider = 'codex' AND sf.source_kind = 'rollout'),
+                (SELECT COUNT(*)
+                 FROM action a
+                 JOIN turn t ON t.id = a.turn_id
+                 JOIN conversation c ON c.id = t.conversation_id
+                 JOIN source_file sf ON sf.id = c.source_file_id
+                 WHERE sf.source_provider = 'codex' AND sf.source_kind = 'rollout')
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(codex_shared_counts, (1, 5, 1, 3));
+
+        let codex_tool_row: (String, Option<i64>, Option<i64>) = db.connection().query_row(
+            "
+            SELECT mp.tool_name, m.input_tokens, m.output_tokens
+            FROM message_part mp
+            JOIN message m ON m.id = mp.message_id
+            JOIN conversation c ON c.id = m.conversation_id
+            JOIN source_file sf ON sf.id = c.source_file_id
+            WHERE sf.source_provider = 'codex'
+                AND sf.source_kind = 'rollout'
+                AND mp.part_kind = 'tool_use'
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(codex_tool_row.0, "Bash");
+        assert_eq!(codex_tool_row.1, Some(123));
+        assert_eq!(codex_tool_row.2, Some(45));
 
         let rollout_row: (
             Option<String>,
