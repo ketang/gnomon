@@ -31,7 +31,7 @@ use rusqlite::OptionalExtension;
 #[command(
     name = "gnomon",
     version,
-    about = "Analyze Claude session history and explore token usage in the terminal."
+    about = "Analyze Claude and Codex session history and explore token usage in the terminal."
 )]
 struct Cli {
     #[command(flatten)]
