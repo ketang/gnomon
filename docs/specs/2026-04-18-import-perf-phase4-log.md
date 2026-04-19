@@ -194,7 +194,7 @@ Measurements:
   Profile shift: parse phase allocation eliminated for all ~295k transcript records;
                  message sub-object HashMap also eliminated per record
 Decision: KEPT
-Commit:
+Commit: 21c95d5
 Key finding: Replacing `serde_json::Value` deserialization with `RawSourceRecord` +
 `RawMessage` typed structs in the parallel parse path eliminates top-level and message
 HashMap allocations (~590k total for the subset corpus) and skips unknown-field string
@@ -213,11 +213,11 @@ Phase: Phase 4
 Long-lived branch: `import-perf-p4`
 Long-lived worktree: `.worktrees/import-perf-p4`
 Last completed: A6 — KEPT (−19.7% subset, −15.8% full; struct-based serde)
-Next action: Commit A6 on candidate branch, merge into import-perf-p4, then run A2 (LTO + PGO).
+Next action: Run A2 (LTO + PGO). Create import-perf-p4-a2 branch + worktree, implement, measure.
 Current best (subset): 5.259s median (−38.0% from 8.487s baseline)
 Current best (full): 15.144s median (−20.2% from 18.969s baseline)
 Target: 10s full corpus
-In-flight uncommitted state: A6 implemented, not yet committed
+In-flight uncommitted state: none
 
 Candidate ranking (live — re-rank after each result):
 1. A2 — LTO + PGO — free binary-level gain now parse phase is leaner (5–15% total wall)
