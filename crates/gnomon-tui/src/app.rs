@@ -5787,7 +5787,7 @@ fn render_column_value(column: ColumnKey, row: &RollupRow, lens: MetricLens) -> 
             format_metric(row.metrics.rtk_saved_tokens)
         }
         ColumnKey::Optional(OptionalColumn::GrossWithRtk) => {
-            format_metric(row.metrics.gross_input + row.metrics.rtk_saved_tokens)
+            format_metric(row.metrics.uncached_input + row.metrics.rtk_saved_tokens)
         }
     }
 }
