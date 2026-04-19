@@ -1,7 +1,3 @@
-// Items in this module are not yet called from the rest of the crate; they
-// will be wired in by the subsequent RTK integration task.
-#![allow(dead_code)]
-
 use std::path::Path;
 
 use anyhow::Result;
@@ -11,6 +7,7 @@ use crate::config::RtkConfig;
 
 /// One RTK command row loaded from RTK's history.db.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct RtkRow {
     pub rtk_row_id: i64,
     pub timestamp_utc: String,
@@ -22,6 +19,7 @@ pub(crate) struct RtkRow {
 
 /// One match between a gnomon action and an RTK row.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct RtkMatch {
     pub action_id: i64,
     pub rtk_row_id: i64,
@@ -32,6 +30,7 @@ pub(crate) struct RtkMatch {
 
 /// A Bash action row loaded from gnomon's DB.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct BashAction {
     pub action_id: i64,
     pub command: String,
@@ -46,6 +45,7 @@ pub(crate) struct BashAction {
 /// into `action_rtk_match`.
 ///
 /// Silently no-ops if RTK's db does not exist or `rtk_config.enabled` is false.
+#[allow(dead_code)]
 pub(crate) fn match_rtk_savings(
     conn: &Connection,
     import_chunk_id: i64,
@@ -289,12 +289,7 @@ mod tests {
             "2026-04-18T10:00:00.000Z",
             "2026-04-18T10:00:01.000Z",
         )];
-        let rtk_rows = vec![make_rtk(
-            42,
-            "git status",
-            "2026-04-18T10:00:00.500+00:00",
-            150,
-        )];
+        let rtk_rows = vec![make_rtk(42, "git status", "2026-04-18T10:00:00.500+00:00", 150)];
         let result = run_cursor(&actions, &rtk_rows, 2000, 30000);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].action_id, 1);
@@ -305,25 +300,10 @@ mod tests {
     #[test]
     fn cursor_does_not_double_match_same_rtk_row() {
         let actions = vec![
-            make_action(
-                1,
-                "git status",
-                "2026-04-18T10:00:00.000Z",
-                "2026-04-18T10:00:01.000Z",
-            ),
-            make_action(
-                2,
-                "git status",
-                "2026-04-18T10:00:01.500Z",
-                "2026-04-18T10:00:02.000Z",
-            ),
+            make_action(1, "git status", "2026-04-18T10:00:00.000Z", "2026-04-18T10:00:01.000Z"),
+            make_action(2, "git status", "2026-04-18T10:00:01.500Z", "2026-04-18T10:00:02.000Z"),
         ];
-        let rtk_rows = vec![make_rtk(
-            42,
-            "git status",
-            "2026-04-18T10:00:00.500+00:00",
-            150,
-        )];
+        let rtk_rows = vec![make_rtk(42, "git status", "2026-04-18T10:00:00.500+00:00", 150)];
         let result = run_cursor(&actions, &rtk_rows, 2000, 30000);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].action_id, 1);
@@ -337,12 +317,7 @@ mod tests {
             "2026-04-18T10:00:00.000Z",
             "2026-04-18T10:00:05.000Z",
         )];
-        let rtk_rows = vec![make_rtk(
-            42,
-            "git status",
-            "2026-04-18T10:00:01.000+00:00",
-            150,
-        )];
+        let rtk_rows = vec![make_rtk(42, "git status", "2026-04-18T10:00:01.000+00:00", 150)];
         let result = run_cursor(&actions, &rtk_rows, 2000, 30000);
         assert!(result.is_empty());
     }
@@ -356,12 +331,7 @@ mod tests {
             "2026-04-18T10:00:01.000Z",
         )];
         // RTK row is 60s after action ended — beyond 30s post_slack.
-        let rtk_rows = vec![make_rtk(
-            42,
-            "git status",
-            "2026-04-18T10:01:01.000+00:00",
-            150,
-        )];
+        let rtk_rows = vec![make_rtk(42, "git status", "2026-04-18T10:01:01.000+00:00", 150)];
         let result = run_cursor(&actions, &rtk_rows, 2000, 30000);
         assert!(result.is_empty());
     }
