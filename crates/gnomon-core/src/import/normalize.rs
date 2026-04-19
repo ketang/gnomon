@@ -178,6 +178,49 @@ pub fn parse_jsonl_file(path: &Path, source_kind: super::SourceFileKind) -> supe
     }
 }
 
+/// Typed top-level record for the transcript JSONL parallel-parse path.
+///
+/// Replaces `serde_json::Value` to avoid HashMap allocation per record and
+/// skip unknown top-level fields (`cwd`, `userType`, `version`, `gitBranch`,
+/// `parentUuid`) that are never read.
+#[derive(serde::Deserialize)]
+struct RawSourceRecord {
+    #[serde(rename = "type")]
+    record_type: Option<String>,
+    uuid: Option<String>,
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+    timestamp: Option<String>,
+    #[serde(rename = "isSidechain")]
+    is_sidechain: Option<bool>,
+    #[serde(rename = "agentId")]
+    agent_id: Option<String>,
+    #[serde(rename = "messageId")]
+    message_id: Option<String>,
+    #[serde(rename = "toolUseID")]
+    tool_use_id: Option<String>,
+    snapshot: Option<RawSnapshot>,
+    message: Option<RawMessage>,
+    data: Option<serde_json::Value>,
+    #[serde(rename = "toolUseResult")]
+    tool_use_result: Option<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawSnapshot {
+    timestamp: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawMessage {
+    id: Option<String>,
+    role: Option<String>,
+    content: Option<serde_json::Value>,
+    model: Option<String>,
+    stop_reason: Option<String>,
+    usage: Option<serde_json::Value>,
+}
+
 fn parse_jsonl_file_inner(
     path: &Path,
     source_kind: super::SourceFileKind,
@@ -188,54 +231,92 @@ fn parse_jsonl_file_inner(
 
     let mut records = Vec::new();
 
-    for (zero_based_line_no, line_result) in reader.lines().enumerate() {
-        let line_no = (zero_based_line_no + 1) as i64;
-        let line = line_result
-            .with_context(|| format!("unable to read line {line_no} from {}", path.display()))?;
+    match source_kind {
+        super::SourceFileKind::Transcript => {
+            let mut has_session_id = false;
+            let mut all_metadata = true;
 
-        let value: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => {
-                return Ok(super::ParseResult::Warning(NormalizeImportWarning {
-                    code: WARNING_INVALID_JSON,
-                    message: format!(
-                        "unable to parse json on line {line_no} from {} (preview: {})",
-                        path.display(),
-                        preview_source_line(&line)
-                    ),
-                }));
+            for (zero_based_line_no, line_result) in reader.lines().enumerate() {
+                let line_no = (zero_based_line_no + 1) as i64;
+                let line = line_result.with_context(|| {
+                    format!("unable to read line {line_no} from {}", path.display())
+                })?;
+
+                let raw: RawSourceRecord = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Ok(super::ParseResult::Warning(NormalizeImportWarning {
+                            code: WARNING_INVALID_JSON,
+                            message: format!(
+                                "unable to parse json on line {line_no} from {} (preview: {})",
+                                path.display(),
+                                preview_source_line(&line)
+                            ),
+                        }));
+                    }
+                };
+
+                if raw.session_id.is_some() {
+                    has_session_id = true;
+                }
+                if raw.record_type.as_deref() != Some("file-history-snapshot") {
+                    all_metadata = false;
+                }
+
+                let recorded_at_utc = raw
+                    .timestamp
+                    .as_deref()
+                    .or_else(|| raw.snapshot.as_ref().and_then(|s| s.timestamp.as_deref()))
+                    .map(ToOwned::to_owned);
+                let extracted_message = extract_message_from_raw(&raw, line_no);
+
+                records.push(super::ParsedRecord {
+                    source_line_no: line_no,
+                    session_id: raw.session_id,
+                    recorded_at_utc,
+                    is_sidechain: raw.is_sidechain.unwrap_or(false),
+                    agent_id: raw.agent_id,
+                    extracted_message,
+                    history_value: None,
+                });
             }
-        };
 
-        let recorded_at_utc = extract_record_timestamp(&value).map(ToOwned::to_owned);
-        let extracted_message = match source_kind {
-            super::SourceFileKind::Transcript => extract_message(&value, line_no),
-            super::SourceFileKind::ClaudeHistory => None,
-        };
-
-        records.push(super::ParsedRecord {
-            source_line_no: line_no,
-            value,
-            recorded_at_utc,
-            extracted_message,
-        });
-    }
-
-    // For transcript files: detect sessionless-metadata-only files.
-    if matches!(source_kind, super::SourceFileKind::Transcript) {
-        let has_session_id = records
-            .iter()
-            .any(|r| extract_session_id(&r.value).is_some());
-        if !has_session_id {
-            let all_metadata = !records.is_empty()
-                && records
-                    .iter()
-                    .all(|r| is_sessionless_metadata_record(&r.value));
-            if all_metadata {
+            if !has_session_id && all_metadata && !records.is_empty() {
                 return Ok(super::ParseResult::SessionlessMetadata);
             }
-            // No session ID and not all metadata — this will be an error
-            // during the write phase (matches existing behavior).
+        }
+        super::SourceFileKind::ClaudeHistory => {
+            for (zero_based_line_no, line_result) in reader.lines().enumerate() {
+                let line_no = (zero_based_line_no + 1) as i64;
+                let line = line_result.with_context(|| {
+                    format!("unable to read line {line_no} from {}", path.display())
+                })?;
+
+                let value: Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Ok(super::ParseResult::Warning(NormalizeImportWarning {
+                            code: WARNING_INVALID_JSON,
+                            message: format!(
+                                "unable to parse json on line {line_no} from {} (preview: {})",
+                                path.display(),
+                                preview_source_line(&line)
+                            ),
+                        }));
+                    }
+                };
+
+                let recorded_at_utc = extract_record_timestamp(&value).map(ToOwned::to_owned);
+                records.push(super::ParsedRecord {
+                    source_line_no: line_no,
+                    session_id: None,
+                    recorded_at_utc,
+                    is_sidechain: false,
+                    agent_id: None,
+                    extracted_message: None,
+                    history_value: Some(value),
+                });
+            }
         }
     }
 
@@ -341,13 +422,13 @@ fn write_parsed_transcript_core(
     for record in parsed.records {
         let sql_start = Instant::now();
         if state.conversation.is_none() {
-            if extract_session_id(&record.value).is_some() {
-                state.initialize_context(conn, &record.value)?;
+            if record.session_id.is_some() {
+                state.initialize_context_from_parsed(conn, &record)?;
                 state.flush_buffered_records()?;
             } else {
                 state.buffered_records.push(BufferedRecord {
-                    source_line_no: record.source_line_no,
-                    value: record.value,
+                    recorded_at_utc: record.recorded_at_utc.clone(),
+                    is_sessionless_metadata: false,
                 });
                 breakdown.sql += sql_start.elapsed();
                 continue;
@@ -429,7 +510,13 @@ fn write_parsed_history_core(
     let mut history_event_count = 0usize;
 
     for record in parsed.records {
-        insert_history_event(conn, params, &record.value, record.source_line_no)?;
+        let value = record.history_value.as_ref().ok_or_else(|| {
+            anyhow!(
+                "history record missing raw value at line {}",
+                record.source_line_no
+            )
+        })?;
+        insert_history_event(conn, params, value, record.source_line_no)?;
         history_event_count += 1;
     }
 
@@ -569,8 +656,8 @@ fn normalize_transcript_jsonl_file_core(
                 state.flush_buffered_records()?;
             } else {
                 state.buffered_records.push(BufferedRecord {
-                    source_line_no: line_no as i64,
-                    value: record,
+                    recorded_at_utc: extract_record_timestamp(&record).map(ToOwned::to_owned),
+                    is_sessionless_metadata: is_sessionless_metadata_record(&record),
                 });
                 breakdown.sql += sql_start.elapsed();
                 continue;
@@ -1022,8 +1109,8 @@ struct StreamState {
 
 #[derive(Debug, Clone)]
 struct BufferedRecord {
-    source_line_no: i64,
-    value: Value,
+    recorded_at_utc: Option<String>,
+    is_sessionless_metadata: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1198,10 +1285,113 @@ impl ImportState {
         Ok(())
     }
 
+    fn initialize_context_from_parsed(
+        &mut self,
+        conn: &Connection,
+        record: &super::ParsedRecord,
+    ) -> Result<()> {
+        let session_id = record
+            .session_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("cannot initialize import context without sessionId"))?;
+        let conversation_external_id =
+            conversation_external_id(session_id, self.params.source_file_id);
+        let timestamp = record.recorded_at_utc.clone();
+
+        conn.prepare_cached(
+            "
+                INSERT INTO conversation (
+                    project_id,
+                    source_file_id,
+                    external_id,
+                    started_at_utc,
+                    ended_at_utc
+                )
+                VALUES (?1, ?2, ?3, ?4, ?4)
+                ",
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
+                self.params.project_id,
+                self.params.source_file_id,
+                conversation_external_id,
+                timestamp
+            ])
+        })
+        .context("unable to insert conversation for normalized file")?;
+        let conversation_id = conn.last_insert_rowid();
+
+        let stream_kind = if record.is_sidechain {
+            "sidechain"
+        } else {
+            "primary"
+        };
+        let stream_external_id = record.agent_id.as_deref();
+
+        conn.prepare_cached(
+            "
+                INSERT INTO stream (
+                    conversation_id,
+                    import_chunk_id,
+                    external_id,
+                    stream_kind,
+                    sequence_no,
+                    opened_at_utc,
+                    closed_at_utc
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                ",
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
+                conversation_id,
+                self.params.import_chunk_id,
+                stream_external_id,
+                stream_kind,
+                PRIMARY_STREAM_SEQUENCE_NO,
+                timestamp
+            ])
+        })
+        .context("unable to insert primary stream for normalized file")?;
+        let stream_id = conn.last_insert_rowid();
+
+        self.conversation = Some(ConversationState {
+            id: conversation_id,
+            started_at_utc: timestamp.clone(),
+            ended_at_utc: timestamp.clone(),
+        });
+        self.stream = Some(StreamState {
+            id: stream_id,
+            opened_at_utc: timestamp.clone(),
+            closed_at_utc: timestamp,
+        });
+
+        Ok(())
+    }
+
     fn flush_buffered_records(&mut self) -> Result<()> {
+        let conversation = self
+            .conversation
+            .as_mut()
+            .ok_or_else(|| anyhow!("conversation state missing while flushing buffered records"))?;
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| anyhow!("stream state missing while flushing buffered records"))?;
         let buffered_records = std::mem::take(&mut self.buffered_records);
         for record in buffered_records {
-            self.process_record(record.value, record.source_line_no)?;
+            update_bounds(
+                &mut conversation.started_at_utc,
+                &mut conversation.ended_at_utc,
+                &record.recorded_at_utc,
+            );
+            update_bounds(
+                &mut stream.opened_at_utc,
+                &mut stream.closed_at_utc,
+                &record.recorded_at_utc,
+            );
+            self.next_record_sequence_no += 1;
+            self.record_count += 1;
         }
         Ok(())
     }
@@ -1797,6 +1987,173 @@ fn insert_message_part(
     Ok(conn.last_insert_rowid())
 }
 
+/// Typed counterpart to [`extract_message`] for the parallel parse path.
+fn extract_message_from_raw(
+    record: &RawSourceRecord,
+    source_line_no: i64,
+) -> Option<ExtractedMessage> {
+    match record.record_type.as_deref() {
+        Some("assistant") => extract_top_level_assistant_from_raw(record, source_line_no),
+        Some("user") => extract_top_level_user_from_raw(record, source_line_no),
+        Some("progress")
+            if record
+                .data
+                .as_ref()
+                .and_then(|d| d.pointer("/type"))
+                .and_then(Value::as_str)
+                == Some("agent_progress") =>
+        {
+            extract_relay_message_from_raw(record, source_line_no)
+        }
+        _ => None,
+    }
+}
+
+fn external_id_from_raw(
+    message_id: Option<&str>,
+    record_uuid: Option<&str>,
+    record_message_id: Option<&str>,
+    record_tool_use_id: Option<&str>,
+    source_line_no: i64,
+) -> String {
+    message_id
+        .map(ToOwned::to_owned)
+        .or_else(|| record_uuid.map(ToOwned::to_owned))
+        .or_else(|| record_message_id.map(ToOwned::to_owned))
+        .or_else(|| record_tool_use_id.map(|id| format!("tool-use:{id}")))
+        .unwrap_or_else(|| format!("line:{source_line_no}"))
+}
+
+fn extract_top_level_assistant_from_raw(
+    record: &RawSourceRecord,
+    source_line_no: i64,
+) -> Option<ExtractedMessage> {
+    let wrapper = record.message.as_ref()?;
+    let external_id = external_id_from_raw(
+        wrapper.id.as_deref(),
+        record.uuid.as_deref(),
+        record.message_id.as_deref(),
+        record.tool_use_id.as_deref(),
+        source_line_no,
+    );
+    let parts = extract_message_parts(wrapper.content.as_ref(), source_line_no).ok()?;
+    let role = wrapper.role.clone()?;
+
+    Some(ExtractedMessage {
+        external_id,
+        source_line_no,
+        role,
+        message_kind: "assistant_message",
+        recorded_at_utc: record.timestamp.clone(),
+        model_name: wrapper.model.clone(),
+        stop_reason: wrapper.stop_reason.clone(),
+        usage_source: if wrapper.usage.is_some() {
+            Some("message_usage")
+        } else {
+            None
+        },
+        usage: Usage::from_json(wrapper.usage.as_ref()),
+        parts,
+    })
+}
+
+fn extract_top_level_user_from_raw(
+    record: &RawSourceRecord,
+    source_line_no: i64,
+) -> Option<ExtractedMessage> {
+    let wrapper = record.message.as_ref()?;
+    let external_id = external_id_from_raw(
+        wrapper.id.as_deref(),
+        record.uuid.as_deref(),
+        record.message_id.as_deref(),
+        record.tool_use_id.as_deref(),
+        source_line_no,
+    );
+    let role = wrapper.role.clone()?;
+    let is_agent_run_summary = record
+        .tool_use_result
+        .as_ref()
+        .and_then(|t| t.get("usage"))
+        .is_some();
+    let message_kind = if is_agent_run_summary {
+        "agent_run_summary"
+    } else if content_is_tool_result_only(wrapper.content.as_ref()) {
+        "user_tool_result"
+    } else {
+        "user_prompt"
+    };
+    let parts = extract_message_parts(wrapper.content.as_ref(), source_line_no).ok()?;
+
+    Some(ExtractedMessage {
+        external_id,
+        source_line_no,
+        role,
+        message_kind,
+        recorded_at_utc: record.timestamp.clone(),
+        model_name: None,
+        stop_reason: None,
+        usage_source: if is_agent_run_summary {
+            Some("tool_use_result_usage")
+        } else {
+            None
+        },
+        usage: if is_agent_run_summary {
+            Usage::from_json(record.tool_use_result.as_ref().and_then(|t| t.get("usage")))
+        } else {
+            Usage::default()
+        },
+        parts,
+    })
+}
+
+fn extract_relay_message_from_raw(
+    record: &RawSourceRecord,
+    source_line_no: i64,
+) -> Option<ExtractedMessage> {
+    let data = record.data.as_ref()?;
+    let relay_wrapper = data.pointer("/message")?;
+    let message_wrapper = relay_wrapper.get("message")?;
+    let role = message_role(message_wrapper)?;
+    let external_id = message_external_id(message_wrapper, relay_wrapper, source_line_no)?;
+    let message_kind = match role.as_str() {
+        "assistant" => "relay_assistant_message",
+        "user" if content_is_tool_result_only(message_wrapper.get("content")) => {
+            "relay_user_tool_result"
+        }
+        "user" => "relay_user_prompt",
+        _ => return None,
+    };
+
+    let usage_source = if role == "assistant" && message_wrapper.get("usage").is_some() {
+        Some("relay_usage")
+    } else {
+        None
+    };
+    let usage = if role == "assistant" {
+        Usage::from_json(message_wrapper.get("usage"))
+    } else {
+        Usage::default()
+    };
+    let parts = extract_message_parts(message_wrapper.get("content"), source_line_no).ok()?;
+
+    Some(ExtractedMessage {
+        external_id,
+        source_line_no,
+        role,
+        message_kind,
+        recorded_at_utc: relay_wrapper
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| record.timestamp.clone()),
+        model_name: optional_string(message_wrapper.get("model")),
+        stop_reason: optional_string(message_wrapper.get("stop_reason")),
+        usage_source,
+        usage,
+        parts,
+    })
+}
+
 fn extract_message(record: &Value, source_line_no: i64) -> Option<ExtractedMessage> {
     match record.get("type").and_then(Value::as_str) {
         Some("assistant") => extract_top_level_assistant(record, source_line_no),
@@ -2023,10 +2380,7 @@ fn extract_session_id(record: &Value) -> Option<&str> {
 }
 
 fn file_contains_only_sessionless_metadata(records: &[BufferedRecord]) -> bool {
-    !records.is_empty()
-        && records
-            .iter()
-            .all(|record| is_sessionless_metadata_record(&record.value))
+    !records.is_empty() && records.iter().all(|r| r.is_sessionless_metadata)
 }
 
 fn is_sessionless_metadata_record(record: &Value) -> bool {

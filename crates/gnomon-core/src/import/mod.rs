@@ -186,9 +186,13 @@ pub(in crate::import) struct ParsedFile {
 /// A single parsed JSONL line with pre-extracted metadata.
 pub(in crate::import) struct ParsedRecord {
     pub(in crate::import) source_line_no: i64,
-    pub(in crate::import) value: serde_json::Value,
+    pub(in crate::import) session_id: Option<String>,
     pub(in crate::import) recorded_at_utc: Option<String>,
+    pub(in crate::import) is_sidechain: bool,
+    pub(in crate::import) agent_id: Option<String>,
     pub(in crate::import) extracted_message: Option<normalize::ExtractedMessage>,
+    /// Populated only for `ClaudeHistory` records; `None` for `Transcript`.
+    pub(in crate::import) history_value: Option<serde_json::Value>,
 }
 
 mod chunk;
