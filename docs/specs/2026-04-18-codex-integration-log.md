@@ -55,17 +55,50 @@ Notes:
 - End every future session back on the base branch and update this log before
   handoff.
 
+### 2026-04-19 — `#119` Provider-Aware Source Model
+
+Status: MERGED into `codex-integration`
+
+Summary:
+
+- Created child branch/worktree
+  `codex-integration-provider-aware-source-model` at
+  `.worktrees/codex-integration-provider-aware-source-model` and merged it back
+  into `codex-integration`.
+- Added provider-aware source modeling and runtime config support while keeping
+  Claude import defaults and the legacy Claude `--source-root` override
+  working.
+- Split `source_provider` from `source_kind` in the import/cache schema,
+  updated importer entry points and normalization, and landed migration
+  `0015_provider_aware_sources.sql`.
+- Landed the initial `#121` redacted Codex fixture slice plus regression tests
+  that cover provider-aware scanning/import planning.
+- Updated operator docs to describe `[sources.claude]`, optional
+  `[sources.codex]`, and the required rebuild after this importer schema bump.
+
+Verification:
+
+- `cargo test --workspace`
+
+Notes:
+
+- The original slash-style child branch name from the plan
+  (`codex-integration/provider-aware-source-model`) was not usable because the
+  flat branch `codex-integration` already exists. Future child branches should
+  use the dashed form `codex-integration-...`.
+
 ---
 
 ## RESUME HERE
 
-Phase: Orchestration complete; implementation not started
+Phase: `#119` merged; ready to start `#120`
 Base branch: `codex-integration`
 Base worktree: `/home/ketan/project/gnomon/.worktrees/codex-integration`
-Last completed: Created the long-lived integration branch, worktree, plan, and log
-Next action: Start `#119` by creating child branch `codex-integration/provider-aware-source-model` and worktree `.worktrees/codex-integration-provider-aware-source-model`, then implement the provider-aware source-model and config refactor
-Open issue sequence: `#119`, `#120`, `#121` incremental, `#122`, `#123`, `#124`, `#125`
-In-flight uncommitted state on base branch: none expected after the orchestration commit
+Last completed: Merged `#119` provider-aware source-model/config refactor and the first `#121` Codex fixture/regression slice from `codex-integration-provider-aware-source-model` into the base branch
+Next action: Start `#120` by creating child branch `codex-integration-shared-session-spine` and worktree `.worktrees/codex-integration-shared-session-spine`, then implement explicit shared session identity and remove query paths that parse `conversation.external_id`
+Open issue sequence: `#120`, `#121` incremental, `#122`, `#123`, `#124`, `#125`
+In-flight uncommitted state on base branch: none expected after the merge and log-update commits
+Child-branch naming note: Because the flat branch `codex-integration` exists, `codex-integration/...` refs are invalid here; use dashed child branch names like `codex-integration-shared-session-spine`
 
 ---
 
@@ -84,10 +117,13 @@ Before doing anything else:
 
 Then:
 
-1. Create the child branch and worktree for `#119` from `codex-integration`.
-2. Implement only the provider-aware source-model/config refactor in that child
-   worktree.
-3. Land any relevant `#121` fixture and regression-test slice with the `#119`
+1. Create the child branch and worktree for `#120` from `codex-integration`.
+   Use a dashed branch name such as
+   `codex-integration-shared-session-spine`; do not use
+   `codex-integration/...` because that ref layout conflicts with the existing
+   flat base branch.
+2. Implement only the shared-session-spine refactor in that child worktree.
+3. Land any relevant `#121` fixture and regression-test slice with the `#120`
    work.
 4. Verify the resulting change.
 5. Merge the child branch back into `codex-integration`.
