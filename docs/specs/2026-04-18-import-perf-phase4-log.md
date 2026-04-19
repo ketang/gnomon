@@ -245,18 +245,42 @@ Next implied: A7 (`jwalk` parallel directory walk) — scan_source phase, modera
 
 ---
 
+## 2026-04-19 — candidate A7: `jwalk` parallel directory walk
+
+Branch: import-perf-p4-a7
+Worktree: .worktrees/import-perf-p4-a7
+Hypothesis: `collect_candidate_source_files` uses `walkdir::WalkDir` (serial) to enumerate all
+JSONL files under the source root. `jwalk` parallelizes directory traversal using rayon. On WSL2
+with ext4, directory reads are not OS-cache-warmed between cold runs, so parallel enumeration
+across subdirectories can reduce the scan_source wall time. Expected: 0.2–0.5s reduction on
+full corpus (scan_source is ~2.8s of the 15.1s full run; directory walk is a fraction of that).
+Implementation: Replace `use walkdir::WalkDir` with `use jwalk::WalkDir` in
+`crates/gnomon-core/src/import/source.rs`. Add `jwalk = "0.8"` to workspace Cargo.toml and
+`jwalk.workspace = true` to `crates/gnomon-core/Cargo.toml`. Update `collect_candidate_source_files`
+for jwalk DirEntry API (`path()` returns `PathBuf` not `&Path`).
+Measurements:
+  Subset:       (pending)
+  Full:         (pending)
+  Row parity:   (pending)
+  Profile shift: (pending)
+Decision: PENDING
+Commit:
+Key finding:
+Next implied:
+
+---
+
 ## RESUME HERE
 
 Phase: Phase 4
 Long-lived branch: `import-perf-p4`
 Long-lived worktree: `.worktrees/import-perf-p4`
 Last completed: A2 — REVERTED (LTO-only: 0% gain; LTO+PGO: 5.7% full but not committable)
-Next action: Run A7 (`jwalk` parallel directory walk). Create import-perf-p4-a7 branch + worktree
-  from import-perf-p4, symlink corpus fixtures, implement per plan Section 1, measure.
+Next action: A7 in progress — implement, measure, decide.
 Current best (subset): 5.259s median (−38.0% from 8.487s baseline; A6 original measurement)
 Current best (full): 15.144s median (−20.2% from 18.969s baseline; A6 original measurement)
 Target: 10s full corpus
-In-flight uncommitted state: none
+In-flight uncommitted state: A7 skeleton written; implementation in import-perf-p4-a7
 
 Candidate ranking (live — re-rank after each result):
 1. A7 — `jwalk` parallel directory walk — scan_source reduction (0.2–0.5s), low effort
