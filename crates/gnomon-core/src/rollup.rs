@@ -23,7 +23,8 @@ const INSERT_CHUNK_ACTION_ROLLUPS_SQL: &str = "
         cache_creation_input_tokens,
         cache_read_input_tokens,
         output_tokens,
-        action_count
+        action_count,
+        rtk_saved_tokens
     )
     SELECT
         action.import_chunk_id,
@@ -41,8 +42,10 @@ const INSERT_CHUNK_ACTION_ROLLUPS_SQL: &str = "
         COALESCE(SUM(COALESCE(action.cache_creation_input_tokens, 0)), 0),
         COALESCE(SUM(COALESCE(action.cache_read_input_tokens, 0)), 0),
         COALESCE(SUM(COALESCE(action.output_tokens, 0)), 0),
-        COUNT(*)
+        COUNT(*),
+        COALESCE(SUM(COALESCE(arm.saved_tokens, 0)), 0)
     FROM action
+    LEFT JOIN action_rtk_match arm ON arm.action_id = action.id
     WHERE action.import_chunk_id = ?1
     GROUP BY
         action.import_chunk_id,
