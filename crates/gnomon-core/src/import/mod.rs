@@ -193,6 +193,7 @@ pub(in crate::import) struct ParsedRecord {
 
 mod chunk;
 mod normalize;
+pub(crate) mod rtk;
 
 pub use chunk::{
     ImportExecutionReport, StartupImport, StartupImportMode, StartupOpenReason,
