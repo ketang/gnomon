@@ -173,9 +173,10 @@ npm run build
 `gnomon` now boots a user config file automatically on first run.
 
 - Linux config path: `~/.config/gnomon/config.toml`
-- Default source root: `~/.claude/projects`
-- When the source root follows the default Claude layout, gnomon also imports
-  the sibling `~/.claude/history.jsonl` file automatically
+- Default Claude transcript root: `~/.claude/projects`
+- When the Claude transcript root follows the default Claude layout, gnomon
+  also imports the sibling `~/.claude/history.jsonl` file automatically
+- Codex sources are opt-in and stay disabled until you configure them
 - Default filter: exclude resolved project roots under `/tmp/`
 
 The generated file starts with sensible defaults and comments. The default
@@ -185,8 +186,15 @@ derived dataset unless you opt back in.
 Example:
 
 ```toml
-[source]
-root = "~/.claude/projects"
+[sources.claude]
+transcript_root = "~/.claude/projects"
+
+# Configure Codex locations explicitly when you want Codex sources scanned.
+#
+# [sources.codex]
+# rollout_root = "~/.codex/sessions"
+# history_file = "~/.codex/history.jsonl"
+# session_index_file = "~/.codex/session_index.jsonl"
 
 [project_identity]
 stale_claude_worktree_recovery = true
@@ -245,7 +253,8 @@ cargo run -p gnomon -- db reset --force
 cargo run -p gnomon -- db rebuild
 ```
 
-Both commands honor the existing `--db` and `--source-root` overrides.
+Both commands honor the existing `--db` override and the legacy Claude
+`--source-root` override.
 `reset` is destructive and requires `--force`; it removes both the derived
 usage database and the persisted browse-cache sidecar.
 `rebuild` clears those persisted cache artifacts and recreates the usage
@@ -269,7 +278,10 @@ reflect the new include/exclude policy.
 Apply the same rebuild step after pulling a version that bumps the importer
 schema version. Import-schema bumps mean `gnomon` now consumes a different
 normalized source-field set, so existing cached rows need reimport to match the
-new contract.
+new contract. The provider-aware source catalog refactor is one such change:
+after pulling a build that introduces `[sources.claude]` and `[sources.codex]`,
+run `db rebuild` once so the cache is reimported with provider and source-kind
+metadata.
 
 Common stale-identity symptoms include:
 

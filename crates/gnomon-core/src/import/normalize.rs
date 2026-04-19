@@ -9,7 +9,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
 use super::{
-    NormalizedMessage, NormalizedPart, NormalizedToolUsePartMetadata, SourceFileKind, Usage,
+    NormalizedMessage, NormalizedPart, NormalizedToolUsePartMetadata, SourceDescriptor,
+    SourceFileKind, SourceProvider, Usage,
 };
 use crate::perf::{PerfLogger, PerfScope};
 
@@ -63,9 +64,19 @@ pub fn normalize_jsonl_file(
     conn: &mut Connection,
     params: &NormalizeJsonlFileParams,
 ) -> Result<NormalizeJsonlFileOutcome> {
-    match load_source_file_kind(conn, params.source_file_id)? {
-        Some(SourceFileKind::Transcript) => normalize_transcript_jsonl_file(conn, params),
-        Some(SourceFileKind::ClaudeHistory) => normalize_history_jsonl_file(conn, params),
+    match load_source_descriptor(conn, params.source_file_id)? {
+        Some(SourceDescriptor {
+            provider: SourceProvider::Claude,
+            kind: SourceFileKind::Transcript,
+        }) => normalize_transcript_jsonl_file(conn, params),
+        Some(SourceDescriptor {
+            provider: SourceProvider::Claude,
+            kind: SourceFileKind::History,
+        }) => normalize_history_jsonl_file(conn, params),
+        Some(_) => {
+            purge_existing_import(conn, params)?;
+            Ok(NormalizeJsonlFileOutcome::Skipped)
+        }
         None => Ok(NormalizeJsonlFileOutcome::Warning(NormalizeImportWarning {
             code: WARNING_UNKNOWN_SOURCE_KIND,
             message: format!(
@@ -84,8 +95,11 @@ pub fn normalize_jsonl_file_in_tx(
     conn: &Connection,
     params: &NormalizeJsonlFileParams,
 ) -> Result<(NormalizeJsonlFileOutcome, Vec<NormalizedMessage>)> {
-    match load_source_file_kind(conn, params.source_file_id)? {
-        Some(SourceFileKind::Transcript) => {
+    match load_source_descriptor(conn, params.source_file_id)? {
+        Some(SourceDescriptor {
+            provider: SourceProvider::Claude,
+            kind: SourceFileKind::Transcript,
+        }) => {
             let mut scope = PerfScope::new(params.perf_logger.clone(), "import.normalize_jsonl");
             scope.field("path", params.path.display().to_string());
             let inner = normalize_transcript_jsonl_file_core(conn, params);
@@ -124,7 +138,10 @@ pub fn normalize_jsonl_file_in_tx(
                 }
             }
         }
-        Some(SourceFileKind::ClaudeHistory) => {
+        Some(SourceDescriptor {
+            provider: SourceProvider::Claude,
+            kind: SourceFileKind::History,
+        }) => {
             let mut scope =
                 PerfScope::new(params.perf_logger.clone(), "import.normalize_history_jsonl");
             scope.field("path", params.path.display().to_string());
@@ -146,6 +163,10 @@ pub fn normalize_jsonl_file_in_tx(
                 Err(err) => scope.finish_error(err),
             }
             result.map(|outcome| (outcome, Vec::new()))
+        }
+        Some(_) => {
+            purge_existing_import(conn, params)?;
+            Ok((NormalizeJsonlFileOutcome::Skipped, Vec::new()))
         }
         None => Ok((
             NormalizeJsonlFileOutcome::Warning(NormalizeImportWarning {
@@ -210,7 +231,9 @@ fn parse_jsonl_file_inner(
         let recorded_at_utc = extract_record_timestamp(&value).map(ToOwned::to_owned);
         let extracted_message = match source_kind {
             super::SourceFileKind::Transcript => extract_message(&value, line_no),
-            super::SourceFileKind::ClaudeHistory => None,
+            super::SourceFileKind::History
+            | super::SourceFileKind::Rollout
+            | super::SourceFileKind::SessionIndex => None,
         };
 
         records.push(super::ParsedRecord {
@@ -252,10 +275,13 @@ pub fn write_parsed_file_in_tx(
     conn: &Connection,
     params: &NormalizeJsonlFileParams,
     parsed: super::ParsedFile,
-    source_kind: super::SourceFileKind,
+    descriptor: SourceDescriptor,
 ) -> Result<(NormalizeJsonlFileOutcome, Vec<NormalizedMessage>)> {
-    match source_kind {
-        super::SourceFileKind::Transcript => {
+    match descriptor {
+        SourceDescriptor {
+            provider: SourceProvider::Claude,
+            kind: super::SourceFileKind::Transcript,
+        } => {
             let mut scope = PerfScope::new(params.perf_logger.clone(), "import.normalize_jsonl");
             scope.field("path", params.path.display().to_string());
             let inner = write_parsed_transcript_core(conn, params, parsed);
@@ -294,7 +320,10 @@ pub fn write_parsed_file_in_tx(
                 }
             }
         }
-        super::SourceFileKind::ClaudeHistory => {
+        SourceDescriptor {
+            provider: SourceProvider::Claude,
+            kind: super::SourceFileKind::History,
+        } => {
             let mut scope =
                 PerfScope::new(params.perf_logger.clone(), "import.normalize_history_jsonl");
             scope.field("path", params.path.display().to_string());
@@ -316,6 +345,10 @@ pub fn write_parsed_file_in_tx(
                 Err(err) => scope.finish_error(err),
             }
             result.map(|outcome| (outcome, Vec::new()))
+        }
+        _ => {
+            purge_existing_import(conn, params)?;
+            Ok((NormalizeJsonlFileOutcome::Skipped, Vec::new()))
         }
     }
 }
@@ -455,17 +488,28 @@ fn write_parsed_history_core(
     ))
 }
 
-fn load_source_file_kind(conn: &Connection, source_file_id: i64) -> Result<Option<SourceFileKind>> {
-    let raw_kind: Option<String> = conn
+fn load_source_descriptor(
+    conn: &Connection,
+    source_file_id: i64,
+) -> Result<Option<SourceDescriptor>> {
+    let descriptor: Option<(String, String)> = conn
         .query_row(
-            "SELECT source_kind FROM source_file WHERE id = ?1",
+            "SELECT source_provider, source_kind FROM source_file WHERE id = ?1",
             [source_file_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
-        .context("unable to load source file kind for normalization")?;
+        .context("unable to load source descriptor for normalization")?;
 
-    Ok(raw_kind.as_deref().and_then(SourceFileKind::from_db_value))
+    descriptor
+        .map(|(provider, kind)| {
+            let provider = SourceProvider::from_db_value(&provider)
+                .with_context(|| format!("unknown source provider `{provider}`"))?;
+            let kind = SourceFileKind::from_db_value(&kind)
+                .with_context(|| format!("unknown source kind `{kind}`"))?;
+            Ok(SourceDescriptor::new(provider, kind))
+        })
+        .transpose()
 }
 
 fn normalize_transcript_jsonl_file(
@@ -2373,6 +2417,7 @@ mod tests {
                 id INTEGER PRIMARY KEY,
                 project_id INTEGER NOT NULL,
                 relative_path TEXT NOT NULL,
+                source_provider TEXT NOT NULL,
                 source_kind TEXT NOT NULL
             );
 
@@ -2453,8 +2498,8 @@ mod tests {
         )?;
         conn.execute(
             "
-            INSERT INTO source_file (id, project_id, relative_path, source_kind)
-            VALUES (1, 1, 'session.jsonl', 'transcript')
+            INSERT INTO source_file (id, project_id, relative_path, source_provider, source_kind)
+            VALUES (1, 1, 'session.jsonl', 'claude', 'transcript')
             ",
             [],
         )?;
@@ -2660,7 +2705,7 @@ mod tests {
         let ids = seed_import_context_with_kind(
             db.connection_mut(),
             "history.jsonl",
-            SourceFileKind::ClaudeHistory,
+            SourceFileKind::History,
         )?;
         let result = normalize_jsonl_file(
             db.connection_mut(),
@@ -2767,8 +2812,8 @@ mod tests {
 
         let source_file_id = conn.query_row(
             "
-            INSERT INTO source_file (project_id, relative_path, source_kind, size_bytes)
-            VALUES (?1, ?2, ?3, 0)
+            INSERT INTO source_file (project_id, relative_path, source_provider, source_kind, size_bytes)
+            VALUES (?1, ?2, 'claude', ?3, 0)
             RETURNING id
             ",
             params![project_id, relative_path, source_kind.as_str()],
@@ -2800,8 +2845,8 @@ mod tests {
     ) -> Result<SeededIds> {
         let source_file_id = conn.query_row(
             "
-            INSERT INTO source_file (project_id, relative_path, source_kind, size_bytes)
-            VALUES (?1, ?2, 'transcript', 0)
+            INSERT INTO source_file (project_id, relative_path, source_provider, source_kind, size_bytes)
+            VALUES (?1, ?2, 'claude', 'transcript', 0)
             RETURNING id
             ",
             params![project_id, relative_path],

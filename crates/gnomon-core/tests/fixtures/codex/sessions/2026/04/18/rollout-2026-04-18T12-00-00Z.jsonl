@@ -1,0 +1,9 @@
+{"type":"session_meta","session_id":"codex-session-1","cli_version":"0.0.0-test","cwd":"/tmp/redacted/project-a","model":"gpt-5.4-codex"}
+{"type":"turn_context","turn_id":"turn-1","cwd":"/tmp/redacted/project-a"}
+{"type":"user_message","id":"user-1","text":"Investigate the failing test"}
+{"type":"agent_message","id":"assistant-1","text":"Inspecting the workspace"}
+{"type":"reasoning","summary":"Check the failing command output first"}
+{"type":"function_call","id":"call-1","name":"shell","arguments":{"command":"cargo test"}}
+{"type":"function_call_output","call_id":"call-1","output":"test parser::fails_on_empty_input ... FAILED"}
+{"type":"token_count","input_tokens":123,"output_tokens":45}
+{"type":"task_state","state":"completed"}

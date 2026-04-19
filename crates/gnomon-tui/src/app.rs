@@ -7027,6 +7027,7 @@ mod tests {
     };
     use gnomon_core::perf::PerfLogger;
     use gnomon_core::query::{ClassificationState, QueryEngine, SnapshotBounds};
+    use gnomon_core::sources::ConfiguredSources;
     use gnomon_core::validation::{ScaleValidationSpec, run_scale_validation};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -8328,6 +8329,7 @@ mod tests {
                 config_path: temp.path().join("config.toml"),
                 db_path: validation.db_path.clone(),
                 source_root: validation.source_root.clone(),
+                sources: ConfiguredSources::legacy_claude(&validation.source_root),
                 project_identity: Default::default(),
                 project_filters: Vec::new(),
             },
@@ -8449,6 +8451,7 @@ mod tests {
                 config_path: temp.path().join("config.toml"),
                 db_path: validation.db_path.clone(),
                 source_root: validation.source_root.clone(),
+                sources: ConfiguredSources::legacy_claude(&validation.source_root),
                 project_identity: Default::default(),
                 project_filters: Vec::new(),
             },
@@ -9052,12 +9055,14 @@ mod tests {
     }
 
     fn make_test_config(dir: &std::path::Path) -> RuntimeConfig {
+        let source_root = dir.join("source");
         RuntimeConfig {
             app_name: "gnomon",
             state_dir: dir.to_path_buf(),
             config_path: dir.join("config.toml"),
             db_path: dir.join("test.sqlite3"),
-            source_root: dir.join("source"),
+            source_root: source_root.clone(),
+            sources: ConfiguredSources::legacy_claude(&source_root),
             project_identity: Default::default(),
             project_filters: Vec::new(),
         }
