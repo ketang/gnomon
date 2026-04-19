@@ -100,18 +100,25 @@ causing checkpoint stalls while 35 concurrent import connections are active. Dis
 `PRAGMA wal_checkpoint(TRUNCATE)` consolidates the WAL. This eliminates mid-import checkpoint
 contention and avoids WAL reader-writer conflicts. Tested previously only as part of the E-bundle
 (which regressed overall because of EXCLUSIVE mode, not this pragma); this isolates A5 individually.
-Implementation: Add `PRAGMA wal_autocheckpoint = 0;` to `configure_import_connection` in
-`crates/gnomon-core/src/db/mod.rs`. Add `PRAGMA wal_checkpoint(TRUNCATE);` call after all
-chunks complete — in `finalize_chunk_import_core` or the post-import hook in `import/chunk.rs`.
+Implementation: Added `PRAGMA wal_autocheckpoint = 0;` to `configure_import_connection` in
+`crates/gnomon-core/src/db/mod.rs`. Added `PRAGMA wal_checkpoint(TRUNCATE);` call via
+`database.connection().execute_batch(...)` in `import_all_with_perf_logger` after all deferred
+chunks complete, instrumented with a `PerfScope`. Used `options.perf_logger.clone()` since
+`perf_logger` was already moved into `ImportWorkerOptions`.
 Measurements:
-  Subset:       *(pending)*
-  Full:         *(pending)*
-  Row parity:   *(pending)*
-  Profile shift: *(pending)*
-Decision: PENDING
+  Subset:       6.543s → 10.967s median (+67.6%); runs: 11.922, 10.967, 12.372, 9.656, 8.276
+  Full:         not measured — subset regression conclusive
+  Row parity:   not checked — reverted before parity run
+  Profile shift: N/A — regression, not improvement
+Decision: REVERTED
 Commit:
-Key finding: *(pending)*
-Next implied: *(pending)*
+Key finding: WAL autocheckpointing during import is not the bottleneck — it helps by keeping the
+WAL small and distributing checkpoint I/O across 35 chunks. Disabling it causes the WAL to grow
+to ~full-DB size (~150MB) across all 35 chunks, then a single TRUNCATE checkpoint must write the
+entire WAL back to the database file in one shot. This serialized I/O at the end is significantly
+more expensive than the distributed autocheckpoints. The E-bundle regression was driven by EXCLUSIVE
+mode (A4), not this pragma. This pragma alone makes things worse.
+Next implied: A1 (SQLite page size 8K/16K) — never measured, low risk, moderate expected gain.
 
 ---
 
@@ -120,21 +127,23 @@ Next implied: *(pending)*
 Phase: Phase 4
 Long-lived branch: `import-perf-p4`
 Long-lived worktree: `.worktrees/import-perf-p4`
-Last completed: A4 — REVERTED (catastrophic deadlock — all chunks failed)
-Next action: Run candidate A5: PRAGMA wal_autocheckpoint = 0 + manual checkpoint at import end.
+Last completed: A5 — REVERTED (wal_autocheckpoint=0 regressed +67.6% on subset — single large checkpoint slower than distributed autocheckpoints)
+Next action: Run candidate A1: SQLite page size 8K or 16K.
+  Set PRAGMA page_size = 8192 (or 16384) before migrations in configure_read_write_connection.
+  The bench harness creates a fresh DB per run so no reset needed.
+  Measure subset and full corpus. If 8K improves, optionally test 16K.
 Current best (subset): 6.543s median (−22.9% from 8.487s baseline)
 Current best (full): 17.982s median (−5.2% from 18.969s baseline)
 Target: 10s full corpus
 In-flight uncommitted state: none
 
 Candidate ranking (live — re-rank after each result):
-1. A5 — `PRAGMA wal_autocheckpoint = 0` + manual checkpoint — decompose E-bundle; single connection OK
-2. A1 — SQLite page size 8K/16K — never measured, low risk
-3. B1 — `:memory:` staging DB → `VACUUM INTO` — biggest potential single-candidate win
-4. A6 — Struct-based serde (replace `serde_json::Value`) — parse phase reduction
-5. A2 — LTO + PGO — free binary-level gain
-6. A7 — `jwalk` parallel directory walk — scan_source reduction
-7. A8 — path_node chunk-level cache (across files in chunk) — classify phase reduction
-8. B2 — Parallel per-chunk `:memory:` DBs + merge (requires B1 KEPT first)
-9. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker
-NOTE: A4 (EXCLUSIVE locking mode) removed from ranking — incompatible with multi-connection import architecture.
+1. A1 — SQLite page size 8K/16K — never measured, low risk, potentially 1–3s gain
+2. B1 — `:memory:` staging DB → `VACUUM INTO` — biggest potential single-candidate win
+3. A6 — Struct-based serde (replace `serde_json::Value`) — parse phase reduction
+4. A2 — LTO + PGO — free binary-level gain
+5. A7 — `jwalk` parallel directory walk — scan_source reduction
+6. A8 — path_node chunk-level cache (across files in chunk) — classify phase reduction
+7. B2 — Parallel per-chunk `:memory:` DBs + merge (requires B1 KEPT first)
+8. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker
+NOTE: A4 (EXCLUSIVE locking) and A5 (wal_autocheckpoint=0) both removed — confirmed counterproductive with multi-connection import architecture.
