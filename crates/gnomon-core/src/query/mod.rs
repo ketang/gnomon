@@ -1,16 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use jiff::{Timestamp, ToSpan};
-use rusqlite::types::Value;
+use rusqlite::types::{Type, Value};
 use rusqlite::{Connection, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
 use crate::opportunity::OpportunitySummary;
 use crate::opportunity::history_drag::{self, HistoryDragTurn};
 use crate::perf::{PerfLogger, PerfScope};
+use crate::sources::SourceProvider;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotBounds {
@@ -67,6 +69,7 @@ pub struct TimeWindowFilter {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BrowseFilters {
     pub time_window: Option<TimeWindowFilter>,
+    pub provider: Option<SourceProvider>,
     pub model: Option<String>,
     pub project_id: Option<i64>,
     pub action_category: Option<String>,
@@ -371,6 +374,8 @@ pub struct RollupRow {
     pub opportunities: OpportunitySummary,
     #[serde(default)]
     pub skill_attribution: Option<SkillAttributionSummary>,
+    #[serde(default)]
+    pub provider_scope: ProviderScope,
     pub project_id: Option<i64>,
     pub project_identity: Option<ProjectIdentity>,
     pub category: Option<String>,
@@ -400,9 +405,36 @@ pub struct ActionFilterOption {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilterOptions {
     pub projects: Vec<ProjectFilterOption>,
+    pub providers: Vec<SourceProvider>,
     pub models: Vec<String>,
     pub categories: Vec<String>,
     pub actions: Vec<ActionFilterOption>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderScope {
+    Claude,
+    Codex,
+    #[default]
+    Mixed,
+}
+
+impl ProviderScope {
+    pub const fn from_provider(provider: SourceProvider) -> Self {
+        match provider {
+            SourceProvider::Claude => Self::Claude,
+            SourceProvider::Codex => Self::Codex,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Mixed => "mixed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,6 +463,7 @@ pub struct OpportunitiesReport {
 pub struct OpportunitiesReportRow {
     pub key: String,
     pub label: String,
+    pub provider_scope: ProviderScope,
     pub project_id: i64,
     pub project_name: String,
     pub conversation_id: i64,
@@ -442,10 +475,16 @@ pub struct OpportunitiesReportRow {
 
 #[derive(Debug, Clone, Default)]
 pub struct OpportunitiesFilters {
+    pub provider: Option<SourceProvider>,
     pub project_id: Option<i64>,
     pub start_at_utc: Option<String>,
     pub end_at_utc: Option<String>,
     pub include_empty: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SkillsFilters {
+    pub provider: Option<SourceProvider>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -500,6 +539,7 @@ pub struct SkillConfidenceCounts {
 pub struct SkillInvocationRow {
     pub skill_name: String,
     pub session_id: String,
+    pub provider_scope: ProviderScope,
     pub recorded_at_utc: Option<String>,
     pub raw_project: Option<String>,
     pub conversation_id: Option<i64>,
@@ -561,6 +601,7 @@ pub struct SkillsReportRow {
     pub kind: SkillsRowKind,
     pub key: String,
     pub label: String,
+    pub provider_scope: ProviderScope,
     pub skill_name: String,
     pub project_id: Option<i64>,
     pub project_name: Option<String>,
@@ -587,6 +628,7 @@ struct SkillSessionAssociation {
     skill_name: String,
     session_id: String,
     invocation_count: u64,
+    provider_scope: ProviderScope,
     conversation_id: Option<i64>,
     project_id: Option<i64>,
     project_name: Option<String>,
@@ -602,6 +644,7 @@ struct SkillSessionAssociation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LoadedSkillTranscriptPart {
     session_id: String,
+    provider: SourceProvider,
     conversation_id: i64,
     project_id: i64,
     project_name: String,
@@ -615,6 +658,7 @@ struct LoadedSkillTranscriptPart {
 struct SkillTranscriptEvidence {
     session_id: String,
     skill_name: String,
+    provider: SourceProvider,
     kind: SkillTranscriptEvidenceKind,
     recorded_at_utc: Option<String>,
     conversation_id: i64,
@@ -626,6 +670,7 @@ struct SkillTranscriptEvidence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AggregatedSkillInvocation {
     invocation_count: u64,
+    provider_scope: ProviderScope,
     conversation_id: Option<i64>,
     project_id: Option<i64>,
     project_name: Option<String>,
@@ -637,6 +682,7 @@ struct AggregatedSkillInvocation {
 const CONVERSATION_TURNS_SQL: &str = "
     SELECT
         c.id AS conversation_id,
+        sf.source_provider,
         c.project_id,
         p.display_name AS project_name,
         c.title,
@@ -646,6 +692,7 @@ const CONVERSATION_TURNS_SQL: &str = "
         COALESCE(t.output_tokens, 0) AS output_tokens
     FROM turn t
     JOIN conversation c ON c.id = t.conversation_id
+    JOIN source_file sf ON sf.id = c.source_file_id
     JOIN project p ON p.id = c.project_id
     JOIN import_chunk ic ON ic.id = t.import_chunk_id
     WHERE ic.state = 'complete'
@@ -696,6 +743,7 @@ const LOAD_RECENT_ACTION_FACTS_SQL: &str = "
         p.git_root_path,
         p.git_origin,
         p.identity_reason,
+        sf.source_provider,
         a.category,
         a.normalized_action,
         a.command_family,
@@ -709,6 +757,9 @@ const LOAD_RECENT_ACTION_FACTS_SQL: &str = "
     FROM action a
     JOIN import_chunk ic ON ic.id = a.import_chunk_id
     JOIN project p ON p.id = ic.project_id
+    JOIN turn t ON t.id = a.turn_id
+    JOIN conversation c ON c.id = t.conversation_id
+    JOIN source_file sf ON sf.id = c.source_file_id
     WHERE ic.state = 'complete'
       AND ic.publish_seq IS NOT NULL
       AND ic.publish_seq <= ?1
@@ -748,6 +799,18 @@ const FILTER_OPTIONS_MODELS_SQL: &str = "
       AND ic.publish_seq <= ?1
       AND m.model_name IS NOT NULL
     ORDER BY m.model_name
+";
+
+const FILTER_OPTIONS_PROVIDERS_SQL: &str = "
+    SELECT DISTINCT sf.source_provider
+    FROM conversation c
+    JOIN source_file sf ON sf.id = c.source_file_id
+    JOIN stream s ON s.conversation_id = c.id
+    JOIN import_chunk ic ON ic.id = s.import_chunk_id
+    WHERE ic.state = 'complete'
+      AND ic.publish_seq IS NOT NULL
+      AND ic.publish_seq <= ?1
+    ORDER BY sf.source_provider
 ";
 
 impl<'conn> QueryEngine<'conn> {
@@ -848,6 +911,7 @@ impl<'conn> QueryEngine<'conn> {
         let mut categories = BTreeSet::new();
         let mut actions = BTreeMap::new();
         let mut models = Vec::new();
+        let mut providers = Vec::new();
 
         let rollup_load_started = Instant::now();
         if snapshot.max_publish_seq > 0 {
@@ -902,6 +966,19 @@ impl<'conn> QueryEngine<'conn> {
             for row in model_rows {
                 models.push(row.context("unable to read filter option model row")?);
             }
+
+            let mut provider_stmt = self
+                .conn
+                .prepare(FILTER_OPTIONS_PROVIDERS_SQL)
+                .context("unable to prepare filter option provider query")?;
+            let provider_rows =
+                provider_stmt.query_map([max_publish_seq], |row| row.get::<_, String>(0))?;
+            for row in provider_rows {
+                let provider = row.context("unable to read filter option provider row")?;
+                if let Some(provider) = SourceProvider::from_db_value(&provider) {
+                    providers.push(provider);
+                }
+            }
         }
         perf.field(
             "rollup_load_ms",
@@ -913,6 +990,7 @@ impl<'conn> QueryEngine<'conn> {
                 .into_iter()
                 .map(|(id, display_name)| ProjectFilterOption { id, display_name })
                 .collect(),
+            providers,
             models,
             categories: categories.into_iter().collect(),
             actions: actions
@@ -926,6 +1004,7 @@ impl<'conn> QueryEngine<'conn> {
         };
         perf.field("build_ms", build_started.elapsed().as_secs_f64() * 1000.0);
         perf.field("project_count", options.projects.len());
+        perf.field("provider_count", options.providers.len());
         perf.field("model_count", options.models.len());
         perf.field("category_count", options.categories.len());
         perf.field("action_count", options.actions.len());
@@ -1155,6 +1234,13 @@ impl<'conn> QueryEngine<'conn> {
             sql.push_str(&format!(" AND c.project_id = ?{}", param_values.len() + 1));
             param_values.push(Value::Integer(project_id));
         }
+        if let Some(provider) = filters.provider {
+            sql.push_str(&format!(
+                " AND sf.source_provider = ?{}",
+                param_values.len() + 1
+            ));
+            param_values.push(Value::Text(provider.as_str().to_string()));
+        }
         if let Some(ref start) = filters.start_at_utc {
             sql.push_str(&format!(
                 " AND datetime(COALESCE(t.ended_at_utc, t.started_at_utc)) >= datetime(?{})",
@@ -1179,13 +1265,14 @@ impl<'conn> QueryEngine<'conn> {
             .query_map(params_from_iter(param_values.iter()), |row| {
                 Ok(ConversationTurnRow {
                     conversation_id: row.get(0)?,
-                    project_id: row.get(1)?,
-                    project_name: row.get(2)?,
-                    conversation_title: row.get(3)?,
-                    _sequence_no: row.get(4)?,
-                    uncached_input: row.get(5)?,
-                    cached_input: row.get(6)?,
-                    output_tokens: row.get(7)?,
+                    provider: source_provider_from_row_value(row.get(1)?)?,
+                    project_id: row.get(2)?,
+                    project_name: row.get(3)?,
+                    conversation_title: row.get(4)?,
+                    _sequence_no: row.get(5)?,
+                    uncached_input: row.get(6)?,
+                    cached_input: row.get(7)?,
+                    output_tokens: row.get(8)?,
                 })
             })
             .context("failed to query conversation turns")?
@@ -1287,8 +1374,8 @@ impl<'conn> QueryEngine<'conn> {
             return Ok(Vec::new());
         }
 
-        let explicit_rows = self.load_explicit_skill_invocations(snapshot)?;
-        let transcript_evidence = self.load_skill_transcript_evidence(snapshot)?;
+        let explicit_rows = self.load_explicit_skill_invocations(snapshot, None)?;
+        let transcript_evidence = self.load_skill_transcript_evidence(snapshot, None)?;
         let mut evidence_by_skill_session =
             HashMap::<(String, String), Vec<SkillTranscriptEvidence>>::new();
         for evidence in transcript_evidence {
@@ -1344,6 +1431,7 @@ impl<'conn> QueryEngine<'conn> {
         &self,
         snapshot: &SnapshotBounds,
         path: SkillsPath,
+        filters: &SkillsFilters,
     ) -> Result<SkillsReport> {
         let mut perf = self.perf_scope("query.skills_report");
         if snapshot.max_publish_seq == 0 {
@@ -1359,7 +1447,7 @@ impl<'conn> QueryEngine<'conn> {
             });
         }
 
-        let associations = self.load_skill_session_associations(snapshot)?;
+        let associations = self.load_skill_session_associations(snapshot, filters)?;
         let unmatched_invocation_count = associations
             .iter()
             .filter(|row| row.conversation_id.is_none())
@@ -1472,6 +1560,7 @@ impl<'conn> QueryEngine<'conn> {
     fn load_skill_session_associations(
         &self,
         snapshot: &SnapshotBounds,
+        filters: &SkillsFilters,
     ) -> Result<Vec<SkillSessionAssociation>> {
         let max_publish_seq = i64::try_from(snapshot.max_publish_seq)
             .context("snapshot publish_seq overflowed i64")?;
@@ -1479,6 +1568,7 @@ impl<'conn> QueryEngine<'conn> {
             WITH conversation_sessions AS (
                 SELECT DISTINCT
                     c.id,
+                    sf.source_provider,
                     c.project_id,
                     p.display_name,
                     c.title,
@@ -1497,6 +1587,7 @@ impl<'conn> QueryEngine<'conn> {
                   AND cic.publish_seq IS NOT NULL
                   AND cic.publish_seq <= ?1
                   AND c.shared_session_id IS NOT NULL
+                  AND (?2 IS NULL OR sf.source_provider = ?2)
             ),
             conversation_metrics AS (
                 SELECT
@@ -1537,21 +1628,26 @@ impl<'conn> QueryEngine<'conn> {
             ),
             skill_sessions AS (
                 SELECT
+                    sfi.source_provider,
                     si.skill_name,
                     si.session_id,
                     COUNT(*) AS invocation_count
                 FROM skill_invocation si
+                JOIN source_file sfi
+                    ON sfi.id = si.source_file_id
                 JOIN import_chunk sic
                     ON sic.id = si.import_chunk_id
                 WHERE sic.state = 'complete'
                   AND sic.publish_seq IS NOT NULL
                   AND sic.publish_seq <= ?1
-                GROUP BY si.skill_name, si.session_id
+                  AND (?2 IS NULL OR sfi.source_provider = ?2)
+                GROUP BY sfi.source_provider, si.skill_name, si.session_id
             )
             SELECT
                 ss.skill_name,
                 ss.session_id,
                 ss.invocation_count,
+                ss.source_provider,
                 cs.id,
                 cs.project_id,
                 cs.display_name,
@@ -1567,34 +1663,46 @@ impl<'conn> QueryEngine<'conn> {
             FROM skill_sessions ss
             LEFT JOIN conversation_sessions cs
                 ON cs.session_id = ss.session_id
+               AND cs.source_provider = ss.source_provider
             LEFT JOIN conversation_metrics cm
                 ON cm.conversation_id = cs.id
             LEFT JOIN attributed_actions aa
                 ON aa.session_id = ss.session_id
                AND aa.skill_name = ss.skill_name
             ORDER BY ss.skill_name, cs.project_id, ss.session_id
-        ";
+        "
+        .to_string();
+
+        let params = vec![
+            Value::Integer(max_publish_seq),
+            filters.provider.map_or(Value::Null, |provider| {
+                Value::Text(provider.as_str().to_string())
+            }),
+        ];
 
         let mut stmt = self
             .conn
-            .prepare(sql)
+            .prepare(&sql)
             .context("unable to prepare skills report query")?;
         let rows = stmt
-            .query_map([max_publish_seq], |row| {
-                let uncached_input = row.get::<_, Option<f64>>(7)?;
-                let cached_input = row.get::<_, Option<f64>>(8)?;
-                let output = row.get::<_, Option<f64>>(9)?;
-                let attributed_uncached_input = row.get::<_, f64>(11)?;
-                let attributed_cached_input = row.get::<_, f64>(12)?;
-                let attributed_output = row.get::<_, f64>(13)?;
+            .query_map(params_from_iter(params.iter()), |row| {
+                let uncached_input = row.get::<_, Option<f64>>(8)?;
+                let cached_input = row.get::<_, Option<f64>>(9)?;
+                let output = row.get::<_, Option<f64>>(10)?;
+                let attributed_uncached_input = row.get::<_, f64>(12)?;
+                let attributed_cached_input = row.get::<_, f64>(13)?;
+                let attributed_output = row.get::<_, f64>(14)?;
                 Ok(SkillSessionAssociation {
                     skill_name: row.get(0)?,
                     session_id: row.get(1)?,
                     invocation_count: row.get::<_, i64>(2)? as u64,
-                    conversation_id: row.get(3)?,
-                    project_id: row.get(4)?,
-                    project_name: row.get(5)?,
-                    conversation_title: row.get(6)?,
+                    provider_scope: ProviderScope::from_provider(source_provider_from_row_value(
+                        row.get(3)?,
+                    )?),
+                    conversation_id: row.get(4)?,
+                    project_id: row.get(5)?,
+                    project_name: row.get(6)?,
+                    conversation_title: row.get(7)?,
                     confidence_counts: SkillConfidenceCounts::default(),
                     transcript_evidence_count: 0,
                     metrics: uncached_input.map(|uncached_input| {
@@ -1608,7 +1716,7 @@ impl<'conn> QueryEngine<'conn> {
                             total: uncached_input + cached_input + output,
                         }
                     }),
-                    attributed_action_count: row.get::<_, i64>(10)? as u64,
+                    attributed_action_count: row.get::<_, i64>(11)? as u64,
                     attributed_metrics: MetricTotals {
                         uncached_input: attributed_uncached_input,
                         cached_input: attributed_cached_input,
@@ -1619,7 +1727,7 @@ impl<'conn> QueryEngine<'conn> {
                             + attributed_output,
                     },
                     top_attribution_confidence: row
-                        .get::<_, Option<String>>(14)?
+                        .get::<_, Option<String>>(15)?
                         .as_deref()
                         .and_then(SkillAttributionConfidence::from_db_value),
                 })
@@ -1630,14 +1738,42 @@ impl<'conn> QueryEngine<'conn> {
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("unable to read skills report rows")?;
         let metrics_by_conversation = self.load_conversation_metrics(snapshot)?;
-        let invocation_rows =
-            self.skill_invocations(snapshot, &SkillInvocationFilters::default())?;
+        let explicit_rows = self.load_explicit_skill_invocations(snapshot, filters.provider)?;
+        let transcript_evidence =
+            self.load_skill_transcript_evidence(snapshot, filters.provider)?;
+        let mut evidence_by_skill_session =
+            HashMap::<(String, String), Vec<SkillTranscriptEvidence>>::new();
+        for evidence in transcript_evidence {
+            evidence_by_skill_session
+                .entry((evidence.skill_name.clone(), evidence.session_id.clone()))
+                .or_default()
+                .push(evidence);
+        }
+        let mut invocation_rows = Vec::new();
+        let mut seen_pairs = HashSet::<(String, String)>::new();
+        for explicit in explicit_rows {
+            let evidence = evidence_by_skill_session
+                .get(&(explicit.skill_name.clone(), explicit.session_id.clone()))
+                .cloned()
+                .unwrap_or_default();
+            seen_pairs.insert((explicit.skill_name.clone(), explicit.session_id.clone()));
+            invocation_rows.push(skill_invocation_row_from_explicit(explicit, &evidence));
+        }
+        for ((skill_name, session_id), evidence) in evidence_by_skill_session {
+            if seen_pairs.contains(&(skill_name.clone(), session_id.clone())) {
+                continue;
+            }
+            invocation_rows.push(skill_invocation_row_from_inferred(
+                skill_name, session_id, &evidence,
+            ));
+        }
         let mut aggregated = BTreeMap::<(String, String), AggregatedSkillInvocation>::new();
         for row in invocation_rows {
             let entry = aggregated
                 .entry((row.skill_name.clone(), row.session_id.clone()))
                 .or_insert_with(|| AggregatedSkillInvocation {
                     invocation_count: 0,
+                    provider_scope: row.provider_scope,
                     conversation_id: row.conversation_id,
                     project_id: row.project_id,
                     project_name: row.project_name.clone(),
@@ -1646,6 +1782,7 @@ impl<'conn> QueryEngine<'conn> {
                     transcript_evidence_count: 0,
                 });
             entry.invocation_count += 1;
+            entry.provider_scope = merge_provider_scopes(entry.provider_scope, row.provider_scope);
             entry.conversation_id = entry.conversation_id.or(row.conversation_id);
             entry.project_id = entry.project_id.or(row.project_id);
             entry.project_name = entry.project_name.clone().or(row.project_name.clone());
@@ -1677,6 +1814,7 @@ impl<'conn> QueryEngine<'conn> {
                     skill_name,
                     session_id,
                     invocation_count: 0,
+                    provider_scope: aggregate.provider_scope,
                     conversation_id: aggregate.conversation_id,
                     project_id: aggregate.project_id,
                     project_name: aggregate.project_name.clone(),
@@ -1692,6 +1830,8 @@ impl<'conn> QueryEngine<'conn> {
                     top_attribution_confidence: None,
                 });
             entry.invocation_count = aggregate.invocation_count;
+            entry.provider_scope =
+                merge_provider_scopes(entry.provider_scope, aggregate.provider_scope);
             entry.conversation_id = entry.conversation_id.or(aggregate.conversation_id);
             entry.project_id = entry.project_id.or(aggregate.project_id);
             entry.project_name = entry
@@ -1718,6 +1858,7 @@ impl<'conn> QueryEngine<'conn> {
     fn load_explicit_skill_invocations(
         &self,
         snapshot: &SnapshotBounds,
+        provider: Option<SourceProvider>,
     ) -> Result<Vec<SkillInvocationRow>> {
         let max_publish_seq = i64::try_from(snapshot.max_publish_seq)
             .context("snapshot publish_seq overflowed i64")?;
@@ -1725,6 +1866,7 @@ impl<'conn> QueryEngine<'conn> {
             SELECT
                 si.skill_name,
                 si.session_id,
+                sfi.source_provider,
                 si.recorded_at_utc,
                 si.raw_project,
                 c.id,
@@ -1732,6 +1874,7 @@ impl<'conn> QueryEngine<'conn> {
                 c.display_name,
                 c.title
             FROM skill_invocation si
+            JOIN source_file sfi ON sfi.id = si.source_file_id
             JOIN import_chunk sic ON sic.id = si.import_chunk_id
             LEFT JOIN (
                 SELECT DISTINCT
@@ -1754,11 +1897,13 @@ impl<'conn> QueryEngine<'conn> {
                   AND cic.publish_seq IS NOT NULL
                   AND cic.publish_seq <= ?1
                   AND c.shared_session_id IS NOT NULL
+                  AND (?2 IS NULL OR sf.source_provider = ?2)
             ) c
                 ON c.session_id = si.session_id
             WHERE sic.state = 'complete'
               AND sic.publish_seq IS NOT NULL
               AND sic.publish_seq <= ?1
+              AND (?2 IS NULL OR sfi.source_provider = ?2)
             ORDER BY si.skill_name, si.session_id, si.recorded_at_utc, c.id
         ";
 
@@ -1767,21 +1912,30 @@ impl<'conn> QueryEngine<'conn> {
             .prepare(sql)
             .context("unable to prepare explicit skill invocation query")?;
         let rows = stmt
-            .query_map([max_publish_seq], |row| {
-                Ok(SkillInvocationRow {
-                    skill_name: row.get(0)?,
-                    session_id: row.get(1)?,
-                    recorded_at_utc: row.get(2)?,
-                    raw_project: row.get(3)?,
-                    conversation_id: row.get(4)?,
-                    project_id: row.get(5)?,
-                    project_name: row.get(6)?,
-                    conversation_title: row.get(7)?,
-                    confidence: SkillInvocationConfidence::Explicit,
-                    transcript_evidence_kinds: Vec::new(),
-                    transcript_evidence_count: 0,
-                })
-            })
+            .query_map(
+                params![
+                    max_publish_seq,
+                    provider.map(|value| value.as_str().to_string())
+                ],
+                |row| {
+                    Ok(SkillInvocationRow {
+                        skill_name: row.get(0)?,
+                        session_id: row.get(1)?,
+                        provider_scope: ProviderScope::from_provider(
+                            source_provider_from_row_value(row.get(2)?)?,
+                        ),
+                        recorded_at_utc: row.get(3)?,
+                        raw_project: row.get(4)?,
+                        conversation_id: row.get(5)?,
+                        project_id: row.get(6)?,
+                        project_name: row.get(7)?,
+                        conversation_title: row.get(8)?,
+                        confidence: SkillInvocationConfidence::Explicit,
+                        transcript_evidence_kinds: Vec::new(),
+                        transcript_evidence_count: 0,
+                    })
+                },
+            )
             .context("unable to execute explicit skill invocation query")?;
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1791,12 +1945,14 @@ impl<'conn> QueryEngine<'conn> {
     fn load_skill_transcript_evidence(
         &self,
         snapshot: &SnapshotBounds,
+        provider: Option<SourceProvider>,
     ) -> Result<Vec<SkillTranscriptEvidence>> {
         let max_publish_seq = i64::try_from(snapshot.max_publish_seq)
             .context("snapshot publish_seq overflowed i64")?;
         let sql = "
             SELECT
                 c.shared_session_id AS session_id,
+                sf.source_provider,
                 c.id,
                 c.project_id,
                 p.display_name,
@@ -1820,6 +1976,7 @@ impl<'conn> QueryEngine<'conn> {
             JOIN project p
                 ON p.id = c.project_id
             WHERE c.shared_session_id IS NOT NULL
+              AND (?2 IS NULL OR sf.source_provider = ?2)
               AND (
                   mp.text_value IS NOT NULL
                   OR mp.metadata_json IS NOT NULL
@@ -1831,18 +1988,25 @@ impl<'conn> QueryEngine<'conn> {
             .prepare(sql)
             .context("unable to prepare transcript skill evidence query")?;
         let rows = stmt
-            .query_map([max_publish_seq], |row| {
-                Ok(LoadedSkillTranscriptPart {
-                    session_id: row.get(0)?,
-                    conversation_id: row.get(1)?,
-                    project_id: row.get(2)?,
-                    project_name: row.get(3)?,
-                    conversation_title: row.get(4)?,
-                    recorded_at_utc: row.get(5)?,
-                    text_value: row.get(6)?,
-                    metadata_json: row.get(7)?,
-                })
-            })
+            .query_map(
+                params![
+                    max_publish_seq,
+                    provider.map(|value| value.as_str().to_string())
+                ],
+                |row| {
+                    Ok(LoadedSkillTranscriptPart {
+                        session_id: row.get(0)?,
+                        provider: source_provider_from_row_value(row.get(1)?)?,
+                        conversation_id: row.get(2)?,
+                        project_id: row.get(3)?,
+                        project_name: row.get(4)?,
+                        conversation_title: row.get(5)?,
+                        recorded_at_utc: row.get(6)?,
+                        text_value: row.get(7)?,
+                        metadata_json: row.get(8)?,
+                    })
+                },
+            )
             .context("unable to execute transcript skill evidence query")?;
 
         let mut evidence = Vec::new();
@@ -1925,19 +2089,20 @@ impl<'conn> QueryEngine<'conn> {
                     git_origin: row.get(5)?,
                     identity_reason: row.get(6)?,
                 },
-                category: row.get(7)?,
-                normalized_action: row.get(8)?,
-                command_family: row.get(9)?,
-                base_command: row.get(10)?,
-                classification_state: row.get(11)?,
-                timestamp: row.get(12)?,
-                input_tokens: row.get(13)?,
-                cache_creation_input_tokens: row.get(14)?,
-                cache_read_input_tokens: row.get(15)?,
-                output_tokens: row.get(16)?,
-                model_names_csv: row.get(17)?,
-                skill_name: row.get(18)?,
-                skill_confidence: row.get(19)?,
+                provider: source_provider_from_row_value(row.get(7)?)?,
+                category: row.get(8)?,
+                normalized_action: row.get(9)?,
+                command_family: row.get(10)?,
+                base_command: row.get(11)?,
+                classification_state: row.get(12)?,
+                timestamp: row.get(13)?,
+                input_tokens: row.get(14)?,
+                cache_creation_input_tokens: row.get(15)?,
+                cache_read_input_tokens: row.get(16)?,
+                output_tokens: row.get(17)?,
+                model_names_csv: row.get(18)?,
+                skill_name: row.get(19)?,
+                skill_confidence: row.get(20)?,
             })
         })?;
 
@@ -1949,6 +2114,7 @@ impl<'conn> QueryEngine<'conn> {
                     project_display_name: row.project_display_name,
                     project_root: row.project_root,
                     project_identity: row.project_identity,
+                    provider: row.provider,
                     category: display_category(row.category.as_deref(), &row.classification_state)?,
                     action: ActionKey {
                         classification_state: parse_classification_state(
@@ -2031,6 +2197,15 @@ impl<'conn> QueryEngine<'conn> {
             })
             .collect::<Result<Vec<_>>>()?;
         let mut facts = facts;
+        let windows = Windows::from_snapshot(&request.snapshot)?;
+        let compiled_filters = CompiledFilters::compile(&request.filters)?;
+        let provider_rows = aggregate_action_request(
+            request,
+            &compiled_filters,
+            &windows,
+            &self.load_action_facts(request)?,
+        )?;
+        apply_provider_rows(&mut facts, provider_rows);
         self.apply_action_rollup_skill_attributions(request, &mut facts)?;
         perf.field("row_count", facts.len());
         perf.finish_ok();
@@ -2137,6 +2312,15 @@ impl<'conn> QueryEngine<'conn> {
         }
 
         for (request, rows) in requests.iter().zip(row_sets.iter_mut()) {
+            let windows = Windows::from_snapshot(&request.snapshot)?;
+            let compiled_filters = CompiledFilters::compile(&request.filters)?;
+            let provider_rows = aggregate_action_request(
+                request,
+                &compiled_filters,
+                &windows,
+                &self.load_action_facts(request)?,
+            )?;
+            apply_provider_rows(rows, provider_rows);
             self.apply_action_rollup_skill_attributions(request, rows)?;
             finalize_browse_rows(request, rows);
         }
@@ -2194,6 +2378,15 @@ impl<'conn> QueryEngine<'conn> {
             }
 
             for (request, rows) in requests.iter().zip(row_sets.iter_mut()) {
+                let windows = Windows::from_snapshot(&request.snapshot)?;
+                let compiled_filters = CompiledFilters::compile(&request.filters)?;
+                let provider_rows = aggregate_path_request(
+                    request,
+                    &compiled_filters,
+                    &windows,
+                    &self.load_path_facts(request)?,
+                )?;
+                apply_provider_rows(rows, provider_rows);
                 self.apply_path_rollup_skill_attributions(request, rows)?;
                 finalize_browse_rows(request, rows);
             }
@@ -2212,21 +2405,22 @@ impl<'conn> QueryEngine<'conn> {
                     action_id: row.get(1)?,
                     project_id: row.get(2)?,
                     project_root: row.get(3)?,
-                    category: row.get(4)?,
-                    normalized_action: row.get(5)?,
-                    command_family: row.get(6)?,
-                    base_command: row.get(7)?,
-                    classification_state: row.get(8)?,
-                    timestamp: row.get(9)?,
-                    input_tokens: row.get(10)?,
-                    cache_creation_input_tokens: row.get(11)?,
-                    cache_read_input_tokens: row.get(12)?,
-                    output_tokens: row.get(13)?,
-                    model_name: row.get(14)?,
-                    file_path: row.get(15)?,
-                    ref_count: row.get(16)?,
-                    skill_name: row.get(17)?,
-                    skill_confidence: row.get(18)?,
+                    provider: source_provider_from_row_value(row.get(4)?)?,
+                    category: row.get(5)?,
+                    normalized_action: row.get(6)?,
+                    command_family: row.get(7)?,
+                    base_command: row.get(8)?,
+                    classification_state: row.get(9)?,
+                    timestamp: row.get(10)?,
+                    input_tokens: row.get(11)?,
+                    cache_creation_input_tokens: row.get(12)?,
+                    cache_read_input_tokens: row.get(13)?,
+                    output_tokens: row.get(14)?,
+                    model_name: row.get(15)?,
+                    file_path: row.get(16)?,
+                    ref_count: row.get(17)?,
+                    skill_name: row.get(18)?,
+                    skill_confidence: row.get(19)?,
                 },
             ))
         })?;
@@ -2248,6 +2442,7 @@ impl<'conn> QueryEngine<'conn> {
                 action_id: loaded_row.action_id,
                 project_id: loaded_row.project_id,
                 project_root: loaded_row.project_root,
+                provider: loaded_row.provider,
                 category: display_category(
                     loaded_row.category.as_deref(),
                     &loaded_row.classification_state,
@@ -2314,16 +2509,17 @@ impl<'conn> QueryEngine<'conn> {
                         git_origin: row.get(5)?,
                         identity_reason: row.get(6)?,
                     },
-                    category: row.get(7)?,
-                    normalized_action: row.get(8)?,
-                    command_family: row.get(9)?,
-                    base_command: row.get(10)?,
-                    classification_state: row.get(11)?,
-                    timestamp: row.get(12)?,
-                    input_tokens: row.get(13)?,
-                    cache_creation_input_tokens: row.get(14)?,
-                    cache_read_input_tokens: row.get(15)?,
-                    output_tokens: row.get(16)?,
+                    provider: source_provider_from_row_value(row.get(7)?)?,
+                    category: row.get(8)?,
+                    normalized_action: row.get(9)?,
+                    command_family: row.get(10)?,
+                    base_command: row.get(11)?,
+                    classification_state: row.get(12)?,
+                    timestamp: row.get(13)?,
+                    input_tokens: row.get(14)?,
+                    cache_creation_input_tokens: row.get(15)?,
+                    cache_read_input_tokens: row.get(16)?,
+                    output_tokens: row.get(17)?,
                     model_names_csv: None,
                     skill_name: None,
                     skill_confidence: None,
@@ -2339,6 +2535,7 @@ impl<'conn> QueryEngine<'conn> {
                     project_display_name: row.project_display_name,
                     project_root: row.project_root,
                     project_identity: row.project_identity,
+                    provider: row.provider,
                     category: display_category(row.category.as_deref(), &row.classification_state)?,
                     action: ActionKey {
                         classification_state: parse_classification_state(
@@ -2383,21 +2580,22 @@ impl<'conn> QueryEngine<'conn> {
                 action_id: row.get(0)?,
                 project_id: row.get(1)?,
                 project_root: row.get(2)?,
-                category: row.get(3)?,
-                normalized_action: row.get(4)?,
-                command_family: row.get(5)?,
-                base_command: row.get(6)?,
-                classification_state: row.get(7)?,
-                timestamp: row.get(8)?,
-                input_tokens: row.get(9)?,
-                cache_creation_input_tokens: row.get(10)?,
-                cache_read_input_tokens: row.get(11)?,
-                output_tokens: row.get(12)?,
-                model_name: row.get(13)?,
-                file_path: row.get(14)?,
-                ref_count: row.get(15)?,
-                skill_name: row.get(16)?,
-                skill_confidence: row.get(17)?,
+                provider: source_provider_from_row_value(row.get(3)?)?,
+                category: row.get(4)?,
+                normalized_action: row.get(5)?,
+                command_family: row.get(6)?,
+                base_command: row.get(7)?,
+                classification_state: row.get(8)?,
+                timestamp: row.get(9)?,
+                input_tokens: row.get(10)?,
+                cache_creation_input_tokens: row.get(11)?,
+                cache_read_input_tokens: row.get(12)?,
+                output_tokens: row.get(13)?,
+                model_name: row.get(14)?,
+                file_path: row.get(15)?,
+                ref_count: row.get(16)?,
+                skill_name: row.get(17)?,
+                skill_confidence: row.get(18)?,
             })
         })?;
 
@@ -2416,6 +2614,7 @@ impl<'conn> QueryEngine<'conn> {
                     action_id: row.action_id,
                     project_id: row.project_id,
                     project_root: row.project_root,
+                    provider: row.provider,
                     category: display_category(row.category.as_deref(), &row.classification_state)?,
                     action: ActionKey {
                         classification_state: parse_classification_state(
@@ -2472,6 +2671,15 @@ impl<'conn> QueryEngine<'conn> {
             })
             .collect::<Result<Vec<_>>>()?;
         let mut rollup_rows = rollup_rows;
+        let windows = Windows::from_snapshot(&request.snapshot)?;
+        let compiled_filters = CompiledFilters::compile(&request.filters)?;
+        let provider_rows = aggregate_path_request(
+            request,
+            &compiled_filters,
+            &windows,
+            &self.load_path_facts(request)?,
+        )?;
+        apply_provider_rows(&mut rollup_rows, provider_rows);
         self.apply_path_rollup_skill_attributions(request, &mut rollup_rows)?;
         perf.field("row_count", rollup_rows.len());
         perf.finish_ok();
@@ -2824,6 +3032,7 @@ struct LoadedActionFact {
     project_display_name: String,
     project_root: String,
     project_identity: ProjectIdentity,
+    provider: SourceProvider,
     category: Option<String>,
     normalized_action: Option<String>,
     command_family: Option<String>,
@@ -2842,6 +3051,7 @@ struct LoadedActionFact {
 #[derive(Debug)]
 struct ConversationTurnRow {
     conversation_id: i64,
+    provider: SourceProvider,
     project_id: i64,
     project_name: String,
     conversation_title: Option<String>,
@@ -2860,6 +3070,7 @@ fn build_opportunities_rows(
     let mut idx = 0;
     while idx < turn_rows.len() {
         let conversation_id = turn_rows[idx].conversation_id;
+        let provider_scope = ProviderScope::from_provider(turn_rows[idx].provider);
         let project_id = turn_rows[idx].project_id;
         let project_name = turn_rows[idx].project_name.clone();
         let conversation_title = turn_rows[idx].conversation_title.clone();
@@ -2896,6 +3107,7 @@ fn build_opportunities_rows(
             label: conversation_title
                 .clone()
                 .unwrap_or_else(|| format!("session {conversation_id}")),
+            provider_scope,
             project_id,
             project_name,
             conversation_id,
@@ -2920,6 +3132,7 @@ struct ActionFact {
     project_display_name: String,
     project_root: String,
     project_identity: ProjectIdentity,
+    provider: SourceProvider,
     category: String,
     action: ActionKey,
     timestamp: Option<Timestamp>,
@@ -2952,6 +3165,7 @@ struct LoadedPathFact {
     action_id: i64,
     project_id: i64,
     project_root: String,
+    provider: SourceProvider,
     category: Option<String>,
     normalized_action: Option<String>,
     command_family: Option<String>,
@@ -2986,6 +3200,7 @@ struct PathFact {
     action_id: i64,
     project_id: i64,
     project_root: String,
+    provider: SourceProvider,
     category: String,
     action: ActionKey,
     timestamp: Option<Timestamp>,
@@ -2999,6 +3214,7 @@ struct PathFact {
 struct CompiledFilters {
     start_at: Option<Timestamp>,
     end_at: Option<Timestamp>,
+    provider: Option<SourceProvider>,
     model: Option<String>,
     project_id: Option<i64>,
     action_category: Option<String>,
@@ -3018,6 +3234,7 @@ impl CompiledFilters {
         Ok(Self {
             start_at,
             end_at,
+            provider: filters.provider,
             model: filters.model.clone(),
             project_id: filters.project_id,
             action_category: filters.action_category.clone(),
@@ -3032,6 +3249,12 @@ impl CompiledFilters {
         category: Option<&str>,
         action: Option<&ActionKey>,
     ) -> bool {
+        if self
+            .provider
+            .is_some_and(|expected| fact.provider != expected)
+        {
+            return false;
+        }
         if self
             .project_id
             .is_some_and(|expected| fact.project_id != expected)
@@ -3082,6 +3305,12 @@ impl CompiledFilters {
         category: &str,
         action: &ActionKey,
     ) -> bool {
+        if self
+            .provider
+            .is_some_and(|expected| fact.provider != expected)
+        {
+            return false;
+        }
         if self
             .project_id
             .is_some_and(|expected| fact.project_id != expected)
@@ -3163,6 +3392,8 @@ struct RollupBuilder {
     uncached_input_reference: f64,
     item_count: u64,
     skill_attribution: Option<SkillAttributionSummary>,
+    provider_scope: ProviderScope,
+    provider_scope_initialized: bool,
 }
 
 #[derive(Debug)]
@@ -3195,6 +3426,17 @@ impl RollupBuilder {
             uncached_input_reference: 0.0,
             item_count: 0,
             skill_attribution: None,
+            provider_scope: ProviderScope::Mixed,
+            provider_scope_initialized: false,
+        }
+    }
+
+    fn add_provider(&mut self, provider: SourceProvider) {
+        if self.provider_scope_initialized {
+            self.provider_scope = merge_provider_scope(self.provider_scope, provider);
+        } else {
+            self.provider_scope = ProviderScope::from_provider(provider);
+            self.provider_scope_initialized = true;
         }
     }
 
@@ -3232,12 +3474,30 @@ impl RollupBuilder {
             item_count: self.item_count,
             opportunities: OpportunitySummary::default(),
             skill_attribution: self.skill_attribution,
+            provider_scope: self.provider_scope,
             project_id: self.project.as_ref().map(|project| project.project_id),
             project_identity: self.project.and_then(|project| project.identity),
             category: self.category,
             action: self.action,
             full_path: self.full_path,
         }
+    }
+}
+
+fn merge_provider_scope(current: ProviderScope, provider: SourceProvider) -> ProviderScope {
+    match (current, provider) {
+        (ProviderScope::Mixed, _) => ProviderScope::Mixed,
+        (ProviderScope::Claude, SourceProvider::Claude) => ProviderScope::Claude,
+        (ProviderScope::Codex, SourceProvider::Codex) => ProviderScope::Codex,
+        _ => ProviderScope::Mixed,
+    }
+}
+
+fn merge_provider_scopes(current: ProviderScope, other: ProviderScope) -> ProviderScope {
+    match (current, other) {
+        (ProviderScope::Claude, ProviderScope::Claude) => ProviderScope::Claude,
+        (ProviderScope::Codex, ProviderScope::Codex) => ProviderScope::Codex,
+        _ => ProviderScope::Mixed,
     }
 }
 
@@ -3248,6 +3508,19 @@ fn parse_skill_attribution(
     Some(SkillAttributionSummary {
         skill_name: skill_name?,
         confidence: SkillAttributionConfidence::from_db_value(confidence.as_deref()?)?,
+    })
+}
+
+fn source_provider_from_row_value(value: String) -> rusqlite::Result<SourceProvider> {
+    SourceProvider::from_db_value(&value).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            value.len(),
+            Type::Text,
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown source provider `{value}`"),
+            )),
+        )
     })
 }
 
@@ -3276,6 +3549,7 @@ fn build_skill_root_rows(associations: &[&SkillSessionAssociation]) -> Vec<Skill
                 kind: SkillsRowKind::Skill,
                 key: format!("skill:{}", association.skill_name),
                 label: association.skill_name.clone(),
+                provider_scope: association.provider_scope,
                 skill_name: association.skill_name.clone(),
                 project_id: None,
                 project_name: None,
@@ -3293,6 +3567,7 @@ fn build_skill_root_rows(associations: &[&SkillSessionAssociation]) -> Vec<Skill
             });
         row.invocation_count += association.invocation_count;
         row.session_count += 1;
+        row.provider_scope = merge_provider_scopes(row.provider_scope, association.provider_scope);
         row.transcript_evidence_count += association.transcript_evidence_count;
         add_skill_confidence_counts(&mut row.confidence_counts, &association.confidence_counts);
         row.metrics.add_assign(metrics);
@@ -3329,6 +3604,7 @@ fn build_skill_project_rows(
             kind: SkillsRowKind::Project,
             key: format!("skill:{skill_name}:project:{project_id}"),
             label: project_name.clone(),
+            provider_scope: association.provider_scope,
             skill_name: skill_name.to_string(),
             project_id: Some(project_id),
             project_name: Some(project_name.clone()),
@@ -3346,6 +3622,7 @@ fn build_skill_project_rows(
         });
         row.invocation_count += association.invocation_count;
         row.session_count += 1;
+        row.provider_scope = merge_provider_scopes(row.provider_scope, association.provider_scope);
         row.transcript_evidence_count += association.transcript_evidence_count;
         add_skill_confidence_counts(&mut row.confidence_counts, &association.confidence_counts);
         row.metrics.add_assign(metrics);
@@ -3378,6 +3655,7 @@ fn build_skill_session_rows(
                     .conversation_title
                     .clone()
                     .unwrap_or_else(|| association.session_id.clone()),
+                provider_scope: association.provider_scope,
                 skill_name: skill_name.to_string(),
                 project_id: association.project_id,
                 project_name: association.project_name.clone(),
@@ -3420,6 +3698,7 @@ fn skill_invocation_row_from_inferred(
     SkillInvocationRow {
         skill_name,
         session_id,
+        provider_scope: ProviderScope::from_provider(first.provider),
         recorded_at_utc: first.recorded_at_utc.clone(),
         raw_project: None,
         conversation_id: Some(first.conversation_id),
@@ -3470,6 +3749,7 @@ fn skill_transcript_evidence_from_part(
                 evidence.push(SkillTranscriptEvidence {
                     session_id: row.session_id.clone(),
                     skill_name,
+                    provider: row.provider,
                     kind: SkillTranscriptEvidenceKind::PromptText,
                     recorded_at_utc: row.recorded_at_utc.clone(),
                     conversation_id: row.conversation_id,
@@ -3490,6 +3770,7 @@ fn skill_transcript_evidence_from_part(
                 evidence.push(SkillTranscriptEvidence {
                     session_id: row.session_id.clone(),
                     skill_name,
+                    provider: row.provider,
                     kind: SkillTranscriptEvidenceKind::ToolInputPath,
                     recorded_at_utc: row.recorded_at_utc.clone(),
                     conversation_id: row.conversation_id,
@@ -3650,13 +3931,16 @@ fn aggregate_projects(
                     Some(fact.project_root.clone()),
                 )
             })
-            .add_metrics(
+            .add_provider(fact.provider);
+        if let Some(builder) = builders.get_mut(&fact.project_id) {
+            builder.add_metrics(
                 &fact.metrics,
                 lens,
                 fact.timestamp,
                 windows,
                 fact.item_count,
             );
+        }
     }
 
     builders.into_values().map(RollupBuilder::build).collect()
@@ -3690,13 +3974,16 @@ fn aggregate_categories(
                     None,
                 )
             })
-            .add_metrics(
+            .add_provider(fact.provider);
+        if let Some(builder) = builders.get_mut(&fact.category) {
+            builder.add_metrics(
                 &fact.metrics,
                 lens,
                 fact.timestamp,
                 windows,
                 fact.item_count,
             );
+        }
     }
 
     builders.into_values().map(RollupBuilder::build).collect()
@@ -3738,13 +4025,16 @@ fn aggregate_actions(
                 )
             })
             .0
-            .add_metrics(
+            .add_provider(fact.provider);
+        if let Some((builder, _)) = builders.get_mut(&fact.action) {
+            builder.add_metrics(
                 &fact.metrics,
                 lens,
                 fact.timestamp,
                 windows,
                 fact.item_count,
             );
+        }
         if let Some((_, skill_attributions)) = builders.get_mut(&fact.action) {
             skill_attributions.push(fact.skill_attribution.clone());
         }
@@ -3833,6 +4123,7 @@ fn aggregate_paths(
                 )
             });
 
+        entry.0.add_provider(fact.provider);
         entry
             .0
             .add_metrics(&fact.metrics, lens, fact.timestamp, windows, 1);
@@ -3862,11 +4153,11 @@ struct PathBrowseScope<'a> {
 }
 
 fn can_use_action_rollups(filters: &BrowseFilters) -> bool {
-    filters.time_window.is_none() && filters.model.is_none()
+    filters.time_window.is_none() && filters.provider.is_none() && filters.model.is_none()
 }
 
 fn can_use_path_rollups(filters: &BrowseFilters) -> bool {
-    filters.time_window.is_none() && filters.model.is_none()
+    filters.time_window.is_none() && filters.provider.is_none() && filters.model.is_none()
 }
 
 fn record_browse_request_perf_fields(perf: &mut PerfScope, request: &BrowseRequest) {
@@ -3888,6 +4179,13 @@ fn record_browse_request_perf_fields(perf: &mut PerfScope, request: &BrowseReque
             .action_category
             .clone()
             .unwrap_or_else(|| "any".to_string()),
+    );
+    perf.field(
+        "filter_provider",
+        request.filters.provider.map_or_else(
+            || "combined".to_string(),
+            |provider| provider.as_str().to_string(),
+        ),
     );
     perf.field(
         "filter_model",
@@ -4393,6 +4691,7 @@ fn grouped_action_rollup_row_to_rollup_row(
                 item_count,
                 opportunities: OpportunitySummary::default(),
                 skill_attribution: None,
+                provider_scope: ProviderScope::Mixed,
                 project_id: Some(project_id),
                 project_identity: row.project_identity,
                 category: None,
@@ -4419,6 +4718,7 @@ fn grouped_action_rollup_row_to_rollup_row(
                 item_count,
                 opportunities: OpportunitySummary::default(),
                 skill_attribution: None,
+                provider_scope: ProviderScope::Mixed,
                 project_id: None,
                 project_identity: None,
                 category: Some(display_category),
@@ -4506,6 +4806,7 @@ fn path_rollup_row_to_rollup_row(
         item_count,
         opportunities: OpportunitySummary::default(),
         skill_attribution: None,
+        provider_scope: ProviderScope::Mixed,
         project_id: Some(project_id),
         project_identity: None,
         category: Some(category),
@@ -4547,6 +4848,7 @@ fn build_grouped_action_row(
         item_count,
         opportunities: OpportunitySummary::default(),
         skill_attribution: None,
+        provider_scope: ProviderScope::Mixed,
         project_id,
         project_identity: None,
         category: Some(display_category),
@@ -4697,6 +4999,19 @@ fn apply_indicator_rows(rows: &mut [RollupRow], indicator_rows: Vec<RollupRow>) 
     }
 }
 
+fn apply_provider_rows(rows: &mut [RollupRow], provider_rows: Vec<RollupRow>) {
+    let providers_by_key = provider_rows
+        .into_iter()
+        .map(|row| (row.key, row.provider_scope))
+        .collect::<BTreeMap<_, _>>();
+
+    for row in rows {
+        if let Some(provider_scope) = providers_by_key.get(&row.key) {
+            row.provider_scope = *provider_scope;
+        }
+    }
+}
+
 fn finalize_browse_rows(request: &BrowseRequest, rows: &mut Vec<RollupRow>) {
     rows.retain(|row| !row.is_zero_value());
     rows.sort_by(|left, right| {
@@ -4751,6 +5066,7 @@ fn build_scoped_action_facts_query(request: &BrowseRequest) -> Result<(String, V
             p.git_root_path,
             p.git_origin,
             p.identity_reason,
+            sf.source_provider,
             a.category,
             a.normalized_action,
             a.command_family,
@@ -4767,6 +5083,9 @@ fn build_scoped_action_facts_query(request: &BrowseRequest) -> Result<(String, V
         FROM action a
         JOIN import_chunk ic ON ic.id = a.import_chunk_id
         JOIN project p ON p.id = ic.project_id
+        JOIN turn t ON t.id = a.turn_id
+        JOIN conversation c ON c.id = t.conversation_id
+        JOIN source_file sf ON sf.id = c.source_file_id
         LEFT JOIN action_message am ON am.action_id = a.id
         LEFT JOIN message m ON m.id = am.message_id
         LEFT JOIN action_skill_attribution asa ON asa.action_id = a.id
@@ -4811,6 +5130,10 @@ fn build_scoped_action_facts_query(request: &BrowseRequest) -> Result<(String, V
 
     if let Some(project_id) = request.filters.project_id {
         append_project_match(&mut sql, &mut query_params, project_id);
+    }
+    if let Some(provider) = request.filters.provider {
+        sql.push_str(" AND sf.source_provider = ?");
+        query_params.push(Value::Text(provider.as_str().to_string()));
     }
     if let Some(category) = request.filters.action_category.as_deref() {
         append_category_match(&mut sql, &mut query_params, category);
@@ -4924,6 +5247,7 @@ fn build_scoped_path_facts_query(request: &BrowseRequest) -> Result<(String, Vec
             a.id,
             p.id,
             p.root_path,
+            sf.source_provider,
             a.category,
             a.normalized_action,
             a.command_family,
@@ -4949,6 +5273,8 @@ fn build_scoped_path_facts_query(request: &BrowseRequest) -> Result<(String, Vec
         JOIN project p ON p.id = ic.project_id
         JOIN action_message am ON am.action_id = a.id
         JOIN message m ON m.id = am.message_id
+        JOIN conversation c ON c.id = m.conversation_id
+        JOIN source_file sf ON sf.id = c.source_file_id
         JOIN message_path_ref mpr ON mpr.message_id = m.id
         JOIN path_node pn ON pn.id = mpr.path_node_id
         LEFT JOIN action_skill_attribution asa ON asa.action_id = a.id
@@ -4966,6 +5292,10 @@ fn build_scoped_path_facts_query(request: &BrowseRequest) -> Result<(String, Vec
 
     if let Some(project_id) = request.filters.project_id {
         append_project_match(&mut sql, &mut query_params, project_id);
+    }
+    if let Some(provider) = request.filters.provider {
+        sql.push_str(" AND sf.source_provider = ?");
+        query_params.push(Value::Text(provider.as_str().to_string()));
     }
     if let Some(category) = request.filters.action_category.as_deref() {
         append_category_match(&mut sql, &mut query_params, category);
@@ -5171,6 +5501,7 @@ fn build_batched_path_facts_query(requests: &[BrowseRequest]) -> Result<(String,
             a.id,
             p.id,
             p.root_path,
+            sf.source_provider,
             a.category,
             a.normalized_action,
             a.command_family,
@@ -5197,6 +5528,8 @@ fn build_batched_path_facts_query(requests: &[BrowseRequest]) -> Result<(String,
         JOIN project p ON p.id = ic.project_id
         JOIN action_message am ON am.action_id = a.id
         JOIN message m ON m.id = am.message_id
+        JOIN conversation c ON c.id = m.conversation_id
+        JOIN source_file sf ON sf.id = c.source_file_id
         JOIN message_path_ref mpr ON mpr.message_id = m.id
         JOIN path_node pn ON pn.id = mpr.path_node_id
         LEFT JOIN action_skill_attribution asa ON asa.action_id = a.id
@@ -5224,6 +5557,10 @@ fn build_batched_path_facts_query(requests: &[BrowseRequest]) -> Result<(String,
 
     if let Some(project_id) = first.filters.project_id {
         append_project_match(&mut sql, &mut query_params, project_id);
+    }
+    if let Some(provider) = first.filters.provider {
+        sql.push_str(" AND sf.source_provider = ?");
+        query_params.push(Value::Text(provider.as_str().to_string()));
     }
     if let Some(category) = first.filters.action_category.as_deref() {
         append_category_match(&mut sql, &mut query_params, category);
@@ -6357,7 +6694,11 @@ mod tests {
         let engine = QueryEngine::new(conn);
         let snapshot = engine.latest_snapshot_bounds()?;
 
-        let root_report = engine.skills_report(&snapshot, SkillsPath::Root)?;
+        let root_report = engine.skills_report(
+            &snapshot,
+            SkillsPath::Root,
+            &crate::query::SkillsFilters::default(),
+        )?;
         assert_eq!(root_report.cost_scope, "session-associated");
         assert_eq!(root_report.attributed_cost_scope, "action-attributed");
         assert_eq!(root_report.unmatched_invocation_count, 1);
@@ -6395,6 +6736,7 @@ mod tests {
             SkillsPath::Skill {
                 skill_name: "planner".to_string(),
             },
+            &crate::query::SkillsFilters::default(),
         )?;
         assert_eq!(planner_projects.rows.len(), 1);
         assert_eq!(
@@ -6417,6 +6759,7 @@ mod tests {
                 skill_name: "reviewer".to_string(),
                 project_id: project_b_id,
             },
+            &crate::query::SkillsFilters::default(),
         )?;
         assert_eq!(reviewer_sessions.rows.len(), 1);
         assert_eq!(
@@ -7365,6 +7708,7 @@ mod tests {
                         display_name: "project-b".to_string(),
                     },
                 ],
+                providers: vec![crate::sources::SourceProvider::Claude],
                 models: vec!["claude-haiku".to_string(), "claude-opus".to_string()],
                 categories: vec![
                     "[mixed]".to_string(),
@@ -8183,6 +8527,7 @@ mod tests {
         let turn_rows: Vec<ConversationTurnRow> = (0..6)
             .map(|i| ConversationTurnRow {
                 conversation_id: 1,
+                provider: crate::sources::SourceProvider::Claude,
                 project_id: 10,
                 project_name: "test-project".to_string(),
                 conversation_title: Some("growing session".to_string()),
@@ -8214,6 +8559,7 @@ mod tests {
         let turn_rows = vec![
             ConversationTurnRow {
                 conversation_id: 1,
+                provider: crate::sources::SourceProvider::Claude,
                 project_id: 10,
                 project_name: "test-project".to_string(),
                 conversation_title: None,
@@ -8224,6 +8570,7 @@ mod tests {
             },
             ConversationTurnRow {
                 conversation_id: 1,
+                provider: crate::sources::SourceProvider::Claude,
                 project_id: 10,
                 project_name: "test-project".to_string(),
                 conversation_title: None,
@@ -8251,6 +8598,7 @@ mod tests {
         for i in 0..6 {
             turn_rows.push(ConversationTurnRow {
                 conversation_id: 1,
+                provider: crate::sources::SourceProvider::Claude,
                 project_id: 10,
                 project_name: "proj".to_string(),
                 conversation_title: Some("has drag".to_string()),
@@ -8265,6 +8613,7 @@ mod tests {
         for i in 0..2 {
             turn_rows.push(ConversationTurnRow {
                 conversation_id: 2,
+                provider: crate::sources::SourceProvider::Claude,
                 project_id: 10,
                 project_name: "proj".to_string(),
                 conversation_title: Some("no drag".to_string()),

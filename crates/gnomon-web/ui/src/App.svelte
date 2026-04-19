@@ -32,6 +32,7 @@
       command_family: null,
       base_command: null,
       parent_path: null,
+      provider: null,
       model: null,
       filter_project_id: null,
       filter_category: null,
@@ -59,6 +60,7 @@
   let rowFilter = "";
   let jumpQuery = "";
   let projectFilterValue = "";
+  let providerFilterValue = "";
   let categoryFilterValue = "";
   let rowFilterInput;
   let jumpInput;
@@ -71,6 +73,7 @@
   let prefetchEpoch = 0;
 
   $: projectFilterValue = currentContext.filter_project_id == null ? "" : String(currentContext.filter_project_id);
+  $: providerFilterValue = currentContext.provider ?? "";
   $: categoryFilterValue = currentContext.filter_category ?? "";
 
   function copyContext(context) {
@@ -121,6 +124,7 @@
       "command_family",
       "base_command",
       "parent_path",
+      "provider",
       "model",
     ]) {
       const value = context[key];
@@ -485,6 +489,7 @@
   async function setRoot(root) {
     currentContext = {
       ...createRootContext(root, currentContext.lens),
+      provider: currentContext.provider,
       model: currentContext.model,
       filter_project_id: currentContext.filter_project_id,
       filter_category: currentContext.filter_category,
@@ -669,6 +674,7 @@
 
     currentContext = {
       ...createRootContext(currentContext.root, currentContext.lens),
+      provider: currentContext.provider,
       model: currentContext.model,
       filter_project_id: currentContext.filter_project_id,
       filter_category: currentContext.filter_category,
@@ -685,6 +691,7 @@
     currentContext = {
       ...currentContext,
       model: null,
+      provider: null,
       filter_project_id: null,
       filter_category: null,
       time_window: "all",
@@ -752,6 +759,23 @@
     announce(shortcutMessage);
   }
 
+  async function cycleProvider() {
+    const values = [null, ...(filters?.providers ?? [])];
+    if (values.length <= 1) {
+      shortcutMessage = "No provider filters available yet.";
+      announce(shortcutMessage);
+      return;
+    }
+
+    currentContext = {
+      ...currentContext,
+      provider: cycleNullableList(values, currentContext.provider),
+    };
+    await loadBrowse({ preserveSelectionKey: selectedRow?.key ?? null });
+    shortcutMessage = `Provider filter: ${providerLabel(currentContext.provider)}.`;
+    announce(shortcutMessage);
+  }
+
   async function cycleProjectFilter() {
     if (currentContext.path !== "root") {
       shortcutMessage = "Project filter is only available from the root view right now.";
@@ -806,6 +830,14 @@
     await loadBrowse({ preserveSelectionKey: selectedRow?.key ?? null });
   }
 
+  async function updateProvider(event) {
+    currentContext = {
+      ...currentContext,
+      provider: event.currentTarget.value || null,
+    };
+    await loadBrowse({ preserveSelectionKey: selectedRow?.key ?? null });
+  }
+
   async function updateProjectFilter(event) {
     currentContext = {
       ...currentContext,
@@ -835,6 +867,13 @@
       return "all projects";
     }
     return filters?.projects?.find((project) => project.id === projectId)?.display_name ?? `project ${projectId}`;
+  }
+
+  function providerLabel(provider) {
+    if (!provider) {
+      return "combined providers";
+    }
+    return provider;
   }
 
   function timeWindowLabel(key) {
@@ -920,6 +959,12 @@
     if (event.key === "m") {
       event.preventDefault();
       await cycleModel();
+      return;
+    }
+
+    if (event.key === "v") {
+      event.preventDefault();
+      await cycleProvider();
       return;
     }
 
@@ -1092,6 +1137,15 @@
         </select>
       </label>
       <label>
+        <span>V provider</span>
+        <select on:change={updateProvider} bind:value={providerFilterValue}>
+          <option value="">Combined providers</option>
+          {#each filters?.providers ?? [] as provider}
+            <option value={provider}>{provider}</option>
+          {/each}
+        </select>
+      </label>
+      <label>
         <span>M model</span>
         <select on:change={updateModel} value={currentContext.model ?? ""}>
           <option value="">All models</option>
@@ -1155,7 +1209,7 @@
       <p>
         <strong>Filters</strong>
         <span>
-          {timeWindowLabel(currentContext.time_window)} · {currentContext.model ?? "all models"} ·
+          {timeWindowLabel(currentContext.time_window)} · {providerLabel(currentContext.provider)} · {currentContext.model ?? "all models"} ·
           {projectFilterLabel(currentContext.filter_project_id)} · {currentContext.filter_category ?? "all categories"} · {opportunityOnly ? "opportunities only" : "all rows"}
         </span>
       </p>
@@ -1189,6 +1243,7 @@
       <span>1/2 root</span>
       <span>l lens</span>
       <span>t time</span>
+      <span>v provider</span>
       <span>m model</span>
       <span>p project</span>
       <span>c category</span>
@@ -1321,6 +1376,7 @@
                       {formatMetric(row.metrics[currentContext.lens])} {LENS_LABELS[currentContext.lens].toLowerCase()}
                     </span>
                     <span class="row-tags">{row.kind}{#if row.category} · {row.category}{/if}</span>
+                    <span class="row-badge">provider {row.provider_scope}</span>
                     {#if row.skill_attribution}
                       <span class="row-badge">skill {row.skill_attribution.skill_name}</span>
                     {/if}
@@ -1361,6 +1417,10 @@
             <p class="empty-state error">{detailError}</p>
           {:else if detail}
             <dl class="detail-grid">
+              <div>
+                <dt>Provider</dt>
+                <dd>{providerLabel(detail.row.provider_scope)}</dd>
+              </div>
               <div>
                 <dt>Kind</dt>
                 <dd>{detail.row.kind}</dd>

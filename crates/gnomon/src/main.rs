@@ -21,9 +21,10 @@ use gnomon_core::opportunity::{OpportunityCategory, OpportunityConfidence, Oppor
 use gnomon_core::perf::PerfLogger;
 use gnomon_core::query::{
     ActionKey, BrowseFilters, BrowsePath, BrowseReport, BrowseRequest, ClassificationState,
-    MetricLens, OpportunitiesFilters, QueryEngine, RootView, SkillsPath, SkillsReport,
-    SnapshotBounds, TimeWindowFilter,
+    MetricLens, OpportunitiesFilters, QueryEngine, RootView, SkillsFilters, SkillsPath,
+    SkillsReport, SnapshotBounds, TimeWindowFilter,
 };
+use gnomon_core::sources::SourceProvider;
 use rusqlite::OptionalExtension;
 
 #[derive(Debug, Parser)]
@@ -243,6 +244,10 @@ struct ReportArgs {
     #[arg(long)]
     end_at_utc: Option<String>,
 
+    /// Restrict results to a single provider. Omit for the explicit combined view.
+    #[arg(long, value_enum)]
+    provider: Option<ProviderArg>,
+
     /// Restrict rollups to a specific model name.
     #[arg(long)]
     model: Option<String>,
@@ -288,6 +293,10 @@ struct SkillsArgs {
     /// Project id used by skill-project paths.
     #[arg(long)]
     project_id: Option<i64>,
+
+    /// Restrict results to a single provider. Omit for the explicit combined view.
+    #[arg(long, value_enum)]
+    provider: Option<ProviderArg>,
 }
 
 #[derive(Debug, Clone, Args, PartialEq)]
@@ -295,6 +304,10 @@ struct OpportunitiesArgs {
     /// Restrict to a single project by id.
     #[arg(long)]
     project_id: Option<i64>,
+
+    /// Restrict results to a single provider. Omit for the explicit combined view.
+    #[arg(long, value_enum)]
+    provider: Option<ProviderArg>,
 
     /// Only show annotations matching this opportunity category.
     #[arg(long, value_enum)]
@@ -338,6 +351,12 @@ enum OpportunityConfidenceArg {
     Low,
     Medium,
     High,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ProviderArg {
+    Claude,
+    Codex,
 }
 
 impl From<OpportunityCategoryArg> for OpportunityCategory {
@@ -634,7 +653,7 @@ fn build_skills_report(
     let database = Database::open(&config.db_path)?;
     let engine = QueryEngine::with_perf(database.connection(), perf_logger);
     let snapshot = engine.latest_snapshot_bounds()?;
-    engine.skills_report(&snapshot, args.build_path()?)
+    engine.skills_report(&snapshot, args.build_path()?, &args.filters())
 }
 
 fn run_opportunities_command(config: &RuntimeConfig, args: &OpportunitiesArgs) -> Result<()> {
@@ -645,6 +664,7 @@ fn run_opportunities_command(config: &RuntimeConfig, args: &OpportunitiesArgs) -
     let snapshot = engine.latest_snapshot_bounds()?;
 
     let filters = OpportunitiesFilters {
+        provider: args.provider.map(Into::into),
         project_id: args.project_id,
         start_at_utc: args.start_at_utc.clone(),
         end_at_utc: args.end_at_utc.clone(),
@@ -1319,6 +1339,7 @@ impl ReportArgs {
 
         BrowseFilters {
             time_window,
+            provider: self.provider.map(Into::into),
             model: self.model.clone(),
             project_id: self.project_id,
             action_category: self.filter_category.clone(),
@@ -1383,6 +1404,12 @@ impl ReportArgs {
 }
 
 impl SkillsArgs {
+    fn filters(&self) -> SkillsFilters {
+        SkillsFilters {
+            provider: self.provider.map(Into::into),
+        }
+    }
+
     fn build_path(&self) -> Result<SkillsPath> {
         match self.path {
             SkillsPathArg::Root => Ok(SkillsPath::Root),
@@ -1405,6 +1432,15 @@ impl SkillsArgs {
     fn required_project_id(&self, context: &str) -> Result<i64> {
         self.project_id
             .with_context(|| format!("{context} requires --project-id"))
+    }
+}
+
+impl From<ProviderArg> for SourceProvider {
+    fn from(value: ProviderArg) -> Self {
+        match value {
+            ProviderArg::Claude => SourceProvider::Claude,
+            ProviderArg::Codex => SourceProvider::Codex,
+        }
     }
 }
 
@@ -1826,6 +1862,7 @@ mod tests {
                         path: SkillsPathArg::SkillProject,
                         skill: Some("planner".to_string()),
                         project_id: Some(7),
+                        provider: None,
                     }
                 );
             }
@@ -2338,6 +2375,7 @@ mod tests {
                 parent_path: None,
                 start_at_utc: None,
                 end_at_utc: None,
+                provider: None,
                 model: None,
                 filter_category: None,
                 classification_state: None,
@@ -2383,6 +2421,7 @@ mod tests {
                     uncached_input_reference: 0.0,
                 },
                 item_count: 0,
+                provider_scope: gnomon_core::query::ProviderScope::Claude,
                 opportunities: OpportunitySummary::default(),
                 skill_attribution: None,
                 project_id: Some(1),
@@ -2437,6 +2476,7 @@ mod tests {
                 parent_path: None,
                 start_at_utc: None,
                 end_at_utc: None,
+                provider: None,
                 model: None,
                 filter_category: None,
                 classification_state: None,
@@ -2464,6 +2504,7 @@ mod tests {
             parent_path: None,
             start_at_utc: None,
             end_at_utc: None,
+            provider: None,
             model: None,
             filter_category: None,
             classification_state: None,
@@ -2485,6 +2526,7 @@ mod tests {
             path: SkillsPathArg::Skill,
             skill: None,
             project_id: None,
+            provider: None,
         };
 
         let err = args

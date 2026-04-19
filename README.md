@@ -1,6 +1,6 @@
 # gnomon
 
-`gnomon` is a terminal application for exploring Claude session history and finding the usage patterns that drive the highest token consumption.
+`gnomon` is a terminal application for exploring Claude and Codex session history and finding the usage patterns that drive the highest token consumption.
 
 ## Current Status
 
@@ -13,11 +13,12 @@ This repository is bootstrapped as a Rust workspace with four crates:
 
 The current binary resolves runtime paths, scans the source manifest, schedules
 `project x day` import chunks, normalizes and classifies actions into the
-SQLite cache, imports Claude `history.jsonl` as a first-class source when the
-source root is the default `~/.claude/projects` tree, and opens a pinned TUI
-against the latest published import snapshot. The TUI now includes synchronized
-map and statistics panes, persistent UI state, current-view filtering, global
-jump, and manual snapshot refresh.
+SQLite cache, keeps Claude and Codex raw imports physically separate while
+sharing one normalized browse model, and opens a pinned TUI against the latest
+published import snapshot. The TUI now includes synchronized map and
+statistics panes, persistent UI state, current-view filtering, explicit
+Claude/Codex/combined provider filtering, global jump, and manual snapshot
+refresh.
 Startup prioritizes the last 24 hours of chunks before the UI opens and
 continues older imports in one background worker after launch by default. Use
 `--startup-full-import` when you want the initial TUI snapshot to wait for the
@@ -125,6 +126,7 @@ invocations imported from Claude history.
 
 ```bash
 cargo run -p gnomon -- skills
+cargo run -p gnomon -- skills --provider codex
 cargo run -p gnomon -- skills --path skill --skill planner
 cargo run -p gnomon -- skills --path skill-project --skill planner --project-id 1
 ```
@@ -132,7 +134,9 @@ cargo run -p gnomon -- skills --path skill-project --skill planner --project-id 
 The JSON output now reports both session-associated totals and explicit
 action-attributed totals. Unmatched invocation counts are also included so you
 can see when an explicit skill invocation did not join to a transcript-backed
-session.
+session. `skills`, `report`, and `opportunities` now accept `--provider
+claude|codex`; omitting the flag keeps the explicit combined view and the JSON
+rows report whether the visible scope is `claude`, `codex`, or `mixed`.
 
 ## Web UI
 
@@ -318,6 +322,7 @@ opening the TUI:
 
 ```bash
 cargo run -p gnomon -- report
+cargo run -p gnomon -- report --provider claude
 cargo run -p gnomon -- report --root category --path category
 cargo run -p gnomon -- report --path project --project-id 1
 ```
@@ -328,6 +333,8 @@ action fields such as `--classification-state` and `--normalized-action`
 supplying the path context when needed.
 Each rollup row now reserves an `opportunities` object in the JSON output so
 future heuristic annotations can ship without changing the hierarchy shape.
+Browse rows also carry a `provider_scope` field so combined views stay explicit
+instead of silently mixing Claude and Codex contributions.
 
 ## Query Benchmarks
 

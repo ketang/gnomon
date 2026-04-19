@@ -23,7 +23,9 @@ use gnomon_core::query::{
     FilterOptions, MetricLens, OpportunitiesFilters, OpportunitiesReport, QueryEngine, RollupRow,
     RootView, SnapshotBounds, SnapshotCoverageSummary, TimeWindowFilter,
 };
+#[cfg(test)]
 use gnomon_core::sources::ConfiguredSources;
+use gnomon_core::sources::SourceProvider;
 use serde::{Deserialize, Serialize};
 
 include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
@@ -120,6 +122,7 @@ struct BrowseQuery {
     parent_path: Option<String>,
     start_at_utc: Option<String>,
     end_at_utc: Option<String>,
+    provider: Option<ProviderQuery>,
     model: Option<String>,
     filter_category: Option<String>,
     classification_state: Option<ClassificationStateQuery>,
@@ -131,6 +134,7 @@ struct BrowseQuery {
 #[derive(Debug, Deserialize)]
 struct OpportunitiesQuery {
     project_id: Option<i64>,
+    provider: Option<ProviderQuery>,
     category: Option<OpportunityCategoryQuery>,
     min_confidence: Option<OpportunityConfidenceQuery>,
     #[serde(default)]
@@ -185,6 +189,13 @@ enum ClassificationStateQuery {
     Classified,
     Mixed,
     Unclassified,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProviderQuery {
+    Claude,
+    Codex,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -391,6 +402,7 @@ async fn root_rollup(
         parent_path: None,
         start_at_utc: None,
         end_at_utc: None,
+        provider: None,
         model: None,
         filter_category: None,
         classification_state: None,
@@ -513,6 +525,14 @@ impl From<ClassificationStateQuery> for ClassificationState {
         }
     }
 }
+impl From<ProviderQuery> for SourceProvider {
+    fn from(value: ProviderQuery) -> Self {
+        match value {
+            ProviderQuery::Claude => SourceProvider::Claude,
+            ProviderQuery::Codex => SourceProvider::Codex,
+        }
+    }
+}
 impl From<OpportunityCategoryQuery> for OpportunityCategory {
     fn from(value: OpportunityCategoryQuery) -> Self {
         match value {
@@ -568,6 +588,7 @@ impl BrowseQuery {
         };
         BrowseFilters {
             time_window,
+            provider: self.provider.map(Into::into),
             model: self.model.clone(),
             project_id: self.project_id,
             action_category: self.filter_category.clone(),
@@ -638,6 +659,7 @@ impl DetailQuery {
 impl OpportunitiesQuery {
     fn to_filters(&self) -> OpportunitiesFilters {
         OpportunitiesFilters {
+            provider: self.provider.map(Into::into),
             project_id: self.project_id,
             start_at_utc: self.start_at_utc.clone(),
             end_at_utc: self.end_at_utc.clone(),
