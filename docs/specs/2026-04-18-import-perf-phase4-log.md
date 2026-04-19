@@ -259,14 +259,25 @@ Implementation: Replace `use walkdir::WalkDir` with `use jwalk::WalkDir` in
 `jwalk.workspace = true` to `crates/gnomon-core/Cargo.toml`. Update `collect_candidate_source_files`
 for jwalk DirEntry API (`path()` returns `PathBuf` not `&Path`).
 Measurements:
-  Subset:       (pending)
-  Full:         (pending)
-  Row parity:   (pending)
-  Profile shift: (pending)
-Decision: PENDING
+  Subset baseline (p4, 11 runs): 5.537, 5.703, 5.963, 6.160, 6.263, 6.353, 7.246, 7.957,
+                                  10.446, 10.735, 10.977 → median 6.353s
+  Subset A7 (10 runs):           5.623, 5.670, 5.707, 6.709, 7.089, 7.122, 7.299, 7.853,
+                                  8.374, 10.232 → median 7.106s
+  Full:         not measured — subset result conclusive (regression)
+  Row parity:   PASS (counts match baseline: project:1, source_file:1649, import_chunk:35,
+                conversation:1648, stream:1648, message:130478, message_part:179412,
+                turn:4915, action:50463)
+  Profile shift: N/A — no improvement
+Decision: REVERTED
 Commit:
-Key finding:
-Next implied:
+Key finding: jwalk raises the subset median from ~6.4s to ~7.1s (+11%) with higher variance.
+Rayon spawn overhead for directory enumeration dominates any parallelism benefit — the Claude
+projects directory structure has only one corpus root with files scattered across ~31 project
+subdirectories, giving jwalk very little parallelism to exploit. The existing scan_source_cache
+means most files are cache hits and don't even need content reads, so the walk phase is already
+fast (<<1s wall). Adding rayon tasks on top of a fast serial walk introduces coordination overhead
+without a compensating speedup.
+Next implied: A8 (path_node chunk-level cache across files in a chunk) — classify phase reduction.
 
 ---
 
@@ -275,12 +286,13 @@ Next implied:
 Phase: Phase 4
 Long-lived branch: `import-perf-p4`
 Long-lived worktree: `.worktrees/import-perf-p4`
-Last completed: A2 — REVERTED (LTO-only: 0% gain; LTO+PGO: 5.7% full but not committable)
-Next action: A7 in progress — implement, measure, decide.
+Last completed: A7 — REVERTED (jwalk parallel walk: +11% regression on subset median, higher variance)
+Next action: Run A8 (path_node chunk-level cache). Create import-perf-p4-a8 branch + worktree
+  from import-perf-p4, implement per plan Section 1, measure.
 Current best (subset): 5.259s median (−38.0% from 8.487s baseline; A6 original measurement)
 Current best (full): 15.144s median (−20.2% from 18.969s baseline; A6 original measurement)
 Target: 10s full corpus
-In-flight uncommitted state: A7 skeleton written; implementation in import-perf-p4-a7
+In-flight uncommitted state: none
 
 Candidate ranking (live — re-rank after each result):
 1. A7 — `jwalk` parallel directory walk — scan_source reduction (0.2–0.5s), low effort
