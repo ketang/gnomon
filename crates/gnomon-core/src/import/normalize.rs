@@ -70,13 +70,19 @@ pub fn normalize_jsonl_file(
             kind: SourceFileKind::Transcript,
         }) => normalize_transcript_jsonl_file(conn, params),
         Some(SourceDescriptor {
-            provider: SourceProvider::Claude,
+            provider,
             kind: SourceFileKind::History,
-        }) => normalize_history_jsonl_file(conn, params),
+        }) if matches!(provider, SourceProvider::Claude | SourceProvider::Codex) => {
+            normalize_history_jsonl_file(conn, params, provider)
+        }
         Some(SourceDescriptor {
             provider: SourceProvider::Codex,
             kind: SourceFileKind::Rollout,
         }) => normalize_codex_rollout_jsonl_file(conn, params),
+        Some(SourceDescriptor {
+            provider: SourceProvider::Codex,
+            kind: SourceFileKind::SessionIndex,
+        }) => normalize_codex_session_index_jsonl_file(conn, params),
         Some(_) => {
             purge_existing_import(conn, params)?;
             Ok(NormalizeJsonlFileOutcome::Skipped)
@@ -143,13 +149,13 @@ pub fn normalize_jsonl_file_in_tx(
             }
         }
         Some(SourceDescriptor {
-            provider: SourceProvider::Claude,
+            provider,
             kind: SourceFileKind::History,
-        }) => {
+        }) if matches!(provider, SourceProvider::Claude | SourceProvider::Codex) => {
             let mut scope =
                 PerfScope::new(params.perf_logger.clone(), "import.normalize_history_jsonl");
             scope.field("path", params.path.display().to_string());
-            let result = normalize_history_jsonl_file_core(conn, params);
+            let result = normalize_history_jsonl_file_core(conn, params, provider);
             match &result {
                 Ok(NormalizeJsonlFileOutcome::Imported(outcome)) => {
                     scope.field("outcome", "imported");
@@ -206,6 +212,43 @@ pub fn normalize_jsonl_file_in_tx(
                 Err(err) => scope.finish_error(err),
             }
             result
+        }
+        Some(SourceDescriptor {
+            provider: SourceProvider::Codex,
+            kind: SourceFileKind::SessionIndex,
+        }) => {
+            let parsed = match parse_jsonl_file_inner(&params.path, SourceFileKind::SessionIndex)? {
+                super::ParseResult::Parsed(parsed) => parsed,
+                super::ParseResult::SessionlessMetadata => {
+                    unreachable!("session index files are never treated as sessionless metadata")
+                }
+                super::ParseResult::Warning(warning) => {
+                    return Ok((NormalizeJsonlFileOutcome::Warning(warning), Vec::new()));
+                }
+            };
+            let mut scope = PerfScope::new(
+                params.perf_logger.clone(),
+                "import.normalize_codex_session_index_jsonl",
+            );
+            scope.field("path", params.path.display().to_string());
+            let result = write_parsed_codex_session_index_core(conn, params, parsed);
+            match &result {
+                Ok(NormalizeJsonlFileOutcome::Imported(outcome)) => {
+                    scope.field("outcome", "imported");
+                    scope.field("record_count", outcome.record_count);
+                    scope.finish_ok();
+                }
+                Ok(NormalizeJsonlFileOutcome::Skipped) => {
+                    scope.field("outcome", "skipped");
+                    scope.finish_ok();
+                }
+                Ok(NormalizeJsonlFileOutcome::Warning(_)) => {
+                    scope.field("outcome", "warning");
+                    scope.finish_ok();
+                }
+                Err(err) => scope.finish_error(err),
+            }
+            result.map(|outcome| (outcome, Vec::new()))
         }
         Some(_) => {
             purge_existing_import(conn, params)?;
@@ -364,13 +407,13 @@ pub fn write_parsed_file_in_tx(
             }
         }
         SourceDescriptor {
-            provider: SourceProvider::Claude,
+            provider,
             kind: super::SourceFileKind::History,
-        } => {
+        } if matches!(provider, SourceProvider::Claude | SourceProvider::Codex) => {
             let mut scope =
                 PerfScope::new(params.perf_logger.clone(), "import.normalize_history_jsonl");
             scope.field("path", params.path.display().to_string());
-            let result = write_parsed_history_core(conn, params, parsed);
+            let result = write_parsed_history_core(conn, params, parsed, provider);
             match &result {
                 Ok(NormalizeJsonlFileOutcome::Imported(outcome)) => {
                     scope.field("outcome", "imported");
@@ -418,6 +461,34 @@ pub fn write_parsed_file_in_tx(
                 Err(err) => scope.finish_error(err),
             }
             result
+        }
+        SourceDescriptor {
+            provider: SourceProvider::Codex,
+            kind: super::SourceFileKind::SessionIndex,
+        } => {
+            let mut scope = PerfScope::new(
+                params.perf_logger.clone(),
+                "import.normalize_codex_session_index_jsonl",
+            );
+            scope.field("path", params.path.display().to_string());
+            let result = write_parsed_codex_session_index_core(conn, params, parsed);
+            match &result {
+                Ok(NormalizeJsonlFileOutcome::Imported(outcome)) => {
+                    scope.field("outcome", "imported");
+                    scope.field("record_count", outcome.record_count);
+                    scope.finish_ok();
+                }
+                Ok(NormalizeJsonlFileOutcome::Skipped) => {
+                    scope.field("outcome", "skipped");
+                    scope.finish_ok();
+                }
+                Ok(NormalizeJsonlFileOutcome::Warning(_)) => {
+                    scope.field("outcome", "warning");
+                    scope.finish_ok();
+                }
+                Err(err) => scope.finish_error(err),
+            }
+            result.map(|outcome| (outcome, Vec::new()))
         }
         _ => {
             purge_existing_import(conn, params)?;
@@ -529,13 +600,14 @@ fn write_parsed_history_core(
     conn: &Connection,
     params: &NormalizeJsonlFileParams,
     parsed: super::ParsedFile,
+    provider: SourceProvider,
 ) -> Result<NormalizeJsonlFileOutcome> {
     purge_existing_import(conn, params)?;
 
     let mut history_event_count = 0usize;
 
     for record in parsed.records {
-        insert_history_event(conn, params, &record.value, record.source_line_no)?;
+        insert_history_event(conn, params, &record.value, record.source_line_no, provider)?;
         history_event_count += 1;
     }
 
@@ -582,6 +654,30 @@ fn normalize_codex_rollout_jsonl_file(
     let (outcome, _messages) = write_parsed_codex_rollout_core(&tx, params, parsed)?;
     tx.commit()
         .context("unable to commit codex rollout import transaction")?;
+    Ok(outcome)
+}
+
+fn normalize_codex_session_index_jsonl_file(
+    conn: &mut Connection,
+    params: &NormalizeJsonlFileParams,
+) -> Result<NormalizeJsonlFileOutcome> {
+    let tx = conn
+        .transaction()
+        .context("unable to start transaction for codex session-index import")?;
+    let parsed = match parse_jsonl_file_inner(&params.path, SourceFileKind::SessionIndex)? {
+        super::ParseResult::Parsed(parsed) => parsed,
+        super::ParseResult::SessionlessMetadata => {
+            unreachable!("session index files are never treated as sessionless metadata")
+        }
+        super::ParseResult::Warning(warning) => {
+            tx.rollback()
+                .context("unable to rollback codex session-index import transaction")?;
+            return Ok(NormalizeJsonlFileOutcome::Warning(warning));
+        }
+    };
+    let outcome = write_parsed_codex_session_index_core(&tx, params, parsed)?;
+    tx.commit()
+        .context("unable to commit codex session-index import transaction")?;
     Ok(outcome)
 }
 
@@ -704,6 +800,82 @@ fn write_parsed_codex_rollout_core(
             history_event_count: 0,
         }),
         normalized_messages,
+    ))
+}
+
+fn write_parsed_codex_session_index_core(
+    conn: &Connection,
+    params: &NormalizeJsonlFileParams,
+    parsed: super::ParsedFile,
+) -> Result<NormalizeJsonlFileOutcome> {
+    purge_existing_import(conn, params)?;
+
+    let mut inserted_count = 0usize;
+    let mut stmt = conn.prepare_cached(
+        "
+        INSERT INTO codex_session_index_entry (
+            import_chunk_id,
+            source_file_id,
+            source_line_no,
+            session_id,
+            first_seen_at_utc,
+            last_seen_at_utc,
+            raw_cwd_path,
+            rollout_relative_path,
+            raw_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ",
+    )?;
+
+    for record in parsed.records {
+        let raw_json = serde_json::to_string(&record.value).with_context(|| {
+            format!(
+                "unable to serialize codex session-index entry on line {} from {}",
+                record.source_line_no,
+                params.path.display()
+            )
+        })?;
+        stmt.execute(params![
+            params.import_chunk_id,
+            params.source_file_id,
+            record.source_line_no,
+            optional_string(record.value.get("session_id")),
+            optional_string(record.value.get("first_seen_at")),
+            optional_string(record.value.get("last_seen_at")),
+            optional_string(record.value.get("cwd")),
+            optional_string(record.value.get("rollout_path")),
+            raw_json,
+        ])
+        .with_context(|| {
+            format!(
+                "unable to insert codex session-index entry on line {} from {}",
+                record.source_line_no,
+                params.path.display()
+            )
+        })?;
+        inserted_count += 1;
+    }
+
+    conn.prepare_cached(
+        "
+        UPDATE import_chunk
+        SET imported_record_count = imported_record_count + ?2
+        WHERE id = ?1
+        ",
+    )
+    .and_then(|mut stmt| stmt.execute(params![params.import_chunk_id, inserted_count as i64]))
+    .context("unable to update import chunk counters after codex session-index import")?;
+
+    Ok(NormalizeJsonlFileOutcome::Imported(
+        NormalizeJsonlFileResult {
+            conversation_id: None,
+            stream_id: None,
+            record_count: inserted_count,
+            message_count: 0,
+            turn_count: 0,
+            history_event_count: 0,
+        },
     ))
 }
 
@@ -969,6 +1141,39 @@ struct SkillInvocationDraft {
     skill_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HistoryEventDraft {
+    session_id: Option<String>,
+    recorded_at_utc: Option<String>,
+    raw_project: Option<String>,
+    display_text: Option<String>,
+    pasted_contents_json: Option<String>,
+}
+
+impl HistoryEventDraft {
+    fn from_record(record: &Value, provider: SourceProvider) -> Result<Self> {
+        match provider {
+            SourceProvider::Claude => Ok(Self {
+                session_id: optional_string(record.get("sessionId")),
+                recorded_at_utc: optional_string(record.get("timestamp")),
+                raw_project: optional_string(record.get("project")),
+                display_text: optional_string(record.get("display")),
+                pasted_contents_json: record
+                    .get("pastedContents")
+                    .map(serde_json::to_string)
+                    .transpose()?,
+            }),
+            SourceProvider::Codex => Ok(Self {
+                session_id: optional_string(record.get("session_id")),
+                recorded_at_utc: optional_string(record.get("timestamp")),
+                raw_project: optional_string(record.get("cwd")),
+                display_text: optional_string(record.get("summary")),
+                pasted_contents_json: None,
+            }),
+        }
+    }
+}
+
 impl HistoryInputKind {
     const fn as_str(self) -> &'static str {
         match self {
@@ -982,10 +1187,11 @@ impl HistoryInputKind {
 fn normalize_history_jsonl_file(
     conn: &mut Connection,
     params: &NormalizeJsonlFileParams,
+    provider: SourceProvider,
 ) -> Result<NormalizeJsonlFileOutcome> {
     let mut scope = PerfScope::new(params.perf_logger.clone(), "import.normalize_history_jsonl");
     scope.field("path", params.path.display().to_string());
-    let result = normalize_history_jsonl_file_inner(conn, params);
+    let result = normalize_history_jsonl_file_inner(conn, params, provider);
     match &result {
         Ok(NormalizeJsonlFileOutcome::Imported(outcome)) => {
             scope.field("outcome", "imported");
@@ -1008,6 +1214,7 @@ fn normalize_history_jsonl_file(
 fn normalize_history_jsonl_file_core(
     conn: &Connection,
     params: &NormalizeJsonlFileParams,
+    provider: SourceProvider,
 ) -> Result<NormalizeJsonlFileOutcome> {
     purge_existing_import(conn, params)?;
 
@@ -1040,7 +1247,7 @@ fn normalize_history_jsonl_file_core(
             }
         };
 
-        insert_history_event(conn, params, &record, line_no as i64)?;
+        insert_history_event(conn, params, &record, line_no as i64, provider)?;
         history_event_count += 1;
     }
 
@@ -1069,11 +1276,12 @@ fn normalize_history_jsonl_file_core(
 fn normalize_history_jsonl_file_inner(
     conn: &mut Connection,
     params: &NormalizeJsonlFileParams,
+    provider: SourceProvider,
 ) -> Result<NormalizeJsonlFileOutcome> {
     let tx = conn
         .transaction()
         .context("unable to start history normalization transaction")?;
-    let result = normalize_history_jsonl_file_core(&tx, params)?;
+    let result = normalize_history_jsonl_file_core(&tx, params, provider)?;
     match &result {
         NormalizeJsonlFileOutcome::Warning(_) => {
             // tx drops, auto-rollback undoes purge + partial writes
@@ -1091,19 +1299,16 @@ fn insert_history_event(
     params: &NormalizeJsonlFileParams,
     record: &Value,
     source_line_no: i64,
+    provider: SourceProvider,
 ) -> Result<()> {
-    let display_text = optional_string(record.get("display"));
+    let history_draft = HistoryEventDraft::from_record(record, provider).with_context(|| {
+        format!(
+            "unable to extract normalized history event on line {source_line_no} from {}",
+            params.path.display()
+        )
+    })?;
+    let display_text = history_draft.display_text.clone();
     let (input_kind, slash_command_name) = classify_history_input(display_text.as_deref());
-    let pasted_contents_json = record
-        .get("pastedContents")
-        .map(serde_json::to_string)
-        .transpose()
-        .with_context(|| {
-            format!(
-                "unable to serialize pastedContents on line {source_line_no} from {}",
-                params.path.display()
-            )
-        })?;
     let raw_json = serde_json::to_string(record).with_context(|| {
         format!(
             "unable to serialize raw history event on line {source_line_no} from {}",
@@ -1134,11 +1339,11 @@ fn insert_history_event(
             params.import_chunk_id,
             params.source_file_id,
             source_line_no,
-            optional_string(record.get("sessionId")),
-            optional_string(record.get("timestamp")),
-            optional_string(record.get("project")),
+            history_draft.session_id,
+            history_draft.recorded_at_utc,
+            history_draft.raw_project,
             display_text,
-            pasted_contents_json,
+            history_draft.pasted_contents_json,
             input_kind.as_str(),
             slash_command_name,
             raw_json,
@@ -1152,7 +1357,7 @@ fn insert_history_event(
     })?;
     let history_event_id = conn.last_insert_rowid();
 
-    if let Some(invocation) = extract_skill_invocation(record) {
+    if let Some(invocation) = extract_skill_invocation(record, provider) {
         insert_skill_invocation(conn, params, history_event_id, &invocation)?;
     }
 
@@ -1177,9 +1382,13 @@ fn classify_history_input(display_text: Option<&str>) -> (HistoryInputKind, Opti
     (HistoryInputKind::PlainPrompt, None)
 }
 
-fn extract_skill_invocation(record: &Value) -> Option<SkillInvocationDraft> {
-    let session_id = optional_string(record.get("sessionId"))?;
-    let display_text = optional_string(record.get("display"))?;
+fn extract_skill_invocation(
+    record: &Value,
+    provider: SourceProvider,
+) -> Option<SkillInvocationDraft> {
+    let history_draft = HistoryEventDraft::from_record(record, provider).ok()?;
+    let session_id = history_draft.session_id?;
+    let display_text = history_draft.display_text?;
     let stripped = display_text.trim().strip_prefix("/skill")?;
     let skill_name = stripped
         .split_whitespace()
@@ -1189,8 +1398,8 @@ fn extract_skill_invocation(record: &Value) -> Option<SkillInvocationDraft> {
 
     Some(SkillInvocationDraft {
         session_id,
-        recorded_at_utc: optional_string(record.get("timestamp")),
-        raw_project: optional_string(record.get("project")),
+        recorded_at_utc: history_draft.recorded_at_utc,
+        raw_project: history_draft.raw_project,
         skill_name,
     })
 }
@@ -1260,6 +1469,10 @@ pub(super) fn purge_existing_import(
     conn.prepare_cached("DELETE FROM codex_rollout_session WHERE source_file_id = ?1")
         .and_then(|mut stmt| stmt.execute([params.source_file_id]))
         .context("unable to purge existing codex rollout raw state")?;
+
+    conn.prepare_cached("DELETE FROM codex_session_index_entry WHERE source_file_id = ?1")
+        .and_then(|mut stmt| stmt.execute([params.source_file_id]))
+        .context("unable to purge existing codex session-index raw state")?;
 
     conn.prepare_cached(
         "
@@ -2643,6 +2856,10 @@ mod tests {
         "{\"sessionId\":\"session-history-2\",\"timestamp\":\"2026-03-26T08:02:00Z\",\"project\":\"/tmp/project-b\"}\n"
     );
 
+    const CODEX_HISTORY_FIXTURE: &str = "{\"session_id\":\"codex-session-1\",\"timestamp\":\"2026-04-18T12:00:00Z\",\"cwd\":\"/tmp/redacted/project-a\",\"summary\":\"Investigate failing test\"}\n";
+
+    const CODEX_SESSION_INDEX_FIXTURE: &str = "{\"session_id\":\"codex-session-1\",\"first_seen_at\":\"2026-04-18T12:00:00Z\",\"last_seen_at\":\"2026-04-18T12:05:00Z\",\"cwd\":\"/tmp/redacted/project-a\",\"rollout_path\":\"2026/04/18/rollout-2026-04-18T12-00-00Z.jsonl\"}\n";
+
     const CODEX_ROLLOUT_FIXTURE: &str = concat!(
         "{\"type\":\"session_meta\",\"session_id\":\"codex-session-1\",\"cli_version\":\"0.0.0-test\",\"cwd\":\"/tmp/redacted/project-a\",\"model\":\"gpt-5.4-codex\"}\n",
         "{\"type\":\"turn_context\",\"turn_id\":\"turn-1\",\"cwd\":\"/tmp/redacted/project-a\"}\n",
@@ -3005,6 +3222,11 @@ mod tests {
                 id INTEGER PRIMARY KEY,
                 source_file_id INTEGER NOT NULL
             );
+
+            CREATE TABLE codex_session_index_entry (
+                id INTEGER PRIMARY KEY,
+                source_file_id INTEGER NOT NULL
+            );
             ",
         )?;
         conn.execute(
@@ -3295,6 +3517,124 @@ mod tests {
                 "planner".to_string(),
                 Some("/tmp/project-a".to_string()),
             )
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_codex_history_jsonl_into_history_events() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let fixture_path = temp.path().join("codex-history.jsonl");
+        std::fs::write(&fixture_path, CODEX_HISTORY_FIXTURE)?;
+
+        let mut db = Database::open(&db_path)?;
+        let ids = seed_import_context_with_provider_and_kind(
+            db.connection_mut(),
+            "history.jsonl",
+            SourceProvider::Codex,
+            SourceFileKind::History,
+        )?;
+        let result = normalize_jsonl_file(
+            db.connection_mut(),
+            &NormalizeJsonlFileParams {
+                project_id: ids.project_id,
+                source_file_id: ids.source_file_id,
+                import_chunk_id: ids.import_chunk_id,
+                path: fixture_path,
+                perf_logger: None,
+            },
+        )?;
+        let NormalizeJsonlFileOutcome::Imported(result) = result else {
+            panic!("codex history fixture should import");
+        };
+
+        assert_eq!(result.record_count, 1);
+        assert_eq!(result.history_event_count, 1);
+
+        let row: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = db.connection().query_row(
+            "
+                SELECT session_id, recorded_at_utc, raw_project, display_text
+                FROM history_event
+                ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(row.0.as_deref(), Some("codex-session-1"));
+        assert_eq!(row.1.as_deref(), Some("2026-04-18T12:00:00Z"));
+        assert_eq!(row.2.as_deref(), Some("/tmp/redacted/project-a"));
+        assert_eq!(row.3.as_deref(), Some("Investigate failing test"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_codex_session_index_jsonl_into_raw_entries() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let fixture_path = temp.path().join("session_index.jsonl");
+        std::fs::write(&fixture_path, CODEX_SESSION_INDEX_FIXTURE)?;
+
+        let mut db = Database::open(&db_path)?;
+        let ids = seed_import_context_with_provider_and_kind(
+            db.connection_mut(),
+            "session_index.jsonl",
+            SourceProvider::Codex,
+            SourceFileKind::SessionIndex,
+        )?;
+        let result = normalize_jsonl_file(
+            db.connection_mut(),
+            &NormalizeJsonlFileParams {
+                project_id: ids.project_id,
+                source_file_id: ids.source_file_id,
+                import_chunk_id: ids.import_chunk_id,
+                path: fixture_path,
+                perf_logger: None,
+            },
+        )?;
+        let NormalizeJsonlFileOutcome::Imported(result) = result else {
+            panic!("codex session-index fixture should import");
+        };
+
+        assert_eq!(result.record_count, 1);
+        assert_eq!(result.history_event_count, 0);
+        assert_eq!(result.conversation_id, None);
+
+        let row: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = db.connection().query_row(
+            "
+            SELECT session_id, first_seen_at_utc, last_seen_at_utc, raw_cwd_path, rollout_relative_path
+            FROM codex_session_index_entry
+            ",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(row.0.as_deref(), Some("codex-session-1"));
+        assert_eq!(row.1.as_deref(), Some("2026-04-18T12:00:00Z"));
+        assert_eq!(row.2.as_deref(), Some("2026-04-18T12:05:00Z"));
+        assert_eq!(row.3.as_deref(), Some("/tmp/redacted/project-a"));
+        assert_eq!(
+            row.4.as_deref(),
+            Some("2026/04/18/rollout-2026-04-18T12-00-00Z.jsonl")
         );
 
         Ok(())

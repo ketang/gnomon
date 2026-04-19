@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 
-pub const INITIAL_SCHEMA_VERSION: u32 = 16;
+pub const INITIAL_SCHEMA_VERSION: u32 = 17;
 pub const DEFAULT_DB_FILENAME: &str = "usage.sqlite3";
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 

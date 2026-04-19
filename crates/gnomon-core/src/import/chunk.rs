@@ -1592,6 +1592,15 @@ fn purge_source_file_from_chunk(
 
     conn.prepare_cached(
         "
+        DELETE FROM codex_session_index_entry
+        WHERE source_file_id = ?1 AND import_chunk_id = ?2
+        ",
+    )
+    .and_then(|mut stmt| stmt.execute(params![source_file_id, import_chunk_id]))
+    .context("unable to purge chunk-scoped codex session-index state for source file")?;
+
+    conn.prepare_cached(
+        "
         DELETE FROM import_warning
         WHERE import_chunk_id = ?1 AND source_file_id = ?2
         ",
@@ -1646,6 +1655,7 @@ fn recompute_chunk_counts(conn: &Connection, import_chunk_id: i64) -> Result<()>
                 SELECT
                     (SELECT COUNT(*) FROM history_event WHERE import_chunk_id = ?1)
                     + (SELECT COUNT(*) FROM codex_rollout_event WHERE import_chunk_id = ?1)
+                    + (SELECT COUNT(*) FROM codex_session_index_entry WHERE import_chunk_id = ?1)
             ),
             imported_message_count = (
                 SELECT COUNT(*)
@@ -2620,14 +2630,15 @@ mod tests {
         assert_eq!(second_import_report.deferred_failure_count, 0);
         assert!(second_import_report.deferred_failure_summary.is_none());
 
-        let counts: (i64, i64, i64, i64, i64) = db.connection().query_row(
+        let counts: (i64, i64, i64, i64, i64, i64) = db.connection().query_row(
             "
             SELECT
                 (SELECT COUNT(*) FROM source_file WHERE imported_schema_version = ?1),
                 (SELECT COUNT(*) FROM conversation),
                 (SELECT COUNT(*) FROM history_event),
                 (SELECT COUNT(*) FROM codex_rollout_session),
-                (SELECT COUNT(*) FROM codex_rollout_event)
+                (SELECT COUNT(*) FROM codex_rollout_event),
+                (SELECT COUNT(*) FROM codex_session_index_entry)
             ",
             params![crate::import::IMPORT_SCHEMA_VERSION],
             |row| {
@@ -2637,14 +2648,16 @@ mod tests {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )?;
         assert_eq!(counts.0, 5);
         assert_eq!(counts.1, 2);
-        assert_eq!(counts.2, 1);
+        assert_eq!(counts.2, 2);
         assert_eq!(counts.3, 1);
         assert_eq!(counts.4, 9);
+        assert_eq!(counts.5, 1);
 
         let codex_shared_counts: (i64, i64, i64, i64) = db.connection().query_row(
             "
@@ -2692,6 +2705,41 @@ mod tests {
         assert_eq!(codex_tool_row.0, "Bash");
         assert_eq!(codex_tool_row.1, Some(123));
         assert_eq!(codex_tool_row.2, Some(45));
+
+        let codex_history_row: (Option<String>, Option<String>, Option<String>) =
+            db.connection().query_row(
+                "
+                SELECT session_id, raw_project, display_text
+                FROM history_event he
+                JOIN source_file sf ON sf.id = he.source_file_id
+                WHERE sf.source_provider = 'codex' AND sf.source_kind = 'history'
+                ",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        assert_eq!(codex_history_row.0.as_deref(), Some("codex-session-1"));
+        assert_eq!(
+            codex_history_row.1.as_deref(),
+            Some("/tmp/redacted/project-a")
+        );
+        assert_eq!(
+            codex_history_row.2.as_deref(),
+            Some("Investigate failing test")
+        );
+
+        let session_index_row: (Option<String>, Option<String>) = db.connection().query_row(
+            "
+            SELECT session_id, rollout_relative_path
+            FROM codex_session_index_entry
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(session_index_row.0.as_deref(), Some("codex-session-1"));
+        assert_eq!(
+            session_index_row.1.as_deref(),
+            Some("2026/04/18/rollout-2026-04-18T12-00-00Z.jsonl")
+        );
 
         let rollout_row: (
             Option<String>,
