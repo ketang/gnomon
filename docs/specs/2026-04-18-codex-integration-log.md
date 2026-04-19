@@ -219,16 +219,64 @@ Verification:
 - `cargo test -p gnomon-core`
 - `cargo test --workspace`
 
+### 2026-04-19 — `#125` Provider-Aware User Surfaces
+
+Status: MERGED into `codex-integration`
+
+Summary:
+
+- Created child branch/worktree
+  `codex-integration-provider-aware-surfaces` at
+  `.worktrees/codex-integration-provider-aware-surfaces` and landed it back on
+  `codex-integration`.
+- Added provider-aware query filters across browse, skills, and opportunities
+  so Claude-only, Codex-only, and explicit combined views all share the same
+  normalized data model without hiding mixed-provider rows.
+- Added provider-aware report output by threading provider filters and
+  `provider_scope` through browse rollups, skills reports, opportunities
+  reports, and JSON output.
+- Updated the TUI and web UI to expose explicit provider filtering, show the
+  selected provider in filter summaries, and label result rows/details as
+  `claude`, `codex`, or `mixed`.
+- Updated operator and design docs to describe the new provider-aware user
+  surfaces and the requirement that mixed-provider results remain visibly
+  mixed.
+- Landed the relevant `#121` regression slice with fixture/test updates across
+  query, report, TUI, and web coverage so provider-aware surface behavior is
+  exercised alongside the Codex integration work.
+
+Verification:
+
+- `cargo fmt --all`
+- `cargo check --workspace`
+- `cargo test --workspace`
+
+Notes:
+
+- GitHub issue `#125` could not be claimed with the `in-progress` label because
+  the installed GitHub app returned `403 Resource not accessible by
+  integration` for label mutations in this repository.
+- At session close, the base branch already pointed at the child branch tip
+  (`601c7f7`), so `git merge --no-ff codex-integration-provider-aware-surfaces`
+  reported `Already up to date` and no additional merge commit was required.
+
 ---
 
 ## RESUME HERE
 
-Phase: `#124` merged; ready to start `#125`
+Phase: Codex integration implementation complete on `codex-integration`; ready
+for final review and merge preparation
 Base branch: `codex-integration`
 Base worktree: `/home/ketan/project/gnomon/.worktrees/codex-integration`
-Last completed: Merged `#124` Codex auxiliary-source import and the next `#121` regression slice from `codex-integration-codex-aux-sources` into the base branch
-Next action: Start `#125` by creating child branch `codex-integration-provider-aware-surfaces` and worktree `.worktrees/codex-integration-provider-aware-surfaces`, then add provider-aware query, report, TUI, web, and docs support for mixed Claude and Codex data
-Open issue sequence: `#125`
+Last completed: Landed `#125` provider-aware query, report, TUI, web, and docs
+support plus the final planned `#121` regression slice from
+`codex-integration-provider-aware-surfaces`; base `codex-integration` now sits
+at commit `601c7f7`
+Next action: Review the full `codex-integration` branch against `main`, run the
+full verification pass one more time from the base worktree, and prepare the
+final no-fast-forward merge into `main` when the user asks for integration
+closure
+Open issue sequence: none in the planned `#119`-`#125` stack
 In-flight uncommitted state on base branch: none expected after the merge and log-update commits
 Child-branch naming note: Because the flat branch `codex-integration` exists, `codex-integration/...` refs are invalid here; use dashed child branch names like `codex-integration-shared-session-spine`
 
@@ -249,24 +297,18 @@ Before doing anything else:
 
 Then:
 
-1. Create the child branch and worktree for `#125` from `codex-integration`.
-   Use a dashed branch name such as
-   `codex-integration-provider-aware-surfaces`; do not use
-   `codex-integration/...` because that ref layout conflicts with the existing
-   flat base branch.
-2. Implement only the provider-aware surface slice in that child worktree.
-   Add provider-aware query filters, report output, TUI surfaces, web surfaces,
-   and docs support for Claude and Codex data while keeping mixed-provider
-   views explicit rather than implicit.
-3. Land any relevant `#121` fixture and regression-test slice with the `#125`
-   work.
-4. Verify the resulting change.
-5. Merge the child branch back into `codex-integration`.
-6. Return to the base worktree.
-7. Update this log with:
-   - what landed
-   - what remains
-   - the next recommended action
-   - a refreshed fresh-agent prompt
+1. Review the full `codex-integration` branch against `main` to confirm the
+   complete `#119`-`#125` stack is present and coherent.
+2. Run the final verification pass from the base worktree:
+   - `cargo fmt --all`
+   - `cargo clippy --workspace --all-targets -- -D warnings`
+   - `cargo test --workspace`
+   - `cargo build --workspace`
+   - `cargo run -p gnomon -- --help`
+3. If verification passes and the user wants closure, merge
+   `codex-integration` into `main` with `git merge --no-ff codex-integration`
+   from an up-to-date `main` worktree.
+4. Update this log with the final merge summary and closure checklist.
 
-End the session on the base branch and base worktree, not on the child branch.
+End the session on the base branch and base worktree unless the user explicitly
+asks for the final merge into `main`.
