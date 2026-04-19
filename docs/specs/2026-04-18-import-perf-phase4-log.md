@@ -122,6 +122,29 @@ Next implied: A1 (SQLite page size 8K/16K) — never measured, low risk, moderat
 
 ---
 
+## 2026-04-19 — candidate A1: SQLite page size 8K
+
+Branch: import-perf-p4-a1
+Worktree: .worktrees/import-perf-p4-a1
+Hypothesis: Default SQLite page size is 4096 bytes. Larger pages (8192) reduce btree depth
+(fewer levels per lookup) and amortize page-header overhead across more rows per page. The
+import workload has large sequential inserts — larger pages reduce page splits and internal
+node updates. The bench harness creates a fresh DB per run so PRAGMA page_size takes effect.
+Implementation: Add `PRAGMA page_size = 8192;` as the first pragma in `configure_import_connection`
+(and `configure_read_write_connection` for consistency) in `crates/gnomon-core/src/db/mod.rs`,
+before `PRAGMA journal_mode = WAL` so it precedes any writes.
+Measurements:
+  Subset:       (pending)
+  Full:         (pending)
+  Row parity:   (pending)
+  Profile shift: (pending)
+Decision: PENDING USER
+Commit:
+Key finding: (pending)
+Next implied: (pending)
+
+---
+
 ## RESUME HERE
 
 Phase: Phase 4
