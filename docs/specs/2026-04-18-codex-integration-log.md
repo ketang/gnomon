@@ -147,16 +147,51 @@ Verification:
 - `cargo test -p gnomon-core`
 - `cargo test --workspace`
 
+### 2026-04-19 — `#123` Codex Rollout Normalization
+
+Status: MERGED into `codex-integration`
+
+Summary:
+
+- Created child branch/worktree
+  `codex-integration-codex-rollout-normalization` at
+  `.worktrees/codex-integration-codex-rollout-normalization` and merged it
+  back into `codex-integration`.
+- Extended rollout normalization so the same Codex rollout file now persists
+  both Codex-specific raw rows and shared normalized `conversation`, `stream`,
+  `message`, `turn`, and `action` rows in one import path.
+- Mapped rollout `user_message`, `agent_message`, `reasoning`,
+  `function_call`, `function_call_output`, and `token_count` into the common
+  model only where there is a real shared analogue.
+- Kept Codex-only structure in the raw rollout tables instead of reshaping raw
+  metadata into Claude-specific transcript assumptions.
+- Normalized Codex `shell` tool calls onto the shared `Bash` tool analogue so
+  existing action classification can attribute rollout-backed shell usage
+  without introducing a provider-specific action taxonomy.
+- Bumped the import schema version for the shared-model rollout contract.
+- Landed the next `#121` regression slice with:
+  - a normalization unit test that proves one rollout file populates both raw
+    Codex tables and shared normalized rows
+  - an end-to-end mixed-source import test that proves rollout-backed Codex
+    sessions now contribute shared conversations, messages, turns, and actions
+
+Verification:
+
+- `cargo test -p gnomon-core normalizes_codex_rollout_into_raw_and_shared_models -- --nocapture`
+- `cargo test -p gnomon-core import_all_imports_codex_rollout_raw_sessions_without_blocking_claude_imports -- --nocapture`
+- `cargo test -p gnomon-core`
+- `cargo test --workspace`
+
 ---
 
 ## RESUME HERE
 
-Phase: `#122` merged; ready to start `#123`
+Phase: `#123` merged; ready to start `#124`
 Base branch: `codex-integration`
 Base worktree: `/home/ketan/project/gnomon/.worktrees/codex-integration`
-Last completed: Merged `#122` Codex rollout raw import and the next `#121` regression slice from `codex-integration-codex-rollout-raw-import` into the base branch
-Next action: Start `#123` by creating child branch `codex-integration-codex-rollout-normalization` and worktree `.worktrees/codex-integration-codex-rollout-normalization`, then normalize rollout-backed Codex sessions into the shared conversation, message, turn, action, and usage model using the raw rollout tables landed in `#122`
-Open issue sequence: `#123`, `#121` incremental, `#124`, `#125`
+Last completed: Merged `#123` Codex rollout normalization and the next `#121` regression slice from `codex-integration-codex-rollout-normalization` into the base branch
+Next action: Start `#124` by creating child branch `codex-integration-codex-aux-sources` and worktree `.worktrees/codex-integration-codex-aux-sources`, then import Codex `history.jsonl` and `session_index.jsonl` as auxiliary Codex sources while preserving unmatched rows instead of inventing project attribution
+Open issue sequence: `#124`, `#121` incremental, `#125`
 In-flight uncommitted state on base branch: none expected after the merge and log-update commits
 Child-branch naming note: Because the flat branch `codex-integration` exists, `codex-integration/...` refs are invalid here; use dashed child branch names like `codex-integration-shared-session-spine`
 
@@ -177,16 +212,16 @@ Before doing anything else:
 
 Then:
 
-1. Create the child branch and worktree for `#123` from `codex-integration`.
+1. Create the child branch and worktree for `#124` from `codex-integration`.
    Use a dashed branch name such as
-   `codex-integration-codex-rollout-normalization`; do not use
+   `codex-integration-codex-aux-sources`; do not use
    `codex-integration/...` because that ref layout conflicts with the existing
    flat base branch.
-2. Implement only the Codex rollout normalization slice in that child worktree.
-   Normalize rollout-backed Codex sessions into the shared conversation,
-   message, turn, action, and usage model without collapsing provider-specific
-   raw metadata back into Claude-shaped assumptions.
-3. Land any relevant `#121` fixture and regression-test slice with the `#123`
+2. Implement only the Codex auxiliary-source slice in that child worktree.
+   Import Codex `history.jsonl` and `session_index.jsonl` as separate Codex
+   auxiliary sources, join them to the shared session spine where possible,
+   and preserve unmatched rows instead of inventing project attribution.
+3. Land any relevant `#121` fixture and regression-test slice with the `#124`
    work.
 4. Verify the resulting change.
 5. Merge the child branch back into `codex-integration`.
