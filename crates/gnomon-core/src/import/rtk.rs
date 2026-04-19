@@ -45,7 +45,6 @@ pub(crate) struct BashAction {
 /// into `action_rtk_match`.
 ///
 /// Silently no-ops if RTK's db does not exist or `rtk_config.enabled` is false.
-#[allow(dead_code)]
 pub(crate) fn match_rtk_savings(
     conn: &Connection,
     import_chunk_id: i64,
