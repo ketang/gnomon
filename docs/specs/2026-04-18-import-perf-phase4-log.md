@@ -134,14 +134,20 @@ Implementation: Add `PRAGMA page_size = 8192;` as the first pragma in `configure
 (and `configure_read_write_connection` for consistency) in `crates/gnomon-core/src/db/mod.rs`,
 before `PRAGMA journal_mode = WAL` so it precedes any writes.
 Measurements:
-  Subset:       (pending)
-  Full:         (pending)
-  Row parity:   (pending)
-  Profile shift: (pending)
-Decision: PENDING USER
+  Subset:       6.543s → 8.312s median (+27.1%); runs: 8.603, 8.461, 8.258, 7.069, 8.312
+  Full:         not measured — subset regression conclusive
+  Row parity:   not checked — reverted before parity run
+  Profile shift: db size with 8K pages: 155.74 MB (baseline not recorded; likely similar)
+Decision: REVERTED
 Commit:
-Key finding: (pending)
-Next implied: (pending)
+Key finding: Larger page size (8192) regresses import throughput by ~27% on subset. Larger
+pages mean each WAL page write doubles in size (8K vs 4K); the workload's dense sequential
+inserts do not produce enough btree depth savings to overcome the increased per-page I/O cost.
+The btree depth reduction benefit requires wide, sparse lookups — the import path's sequential
+inserts with FK=OFF don't traverse the tree deeply enough to benefit. This is consistent with
+the CPU-floor diagnostic (D0): the bottleneck is raw write I/O, not lookup depth.
+Next implied: B1 (`:memory:` staging DB → `VACUUM INTO`) — biggest single-candidate potential,
+eliminates WAL overhead entirely for the write phase.
 
 ---
 
@@ -150,23 +156,23 @@ Next implied: (pending)
 Phase: Phase 4
 Long-lived branch: `import-perf-p4`
 Long-lived worktree: `.worktrees/import-perf-p4`
-Last completed: A5 — REVERTED (wal_autocheckpoint=0 regressed +67.6% on subset — single large checkpoint slower than distributed autocheckpoints)
-Next action: Run candidate A1: SQLite page size 8K or 16K.
-  Set PRAGMA page_size = 8192 (or 16384) before migrations in configure_read_write_connection.
-  The bench harness creates a fresh DB per run so no reset needed.
-  Measure subset and full corpus. If 8K improves, optionally test 16K.
+Last completed: A1 — REVERTED (page_size=8192 regressed +27.1% on subset — larger WAL page writes dominate)
+Next action: Run candidate B1: `:memory:` staging DB → `VACUUM INTO`.
+  All chunk writes go to an in-process `:memory:` SQLite; at chunk end, call `VACUUM INTO <final_path>`.
+  In-memory btree operations avoid WAL overhead entirely. See Section 1 of plan for full description.
+  Code location: `crates/gnomon-core/src/import/chunk.rs` (the per-chunk import functions).
+  Create branch import-perf-p4-b1 and worktree .worktrees/import-perf-p4-b1 from import-perf-p4.
 Current best (subset): 6.543s median (−22.9% from 8.487s baseline)
 Current best (full): 17.982s median (−5.2% from 18.969s baseline)
 Target: 10s full corpus
 In-flight uncommitted state: none
 
 Candidate ranking (live — re-rank after each result):
-1. A1 — SQLite page size 8K/16K — never measured, low risk, potentially 1–3s gain
-2. B1 — `:memory:` staging DB → `VACUUM INTO` — biggest potential single-candidate win
-3. A6 — Struct-based serde (replace `serde_json::Value`) — parse phase reduction
-4. A2 — LTO + PGO — free binary-level gain
-5. A7 — `jwalk` parallel directory walk — scan_source reduction
-6. A8 — path_node chunk-level cache (across files in chunk) — classify phase reduction
-7. B2 — Parallel per-chunk `:memory:` DBs + merge (requires B1 KEPT first)
-8. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker
-NOTE: A4 (EXCLUSIVE locking) and A5 (wal_autocheckpoint=0) both removed — confirmed counterproductive with multi-connection import architecture.
+1. B1 — `:memory:` staging DB → `VACUUM INTO` — biggest potential single-candidate win (4–8s)
+2. A6 — Struct-based serde (replace `serde_json::Value`) — parse phase reduction (0.5–1.5s)
+3. A2 — LTO + PGO — free binary-level gain (5–15% total wall)
+4. A7 — `jwalk` parallel directory walk — scan_source reduction (0.2–0.5s)
+5. A8 — path_node chunk-level cache (across files in chunk) — classify phase reduction (0.3–1.0s)
+6. B2 — Parallel per-chunk `:memory:` DBs + merge (requires B1 KEPT first)
+7. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker
+NOTE: A1 (page_size 8K), A4 (EXCLUSIVE locking), A5 (wal_autocheckpoint=0) all removed — confirmed counterproductive. The write bottleneck is raw WAL I/O throughput; SQLite pragma tweaks cannot overcome it.
