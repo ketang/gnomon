@@ -1583,6 +1583,15 @@ fn purge_source_file_from_chunk(
 
     conn.prepare_cached(
         "
+        DELETE FROM codex_rollout_session
+        WHERE source_file_id = ?1 AND import_chunk_id = ?2
+        ",
+    )
+    .and_then(|mut stmt| stmt.execute(params![source_file_id, import_chunk_id]))
+    .context("unable to purge chunk-scoped codex rollout raw state for source file")?;
+
+    conn.prepare_cached(
+        "
         DELETE FROM import_warning
         WHERE import_chunk_id = ?1 AND source_file_id = ?2
         ",
@@ -1634,9 +1643,9 @@ fn recompute_chunk_counts(conn: &Connection, import_chunk_id: i64) -> Result<()>
         UPDATE import_chunk
         SET
             imported_record_count = (
-                SELECT COUNT(*)
-                FROM history_event
-                WHERE import_chunk_id = ?1
+                SELECT
+                    (SELECT COUNT(*) FROM history_event WHERE import_chunk_id = ?1)
+                    + (SELECT COUNT(*) FROM codex_rollout_event WHERE import_chunk_id = ?1)
             ),
             imported_message_count = (
                 SELECT COUNT(*)
@@ -2542,7 +2551,8 @@ mod tests {
     }
 
     #[test]
-    fn import_all_skips_unsupported_codex_sources_without_blocking_claude_imports() -> Result<()> {
+    fn import_all_imports_codex_rollout_raw_sessions_without_blocking_claude_imports() -> Result<()>
+    {
         let temp = tempdir()?;
         let db_path = temp.path().join("usage.sqlite3");
         let claude_root = temp.path().join(".claude");
@@ -2605,19 +2615,70 @@ mod tests {
         assert_eq!(import_report.deferred_failure_count, 0);
         assert!(import_report.deferred_failure_summary.is_none());
 
-        let counts: (i64, i64, i64) = db.connection().query_row(
+        let second_import_report =
+            import_all_with_sources_and_perf_logger(db.connection(), &db_path, &sources, None)?;
+        assert_eq!(second_import_report.deferred_failure_count, 0);
+        assert!(second_import_report.deferred_failure_summary.is_none());
+
+        let counts: (i64, i64, i64, i64, i64) = db.connection().query_row(
             "
             SELECT
                 (SELECT COUNT(*) FROM source_file WHERE imported_schema_version = ?1),
                 (SELECT COUNT(*) FROM conversation),
-                (SELECT COUNT(*) FROM history_event)
+                (SELECT COUNT(*) FROM history_event),
+                (SELECT COUNT(*) FROM codex_rollout_session),
+                (SELECT COUNT(*) FROM codex_rollout_event)
             ",
             params![crate::import::IMPORT_SCHEMA_VERSION],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )?;
         assert_eq!(counts.0, 5);
         assert_eq!(counts.1, 1);
         assert_eq!(counts.2, 1);
+        assert_eq!(counts.3, 1);
+        assert_eq!(counts.4, 9);
+
+        let rollout_row: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = db.connection().query_row(
+            "
+                SELECT
+                    crs.session_id,
+                    crs.raw_cwd_path,
+                    crs.cli_version,
+                    crs.model_name,
+                    p.root_path
+                FROM codex_rollout_session crs
+                JOIN project p ON p.id = crs.project_id
+                ",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(rollout_row.0.as_deref(), Some("codex-session-1"));
+        assert_eq!(rollout_row.1.as_deref(), Some("/tmp/redacted/project-a"));
+        assert_eq!(rollout_row.2.as_deref(), Some("0.0.0-test"));
+        assert_eq!(rollout_row.3.as_deref(), Some("gpt-5.4-codex"));
+        assert_eq!(rollout_row.4, "/tmp/redacted/project-a");
 
         Ok(())
     }

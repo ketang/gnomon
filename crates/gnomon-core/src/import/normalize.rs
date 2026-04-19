@@ -73,6 +73,10 @@ pub fn normalize_jsonl_file(
             provider: SourceProvider::Claude,
             kind: SourceFileKind::History,
         }) => normalize_history_jsonl_file(conn, params),
+        Some(SourceDescriptor {
+            provider: SourceProvider::Codex,
+            kind: SourceFileKind::Rollout,
+        }) => normalize_codex_rollout_jsonl_file(conn, params),
         Some(_) => {
             purge_existing_import(conn, params)?;
             Ok(NormalizeJsonlFileOutcome::Skipped)
@@ -346,6 +350,34 @@ pub fn write_parsed_file_in_tx(
             }
             result.map(|outcome| (outcome, Vec::new()))
         }
+        SourceDescriptor {
+            provider: SourceProvider::Codex,
+            kind: super::SourceFileKind::Rollout,
+        } => {
+            let mut scope = PerfScope::new(
+                params.perf_logger.clone(),
+                "import.normalize_codex_rollout_jsonl",
+            );
+            scope.field("path", params.path.display().to_string());
+            let result = write_parsed_codex_rollout_core(conn, params, parsed);
+            match &result {
+                Ok(NormalizeJsonlFileOutcome::Imported(outcome)) => {
+                    scope.field("outcome", "imported");
+                    scope.field("record_count", outcome.record_count);
+                    scope.finish_ok();
+                }
+                Ok(NormalizeJsonlFileOutcome::Skipped) => {
+                    scope.field("outcome", "skipped");
+                    scope.finish_ok();
+                }
+                Ok(NormalizeJsonlFileOutcome::Warning(_)) => {
+                    scope.field("outcome", "warning");
+                    scope.finish_ok();
+                }
+                Err(err) => scope.finish_error(err),
+            }
+            result.map(|outcome| (outcome, Vec::new()))
+        }
         _ => {
             purge_existing_import(conn, params)?;
             Ok((NormalizeJsonlFileOutcome::Skipped, Vec::new()))
@@ -484,6 +516,112 @@ fn write_parsed_history_core(
             message_count: 0,
             turn_count: 0,
             history_event_count,
+        },
+    ))
+}
+
+fn normalize_codex_rollout_jsonl_file(
+    conn: &mut Connection,
+    params: &NormalizeJsonlFileParams,
+) -> Result<NormalizeJsonlFileOutcome> {
+    let tx = conn
+        .transaction()
+        .context("unable to start transaction for codex rollout import")?;
+    let parsed = match parse_jsonl_file_inner(&params.path, SourceFileKind::Rollout)? {
+        super::ParseResult::Parsed(parsed) => parsed,
+        super::ParseResult::SessionlessMetadata => {
+            unreachable!("rollout files are never treated as sessionless metadata")
+        }
+        super::ParseResult::Warning(warning) => {
+            tx.rollback()
+                .context("unable to rollback codex rollout import transaction")?;
+            return Ok(NormalizeJsonlFileOutcome::Warning(warning));
+        }
+    };
+    let outcome = write_parsed_codex_rollout_core(&tx, params, parsed)?;
+    tx.commit()
+        .context("unable to commit codex rollout import transaction")?;
+    Ok(outcome)
+}
+
+fn write_parsed_codex_rollout_core(
+    conn: &Connection,
+    params: &NormalizeJsonlFileParams,
+    parsed: super::ParsedFile,
+) -> Result<NormalizeJsonlFileOutcome> {
+    purge_existing_import(conn, params)?;
+
+    let metadata = CodexRolloutSessionDraft::from_records(&parsed.records)?;
+    let rollout_session_id: i64 = conn.query_row(
+        "
+        INSERT INTO codex_rollout_session (
+            project_id,
+            source_file_id,
+            import_chunk_id,
+            session_id,
+            raw_cwd_path,
+            cli_version,
+            originator,
+            model_provider,
+            model_name,
+            started_at_utc,
+            completed_at_utc,
+            metadata_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        RETURNING id
+        ",
+        params![
+            params.project_id,
+            params.source_file_id,
+            params.import_chunk_id,
+            metadata.session_id,
+            metadata.raw_cwd_path,
+            metadata.cli_version,
+            metadata.originator,
+            metadata.model_provider,
+            metadata.model_name,
+            metadata.started_at_utc,
+            metadata.completed_at_utc,
+            metadata.metadata_json,
+        ],
+        |row| row.get(0),
+    )?;
+
+    let mut event_stmt = conn.prepare_cached(
+        "
+        INSERT INTO codex_rollout_event (
+            codex_rollout_session_id,
+            source_file_id,
+            import_chunk_id,
+            source_line_no,
+            event_kind,
+            recorded_at_utc,
+            raw_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ",
+    )?;
+    for record in &parsed.records {
+        event_stmt.execute(params![
+            rollout_session_id,
+            params.source_file_id,
+            params.import_chunk_id,
+            record.source_line_no,
+            codex_rollout_event_kind(&record.value),
+            record.recorded_at_utc,
+            serde_json::to_string(&record.value)?,
+        ])?;
+    }
+
+    Ok(NormalizeJsonlFileOutcome::Imported(
+        NormalizeJsonlFileResult {
+            conversation_id: None,
+            stream_id: None,
+            record_count: parsed.records.len(),
+            message_count: 0,
+            turn_count: 0,
+            history_event_count: 0,
         },
     ))
 }
@@ -1038,6 +1176,10 @@ pub(super) fn purge_existing_import(
         .and_then(|mut stmt| stmt.execute([params.source_file_id]))
         .context("unable to purge existing normalized skill invocation state")?;
 
+    conn.prepare_cached("DELETE FROM codex_rollout_session WHERE source_file_id = ?1")
+        .and_then(|mut stmt| stmt.execute([params.source_file_id]))
+        .context("unable to purge existing codex rollout raw state")?;
+
     conn.prepare_cached(
         "
         DELETE FROM import_warning
@@ -1062,6 +1204,68 @@ struct StreamState {
     id: i64,
     opened_at_utc: Option<String>,
     closed_at_utc: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CodexRolloutSessionDraft {
+    session_id: Option<String>,
+    raw_cwd_path: Option<String>,
+    cli_version: Option<String>,
+    originator: Option<String>,
+    model_provider: Option<String>,
+    model_name: Option<String>,
+    started_at_utc: Option<String>,
+    completed_at_utc: Option<String>,
+    metadata_json: String,
+}
+
+impl CodexRolloutSessionDraft {
+    fn from_records(records: &[super::ParsedRecord]) -> Result<Self> {
+        let mut draft = Self {
+            metadata_json: "{}".to_string(),
+            ..Self::default()
+        };
+
+        for record in records {
+            if draft.started_at_utc.is_none() {
+                draft.started_at_utc = record.recorded_at_utc.clone();
+            }
+            if record.recorded_at_utc.is_some() {
+                draft.completed_at_utc = record.recorded_at_utc.clone();
+            }
+
+            if draft.session_id.is_none() {
+                draft.session_id = optional_string(record.value.get("session_id"))
+                    .or_else(|| optional_string(record.value.pointer("/payload/session_id")));
+            }
+            if draft.raw_cwd_path.is_none() {
+                draft.raw_cwd_path = optional_string(record.value.get("cwd"))
+                    .or_else(|| optional_string(record.value.pointer("/payload/cwd")));
+            }
+
+            if record.value.get("type").and_then(Value::as_str) == Some("session_meta") {
+                draft.cli_version = draft
+                    .cli_version
+                    .or_else(|| optional_string(record.value.get("cli_version")))
+                    .or_else(|| optional_string(record.value.pointer("/payload/cli_version")));
+                draft.originator = draft
+                    .originator
+                    .or_else(|| optional_string(record.value.get("originator")))
+                    .or_else(|| optional_string(record.value.pointer("/payload/originator")));
+                draft.model_provider = draft
+                    .model_provider
+                    .or_else(|| optional_string(record.value.get("model_provider")))
+                    .or_else(|| optional_string(record.value.pointer("/payload/model_provider")));
+                draft.model_name = draft
+                    .model_name
+                    .or_else(|| optional_string(record.value.get("model")))
+                    .or_else(|| optional_string(record.value.pointer("/payload/model")));
+                draft.metadata_json = serde_json::to_string(&record.value)?;
+            }
+        }
+
+        Ok(draft)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2098,6 +2302,14 @@ fn optional_string(value: Option<&Value>) -> Option<String> {
     value.and_then(Value::as_str).map(ToOwned::to_owned)
 }
 
+fn codex_rollout_event_kind(value: &Value) -> String {
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 fn update_bounds(start: &mut Option<String>, end: &mut Option<String>, candidate: &Option<String>) {
     if let Some(candidate) = candidate {
         if start.as_ref().is_none_or(|current| candidate < current) {
@@ -2494,6 +2706,11 @@ mod tests {
             );
 
             CREATE TABLE skill_invocation (
+                id INTEGER PRIMARY KEY,
+                source_file_id INTEGER NOT NULL
+            );
+
+            CREATE TABLE codex_rollout_session (
                 id INTEGER PRIMARY KEY,
                 source_file_id INTEGER NOT NULL
             );
