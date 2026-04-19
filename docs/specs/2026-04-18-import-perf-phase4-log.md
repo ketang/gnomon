@@ -71,14 +71,22 @@ contribution.
 Implementation: Add `PRAGMA locking_mode = EXCLUSIVE;` to `configure_import_connection` in
 `crates/gnomon-core/src/db/mod.rs`, alongside the existing `foreign_keys = OFF`.
 Measurements:
-  Subset:       *(pending)*
-  Full:         *(pending)*
-  Row parity:   *(pending)*
-  Profile shift: *(pending)*
-Decision: PENDING
+  Subset:       6.543s → ~175s (catastrophic regression — 26× slower); 3 of 3 observed runs
+                showed 0 rows for conversation/message/turn/action (all 35 chunks failed);
+                benchmark terminated after 3 iterations
+  Full:         not measured — subset result conclusive
+  Row parity:   FAIL (all deferred chunks produced 0 rows; import_chunk:35 written but empty)
+  Profile shift: N/A — pipeline deadlocked, not just slow
+Decision: REVERTED
 Commit:
-Key finding:
-Next implied:
+Key finding: EXCLUSIVE locking mode is incompatible with the current import architecture.
+The pipeline opens multiple SQLite connections with overlapping lifetimes per chunk (import
+connection + at least one other reader/writer). EXCLUSIVE mode holds file locks indefinitely
+after first write, so subsequent connection attempts time out. busy_timeout × 35 chunks ≈ 175s
+exactly matches the observed wall time. To use EXCLUSIVE mode, the architecture would need to
+ensure a single connection owns the DB for the entire import duration — a more invasive change
+than a one-line pragma addition.
+Next implied: A5 (PRAGMA wal_autocheckpoint = 0 + manual checkpoint) — next E-bundle decompose.
 
 ---
 
@@ -87,21 +95,21 @@ Next implied:
 Phase: Phase 4
 Long-lived branch: `import-perf-p4`
 Long-lived worktree: `.worktrees/import-perf-p4`
-Last completed: A3 — KEPT (0a0a6ce)
-Next action: Run candidate A4: PRAGMA locking_mode = EXCLUSIVE on import connection alone.
+Last completed: A4 — REVERTED (catastrophic deadlock — all chunks failed)
+Next action: Run candidate A5: PRAGMA wal_autocheckpoint = 0 + manual checkpoint at import end.
 Current best (subset): 6.543s median (−22.9% from 8.487s baseline)
 Current best (full): 17.982s median (−5.2% from 18.969s baseline)
 Target: 10s full corpus
 In-flight uncommitted state: none
 
 Candidate ranking (live — re-rank after each result):
-1. A4 — `PRAGMA locking_mode = EXCLUSIVE` alone — decompose E-bundle, untested solo
-2. A5 — `PRAGMA wal_autocheckpoint = 0` + manual checkpoint — decompose E-bundle
-3. A1 — SQLite page size 8K/16K — never measured, low risk
-4. B1 — `:memory:` staging DB → `VACUUM INTO` — biggest potential single-candidate win
-5. A6 — Struct-based serde (replace `serde_json::Value`) — parse phase reduction
-6. A2 — LTO + PGO — free binary-level gain
-7. A7 — `jwalk` parallel directory walk — scan_source reduction
-8. A8 — path_node chunk-level cache (across files in chunk) — classify phase reduction
-9. B2 — Parallel per-chunk `:memory:` DBs + merge (requires B1 KEPT first)
-10. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker
+1. A5 — `PRAGMA wal_autocheckpoint = 0` + manual checkpoint — decompose E-bundle; single connection OK
+2. A1 — SQLite page size 8K/16K — never measured, low risk
+3. B1 — `:memory:` staging DB → `VACUUM INTO` — biggest potential single-candidate win
+4. A6 — Struct-based serde (replace `serde_json::Value`) — parse phase reduction
+5. A2 — LTO + PGO — free binary-level gain
+6. A7 — `jwalk` parallel directory walk — scan_source reduction
+7. A8 — path_node chunk-level cache (across files in chunk) — classify phase reduction
+8. B2 — Parallel per-chunk `:memory:` DBs + merge (requires B1 KEPT first)
+9. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker
+NOTE: A4 (EXCLUSIVE locking mode) removed from ranking — incompatible with multi-connection import architecture.
