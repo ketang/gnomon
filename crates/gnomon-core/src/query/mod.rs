@@ -308,15 +308,6 @@ impl MetricTotals {
         }
     }
 
-    fn add_assign(&mut self, other: &Self) {
-        self.uncached_input += other.uncached_input;
-        self.cached_input += other.cached_input;
-        self.gross_input += other.gross_input;
-        self.output += other.output;
-        self.total += other.total;
-        self.rtk_saved_tokens += other.rtk_saved_tokens;
-    }
-
     fn divided_by(&self, divisor: f64) -> Self {
         if divisor <= 0.0 {
             return Self::zero();
@@ -347,6 +338,7 @@ impl MetricTotals {
             && self.gross_input == 0.0
             && self.output == 0.0
             && self.total == 0.0
+            && self.rtk_saved_tokens == 0.0
     }
 }
 
@@ -2902,7 +2894,7 @@ fn build_opportunities_rows(
                 row.cached_input,
                 row.output_tokens,
             );
-            metrics.add_assign(&row_metrics);
+            metrics += row_metrics.clone();
             turn_count += 1;
             idx += 1;
         }
@@ -3229,7 +3221,7 @@ impl RollupBuilder {
         windows: &Windows,
         item_count: u64,
     ) {
-        self.metrics.add_assign(metrics);
+        self.metrics += metrics.clone();
         self.item_count += item_count;
         self.uncached_input_reference += metrics.uncached_input;
 
@@ -3318,10 +3310,9 @@ fn build_skill_root_rows(associations: &[&SkillSessionAssociation]) -> Vec<Skill
         row.session_count += 1;
         row.transcript_evidence_count += association.transcript_evidence_count;
         add_skill_confidence_counts(&mut row.confidence_counts, &association.confidence_counts);
-        row.metrics.add_assign(metrics);
+        row.metrics += metrics.clone();
         row.attributed_action_count += association.attributed_action_count;
-        row.attributed_metrics
-            .add_assign(&association.attributed_metrics);
+        row.attributed_metrics += association.attributed_metrics.clone();
         row.top_attribution_confidence = row
             .top_attribution_confidence
             .or(association.top_attribution_confidence);
@@ -3371,10 +3362,9 @@ fn build_skill_project_rows(
         row.session_count += 1;
         row.transcript_evidence_count += association.transcript_evidence_count;
         add_skill_confidence_counts(&mut row.confidence_counts, &association.confidence_counts);
-        row.metrics.add_assign(metrics);
+        row.metrics += metrics.clone();
         row.attributed_action_count += association.attributed_action_count;
-        row.attributed_metrics
-            .add_assign(&association.attributed_metrics);
+        row.attributed_metrics += association.attributed_metrics.clone();
         row.top_attribution_confidence = row
             .top_attribution_confidence
             .or(association.top_attribution_confidence);
