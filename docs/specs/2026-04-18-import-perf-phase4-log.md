@@ -281,18 +281,45 @@ Next implied: A8 (path_node chunk-level cache across files in a chunk) — class
 
 ---
 
+## 2026-04-19 — candidate A8: path_node chunk-level cache (HashMap across all files in a chunk)
+
+Branch: import-perf-p4-a8
+Worktree: .worktrees/import-perf-p4-a8
+Hypothesis: `ensure_path_node` does a SELECT (and sometimes INSERT) per path component per message.
+Paths like `/home/ketan/project/gnomon/crates/gnomon-core/src/` appear across many files in the
+same project-day chunk. G2 tested per-file memoization and full corpus regressed; this experiment
+is different: a `HashMap<String, i64>` (full_path → path_node_id) that persists across ALL files
+within a single chunk. Shared path prefixes (project root, `crates/`, `src/`) are looked up once
+and reused for every subsequent file. The cache is scoped to one chunk to avoid cross-chunk state.
+Implementation: Add `path_node_cache: &mut HashMap<String, i64>` to `ensure_path_node`,
+`ensure_path_node_chain`, `persist_path_refs`, `classify_and_persist_actions`, and
+`build_actions_core_with_messages` in `crates/gnomon-core/src/classify/mod.rs`. Add the parameter
+to `build_actions_in_tx_with_messages` (public API). In `import_chunk` (chunk.rs), initialize
+`HashMap::new()` before the file loop and pass `&mut path_node_cache` on each call.
+For standalone `build_actions_core`, create a local `HashMap::new()` per call.
+Measurements:
+  Subset:       — → — (−−%)
+  Full:         — → — (−−%)
+  Row parity:   PENDING
+  Profile shift: PENDING
+Decision: PENDING
+Commit:
+Key finding:
+Next implied:
+
+---
+
 ## RESUME HERE
 
 Phase: Phase 4
 Long-lived branch: `import-perf-p4`
 Long-lived worktree: `.worktrees/import-perf-p4`
 Last completed: A7 — REVERTED (jwalk parallel walk: +11% regression on subset median, higher variance)
-Next action: Run A8 (path_node chunk-level cache). Create import-perf-p4-a8 branch + worktree
-  from import-perf-p4, implement per plan Section 1, measure.
+Next action: A8 in progress — implement and measure.
 Current best (subset): 5.259s median (−38.0% from 8.487s baseline; A6 original measurement)
 Current best (full): 15.144s median (−20.2% from 18.969s baseline; A6 original measurement)
 Target: 10s full corpus
-In-flight uncommitted state: none
+In-flight uncommitted state: A8 skeleton written to log (not yet committed)
 
 Candidate ranking (live — re-rank after each result):
 1. A8 — path_node chunk-level cache (across files in chunk) — classify phase (0.3–1.0s)
