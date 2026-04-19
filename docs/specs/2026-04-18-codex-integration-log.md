@@ -115,16 +115,48 @@ Verification:
 - `cargo test -p gnomon-core`
 - `cargo test --workspace`
 
+### 2026-04-19 — `#122` Codex Rollout Raw Import
+
+Status: MERGED into `codex-integration`
+
+Summary:
+
+- Created child branch/worktree `codex-integration-codex-rollout-raw-import`
+  at `.worktrees/codex-integration-codex-rollout-raw-import` and merged it
+  back into `codex-integration`.
+- Added migration `0017_codex_rollout_raw.sql`, bumped the initial schema
+  version, and bumped the import schema version for the raw rollout contract.
+- Introduced Codex-specific raw tables `codex_rollout_session` and
+  `codex_rollout_event` so rollout data stays physically separate from Claude
+  raw data.
+- Implemented Codex rollout raw import, including session metadata capture,
+  per-line raw event persistence, purge/reimport behavior, and chunk record
+  counting for Codex rollout rows.
+- Updated rollout scan attribution to read Codex-native `cwd` metadata,
+  including `session_meta.payload.cwd`, so rollout-backed projects resolve from
+  Codex session metadata instead of the rollout root path.
+- Landed the next `#121` regression slice with:
+  - a scan test that proves payload-based rollout `cwd` attribution
+  - an end-to-end import test that proves raw Codex rollout rows import into
+    Codex-specific tables and remain stable across reimport
+
+Verification:
+
+- `cargo test -p gnomon-core scan_codex_rollout_uses_payload_cwd_for_project_attribution -- --nocapture`
+- `cargo test -p gnomon-core import_all_imports_codex_rollout_raw_sessions_without_blocking_claude_imports -- --nocapture`
+- `cargo test -p gnomon-core`
+- `cargo test --workspace`
+
 ---
 
 ## RESUME HERE
 
-Phase: `#120` merged; ready to start `#122`
+Phase: `#122` merged; ready to start `#123`
 Base branch: `codex-integration`
 Base worktree: `/home/ketan/project/gnomon/.worktrees/codex-integration`
-Last completed: Merged `#120` shared-session-spine refactor and the next `#121` regression slice from `codex-integration-shared-session-spine` into the base branch
-Next action: Start `#122` by creating child branch `codex-integration-codex-rollout-raw-import` and worktree `.worktrees/codex-integration-codex-rollout-raw-import`, then implement raw Codex rollout import from configured rollout files into Codex-specific raw tables with project attribution from Codex `cwd`
-Open issue sequence: `#122`, `#121` incremental, `#123`, `#124`, `#125`
+Last completed: Merged `#122` Codex rollout raw import and the next `#121` regression slice from `codex-integration-codex-rollout-raw-import` into the base branch
+Next action: Start `#123` by creating child branch `codex-integration-codex-rollout-normalization` and worktree `.worktrees/codex-integration-codex-rollout-normalization`, then normalize rollout-backed Codex sessions into the shared conversation, message, turn, action, and usage model using the raw rollout tables landed in `#122`
+Open issue sequence: `#123`, `#121` incremental, `#124`, `#125`
 In-flight uncommitted state on base branch: none expected after the merge and log-update commits
 Child-branch naming note: Because the flat branch `codex-integration` exists, `codex-integration/...` refs are invalid here; use dashed child branch names like `codex-integration-shared-session-spine`
 
@@ -145,15 +177,16 @@ Before doing anything else:
 
 Then:
 
-1. Create the child branch and worktree for `#122` from `codex-integration`.
+1. Create the child branch and worktree for `#123` from `codex-integration`.
    Use a dashed branch name such as
-   `codex-integration-codex-rollout-raw-import`; do not use
+   `codex-integration-codex-rollout-normalization`; do not use
    `codex-integration/...` because that ref layout conflicts with the existing
    flat base branch.
-2. Implement only the raw Codex rollout import slice in that child worktree.
-   Treat configured Codex rollout files as first-class raw sources and write
-   them into Codex-specific raw tables with project identity from Codex `cwd`.
-3. Land any relevant `#121` fixture and regression-test slice with the `#122`
+2. Implement only the Codex rollout normalization slice in that child worktree.
+   Normalize rollout-backed Codex sessions into the shared conversation,
+   message, turn, action, and usage model without collapsing provider-specific
+   raw metadata back into Claude-shaped assumptions.
+3. Land any relevant `#121` fixture and regression-test slice with the `#123`
    work.
 4. Verify the resulting change.
 5. Merge the child branch back into `codex-integration`.
