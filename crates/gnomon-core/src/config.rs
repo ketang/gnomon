@@ -44,9 +44,10 @@ pub struct RuntimeConfig {
     pub source_root: PathBuf,
     pub project_identity: ProjectIdentityPolicy,
     pub project_filters: Vec<ProjectFilterRule>,
+    pub rtk: RtkConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 struct FileConfig {
     #[serde(default)]
     source: SourceConfig,
@@ -54,6 +55,8 @@ struct FileConfig {
     project_identity: ProjectIdentityPolicy,
     #[serde(default)]
     project_filters: Vec<ProjectFilterRule>,
+    #[serde(default)]
+    rtk: RtkConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
@@ -157,6 +160,48 @@ impl ProjectFilterRule {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct RtkConfig {
+    #[serde(default = "RtkConfig::default_enabled")]
+    pub enabled: bool,
+    #[serde(default = "RtkConfig::default_db_path")]
+    pub db_path: String,
+    #[serde(default = "RtkConfig::default_pre_slack_ms")]
+    pub pre_slack_ms: u64,
+    #[serde(default = "RtkConfig::default_post_slack_ms")]
+    pub post_slack_ms: u64,
+}
+
+impl RtkConfig {
+    fn default_enabled() -> bool {
+        true
+    }
+    fn default_db_path() -> String {
+        "~/.local/share/rtk/history.db".to_string()
+    }
+    fn default_pre_slack_ms() -> u64 {
+        2000
+    }
+    fn default_post_slack_ms() -> u64 {
+        30000
+    }
+
+    pub fn resolved_db_path(&self) -> Result<PathBuf> {
+        expand_user_path(&self.db_path)
+    }
+}
+
+impl Default for RtkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Self::default_enabled(),
+            db_path: Self::default_db_path(),
+            pre_slack_ms: Self::default_pre_slack_ms(),
+            post_slack_ms: Self::default_post_slack_ms(),
+        }
+    }
+}
+
 impl RuntimeConfig {
     pub fn load(overrides: ConfigOverrides) -> Result<Self> {
         let state_dir = match overrides.state_dir {
@@ -188,6 +233,7 @@ impl RuntimeConfig {
             source_root,
             project_identity: file_config.project_identity,
             project_filters: file_config.project_filters,
+            rtk: file_config.rtk,
         })
     }
 
@@ -272,8 +318,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ConfigOverrides, DEFAULT_CONFIG_FILENAME, ProjectFilterAction, ProjectFilterContext,
-        ProjectFilterMatchOn, ProjectFilterRule, RuntimeConfig,
+        ConfigOverrides, DEFAULT_CONFIG_FILENAME, FileConfig, ProjectFilterAction,
+        ProjectFilterContext, ProjectFilterMatchOn, ProjectFilterRule, RtkConfig, RuntimeConfig,
     };
     use crate::db::DEFAULT_DB_FILENAME;
 
@@ -333,6 +379,7 @@ mod tests {
             source_root: temp.path().join("source"),
             project_identity: Default::default(),
             project_filters: Vec::new(),
+            rtk: Default::default(),
         };
         assert!(
             !state_dir.exists(),
@@ -403,5 +450,26 @@ mod tests {
 
         assert!(rule.matches(&ctx)?);
         Ok(())
+    }
+
+    #[test]
+    fn rtk_config_defaults_to_enabled_with_standard_db_path() {
+        let cfg = RtkConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.pre_slack_ms, 2000);
+        assert_eq!(cfg.post_slack_ms, 30000);
+    }
+
+    #[test]
+    fn file_config_with_rtk_section_parses_correctly() {
+        let toml = r#"
+[rtk]
+enabled = false
+pre_slack_ms = 5000
+"#;
+        let file_cfg: FileConfig = toml::from_str(toml).unwrap();
+        assert!(!file_cfg.rtk.enabled);
+        assert_eq!(file_cfg.rtk.pre_slack_ms, 5000);
+        assert_eq!(file_cfg.rtk.post_slack_ms, 30000); // default
     }
 }

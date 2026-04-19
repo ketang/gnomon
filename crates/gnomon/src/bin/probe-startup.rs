@@ -57,6 +57,7 @@ fn main() -> Result<()> {
         source_root,
         project_identity: Default::default(),
         project_filters: Vec::new(),
+        rtk: Default::default(),
     };
     config.ensure_dirs()?;
 

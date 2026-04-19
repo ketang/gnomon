@@ -8330,6 +8330,7 @@ mod tests {
                 source_root: validation.source_root.clone(),
                 project_identity: Default::default(),
                 project_filters: Vec::new(),
+                rtk: Default::default(),
             },
             validation.final_snapshot.clone(),
             StartupOpenReason::Last24hReady,
@@ -8451,6 +8452,7 @@ mod tests {
                 source_root: validation.source_root.clone(),
                 project_identity: Default::default(),
                 project_filters: Vec::new(),
+                rtk: Default::default(),
             },
             validation.final_snapshot.clone(),
             StartupOpenReason::Last24hReady,
@@ -9060,6 +9062,7 @@ mod tests {
             source_root: dir.join("source"),
             project_identity: Default::default(),
             project_filters: Vec::new(),
+            rtk: Default::default(),
         }
     }
 
