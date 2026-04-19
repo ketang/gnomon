@@ -171,6 +171,33 @@ Next implied: A6 (struct-based serde) — parse phase 5s/run, 2–4× speedup po
 
 ---
 
+## 2026-04-19 — candidate A6: struct-based serde deserialization (replace `serde_json::Value`)
+
+Branch: import-perf-p4-a6
+Worktree: .worktrees/import-perf-p4-a6
+Hypothesis: `parse_jsonl_file_inner` deserializes each transcript JSONL line into a fully general
+`serde_json::Value` tree, allocating a HashMap per JSON object and a heap `String` per string field,
+including for unknown fields (`cwd`, `userType`, `version`, `gitBranch`, `parentUuid`) that are
+never read. Replacing the top-level record and the `message` sub-object with typed Rust structs
+(`RawSourceRecord`, `RawMessage`) will skip unknown-field allocations entirely and eliminate two
+HashMap allocations per message line (~295k messages × 2 = ~590k HashMaps). The `content` field
+stays as `Value` since content parts have variable schema.
+Implementation: Add `RawSourceRecord` + `RawMessage` + `RawSnapshot` in `normalize.rs`. Update
+`parse_jsonl_file_inner` to deserialize via `RawSourceRecord`. Update `extract_message` and helpers
+to take `&RawSourceRecord`. Update `ParsedRecord` (in `mod.rs`) to carry pre-extracted scalar fields
+instead of `serde_json::Value`. Update write phase to use pre-extracted fields.
+Measurements:
+  Subset:       <pending>
+  Full:         <pending>
+  Row parity:   <pending>
+  Profile shift: <pending>
+Decision: PENDING
+Commit:
+Key finding: <pending>
+Next implied: <pending>
+
+---
+
 ## RESUME HERE
 
 Phase: Phase 4
