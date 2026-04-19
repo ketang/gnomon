@@ -87,16 +87,44 @@ Notes:
   flat branch `codex-integration` already exists. Future child branches should
   use the dashed form `codex-integration-...`.
 
+### 2026-04-19 — `#120` Shared Session Spine
+
+Status: MERGED into `codex-integration`
+
+Summary:
+
+- Created child branch/worktree `codex-integration-shared-session-spine` at
+  `.worktrees/codex-integration-shared-session-spine` and merged it back into
+  `codex-integration`.
+- Added explicit `conversation.shared_session_id` via migration
+  `0016_shared_session_spine.sql` and bumped the initial schema version.
+- Updated transcript normalization to persist the raw session id directly on
+  each conversation while preserving the existing opaque per-source-file
+  `external_id`.
+- Replaced the remaining skill/session query joins that substring-parsed
+  `conversation.external_id` with direct joins on `shared_session_id`.
+- Landed the next `#121` regression slice by updating skill/session query tests
+  to prove they still join when `external_id` is opaque and only
+  `shared_session_id` carries the session identity.
+
+Verification:
+
+- `cargo test -p gnomon-core normalization_allows_duplicate_session_ids_across_source_files -- --nocapture`
+- `cargo test -p gnomon-core skill_invocations_join_to_sessions_and_preserve_unmatched_rows -- --nocapture`
+- `cargo test -p gnomon-core skills_report_aggregates_session_associated_metrics_by_skill_project_and_session -- --nocapture`
+- `cargo test -p gnomon-core`
+- `cargo test --workspace`
+
 ---
 
 ## RESUME HERE
 
-Phase: `#119` merged; ready to start `#120`
+Phase: `#120` merged; ready to start `#122`
 Base branch: `codex-integration`
 Base worktree: `/home/ketan/project/gnomon/.worktrees/codex-integration`
-Last completed: Merged `#119` provider-aware source-model/config refactor and the first `#121` Codex fixture/regression slice from `codex-integration-provider-aware-source-model` into the base branch
-Next action: Start `#120` by creating child branch `codex-integration-shared-session-spine` and worktree `.worktrees/codex-integration-shared-session-spine`, then implement explicit shared session identity and remove query paths that parse `conversation.external_id`
-Open issue sequence: `#120`, `#121` incremental, `#122`, `#123`, `#124`, `#125`
+Last completed: Merged `#120` shared-session-spine refactor and the next `#121` regression slice from `codex-integration-shared-session-spine` into the base branch
+Next action: Start `#122` by creating child branch `codex-integration-codex-rollout-raw-import` and worktree `.worktrees/codex-integration-codex-rollout-raw-import`, then implement raw Codex rollout import from configured rollout files into Codex-specific raw tables with project attribution from Codex `cwd`
+Open issue sequence: `#122`, `#121` incremental, `#123`, `#124`, `#125`
 In-flight uncommitted state on base branch: none expected after the merge and log-update commits
 Child-branch naming note: Because the flat branch `codex-integration` exists, `codex-integration/...` refs are invalid here; use dashed child branch names like `codex-integration-shared-session-spine`
 
@@ -117,13 +145,15 @@ Before doing anything else:
 
 Then:
 
-1. Create the child branch and worktree for `#120` from `codex-integration`.
+1. Create the child branch and worktree for `#122` from `codex-integration`.
    Use a dashed branch name such as
-   `codex-integration-shared-session-spine`; do not use
+   `codex-integration-codex-rollout-raw-import`; do not use
    `codex-integration/...` because that ref layout conflicts with the existing
    flat base branch.
-2. Implement only the shared-session-spine refactor in that child worktree.
-3. Land any relevant `#121` fixture and regression-test slice with the `#120`
+2. Implement only the raw Codex rollout import slice in that child worktree.
+   Treat configured Codex rollout files as first-class raw sources and write
+   them into Codex-specific raw tables with project identity from Codex `cwd`.
+3. Land any relevant `#121` fixture and regression-test slice with the `#122`
    work.
 4. Verify the resulting change.
 5. Merge the child branch back into `codex-integration`.
