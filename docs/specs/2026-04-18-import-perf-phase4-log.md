@@ -295,9 +295,10 @@ Target: 10s full corpus
 In-flight uncommitted state: none
 
 Candidate ranking (live — re-rank after each result):
-1. A7 — `jwalk` parallel directory walk — scan_source reduction (0.2–0.5s), low effort
-2. A8 — path_node chunk-level cache (across files in chunk) — classify phase (0.3–1.0s)
-3. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker
+1. A8 — path_node chunk-level cache (across files in chunk) — classify phase (0.3–1.0s)
+2. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker
+NOTE: A7 (`jwalk`) — DISCARD. Parallel walk raises median +11%, adds variance. Walk phase is
+  already fast (<<1s) due to scan_source_cache; rayon overhead dominates any parallelism benefit.
 NOTE: A2 (LTO+PGO) — DISCARD. LTO alone is no-op; PGO provides 5.7% but requires non-committable
   build workflow. Not worth complexity for <6% gain.
 NOTE: B1 (`:memory:` staging), B2 (parallel memory DBs) — DISCARD. In-memory SQLite is 4× slower.
