@@ -207,6 +207,31 @@ Next implied: A2 (LTO + PGO) — binary-level optimization now that parse phase 
 
 ---
 
+## 2026-04-19 — candidate A2: LTO + PGO on release binary
+
+Branch: import-perf-p4-a2
+Worktree: .worktrees/import-perf-p4-a2
+Hypothesis: LTO enables cross-crate inlining at link time (rusqlite, serde_json, rayon hot paths
+inline into gnomon). PGO recompiles using a real execution profile so the compiler can optimize
+for actual hot branches. After A6 reduced parse-phase allocations, the binary is leaner and
+additional inlining opportunities exist across crate boundaries (especially rusqlite's SQLite
+wrapper and serde's generated code). Expected 5–15% total wall reduction on the ~33% non-SQL
+phases; SQL phase may also benefit from tighter code at the rusqlite boundary.
+Implementation: Add `lto = "thin"` to `[profile.release]` in Cargo.toml. Build with
+`RUSTFLAGS="-Cprofile-generate=/tmp/pgo-data"`, run bench to collect profiles, merge with
+`llvm-profdata merge`, rebuild with `RUSTFLAGS="-Cprofile-use=/tmp/pgo-merged.profdata"`.
+Measurements:
+  Subset:       
+  Full:         
+  Row parity:   
+  Profile shift: 
+Decision: PENDING
+Commit:
+Key finding:
+Next implied:
+
+---
+
 ## RESUME HERE
 
 Phase: Phase 4
