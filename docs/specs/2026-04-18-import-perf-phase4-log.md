@@ -298,14 +298,24 @@ to `build_actions_in_tx_with_messages` (public API). In `import_chunk` (chunk.rs
 `HashMap::new()` before the file loop and pass `&mut path_node_cache` on each call.
 For standalone `build_actions_core`, create a local `HashMap::new()` per call.
 Measurements:
-  Subset:       — → — (−−%)
-  Full:         — → — (−−%)
-  Row parity:   PENDING
-  Profile shift: PENDING
-Decision: PENDING
+  Subset:       5.259s → 5.418s median (+3.0%); runs: 5.355, 5.418, 5.299, 6.352, 6.192
+  Full:         15.144s → 15.166s median (+0.1%); runs: 15.166, 14.540, 15.339
+  Row parity:   PASS (project:31, source_file:4548, import_chunk:162, conversation:4547,
+                stream:4547, message:294995, message_part:411842, turn:13363, action:120922)
+  Profile shift: N/A — no improvement
+Decision: REVERTED
 Commit:
-Key finding:
-Next implied:
+Key finding: The chunk-level path_node cache provides zero measurable improvement. Subset is
++3% (noise) and full corpus is +0.1% (noise). SQLite's prepare_cached + B-tree index on
+(project_id, full_path) already handles repeated path_node lookups efficiently. The HashMap
+adds coordination overhead (hashing, allocation) without meaningful SELECT savings because:
+(1) most path_refs across conversations in a chunk are unique file paths, giving low cache hit
+rate for leaf nodes; (2) intermediate directory nodes (which do repeat) are already fast via
+prepare_cached; (3) path_ref density is low — not every message has path_refs, so the classify
+phase is dominated by action/turn inserts, not path_node lookups. Confirms G2's finding that
+path_node lookups are not the bottleneck.
+Next implied: C1 (per-project sharding + global metadata DB) — the only remaining candidate;
+all Tier 1–2 candidates exhausted. Requires significant architectural rework.
 
 ---
 
@@ -314,19 +324,19 @@ Next implied:
 Phase: Phase 4
 Long-lived branch: `import-perf-p4`
 Long-lived worktree: `.worktrees/import-perf-p4`
-Last completed: A7 — REVERTED (jwalk parallel walk: +11% regression on subset median, higher variance)
-Next action: A8 in progress — implement and measure.
+Last completed: A8 — REVERTED (chunk-level path_node cache: +0.1% full corpus, noise only)
+Next action: C1 (per-project sharding + global metadata DB) — only remaining candidate.
+  Requires significant architectural rework; plan before implementing.
 Current best (subset): 5.259s median (−38.0% from 8.487s baseline; A6 original measurement)
 Current best (full): 15.144s median (−20.2% from 18.969s baseline; A6 original measurement)
 Target: 10s full corpus
-In-flight uncommitted state: A8 skeleton written to log (not yet committed)
+In-flight uncommitted state: none
 
 Candidate ranking (live — re-rank after each result):
-1. A8 — path_node chunk-level cache (across files in chunk) — classify phase (0.3–1.0s)
-2. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker
-NOTE: A7 (`jwalk`) — DISCARD. Parallel walk raises median +11%, adds variance. Walk phase is
-  already fast (<<1s) due to scan_source_cache; rayon overhead dominates any parallelism benefit.
-NOTE: A2 (LTO+PGO) — DISCARD. LTO alone is no-op; PGO provides 5.7% but requires non-committable
-  build workflow. Not worth complexity for <6% gain.
+1. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker;
+   only remaining candidate with potential to reach 10s target.
+NOTE: A8 (path_node chunk-level cache) — DISCARD. Zero benefit; path_node lookups not bottleneck.
+NOTE: A7 (`jwalk`) — DISCARD. Parallel walk raises median +11%, adds variance.
+NOTE: A2 (LTO+PGO) — DISCARD. LTO alone is no-op; PGO requires non-committable workflow.
 NOTE: B1 (`:memory:` staging), B2 (parallel memory DBs) — DISCARD. In-memory SQLite is 4× slower.
 NOTE: A1 (page_size 8K), A4 (EXCLUSIVE locking), A5 (wal_autocheckpoint=0) — DISCARD.
