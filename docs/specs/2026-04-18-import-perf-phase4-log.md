@@ -151,28 +151,46 @@ eliminates WAL overhead entirely for the write phase.
 
 ---
 
+## 2026-04-19 — candidate B1: `:memory:` staging DB → `VACUUM INTO`
+
+Branch: import-perf-p4-b1
+Worktree: .worktrees/import-perf-p4-b1
+Hypothesis: All chunk writes go to an in-process `:memory:` SQLite to eliminate WAL overhead.
+Measurements:
+  Subset:       6.543s → ~24.6s single run (+276% catastrophic regression)
+  Full:         not measured
+  Row parity:   not checked — reverted
+Decision: REVERTED
+Key finding: SQLite `:memory:` DB is 4× SLOWER than WAL-backed disk with mmap for this workload.
+  Root causes: (1) `:memory:` uses MEMORY journal mode (WAL rejected) — copies old page before
+  each modification vs WAL's append-only writes. (2) Pages allocated as separate malloc() buffers:
+  cache-hostile random access vs mmap'd contiguous memory. (3) Baseline's mmap_size=256MB gives
+  "in-memory" read performance via OS page cache — same benefit without the write regression.
+  B2 (parallel memory DBs) also discarded — same root cause.
+Next implied: A6 (struct-based serde) — parse phase 5s/run, 2–4× speedup possible.
+
+---
+
 ## RESUME HERE
 
 Phase: Phase 4
 Long-lived branch: `import-perf-p4`
 Long-lived worktree: `.worktrees/import-perf-p4`
-Last completed: A1 — REVERTED (page_size=8192 regressed +27.1% on subset — larger WAL page writes dominate)
-Next action: Run candidate B1: `:memory:` staging DB → `VACUUM INTO`.
-  All chunk writes go to an in-process `:memory:` SQLite; at chunk end, call `VACUUM INTO <final_path>`.
-  In-memory btree operations avoid WAL overhead entirely. See Section 1 of plan for full description.
-  Code location: `crates/gnomon-core/src/import/chunk.rs` (the per-chunk import functions).
-  Create branch import-perf-p4-b1 and worktree .worktrees/import-perf-p4-b1 from import-perf-p4.
+Last completed: B1 — REVERTED (+276% regression on subset; `:memory:` DB 4× slower than WAL+mmap)
+Next action: Run candidate A6: struct-based serde (replace `serde_json::Value` in normalize.rs).
+  Parse phase is ~5s/run (~19% of total wall). A typed RawSourceRecord struct should cut it 2–4×.
+  Create branch import-perf-p4-a6 and worktree .worktrees/import-perf-p4-a6 from import-perf-p4.
 Current best (subset): 6.543s median (−22.9% from 8.487s baseline)
 Current best (full): 17.982s median (−5.2% from 18.969s baseline)
 Target: 10s full corpus
 In-flight uncommitted state: none
 
 Candidate ranking (live — re-rank after each result):
-1. B1 — `:memory:` staging DB → `VACUUM INTO` — biggest potential single-candidate win (4–8s)
-2. A6 — Struct-based serde (replace `serde_json::Value`) — parse phase reduction (0.5–1.5s)
-3. A2 — LTO + PGO — free binary-level gain (5–15% total wall)
-4. A7 — `jwalk` parallel directory walk — scan_source reduction (0.2–0.5s)
-5. A8 — path_node chunk-level cache (across files in chunk) — classify phase reduction (0.3–1.0s)
-6. B2 — Parallel per-chunk `:memory:` DBs + merge (requires B1 KEPT first)
-7. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker
-NOTE: A1 (page_size 8K), A4 (EXCLUSIVE locking), A5 (wal_autocheckpoint=0) all removed — confirmed counterproductive. The write bottleneck is raw WAL I/O throughput; SQLite pragma tweaks cannot overcome it.
+1. A6 — Struct-based serde (replace `serde_json::Value`) — parse phase 5s/run, 2–4× speedup possible
+2. A2 — LTO + PGO — free binary-level gain (5–15% total wall)
+3. A7 — `jwalk` parallel directory walk — scan_source reduction (0.2–0.5s)
+4. A8 — path_node chunk-level cache (across files in chunk) — classify phase reduction (0.3–1.0s)
+5. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker
+NOTE: B1 (`:memory:` staging), B2 (parallel memory DBs) — DISCARD. In-memory SQLite is slower
+  than WAL+mmap due to MEMORY journal mode + malloc page fragmentation. A1 (page_size 8K),
+  A4 (EXCLUSIVE locking), A5 (wal_autocheckpoint=0) also removed — all counterproductive.
