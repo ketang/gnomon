@@ -69,6 +69,12 @@ struct DiscoveredSourceFile {
 #[derive(Debug, Deserialize)]
 struct SourceRecordHeader {
     cwd: Option<PathBuf>,
+    payload: Option<SourceRecordPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceRecordPayload {
+    cwd: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -660,10 +666,6 @@ fn resolve_candidate_source_file(
         }
         | SourceDescriptor {
             provider: SourceProvider::Codex,
-            kind: SourceFileKind::Rollout,
-        }
-        | SourceDescriptor {
-            provider: SourceProvider::Codex,
             kind: SourceFileKind::SessionIndex,
         } => {
             let project_reason = match candidate.descriptor {
@@ -677,21 +679,16 @@ fn resolve_candidate_source_file(
                 } => CODEX_HISTORY_PROJECT_REASON,
                 SourceDescriptor {
                     provider: SourceProvider::Codex,
-                    kind: SourceFileKind::Rollout,
-                } => CODEX_ROLLOUT_PROJECT_REASON,
-                SourceDescriptor {
-                    provider: SourceProvider::Codex,
                     kind: SourceFileKind::SessionIndex,
                 } => CODEX_SESSION_INDEX_PROJECT_REASON,
                 _ => unreachable!(),
             };
             let scan_root = Path::new(&candidate.scan_root_path);
             let project_root = match candidate.descriptor.kind {
-                SourceFileKind::Rollout => scan_root,
                 SourceFileKind::History | SourceFileKind::SessionIndex => {
                     scan_root.parent().unwrap_or(scan_root)
                 }
-                SourceFileKind::Transcript => unreachable!(),
+                SourceFileKind::Transcript | SourceFileKind::Rollout => unreachable!(),
             };
             let project = vcs::path_project(project_root, project_reason);
             let raw_cwd = None;
@@ -705,6 +702,48 @@ fn resolve_candidate_source_file(
                 raw_cwd_path: None,
                 excluded,
                 scan_warnings_json: "[]".to_string(),
+                project: Some(project),
+            })
+        }
+        SourceDescriptor {
+            provider: SourceProvider::Codex,
+            kind: SourceFileKind::Rollout,
+        } => {
+            let ExtractedCwd { cwd, mut warnings } = extract_cwd(&candidate.absolute_path)?;
+            let raw_cwd = cwd.clone();
+            let project = match cwd {
+                Some(cwd) => {
+                    resolve_project_with_memo(cwd, identity_policy, &resolved_project_cache)
+                }
+                None => vcs::path_project(&candidate.absolute_path, CODEX_ROLLOUT_PROJECT_REASON),
+            };
+
+            let excluded = (!identity_policy.fallback_path_projects
+                && project.identity_kind == ProjectIdentityKind::Path)
+                || should_exclude_project(raw_cwd.as_deref(), &project, project_filters)?;
+
+            if project.identity_kind == ProjectIdentityKind::Path
+                && let Some(reason) = &project.identity_reason
+            {
+                warnings.push(ScanWarning::new(WARNING_PATH_PROJECT, reason.clone()));
+            }
+
+            let scan_warnings_json = serde_json::to_string(&warnings).with_context(|| {
+                format!(
+                    "unable to serialize scan warnings for {}",
+                    candidate.absolute_path.display()
+                )
+            })?;
+
+            Ok(ScanCacheRecord {
+                descriptor: candidate.descriptor,
+                scan_root_path: candidate.scan_root_path.clone(),
+                relative_path: candidate.relative_path.clone(),
+                modified_at_utc: candidate.modified_at_utc.clone(),
+                size_bytes: candidate.size_bytes,
+                raw_cwd_path: raw_cwd.as_ref().map(|path| path_to_string(path)),
+                excluded,
+                scan_warnings_json,
                 project: Some(project),
             })
         }
@@ -1074,7 +1113,10 @@ fn extract_cwd(source_file_path: &Path) -> Result<ExtractedCwd> {
 
         match serde_json::from_str::<SourceRecordHeader>(&line) {
             Ok(record) => {
-                if let Some(cwd) = record.cwd {
+                if let Some(cwd) = record
+                    .cwd
+                    .or_else(|| record.payload.and_then(|payload| payload.cwd))
+                {
                     let mut warnings = Vec::new();
                     if let Some(warning) = first_parse_warning {
                         warnings.push(warning);
@@ -2154,6 +2196,58 @@ mod tests {
                 ),
             ]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_codex_rollout_uses_payload_cwd_for_project_attribution() -> Result<()> {
+        let temp = tempdir()?;
+        let repo_root = temp.path().join("repo");
+        let repo_cwd = repo_root.join("workspace");
+        let rollout_root = temp.path().join(".codex").join("sessions");
+        let rollout_path = rollout_root
+            .join("2026")
+            .join("04")
+            .join("18")
+            .join("rollout.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent should exist"))?;
+        fs::create_dir_all(&repo_cwd)?;
+        gix::init(&repo_root)?;
+        fs::write(
+            &rollout_path,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\",\"cli_version\":\"0.0.0-test\"}}}}\n",
+                repo_cwd.display()
+            ),
+        )?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Codex,
+            SourceFileKind::Rollout,
+            rollout_root,
+        )]);
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+
+        let row: (String, String) = db.connection().query_row(
+            "
+            SELECT p.root_path, sf.relative_path
+            FROM source_file sf
+            JOIN project p ON p.id = sf.project_id
+            WHERE sf.source_provider = 'codex' AND sf.source_kind = 'rollout'
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(row.0, repo_root.display().to_string());
+        assert_eq!(row.1, "2026/04/18/rollout.jsonl");
 
         Ok(())
     }
