@@ -271,6 +271,8 @@ pub struct MetricTotals {
     pub gross_input: f64,
     pub output: f64,
     pub total: f64,
+    #[serde(default)]
+    pub rtk_saved_tokens: f64,
 }
 
 impl MetricTotals {
@@ -281,6 +283,7 @@ impl MetricTotals {
             gross_input: 0.0,
             output: 0.0,
             total: 0.0,
+            rtk_saved_tokens: 0.0,
         }
     }
 
@@ -301,6 +304,7 @@ impl MetricTotals {
             gross_input,
             output,
             total: gross_input + output,
+            rtk_saved_tokens: 0.0,
         }
     }
 
@@ -310,6 +314,7 @@ impl MetricTotals {
         self.gross_input += other.gross_input;
         self.output += other.output;
         self.total += other.total;
+        self.rtk_saved_tokens += other.rtk_saved_tokens;
     }
 
     fn divided_by(&self, divisor: f64) -> Self {
@@ -323,6 +328,7 @@ impl MetricTotals {
             gross_input: self.gross_input / divisor,
             output: self.output / divisor,
             total: self.total / divisor,
+            rtk_saved_tokens: self.rtk_saved_tokens / divisor,
         }
     }
 
@@ -341,6 +347,17 @@ impl MetricTotals {
             && self.gross_input == 0.0
             && self.output == 0.0
             && self.total == 0.0
+    }
+}
+
+impl std::ops::AddAssign for MetricTotals {
+    fn add_assign(&mut self, other: Self) {
+        self.uncached_input += other.uncached_input;
+        self.cached_input += other.cached_input;
+        self.gross_input += other.gross_input;
+        self.output += other.output;
+        self.total += other.total;
+        self.rtk_saved_tokens += other.rtk_saved_tokens;
     }
 }
 
@@ -1606,6 +1623,7 @@ impl<'conn> QueryEngine<'conn> {
                             gross_input: uncached_input + cached_input,
                             output,
                             total: uncached_input + cached_input + output,
+                            rtk_saved_tokens: 0.0,
                         }
                     }),
                     attributed_action_count: row.get::<_, i64>(10)? as u64,
@@ -1617,6 +1635,7 @@ impl<'conn> QueryEngine<'conn> {
                         total: attributed_uncached_input
                             + attributed_cached_input
                             + attributed_output,
+                        rtk_saved_tokens: 0.0,
                     },
                     top_attribution_confidence: row
                         .get::<_, Option<String>>(14)?
@@ -1892,6 +1911,7 @@ impl<'conn> QueryEngine<'conn> {
                         gross_input: uncached_input + cached_input,
                         output,
                         total: uncached_input + cached_input + output,
+                        rtk_saved_tokens: 0.0,
                     },
                 ))
             })
@@ -2021,6 +2041,7 @@ impl<'conn> QueryEngine<'conn> {
                 cache_read_input_tokens: row.get(14)?,
                 output_tokens: row.get(15)?,
                 action_count: row.get(16)?,
+                rtk_saved_tokens: row.get(17)?,
             })
         })?;
 
@@ -2100,6 +2121,7 @@ impl<'conn> QueryEngine<'conn> {
                     cache_read_input_tokens: row.get(15)?,
                     output_tokens: row.get(16)?,
                     action_count: row.get(17)?,
+                    rtk_saved_tokens: row.get(18)?,
                 },
             ))
         })?;
@@ -2945,6 +2967,7 @@ struct LoadedGroupedActionRollupRow {
     cache_read_input_tokens: i64,
     output_tokens: i64,
     action_count: i64,
+    rtk_saved_tokens: i64,
 }
 
 #[derive(Debug)]
@@ -3963,7 +3986,8 @@ fn build_grouped_action_rollup_rows_query(request: &BrowseRequest) -> Result<(St
             COALESCE(SUM(car.cache_creation_input_tokens), 0),
             COALESCE(SUM(car.cache_read_input_tokens), 0),
             COALESCE(SUM(car.output_tokens), 0),
-            COALESCE(SUM(car.action_count), 0)
+            COALESCE(SUM(car.action_count), 0),
+            COALESCE(SUM(car.rtk_saved_tokens), 0)
         FROM chunk_action_rollup car
         JOIN import_chunk ic ON ic.id = car.import_chunk_id
         JOIN project p ON p.id = ic.project_id
@@ -3991,7 +4015,8 @@ fn build_grouped_action_rollup_rows_query(request: &BrowseRequest) -> Result<(St
             COALESCE(SUM(car.cache_creation_input_tokens), 0),
             COALESCE(SUM(car.cache_read_input_tokens), 0),
             COALESCE(SUM(car.output_tokens), 0),
-            COALESCE(SUM(car.action_count), 0)
+            COALESCE(SUM(car.action_count), 0),
+            COALESCE(SUM(car.rtk_saved_tokens), 0)
         FROM chunk_action_rollup car
         JOIN import_chunk ic ON ic.id = car.import_chunk_id
         JOIN project p ON p.id = ic.project_id
@@ -4019,7 +4044,8 @@ fn build_grouped_action_rollup_rows_query(request: &BrowseRequest) -> Result<(St
             COALESCE(SUM(car.cache_creation_input_tokens), 0),
             COALESCE(SUM(car.cache_read_input_tokens), 0),
             COALESCE(SUM(car.output_tokens), 0),
-            COALESCE(SUM(car.action_count), 0)
+            COALESCE(SUM(car.action_count), 0),
+            COALESCE(SUM(car.rtk_saved_tokens), 0)
         FROM chunk_action_rollup car
         JOIN import_chunk ic ON ic.id = car.import_chunk_id
         JOIN project p ON p.id = ic.project_id
@@ -4223,7 +4249,8 @@ fn build_batched_grouped_action_rollup_rows_query(
             COALESCE(SUM(car.cache_creation_input_tokens), 0),
             COALESCE(SUM(car.cache_read_input_tokens), 0),
             COALESCE(SUM(car.output_tokens), 0),
-            COALESCE(SUM(car.action_count), 0)
+            COALESCE(SUM(car.action_count), 0),
+            COALESCE(SUM(car.rtk_saved_tokens), 0)
         "
         }
         GroupedActionRollupShape::Category => {
@@ -4244,7 +4271,8 @@ fn build_batched_grouped_action_rollup_rows_query(
             COALESCE(SUM(car.cache_creation_input_tokens), 0),
             COALESCE(SUM(car.cache_read_input_tokens), 0),
             COALESCE(SUM(car.output_tokens), 0),
-            COALESCE(SUM(car.action_count), 0)
+            COALESCE(SUM(car.action_count), 0),
+            COALESCE(SUM(car.rtk_saved_tokens), 0)
         "
         }
         GroupedActionRollupShape::Action => {
@@ -4265,7 +4293,8 @@ fn build_batched_grouped_action_rollup_rows_query(
             COALESCE(SUM(car.cache_creation_input_tokens), 0),
             COALESCE(SUM(car.cache_read_input_tokens), 0),
             COALESCE(SUM(car.output_tokens), 0),
-            COALESCE(SUM(car.action_count), 0)
+            COALESCE(SUM(car.action_count), 0),
+            COALESCE(SUM(car.rtk_saved_tokens), 0)
         "
         }
     });
@@ -4357,12 +4386,13 @@ fn grouped_action_rollup_row_to_rollup_row(
     request: &BrowseRequest,
     row: LoadedGroupedActionRollupRow,
 ) -> Result<RollupRow> {
-    let metrics = MetricTotals::from_usage(
+    let mut metrics = MetricTotals::from_usage(
         row.input_tokens,
         row.cache_creation_input_tokens,
         row.cache_read_input_tokens,
         row.output_tokens,
     );
+    metrics.rtk_saved_tokens = row.rtk_saved_tokens as f64;
     let uncached_input_reference = metrics.uncached_input;
     let item_count = u64::try_from(row.action_count)
         .context("grouped action rollup action_count overflowed u64")?;
@@ -4491,6 +4521,7 @@ fn path_rollup_row_to_rollup_row(
             + row.cache_creation_input_tokens
             + row.cache_read_input_tokens
             + row.output_tokens,
+        rtk_saved_tokens: 0.0,
     };
 
     Ok(RollupRow {
@@ -8472,5 +8503,23 @@ mod tests {
             assert_eq!(request.lens, batch.lens);
             assert_eq!(request.filters, batch.filters);
         }
+    }
+
+    #[test]
+    fn metric_totals_rtk_saved_tokens_defaults_to_zero() {
+        let m = super::MetricTotals::zero();
+        assert_eq!(m.rtk_saved_tokens, 0.0);
+    }
+
+    #[test]
+    fn metric_totals_add_assign_includes_rtk_saved_tokens() {
+        let mut a = super::MetricTotals::zero();
+        a.rtk_saved_tokens = 100.0;
+        let b = super::MetricTotals {
+            rtk_saved_tokens: 50.0,
+            ..super::MetricTotals::zero()
+        };
+        a += b;
+        assert_eq!(a.rtk_saved_tokens, 150.0);
     }
 }

@@ -7160,6 +7160,7 @@ mod tests {
                     gross_input: 3.0,
                     output: 0.0,
                     total: 3.0,
+                    rtk_saved_tokens: 0.0,
                 },
                 indicators: gnomon_core::query::MetricIndicators {
                     selected_lens_last_5_hours: 3.0,
@@ -7330,6 +7331,7 @@ mod tests {
                 gross_input: 5.0,
                 output: 0.0,
                 total: 5.0,
+                rtk_saved_tokens: 0.0,
             },
             indicators: gnomon_core::query::MetricIndicators {
                 selected_lens_last_5_hours: 5.0,
@@ -7367,6 +7369,7 @@ mod tests {
                 gross_input: 5.0,
                 output: 0.0,
                 total: 5.0,
+                rtk_saved_tokens: 0.0,
             },
             indicators: gnomon_core::query::MetricIndicators {
                 selected_lens_last_5_hours: 5.0,
@@ -8943,6 +8946,7 @@ mod tests {
                 gross_input: 6.0,
                 output: 2.0,
                 total: 8.0,
+                rtk_saved_tokens: 0.0,
             },
             indicators: gnomon_core::query::MetricIndicators {
                 selected_lens_last_5_hours: 5.0,
@@ -8982,6 +8986,7 @@ mod tests {
                 gross_input: spec.value,
                 output: 0.0,
                 total: spec.value,
+                rtk_saved_tokens: 0.0,
             },
             indicators: gnomon_core::query::MetricIndicators {
                 selected_lens_last_5_hours: spec.value,

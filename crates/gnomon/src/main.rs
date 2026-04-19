@@ -2377,6 +2377,7 @@ mod tests {
                     gross_input: 0.0,
                     output: 0.0,
                     total: 0.0,
+                    rtk_saved_tokens: 0.0,
                 },
                 indicators: MetricIndicators {
                     selected_lens_last_5_hours: 0.0,

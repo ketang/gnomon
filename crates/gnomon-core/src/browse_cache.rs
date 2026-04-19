@@ -480,6 +480,7 @@ mod tests {
                 gross_input: 12.0,
                 output: 3.0,
                 total: 15.0,
+                rtk_saved_tokens: 0.0,
             },
             indicators: MetricIndicators {
                 selected_lens_last_5_hours: 12.0,
@@ -528,6 +529,7 @@ mod tests {
                 gross_input: 57_000.0,
                 output: 8_500.0,
                 total: 65_500.0,
+                rtk_saved_tokens: 0.0,
             },
             indicators: MetricIndicators {
                 selected_lens_last_5_hours: 15_000.0,
@@ -562,6 +564,7 @@ mod tests {
                 gross_input: 25_000.0,
                 output: 4_000.0,
                 total: 29_000.0,
+                rtk_saved_tokens: 0.0,
             },
             indicators: MetricIndicators {
                 selected_lens_last_5_hours: 8_000.0,
@@ -590,6 +593,7 @@ mod tests {
                 gross_input: 12_500.0,
                 output: 2_000.0,
                 total: 14_500.0,
+                rtk_saved_tokens: 0.0,
             },
             indicators: MetricIndicators {
                 selected_lens_last_5_hours: 4_000.0,
@@ -624,6 +628,7 @@ mod tests {
                 gross_input: 3_800.0,
                 output: 600.0,
                 total: 4_400.0,
+                rtk_saved_tokens: 0.0,
             },
             indicators: MetricIndicators {
                 selected_lens_last_5_hours: 1_200.0,
