@@ -182,16 +182,53 @@ Verification:
 - `cargo test -p gnomon-core`
 - `cargo test --workspace`
 
+### 2026-04-19 — `#124` Codex Auxiliary Sources
+
+Status: MERGED into `codex-integration`
+
+Summary:
+
+- Created child branch/worktree `codex-integration-codex-aux-sources` at
+  `.worktrees/codex-integration-codex-aux-sources` and merged it back into
+  `codex-integration`.
+- Added migration `0018_codex_aux_sources.sql`, bumped the initial schema
+  version, and bumped the import schema version for the Codex auxiliary-source
+  contract.
+- Generalized history normalization so both Claude and Codex `history.jsonl`
+  files import through the shared `history_event` path with provider-aware
+  field extraction instead of Claude-only key assumptions.
+- Mapped Codex `history.jsonl` rows into shared auxiliary history fields using
+  `session_id`, `timestamp`, `cwd`, and `summary`, which preserves unmatched
+  rows without inventing transcript-backed project attribution.
+- Introduced Codex-specific raw table `codex_session_index_entry` so
+  `session_index.jsonl` imports as a first-class auxiliary source without
+  forcing it into the history-event shape.
+- Updated chunk purge/recount logic so Codex session-index rows reimport
+  cleanly and contribute to import record counts.
+- Landed the next `#121` regression slice with:
+  - a normalization unit test for Codex `history.jsonl`
+  - a normalization unit test for Codex `session_index.jsonl`
+  - an end-to-end mixed-source import test that proves Codex history and
+    session-index rows import alongside rollout and Claude sources
+
+Verification:
+
+- `cargo test -p gnomon-core normalizes_codex_history_jsonl_into_history_events -- --nocapture`
+- `cargo test -p gnomon-core normalizes_codex_session_index_jsonl_into_raw_entries -- --nocapture`
+- `cargo test -p gnomon-core import_all_imports_codex_rollout_raw_sessions_without_blocking_claude_imports -- --nocapture`
+- `cargo test -p gnomon-core`
+- `cargo test --workspace`
+
 ---
 
 ## RESUME HERE
 
-Phase: `#123` merged; ready to start `#124`
+Phase: `#124` merged; ready to start `#125`
 Base branch: `codex-integration`
 Base worktree: `/home/ketan/project/gnomon/.worktrees/codex-integration`
-Last completed: Merged `#123` Codex rollout normalization and the next `#121` regression slice from `codex-integration-codex-rollout-normalization` into the base branch
-Next action: Start `#124` by creating child branch `codex-integration-codex-aux-sources` and worktree `.worktrees/codex-integration-codex-aux-sources`, then import Codex `history.jsonl` and `session_index.jsonl` as auxiliary Codex sources while preserving unmatched rows instead of inventing project attribution
-Open issue sequence: `#124`, `#121` incremental, `#125`
+Last completed: Merged `#124` Codex auxiliary-source import and the next `#121` regression slice from `codex-integration-codex-aux-sources` into the base branch
+Next action: Start `#125` by creating child branch `codex-integration-provider-aware-surfaces` and worktree `.worktrees/codex-integration-provider-aware-surfaces`, then add provider-aware query, report, TUI, web, and docs support for mixed Claude and Codex data
+Open issue sequence: `#125`
 In-flight uncommitted state on base branch: none expected after the merge and log-update commits
 Child-branch naming note: Because the flat branch `codex-integration` exists, `codex-integration/...` refs are invalid here; use dashed child branch names like `codex-integration-shared-session-spine`
 
@@ -212,16 +249,16 @@ Before doing anything else:
 
 Then:
 
-1. Create the child branch and worktree for `#124` from `codex-integration`.
+1. Create the child branch and worktree for `#125` from `codex-integration`.
    Use a dashed branch name such as
-   `codex-integration-codex-aux-sources`; do not use
+   `codex-integration-provider-aware-surfaces`; do not use
    `codex-integration/...` because that ref layout conflicts with the existing
    flat base branch.
-2. Implement only the Codex auxiliary-source slice in that child worktree.
-   Import Codex `history.jsonl` and `session_index.jsonl` as separate Codex
-   auxiliary sources, join them to the shared session spine where possible,
-   and preserve unmatched rows instead of inventing project attribution.
-3. Land any relevant `#121` fixture and regression-test slice with the `#124`
+2. Implement only the provider-aware surface slice in that child worktree.
+   Add provider-aware query filters, report output, TUI surfaces, web surfaces,
+   and docs support for Claude and Codex data while keeping mixed-provider
+   views explicit rather than implicit.
+3. Land any relevant `#121` fixture and regression-test slice with the `#125`
    work.
 4. Verify the resulting change.
 5. Merge the child branch back into `codex-integration`.
