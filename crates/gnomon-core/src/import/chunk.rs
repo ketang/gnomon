@@ -333,7 +333,7 @@ pub fn import_all_with_perf_logger(
     };
 
     let open_scope = PerfScope::new(perf_logger.clone(), "import.open_database");
-    let mut database = match Database::open(db_path) {
+    let mut database = match Database::open_for_import(db_path) {
         Ok(database) => {
             open_scope.finish_ok();
             database
@@ -961,7 +961,7 @@ fn run_import_worker(
 ) -> Result<()> {
     let mut worker_scope = PerfScope::new(options.perf_logger.clone(), "import.worker_total");
     let open_scope = PerfScope::new(options.perf_logger.clone(), "import.open_database");
-    let mut database = match Database::open(db_path) {
+    let mut database = match Database::open_for_import(db_path) {
         Ok(database) => {
             open_scope.finish_ok();
             database
@@ -1649,7 +1649,6 @@ mod tests {
     };
     use crate::db::Database;
     use crate::import::scan_source_manifest;
-    use crate::query::SnapshotBounds;
 
     const WAIT_TIMEOUT_MS: u64 = 5;
     const WORKER_DELAY_MS: u64 = 50;
@@ -2493,6 +2492,7 @@ mod tests {
         i64::try_from(content.len()).context("fixture size exceeded i64")
     }
 
+    #[allow(dead_code)]
     fn write_action_fixture(path: &Path, session_id: &str, cwd: &Path) -> Result<i64> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;

@@ -1463,7 +1463,8 @@ mod tests {
             equals: None,
         };
         let policy = ProjectIdentityPolicy::default();
-        let policy_fingerprint = scan_policy_fingerprint(&policy, &[exclude_rule.clone()])?;
+        let policy_fingerprint =
+            scan_policy_fingerprint(&policy, std::slice::from_ref(&exclude_rule))?;
         let discovery = discover_source_files(
             db.connection(),
             &source_root,

@@ -88,6 +88,8 @@ enum DbSubcommand {
     Rebuild,
     /// Report current import chunk state, phase, and recent failures.
     Status,
+    /// Verify database integrity: SQLite page structure and foreign-key consistency.
+    Check,
 }
 
 #[derive(Debug, Clone, Args, Default)]
@@ -552,6 +554,7 @@ fn run_db_command(config: &RuntimeConfig, command: DbSubcommand) -> Result<()> {
         }
         DbSubcommand::Rebuild => rebuild_database(config),
         DbSubcommand::Status => run_db_status_command(config),
+        DbSubcommand::Check => run_db_check_command(config),
     }
 }
 
@@ -738,6 +741,66 @@ fn run_db_status_command(config: &RuntimeConfig) -> Result<()> {
     let report = build_import_status_report(config)?;
     print!("{}", render_import_status_report(&report));
     Ok(())
+}
+
+fn run_db_check_command(config: &RuntimeConfig) -> Result<()> {
+    if !config.db_path.exists() {
+        bail!(
+            "database not found at {}; run an import first",
+            config.db_path.display()
+        );
+    }
+
+    let db = Database::open_read_only(&config.db_path)
+        .with_context(|| format!("unable to open {}", config.db_path.display()))?;
+    let conn = db.connection();
+
+    let mut issues: Vec<String> = Vec::new();
+
+    let integrity_rows: Vec<String> = conn
+        .prepare("PRAGMA integrity_check")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()
+        })
+        .context("unable to run integrity_check")?;
+
+    if integrity_rows == ["ok"] {
+        println!("integrity_check: ok");
+    } else {
+        for row in &integrity_rows {
+            issues.push(format!("integrity_check: {row}"));
+        }
+    }
+
+    let fk_rows: Vec<(String, i64, String, i64)> = conn
+        .prepare("PRAGMA foreign_key_check")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .context("unable to run foreign_key_check")?;
+
+    if fk_rows.is_empty() {
+        println!("foreign_key_check: ok");
+    } else {
+        for (table, rowid, parent, fkid) in &fk_rows {
+            issues.push(format!(
+                "foreign_key_check: {table} rowid={rowid} references {parent} (fk index {fkid})"
+            ));
+        }
+    }
+
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        for issue in &issues {
+            eprintln!("{issue}");
+        }
+        bail!("{} integrity issue(s) found", issues.len());
+    }
 }
 
 fn build_import_status_report(config: &RuntimeConfig) -> Result<ImportStatusReport> {
@@ -1638,6 +1701,7 @@ mod tests {
                 DbSubcommand::Reset(args) => assert!(args.force),
                 DbSubcommand::Rebuild => panic!("expected reset subcommand"),
                 DbSubcommand::Status => panic!("expected reset subcommand"),
+                DbSubcommand::Check => panic!("expected reset subcommand"),
             },
             Some(Command::Benchmark(_)) => panic!("expected db command"),
             Some(Command::Report(_)) => panic!("expected db command"),
@@ -1672,6 +1736,7 @@ mod tests {
                 DbSubcommand::Rebuild => {}
                 DbSubcommand::Reset(_) => panic!("expected rebuild subcommand"),
                 DbSubcommand::Status => panic!("expected rebuild subcommand"),
+                DbSubcommand::Check => panic!("expected rebuild subcommand"),
             },
             Some(Command::Benchmark(_)) => panic!("expected db command"),
             Some(Command::Report(_)) => panic!("expected db command"),
