@@ -17,5 +17,6 @@ pub fn all() -> Migrations<'static> {
         M::up(include_str!("migrations/0011_d1b_message_turn_id.sql")),
         M::up(include_str!("migrations/0013_scan_source_cache.sql")),
         M::up(include_str!("migrations/0014_pending_chunk_rebuild.sql")),
+        M::up(include_str!("migrations/0015_provider_aware_sources.sql")),
     ])
 }

@@ -14,9 +14,10 @@ use jiff::{Timestamp, ToSpan, tz::TimeZone};
 use rusqlite::{Connection, params};
 
 use super::{
-    IMPORT_SCHEMA_VERSION, NormalizeImportWarning, NormalizeJsonlFileOutcome,
+    ConfiguredSources, IMPORT_SCHEMA_VERSION, NormalizeImportWarning, NormalizeJsonlFileOutcome,
     NormalizeJsonlFileParams, ParseResult, STARTUP_IMPORT_WINDOW_HOURS, STARTUP_OPEN_DEADLINE_SECS,
-    SourceFileKind, normalize::parse_jsonl_file, normalize::write_parsed_file_in_tx,
+    SourceDescriptor, SourceFileKind, normalize::parse_jsonl_file,
+    normalize::write_parsed_file_in_tx,
 };
 use rayon::prelude::*;
 
@@ -158,6 +159,7 @@ impl ImportPhase {
 struct ChunkSourceFile {
     source_file_id: i64,
     relative_path: String,
+    source_provider: super::SourceProvider,
     source_kind: SourceFileKind,
 }
 
@@ -167,6 +169,7 @@ struct SourceFileRow {
     project_id: i64,
     project_key: String,
     relative_path: String,
+    source_provider: String,
     source_kind: String,
     modified_at_utc: Option<String>,
     discovered_at_utc: String,
@@ -202,10 +205,11 @@ pub fn start_startup_import(
     db_path: &Path,
     source_root: &Path,
 ) -> Result<StartupImport> {
-    start_startup_import_with_mode_and_progress(
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    start_startup_import_with_sources_and_mode_and_progress(
         conn,
         db_path,
-        source_root,
+        &sources,
         StartupImportMode::RecentFirst,
         |_| {},
     )
@@ -220,10 +224,11 @@ pub fn start_startup_import_with_progress<F>(
 where
     F: FnMut(&StartupProgressUpdate),
 {
-    start_startup_import_with_mode_and_progress(
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    start_startup_import_with_sources_and_mode_and_progress(
         conn,
         db_path,
-        source_root,
+        &sources,
         StartupImportMode::RecentFirst,
         on_progress,
     )
@@ -239,12 +244,32 @@ pub fn start_startup_import_with_mode_and_progress<F>(
 where
     F: FnMut(&StartupProgressUpdate),
 {
-    let state_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
-    let perf_logger = PerfLogger::from_env(state_dir).ok().flatten();
-    start_startup_import_with_perf_logger(
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    start_startup_import_with_sources_and_mode_and_progress(
         conn,
         db_path,
-        source_root,
+        &sources,
+        import_mode,
+        on_progress,
+    )
+}
+
+pub fn start_startup_import_with_sources_and_mode_and_progress<F>(
+    conn: &Connection,
+    db_path: &Path,
+    sources: &ConfiguredSources,
+    import_mode: StartupImportMode,
+    on_progress: F,
+) -> Result<StartupImport>
+where
+    F: FnMut(&StartupProgressUpdate),
+{
+    let state_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let perf_logger = PerfLogger::from_env(state_dir).ok().flatten();
+    start_startup_import_with_sources_and_perf_logger(
+        conn,
+        db_path,
+        sources,
         import_mode,
         perf_logger,
         on_progress,
@@ -260,6 +285,28 @@ pub fn start_startup_import_with_perf_logger<F>(
     source_root: &Path,
     import_mode: StartupImportMode,
     perf_logger: Option<PerfLogger>,
+    on_progress: F,
+) -> Result<StartupImport>
+where
+    F: FnMut(&StartupProgressUpdate),
+{
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    start_startup_import_with_sources_and_perf_logger(
+        conn,
+        db_path,
+        &sources,
+        import_mode,
+        perf_logger,
+        on_progress,
+    )
+}
+
+pub fn start_startup_import_with_sources_and_perf_logger<F>(
+    conn: &Connection,
+    db_path: &Path,
+    sources: &ConfiguredSources,
+    import_mode: StartupImportMode,
+    perf_logger: Option<PerfLogger>,
     mut on_progress: F,
 ) -> Result<StartupImport>
 where
@@ -269,10 +316,10 @@ where
         perf_logger,
         ..ImportWorkerOptions::default()
     };
-    start_startup_import_with_options(
+    start_startup_import_with_options_and_sources(
         conn,
         db_path,
-        source_root,
+        sources,
         Duration::from_secs(STARTUP_OPEN_DEADLINE_SECS),
         import_mode,
         options,
@@ -287,7 +334,8 @@ pub fn import_all(
 ) -> Result<ImportExecutionReport> {
     let state_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
     let perf_logger = PerfLogger::from_env(state_dir).ok().flatten();
-    import_all_with_perf_logger(conn, db_path, source_root, perf_logger)
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    import_all_with_sources_and_perf_logger(conn, db_path, &sources, perf_logger)
 }
 
 /// Like [`import_all`] but accepts an explicit [`PerfLogger`] instead of
@@ -298,6 +346,16 @@ pub fn import_all_with_perf_logger(
     conn: &Connection,
     db_path: &Path,
     source_root: &Path,
+    perf_logger: Option<PerfLogger>,
+) -> Result<ImportExecutionReport> {
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    import_all_with_sources_and_perf_logger(conn, db_path, &sources, perf_logger)
+}
+
+pub fn import_all_with_sources_and_perf_logger(
+    conn: &Connection,
+    db_path: &Path,
+    sources: &ConfiguredSources,
     perf_logger: Option<PerfLogger>,
 ) -> Result<ImportExecutionReport> {
     let mut import_scope = PerfScope::new(perf_logger.clone(), "import.total");
@@ -352,7 +410,7 @@ pub fn import_all_with_perf_logger(
     for chunk in &prepared.startup_chunks {
         import_chunk(
             &mut database,
-            source_root,
+            sources,
             chunk,
             ImportPhase::Startup,
             &options,
@@ -369,7 +427,7 @@ pub fn import_all_with_perf_logger(
     for chunk in &prepared.deferred_chunks {
         if let Err(err) = import_chunk(
             &mut database,
-            source_root,
+            sources,
             chunk,
             ImportPhase::Deferred,
             &options,
@@ -399,10 +457,32 @@ pub fn import_all_with_perf_logger(
     Ok(report)
 }
 
+#[cfg(test)]
 fn start_startup_import_with_options(
     conn: &Connection,
     db_path: &Path,
     source_root: &Path,
+    wait_timeout: Duration,
+    import_mode: StartupImportMode,
+    worker_options: ImportWorkerOptions,
+    on_progress: Option<&mut dyn FnMut(&StartupProgressUpdate)>,
+) -> Result<StartupImport> {
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    start_startup_import_with_options_and_sources(
+        conn,
+        db_path,
+        &sources,
+        wait_timeout,
+        import_mode,
+        worker_options,
+        on_progress,
+    )
+}
+
+fn start_startup_import_with_options_and_sources(
+    conn: &Connection,
+    db_path: &Path,
+    sources: &ConfiguredSources,
     wait_timeout: Duration,
     import_mode: StartupImportMode,
     worker_options: ImportWorkerOptions,
@@ -469,7 +549,7 @@ fn start_startup_import_with_options(
 
     let (sender, receiver) = mpsc::channel();
     let db_path = db_path.to_path_buf();
-    let source_root = source_root.to_path_buf();
+    let sources = sources.clone();
     let prepared_for_worker = prepared.clone();
     let sender_for_worker = sender;
     let worker = match thread::Builder::new()
@@ -477,7 +557,7 @@ fn start_startup_import_with_options(
         .spawn(move || {
             run_import_worker(
                 &db_path,
-                &source_root,
+                &sources,
                 &prepared_for_worker,
                 sender_for_worker,
                 &worker_options,
@@ -629,6 +709,8 @@ fn build_import_plan(
         let source_file = ChunkSourceFile {
             source_file_id: row.source_file_id,
             relative_path: row.relative_path.clone(),
+            source_provider: super::SourceProvider::from_db_value(&row.source_provider)
+                .ok_or_else(|| anyhow!("unknown source file provider {}", row.source_provider))?,
             source_kind: SourceFileKind::from_db_value(&row.source_kind)
                 .ok_or_else(|| anyhow!("unknown source file kind {}", row.source_kind))?,
         };
@@ -671,12 +753,30 @@ fn build_import_plan(
     let mut deferred_candidates = Vec::new();
 
     for (descriptor, mut changes) in chunk_changes {
-        changes
-            .import_source_files
-            .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        changes
-            .remove_only_source_files
-            .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        changes.import_source_files.sort_by(|left, right| {
+            (
+                left.source_provider.as_str(),
+                left.source_kind.as_str(),
+                left.relative_path.as_str(),
+            )
+                .cmp(&(
+                    right.source_provider.as_str(),
+                    right.source_kind.as_str(),
+                    right.relative_path.as_str(),
+                ))
+        });
+        changes.remove_only_source_files.sort_by(|left, right| {
+            (
+                left.source_provider.as_str(),
+                left.source_kind.as_str(),
+                left.relative_path.as_str(),
+            )
+                .cmp(&(
+                    right.source_provider.as_str(),
+                    right.source_kind.as_str(),
+                    right.relative_path.as_str(),
+                ))
+        });
 
         let chunk = ChunkCandidate {
             project_id: descriptor.project_id,
@@ -715,6 +815,7 @@ fn load_source_files(conn: &Connection) -> Result<Vec<SourceFileRow>> {
                 source_file.project_id,
                 project.canonical_key,
                 source_file.relative_path,
+                source_file.source_provider,
                 source_file.source_kind,
                 source_file.modified_at_utc,
                 source_file.discovered_at_utc,
@@ -736,13 +837,14 @@ fn load_source_files(conn: &Connection) -> Result<Vec<SourceFileRow>> {
                 project_id: row.get(1)?,
                 project_key: row.get(2)?,
                 relative_path: row.get(3)?,
-                source_kind: row.get(4)?,
-                modified_at_utc: row.get(5)?,
-                discovered_at_utc: row.get(6)?,
-                size_bytes: row.get(7)?,
-                imported_size_bytes: row.get(8)?,
-                imported_modified_at_utc: row.get(9)?,
-                imported_schema_version: row.get(10)?,
+                source_provider: row.get(4)?,
+                source_kind: row.get(5)?,
+                modified_at_utc: row.get(6)?,
+                discovered_at_utc: row.get(7)?,
+                size_bytes: row.get(8)?,
+                imported_size_bytes: row.get(9)?,
+                imported_modified_at_utc: row.get(10)?,
+                imported_schema_version: row.get(11)?,
             })
         })
         .context("unable to enumerate source files for import planning")?;
@@ -954,7 +1056,7 @@ fn mark_chunks_failed(
 
 fn run_import_worker(
     db_path: &Path,
-    source_root: &Path,
+    sources: &ConfiguredSources,
     plan: &PreparedImportPlan,
     sender: mpsc::Sender<StartupWorkerEvent>,
     options: &ImportWorkerOptions,
@@ -989,13 +1091,8 @@ fn run_import_worker(
             plan.startup_chunks.len(),
             chunk,
         );
-        if let Err(err) = import_chunk(
-            &mut database,
-            source_root,
-            chunk,
-            ImportPhase::Startup,
-            options,
-        ) {
+        if let Err(err) = import_chunk(&mut database, sources, chunk, ImportPhase::Startup, options)
+        {
             startup_failures.push(compact_status_text(format!("{err:#}")));
         }
     }
@@ -1016,7 +1113,7 @@ fn run_import_worker(
         );
         if let Err(err) = import_chunk(
             &mut database,
-            source_root,
+            sources,
             chunk,
             ImportPhase::Deferred,
             options,
@@ -1079,7 +1176,7 @@ fn compact_status_text(text: impl Into<String>) -> String {
 
 fn import_chunk(
     database: &mut Database,
-    source_root: &Path,
+    sources: &ConfiguredSources,
     chunk: &PreparedChunk,
     phase: ImportPhase,
     options: &ImportWorkerOptions,
@@ -1125,7 +1222,24 @@ fn import_chunk(
             .import_source_files
             .par_iter()
             .map(|source_file| {
-                let path = source_root.join(&source_file.relative_path);
+                let path = sources.resolve_path(
+                    SourceDescriptor::new(source_file.source_provider, source_file.source_kind),
+                    &source_file.relative_path,
+                );
+                let path = match path {
+                    Ok(path) => path,
+                    Err(err) => {
+                        return ParseResult::Warning(NormalizeImportWarning {
+                            code: "missing_source_path",
+                            message: format!(
+                                "unable to resolve source path for provider={} kind={} relative_path={}: {err:#}",
+                                source_file.source_provider.as_str(),
+                                source_file.source_kind.as_str(),
+                                source_file.relative_path
+                            ),
+                        });
+                    }
+                };
                 parse_jsonl_file(&path, source_file.source_kind)
             })
             .collect();
@@ -1188,7 +1302,13 @@ fn import_chunk(
                         project_id: chunk.project_id,
                         source_file_id: source_file.source_file_id,
                         import_chunk_id: chunk.import_chunk_id,
-                        path: source_root.join(&source_file.relative_path),
+                        path: sources.resolve_path(
+                            SourceDescriptor::new(
+                                source_file.source_provider,
+                                source_file.source_kind,
+                            ),
+                            &source_file.relative_path,
+                        )?,
                         perf_logger: options.perf_logger.clone(),
                     };
                     super::normalize::purge_existing_import(&sp, &params)?;
@@ -1221,18 +1341,25 @@ fn import_chunk(
                         project_id: chunk.project_id,
                         source_file_id: source_file.source_file_id,
                         import_chunk_id: chunk.import_chunk_id,
-                        path: source_root.join(&source_file.relative_path),
+                        path: sources.resolve_path(
+                            SourceDescriptor::new(
+                                source_file.source_provider,
+                                source_file.source_kind,
+                            ),
+                            &source_file.relative_path,
+                        )?,
                         perf_logger: options.perf_logger.clone(),
                     };
 
-                    let (outcome, normalized_messages) =
-                        write_parsed_file_in_tx(&sp, &params, parsed_file, source_file.source_kind)
-                            .with_context(|| {
-                                format!(
-                                    "unable to normalize source file {}",
-                                    source_root.join(&source_file.relative_path).display()
-                                )
-                            })?;
+                    let (outcome, normalized_messages) = write_parsed_file_in_tx(
+                        &sp,
+                        &params,
+                        parsed_file,
+                        SourceDescriptor::new(source_file.source_provider, source_file.source_kind),
+                    )
+                    .with_context(|| {
+                        format!("unable to normalize source file {}", params.path.display())
+                    })?;
 
                     match outcome {
                         NormalizeJsonlFileOutcome::Imported(result) => {
@@ -1248,7 +1375,7 @@ fn import_chunk(
                                 .with_context(|| {
                                     format!(
                                         "unable to build actions for source file {}",
-                                        source_root.join(&source_file.relative_path).display()
+                                        params.path.display()
                                     )
                                 })?;
                             }
@@ -1645,11 +1772,13 @@ mod tests {
 
     use super::{
         ImportWorkerOptions, StartupImportMode, StartupOpenReason, StartupWorkerEvent,
-        build_import_plan, import_all, start_startup_import_with_options,
+        build_import_plan, import_all, import_all_with_sources_and_perf_logger,
+        start_startup_import_with_options,
     };
+    use crate::config::ProjectIdentityPolicy;
     use crate::db::Database;
-    use crate::import::scan_source_manifest;
-    use crate::query::SnapshotBounds;
+    use crate::import::{scan_source_manifest, scan_sources_manifest_with_policy};
+    use crate::sources::{ConfiguredSource, ConfiguredSources, SourceFileKind, SourceProvider};
 
     const WAIT_TIMEOUT_MS: u64 = 5;
     const WORKER_DELAY_MS: u64 = 50;
@@ -2412,6 +2541,87 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn import_all_skips_unsupported_codex_sources_without_blocking_claude_imports() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let claude_root = temp.path().join(".claude");
+        let claude_projects = claude_root.join("projects");
+        let claude_history = claude_root.join("history.jsonl");
+        let project_root = temp.path().join("project");
+        let project_cwd = project_root.join("workspace");
+        fs::create_dir_all(&project_cwd)?;
+        gix::init(&project_root)?;
+        let _ = write_session_fixture_with_cwd(
+            &claude_projects.join("project/session.jsonl"),
+            "claude-session",
+            &project_cwd,
+        )?;
+        fs::write(
+            &claude_history,
+            "{\"sessionId\":\"claude-history-1\",\"timestamp\":\"2026-04-18T12:00:00Z\",\"display\":\"hello\"}\n",
+        )?;
+
+        let codex_root = codex_fixture_root();
+        let sources = ConfiguredSources::new(vec![
+            ConfiguredSource::directory(
+                SourceProvider::Claude,
+                SourceFileKind::Transcript,
+                claude_projects,
+            ),
+            ConfiguredSource::file(
+                SourceProvider::Claude,
+                SourceFileKind::History,
+                claude_history,
+            ),
+            ConfiguredSource::directory(
+                SourceProvider::Codex,
+                SourceFileKind::Rollout,
+                codex_root.join("sessions"),
+            ),
+            ConfiguredSource::file(
+                SourceProvider::Codex,
+                SourceFileKind::History,
+                codex_root.join("history.jsonl"),
+            ),
+            ConfiguredSource::file(
+                SourceProvider::Codex,
+                SourceFileKind::SessionIndex,
+                codex_root.join("session_index.jsonl"),
+            ),
+        ]);
+
+        let mut db = Database::open(&db_path)?;
+        let scan_report = scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+        assert_eq!(scan_report.discovered_source_files, 5);
+
+        let import_report =
+            import_all_with_sources_and_perf_logger(db.connection(), &db_path, &sources, None)?;
+        assert_eq!(import_report.deferred_failure_count, 0);
+        assert!(import_report.deferred_failure_summary.is_none());
+
+        let counts: (i64, i64, i64) = db.connection().query_row(
+            "
+            SELECT
+                (SELECT COUNT(*) FROM source_file WHERE imported_schema_version = ?1),
+                (SELECT COUNT(*) FROM conversation),
+                (SELECT COUNT(*) FROM history_event)
+            ",
+            params![crate::import::IMPORT_SCHEMA_VERSION],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(counts.0, 5);
+        assert_eq!(counts.1, 1);
+        assert_eq!(counts.2, 1);
+
+        Ok(())
+    }
+
     fn insert_project(
         conn: &mut Connection,
         canonical_key: &str,
@@ -2464,10 +2674,12 @@ mod tests {
             INSERT INTO source_file (
                 project_id,
                 relative_path,
+                source_provider,
+                source_kind,
                 modified_at_utc,
                 size_bytes
             )
-            VALUES (?1, ?2, ?3, ?4)
+            VALUES (?1, ?2, 'claude', 'transcript', ?3, ?4)
             RETURNING id
             ",
             params![project_id, relative_path, modified_at_utc, size_bytes],
@@ -2493,6 +2705,7 @@ mod tests {
         i64::try_from(content.len()).context("fixture size exceeded i64")
     }
 
+    #[allow(dead_code)]
     fn write_action_fixture(path: &Path, session_id: &str, cwd: &Path) -> Result<i64> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -2561,5 +2774,12 @@ mod tests {
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<rusqlite::Result<BTreeMap<_, _>>>()
             .context("unable to collect conversation ids by relative path")
+    }
+
+    fn codex_fixture_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("codex")
     }
 }

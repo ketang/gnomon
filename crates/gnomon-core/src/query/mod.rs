@@ -5726,12 +5726,13 @@ mod tests {
             INSERT INTO source_file (
                 project_id,
                 relative_path,
+                source_provider,
                 source_kind,
                 modified_at_utc,
                 size_bytes,
                 scan_warnings_json
             )
-            VALUES (?1, '../history.jsonl', 'claude_history', '2026-03-26T09:00:00Z', 1, '[]')
+            VALUES (?1, 'history.jsonl', 'claude', 'history', '2026-03-26T09:00:00Z', 1, '[]')
             RETURNING id
             ",
             [fixture.project_a_id],
@@ -5850,12 +5851,13 @@ mod tests {
             INSERT INTO source_file (
                 project_id,
                 relative_path,
+                source_provider,
                 source_kind,
                 modified_at_utc,
                 size_bytes,
                 scan_warnings_json
             )
-            VALUES (?1, '../history.jsonl', 'claude_history', '2026-03-28T09:00:00Z', 1, '[]')
+            VALUES (?1, 'history.jsonl', 'claude', 'history', '2026-03-28T09:00:00Z', 1, '[]')
             RETURNING id
             ",
             [fixture.project_a_id],
@@ -6221,12 +6223,13 @@ mod tests {
             INSERT INTO source_file (
                 project_id,
                 relative_path,
+                source_provider,
                 source_kind,
                 modified_at_utc,
                 size_bytes,
                 scan_warnings_json
             )
-            VALUES (?1, '../history.jsonl', 'claude_history', '2026-03-28T09:00:00Z', 1, '[]')
+            VALUES (?1, 'history.jsonl', 'claude', 'history', '2026-03-28T09:00:00Z', 1, '[]')
             RETURNING id
             ",
             [fixture.project_a_id],
@@ -7839,11 +7842,13 @@ mod tests {
             INSERT INTO source_file (
                 project_id,
                 relative_path,
+                source_provider,
+                source_kind,
                 modified_at_utc,
                 size_bytes,
                 scan_warnings_json
             )
-            VALUES (?1, ?2, ?3, 1, '[]')
+            VALUES (?1, ?2, 'claude', 'transcript', ?3, 1, '[]')
             RETURNING id
             ",
             params![

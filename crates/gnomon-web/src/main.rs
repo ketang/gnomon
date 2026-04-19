@@ -14,8 +14,8 @@ use clap::{Args, Parser};
 use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
 use gnomon_core::db::Database;
 use gnomon_core::import::{
-    StartupOpenReason, StartupProgressUpdate, StartupWorkerEvent, scan_source_manifest_with_policy,
-    start_startup_import,
+    StartupOpenReason, StartupProgressUpdate, StartupWorkerEvent,
+    scan_sources_manifest_with_policy, start_startup_import_with_sources_and_mode_and_progress,
 };
 use gnomon_core::opportunity::{OpportunityCategory, OpportunityConfidence};
 use gnomon_core::query::{
@@ -23,6 +23,7 @@ use gnomon_core::query::{
     FilterOptions, MetricLens, OpportunitiesFilters, OpportunitiesReport, QueryEngine, RollupRow,
     RootView, SnapshotBounds, SnapshotCoverageSummary, TimeWindowFilter,
 };
+use gnomon_core::sources::ConfiguredSources;
 use serde::{Deserialize, Serialize};
 
 include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
@@ -249,14 +250,19 @@ fn local_bind_addr(port: u16) -> SocketAddr {
 fn build_app_state(config: RuntimeConfig) -> Result<AppState> {
     config.ensure_dirs()?;
     let mut database = Database::open(&config.db_path)?;
-    let _scan = scan_source_manifest_with_policy(
+    let _scan = scan_sources_manifest_with_policy(
         &mut database,
-        &config.source_root,
+        &config.sources,
         &config.project_identity,
         &config.project_filters,
     )?;
-    let mut startup_import =
-        start_startup_import(database.connection(), &config.db_path, &config.source_root)?;
+    let mut startup_import = start_startup_import_with_sources_and_mode_and_progress(
+        database.connection(),
+        &config.db_path,
+        &config.sources,
+        gnomon_core::import::StartupImportMode::RecentFirst,
+        |_| {},
+    )?;
     let startup = Arc::new(Mutex::new(StartupState {
         pinned_snapshot: startup_import.snapshot.clone(),
         open_reason: startup_import.open_reason,
@@ -757,13 +763,15 @@ mod tests {
     }
 
     fn test_app_state() -> AppState {
+        let source_root = PathBuf::from("/tmp/gnomon-web-test/source");
         AppState {
             config: RuntimeConfig {
                 app_name: "gnomon",
                 state_dir: PathBuf::from("/tmp/gnomon-web-test"),
                 config_path: PathBuf::from("/tmp/gnomon-web-test/config.toml"),
                 db_path: PathBuf::from("/tmp/gnomon-web-test/usage.sqlite3"),
-                source_root: PathBuf::from("/tmp/gnomon-web-test/source"),
+                source_root: source_root.clone(),
+                sources: ConfiguredSources::legacy_claude(&source_root),
                 project_identity: Default::default(),
                 project_filters: Vec::new(),
             },
@@ -782,6 +790,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("creating temp dir for test db should succeed");
         let root = temp.path().to_path_buf();
         let db_path = root.join("usage.sqlite3");
+        let source_root = root.join("source");
         Database::open(&db_path).expect("opening test database should succeed");
         let app_state = AppState {
             config: RuntimeConfig {
@@ -789,7 +798,8 @@ mod tests {
                 state_dir: root.join("state"),
                 config_path: root.join("config.toml"),
                 db_path,
-                source_root: root.join("source"),
+                source_root: source_root.clone(),
+                sources: ConfiguredSources::legacy_claude(&source_root),
                 project_identity: Default::default(),
                 project_filters: Vec::new(),
             },

@@ -139,6 +139,7 @@ mod tests {
     use gnomon_core::import::StartupOpenReason;
     use gnomon_core::perf::PerfLogger;
     use gnomon_core::query::{BrowsePath, RootView, SnapshotBounds};
+    use gnomon_core::sources::ConfiguredSources;
     use serde_json::Value;
     use tempfile::tempdir;
 
@@ -214,12 +215,14 @@ mod tests {
     }
 
     fn make_test_config(root: &std::path::Path) -> RuntimeConfig {
+        let source_root = root.join("source");
         RuntimeConfig {
             app_name: "gnomon",
             state_dir: root.to_path_buf(),
             config_path: root.join("config.toml"),
             db_path: root.join("usage.sqlite3"),
-            source_root: root.join("source"),
+            source_root: source_root.clone(),
+            sources: ConfiguredSources::legacy_claude(&source_root),
             project_identity: Default::default(),
             project_filters: Vec::new(),
         }
