@@ -65,6 +65,7 @@ impl Drop for StartupImport {
 struct ImportWorkerOptions {
     per_chunk_delay: Duration,
     perf_logger: Option<PerfLogger>,
+    rtk_config: Option<crate::config::RtkConfig>,
 }
 
 #[derive(Debug)]
@@ -280,6 +281,32 @@ where
     )
 }
 
+pub fn start_startup_import_with_rtk<F>(
+    conn: &Connection,
+    db_path: &Path,
+    source_root: &Path,
+    import_mode: StartupImportMode,
+    rtk_config: Option<crate::config::RtkConfig>,
+    mut on_progress: F,
+) -> Result<StartupImport>
+where
+    F: FnMut(&StartupProgressUpdate),
+{
+    let options = ImportWorkerOptions {
+        rtk_config,
+        ..ImportWorkerOptions::default()
+    };
+    start_startup_import_with_options(
+        conn,
+        db_path,
+        source_root,
+        Duration::from_secs(STARTUP_OPEN_DEADLINE_SECS),
+        import_mode,
+        options,
+        Some(&mut on_progress),
+    )
+}
+
 pub fn import_all(
     conn: &Connection,
     db_path: &Path,
@@ -300,6 +327,36 @@ pub fn import_all_with_perf_logger(
     source_root: &Path,
     perf_logger: Option<PerfLogger>,
 ) -> Result<ImportExecutionReport> {
+    let options = ImportWorkerOptions {
+        perf_logger,
+        ..ImportWorkerOptions::default()
+    };
+    import_all_with_options(conn, db_path, source_root, options)
+}
+
+pub fn import_all_with_rtk(
+    conn: &Connection,
+    db_path: &Path,
+    source_root: &Path,
+    rtk_config: Option<crate::config::RtkConfig>,
+) -> Result<ImportExecutionReport> {
+    let state_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let perf_logger = PerfLogger::from_env(state_dir).ok().flatten();
+    let options = ImportWorkerOptions {
+        perf_logger,
+        rtk_config,
+        ..ImportWorkerOptions::default()
+    };
+    import_all_with_options(conn, db_path, source_root, options)
+}
+
+fn import_all_with_options(
+    conn: &Connection,
+    db_path: &Path,
+    source_root: &Path,
+    options: ImportWorkerOptions,
+) -> Result<ImportExecutionReport> {
+    let perf_logger = options.perf_logger.clone();
     let mut import_scope = PerfScope::new(perf_logger.clone(), "import.total");
     let now = Timestamp::now();
     let time_zone = TimeZone::system();
@@ -342,11 +399,6 @@ pub fn import_all_with_perf_logger(
             open_scope.finish_error(&err);
             return Err(err).with_context(|| format!("unable to open {}", db_path.display()));
         }
-    };
-
-    let options = ImportWorkerOptions {
-        perf_logger,
-        ..ImportWorkerOptions::default()
     };
 
     for chunk in &prepared.startup_chunks {
@@ -1493,6 +1545,32 @@ fn finalize_chunk_import_core(
 
     recompute_chunk_counts(conn, chunk.import_chunk_id)?;
     rebuild_chunk_action_rollups(conn, chunk.import_chunk_id, options.perf_logger.clone())?;
+
+    // RTK match phase — after actions committed, before path rollups.
+    if let Some(rtk_config) = &options.rtk_config {
+        let project_root_path: Option<String> = conn
+            .query_row(
+                "SELECT root_path FROM project WHERE id = ?1",
+                params![chunk.project_id],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(root_path) = project_root_path.as_deref()
+            && let Err(e) = crate::import::rtk::match_rtk_savings(
+                conn,
+                chunk.import_chunk_id,
+                root_path,
+                &chunk.chunk_day_local,
+                rtk_config,
+            )
+        {
+            tracing::warn!(
+                "RTK match phase failed for chunk {}: {e}",
+                chunk.import_chunk_id
+            );
+        }
+    }
+
     rebuild_chunk_path_rollups(conn, chunk.import_chunk_id, options.perf_logger.clone())?;
     clear_pending_chunk_rebuild(conn, chunk.project_id, &chunk.chunk_day_local)?;
 
@@ -1910,6 +1988,7 @@ mod tests {
             ImportWorkerOptions {
                 per_chunk_delay: Duration::from_millis(WORKER_DELAY_MS),
                 perf_logger: None,
+                rtk_config: None,
             },
             None,
         )?;
@@ -1998,6 +2077,7 @@ mod tests {
             ImportWorkerOptions {
                 per_chunk_delay: Duration::from_millis(WORKER_DELAY_MS),
                 perf_logger: None,
+                rtk_config: None,
             },
             None,
         )?;

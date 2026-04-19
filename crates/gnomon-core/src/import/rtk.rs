@@ -289,7 +289,12 @@ mod tests {
             "2026-04-18T10:00:00.000Z",
             "2026-04-18T10:00:01.000Z",
         )];
-        let rtk_rows = vec![make_rtk(42, "git status", "2026-04-18T10:00:00.500+00:00", 150)];
+        let rtk_rows = vec![make_rtk(
+            42,
+            "git status",
+            "2026-04-18T10:00:00.500+00:00",
+            150,
+        )];
         let result = run_cursor(&actions, &rtk_rows, 2000, 30000);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].action_id, 1);
@@ -300,10 +305,25 @@ mod tests {
     #[test]
     fn cursor_does_not_double_match_same_rtk_row() {
         let actions = vec![
-            make_action(1, "git status", "2026-04-18T10:00:00.000Z", "2026-04-18T10:00:01.000Z"),
-            make_action(2, "git status", "2026-04-18T10:00:01.500Z", "2026-04-18T10:00:02.000Z"),
+            make_action(
+                1,
+                "git status",
+                "2026-04-18T10:00:00.000Z",
+                "2026-04-18T10:00:01.000Z",
+            ),
+            make_action(
+                2,
+                "git status",
+                "2026-04-18T10:00:01.500Z",
+                "2026-04-18T10:00:02.000Z",
+            ),
         ];
-        let rtk_rows = vec![make_rtk(42, "git status", "2026-04-18T10:00:00.500+00:00", 150)];
+        let rtk_rows = vec![make_rtk(
+            42,
+            "git status",
+            "2026-04-18T10:00:00.500+00:00",
+            150,
+        )];
         let result = run_cursor(&actions, &rtk_rows, 2000, 30000);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].action_id, 1);
@@ -317,7 +337,12 @@ mod tests {
             "2026-04-18T10:00:00.000Z",
             "2026-04-18T10:00:05.000Z",
         )];
-        let rtk_rows = vec![make_rtk(42, "git status", "2026-04-18T10:00:01.000+00:00", 150)];
+        let rtk_rows = vec![make_rtk(
+            42,
+            "git status",
+            "2026-04-18T10:00:01.000+00:00",
+            150,
+        )];
         let result = run_cursor(&actions, &rtk_rows, 2000, 30000);
         assert!(result.is_empty());
     }
@@ -331,7 +356,12 @@ mod tests {
             "2026-04-18T10:00:01.000Z",
         )];
         // RTK row is 60s after action ended — beyond 30s post_slack.
-        let rtk_rows = vec![make_rtk(42, "git status", "2026-04-18T10:01:01.000+00:00", 150)];
+        let rtk_rows = vec![make_rtk(
+            42,
+            "git status",
+            "2026-04-18T10:01:01.000+00:00",
+            150,
+        )];
         let result = run_cursor(&actions, &rtk_rows, 2000, 30000);
         assert!(result.is_empty());
     }
