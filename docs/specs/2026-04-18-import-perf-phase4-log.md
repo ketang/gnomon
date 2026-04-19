@@ -60,6 +60,28 @@ Next implied: A4 (PRAGMA locking_mode = EXCLUSIVE alone) — further decompose E
 
 ---
 
+## 2026-04-18 — candidate A4: `PRAGMA locking_mode = EXCLUSIVE` on import connection
+
+Branch: import-perf-p4-a4
+Worktree: .worktrees/import-perf-p4-a4
+Hypothesis: The import connection is the sole writer during bulk import. EXCLUSIVE mode avoids
+re-acquiring and releasing shared locks on every read/write operation. Tested previously only as
+part of the E-bundle (which regressed overall); this isolates the pragma to measure its individual
+contribution.
+Implementation: Add `PRAGMA locking_mode = EXCLUSIVE;` to `configure_import_connection` in
+`crates/gnomon-core/src/db/mod.rs`, alongside the existing `foreign_keys = OFF`.
+Measurements:
+  Subset:       *(pending)*
+  Full:         *(pending)*
+  Row parity:   *(pending)*
+  Profile shift: *(pending)*
+Decision: PENDING
+Commit:
+Key finding:
+Next implied:
+
+---
+
 ## RESUME HERE
 
 Phase: Phase 4
