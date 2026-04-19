@@ -193,12 +193,14 @@ pub(in crate::import) struct ParsedRecord {
 
 mod chunk;
 mod normalize;
+pub(crate) mod rtk;
 
 pub use chunk::{
     ImportExecutionReport, StartupImport, StartupImportMode, StartupOpenReason,
     StartupProgressUpdate, StartupWorkerEvent, import_all, import_all_with_perf_logger,
-    start_startup_import, start_startup_import_with_mode_and_progress,
+    import_all_with_rtk, start_startup_import, start_startup_import_with_mode_and_progress,
     start_startup_import_with_perf_logger, start_startup_import_with_progress,
+    start_startup_import_with_rtk,
 };
 pub use normalize::{
     NormalizeImportWarning, NormalizeJsonlFileOutcome, NormalizeJsonlFileParams,

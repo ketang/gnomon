@@ -13,9 +13,8 @@ use gnomon_core::browse_cache::{
 use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
 use gnomon_core::db::{Database, ResetReport};
 use gnomon_core::import::{
-    StartupImportMode, StartupProgressUpdate, StartupWorkerEvent, import_all,
-    scan_source_manifest_with_policy, start_startup_import,
-    start_startup_import_with_mode_and_progress,
+    StartupImportMode, StartupProgressUpdate, StartupWorkerEvent, import_all_with_rtk,
+    scan_source_manifest_with_policy, start_startup_import_with_rtk,
 };
 use gnomon_core::opportunity::{OpportunityCategory, OpportunityConfidence, OpportunitySummary};
 use gnomon_core::perf::PerfLogger;
@@ -503,11 +502,12 @@ fn run_app(config: &RuntimeConfig, startup_args: StartupArgs) -> Result<()> {
         &config.project_identity,
         &config.project_filters,
     )?;
-    let mut startup_import = start_startup_import_with_mode_and_progress(
+    let mut startup_import = start_startup_import_with_rtk(
         database.connection(),
         &config.db_path,
         &config.source_root,
         startup_args.import_mode(),
+        Some(config.rtk.clone()),
         |update| startup_progress.import_progress(update),
     )?;
     let snapshot = startup_import.snapshot.clone();
@@ -572,8 +572,14 @@ fn run_snapshot_command(config: &RuntimeConfig, args: &SnapshotArgs) -> Result<(
         &config.project_identity,
         &config.project_filters,
     )?;
-    let mut startup_import =
-        start_startup_import(database.connection(), &config.db_path, &config.source_root)?;
+    let mut startup_import = start_startup_import_with_rtk(
+        database.connection(),
+        &config.db_path,
+        &config.source_root,
+        StartupImportMode::RecentFirst,
+        Some(config.rtk.clone()),
+        |_| {},
+    )?;
     let snapshot = startup_import.snapshot.clone();
     let open_reason = startup_import.open_reason;
     let startup_progress_update = startup_import.startup_progress_update.clone();
@@ -714,7 +720,12 @@ fn rebuild_database(config: &RuntimeConfig) -> Result<()> {
         &config.project_identity,
         &config.project_filters,
     )?;
-    let import_report = import_all(database.connection(), &config.db_path, &config.source_root)?;
+    let import_report = import_all_with_rtk(
+        database.connection(),
+        &config.db_path,
+        &config.source_root,
+        Some(config.rtk.clone()),
+    )?;
     let completed_chunks = count_completed_chunks(&config.db_path)?;
 
     print_derived_reset_report(&config.state_dir, &config.db_path, &reset_report);
@@ -2366,6 +2377,7 @@ mod tests {
                     gross_input: 0.0,
                     output: 0.0,
                     total: 0.0,
+                    rtk_saved_tokens: 0.0,
                 },
                 indicators: MetricIndicators {
                     selected_lens_last_5_hours: 0.0,

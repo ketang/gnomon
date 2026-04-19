@@ -222,6 +222,7 @@ mod tests {
             source_root: root.join("source"),
             project_identity: Default::default(),
             project_filters: Vec::new(),
+            rtk: Default::default(),
         }
     }
 }

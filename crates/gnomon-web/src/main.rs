@@ -766,6 +766,7 @@ mod tests {
                 source_root: PathBuf::from("/tmp/gnomon-web-test/source"),
                 project_identity: Default::default(),
                 project_filters: Vec::new(),
+                rtk: Default::default(),
             },
             startup: Arc::new(Mutex::new(StartupState {
                 pinned_snapshot: SnapshotBounds::bootstrap(),
@@ -792,6 +793,7 @@ mod tests {
                 source_root: root.join("source"),
                 project_identity: Default::default(),
                 project_filters: Vec::new(),
+                rtk: Default::default(),
             },
             startup: Arc::new(Mutex::new(StartupState {
                 pinned_snapshot: SnapshotBounds::bootstrap(),

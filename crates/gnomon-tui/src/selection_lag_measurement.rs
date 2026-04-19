@@ -93,6 +93,7 @@ fn selection_move_measurement_trace_is_reproducible() -> Result<()> {
             source_root: validation.source_root.clone(),
             project_identity: Default::default(),
             project_filters: Vec::new(),
+            rtk: Default::default(),
         },
         validation.final_snapshot.clone(),
         StartupOpenReason::Last24hReady,
