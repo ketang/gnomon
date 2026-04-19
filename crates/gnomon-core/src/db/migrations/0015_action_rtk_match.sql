@@ -2,7 +2,7 @@ CREATE TABLE action_rtk_match (
     action_id    INTEGER PRIMARY KEY REFERENCES action(id) ON DELETE CASCADE,
     rtk_row_id   INTEGER NOT NULL,
     saved_tokens INTEGER NOT NULL CHECK (saved_tokens >= 0),
-    savings_pct  REAL    NOT NULL,
+    savings_pct  REAL    NOT NULL CHECK (savings_pct >= 0.0 AND savings_pct <= 100.0),
     exec_time_ms INTEGER NOT NULL CHECK (exec_time_ms >= 0)
 );
 
