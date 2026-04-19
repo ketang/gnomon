@@ -90,6 +90,31 @@ Next implied: A5 (PRAGMA wal_autocheckpoint = 0 + manual checkpoint) — next E-
 
 ---
 
+## 2026-04-19 — candidate A5: `PRAGMA wal_autocheckpoint = 0` + manual checkpoint
+
+Branch: import-perf-p4-a5
+Worktree: .worktrees/import-perf-p4-a5
+Hypothesis: Automatic WAL checkpointing fires mid-import (after every 1000 pages by default),
+causing checkpoint stalls while 35 concurrent import connections are active. Disabling autocheckpoint
+(setting it to 0) defers all WAL consolidation until after all chunks complete, then a single
+`PRAGMA wal_checkpoint(TRUNCATE)` consolidates the WAL. This eliminates mid-import checkpoint
+contention and avoids WAL reader-writer conflicts. Tested previously only as part of the E-bundle
+(which regressed overall because of EXCLUSIVE mode, not this pragma); this isolates A5 individually.
+Implementation: Add `PRAGMA wal_autocheckpoint = 0;` to `configure_import_connection` in
+`crates/gnomon-core/src/db/mod.rs`. Add `PRAGMA wal_checkpoint(TRUNCATE);` call after all
+chunks complete — in `finalize_chunk_import_core` or the post-import hook in `import/chunk.rs`.
+Measurements:
+  Subset:       *(pending)*
+  Full:         *(pending)*
+  Row parity:   *(pending)*
+  Profile shift: *(pending)*
+Decision: PENDING
+Commit:
+Key finding: *(pending)*
+Next implied: *(pending)*
+
+---
+
 ## RESUME HERE
 
 Phase: Phase 4
