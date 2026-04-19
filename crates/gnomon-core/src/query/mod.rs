@@ -1673,7 +1673,7 @@ impl<'conn> QueryEngine<'conn> {
         "
         .to_string();
 
-        let params = vec![
+        let params = [
             Value::Integer(max_publish_seq),
             filters.provider.map_or(Value::Null, |provider| {
                 Value::Text(provider.as_str().to_string())

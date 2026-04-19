@@ -2887,6 +2887,22 @@ mod tests {
         String,
         Option<String>,
     );
+    type SessionIndexRow = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    type RolloutMessageRow = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    );
+    type RolloutPartRow = (String, Option<String>, Option<String>, Option<String>);
 
     #[test]
     fn normalizes_main_session_and_deduplicates_assistant_usage() -> Result<()> {
@@ -3606,13 +3622,7 @@ mod tests {
         assert_eq!(result.history_event_count, 0);
         assert_eq!(result.conversation_id, None);
 
-        let row: (
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) = db.connection().query_row(
+        let row: SessionIndexRow = db.connection().query_row(
             "
             SELECT session_id, first_seen_at_utc, last_seen_at_utc, raw_cwd_path, rollout_relative_path
             FROM codex_session_index_entry
@@ -3702,14 +3712,7 @@ mod tests {
         )?;
         assert_eq!(raw_counts, (1, 9));
 
-        let messages: Vec<(
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<i64>,
-            Option<i64>,
-        )> = {
+        let messages: Vec<RolloutMessageRow> = {
             let mut stmt = conn.prepare(
                 "
                 SELECT external_id, role, message_kind, usage_source, input_tokens, output_tokens
@@ -3776,7 +3779,7 @@ mod tests {
             ]
         );
 
-        let parts: Vec<(String, Option<String>, Option<String>, Option<String>)> = {
+        let parts: Vec<RolloutPartRow> = {
             let mut stmt = conn.prepare(
                 "
                 SELECT part_kind, text_value, tool_name, tool_call_id

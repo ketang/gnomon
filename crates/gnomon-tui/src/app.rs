@@ -4919,12 +4919,10 @@ fn sanitize_ui_state(ui_state: &mut PersistedUiState, filter_options: &FilterOpt
         ui_state.model = None;
     }
 
-    if ui_state.provider.is_some_and(|provider| {
-        !filter_options
-            .providers
-            .iter()
-            .any(|candidate| *candidate == provider)
-    }) {
+    if ui_state
+        .provider
+        .is_some_and(|provider| !filter_options.providers.contains(&provider))
+    {
         ui_state.provider = None;
     }
 
