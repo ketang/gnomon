@@ -21,14 +21,20 @@
 - Next action: create the first serial task branch.
 
 
+### 2026-04-20T22:52:13Z — Started task
+- Branch: `import-testing-parity-01-coverage-matrix`.
+- Worktree: `/home/ketan/project/gnomon/.worktrees/import-testing-parity-01-coverage-matrix`.
+- Base head at branch creation: `e4f1ae599cf097e1aad12191164e198ad356fbf3`.
+
+
 ## RESUME HERE
 <!-- expedition-resume:start -->
 - Expedition: `import-testing-parity`
-- Status: `ready_for_task`
+- Status: `task_in_progress`
 - Base branch: `import-testing-parity`
 - Base worktree: `/home/ketan/project/gnomon/.worktrees/import-testing-parity`
-- Active task branch: `none`
-- Active task worktree: `none`
+- Active task branch: `import-testing-parity-01-coverage-matrix`
+- Active task worktree: `/home/ketan/project/gnomon/.worktrees/import-testing-parity-01-coverage-matrix`
 - Last completed: `none`
-- Next action: Create the first task branch from the expedition base branch.
+- Next action: Complete work on `import-testing-parity-01-coverage-matrix` in `/home/ketan/project/gnomon/.worktrees/import-testing-parity-01-coverage-matrix`.
 <!-- expedition-resume:end -->

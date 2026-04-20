@@ -1,15 +1,23 @@
 {
-  "active_task": null,
+  "active_task": {
+    "base_head": "e4f1ae599cf097e1aad12191164e198ad356fbf3",
+    "branch": "import-testing-parity-01-coverage-matrix",
+    "kind": "task",
+    "number": 1,
+    "slug": "coverage-matrix",
+    "started_at": "2026-04-20T22:52:13Z",
+    "worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity-01-coverage-matrix"
+  },
   "base_branch": "import-testing-parity",
   "base_worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity",
   "created_at": "2026-04-20T22:51:07Z",
   "expedition": "import-testing-parity",
   "last_completed": null,
-  "next_action": "Create the first task branch from the expedition base branch.",
+  "next_action": "Complete work on `import-testing-parity-01-coverage-matrix` in `/home/ketan/project/gnomon/.worktrees/import-testing-parity-01-coverage-matrix`.",
   "next_task_number": 1,
   "preserved_experiments": [],
   "primary_branch": "main",
   "schema_version": 1,
-  "status": "ready_for_task",
-  "updated_at": "2026-04-20T22:51:07Z"
+  "status": "task_in_progress",
+  "updated_at": "2026-04-20T22:52:13Z"
 }
