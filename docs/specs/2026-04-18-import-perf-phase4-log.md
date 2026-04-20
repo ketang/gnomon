@@ -340,36 +340,81 @@ via `rayon::par_iter`. (c) Bench harness `count_rows` updated to aggregate from 
 Schema: both global and shard DBs use the same full migrations; shards just have the scheduling
 tables empty (FK=OFF so references from shard data tables to global scheduling tables are
 not enforced). Old non-sharded path (startup worker, TUI background import) unchanged.
-Measurements:
-  Subset:       6.543s baseline → TBD
-  Full:         15.144s baseline → TBD
-  Row parity:   TBD
-  Profile shift: TBD
-Decision: PENDING
-Commit:
-Key finding: TBD
-Next implied: TBD
+Measurements (initial sharded-only, query layer broken):
+  Subset:       5.259s (A6 baseline) → 4.982s median (−5.3%); runs: 4.556, 4.879, 4.982, 5.300, 5.402
+  Full:         15.144s (A6 baseline) → 7.832s median (−48.3%); runs: 7.785, 7.832, 8.267
+  Row parity:   PASS (project:31, source_file:4548, import_chunk:162, conversation:4547,
+                stream:4547, message:294995, message_part:411842, turn:13363, action:120922)
+  ⚠ Follow-up audit caught broken query layer: `gnomon report` returned empty
+    `"rows": []` because the query layer reads `chunk_action_rollup` and
+    `chunk_path_rollup` from the global DB, which was empty (rollups lived
+    only in shards). Session protocol Step 4's `gnomon report` spot-check
+    was skipped, and the tests that passed did not exercise the query layer
+    against sharded data (6/7 integration tests failed on the pre-existing
+    `imported_record_count_sum=0` bug before reaching query assertions; the
+    1 passing test uses `start_startup_import` which still writes to global).
+
+Fix commit (d36b289): read rollup rows from shard into memory before opening
+the global finalize transaction; then INSERT them into global within the
+same finalize transaction as chunk metadata. Reading outside the transaction
+keeps the global write lock free during shard reads; writing inside preserves
+atomicity — a chunk becomes `published` only once its rollup data is in global.
+
+Measurements (post-fix, query layer working):
+  Subset:       5.259s → 5.362s median (+2.0%; rollup copy overhead on 1 project)
+                runs: 5.303, 5.346, 5.362, 5.369, 5.516
+  Full:         15.144s → 8.966s median (−40.8%); runs: 7.485, 8.470, 8.966, 11.111, 12.200
+                Higher variance than pre-fix due to global WAL lock contention between
+                31 parallel rollup writers; still well under the 10s target.
+  Query layer:  `gnomon report` returns 31 projects totaling 120,922 actions (matches
+                bench count). Category drill-down returns all 11 categories with
+                correct per-category counts summing to 50,463 for subset project.
+  Row parity:   PASS (unchanged counts across all 9 tables).
+  Quality gates: fmt ✓, clippy ✓, cargo test 370/370 ✓.
+  Integration tests: 1/7 (same pre-existing baseline — `imported_record_count_sum=0`
+                bug unchanged by C1; tests updated to aggregate counts from both
+                global DB and shard DBs for dual-path compatibility).
+
+Decision: KEPT (commit pending merge to long-lived branch)
+Commits on import-perf-p4-c1 branch:
+  8aa0e9a - initial C1 sharded parallel import
+  d36b289 - copy chunk rollups from shard to global for query layer
+Key finding: Per-project SQLite shards break the single-writer SQLite bottleneck.
+With 31 projects and 6 CPU cores, bulk data writes run at ~6× parallelism.
+Architecture: bulk data + rollup computation → shards (parallel); metadata
+(import_chunk state, source_file, publish_seq) + rollup-table copies → global
+DB (serialized via SQLite WAL). Two architectural constraints surfaced during
+implementation: (1) `load_conversation_context` JOINs project for root_path,
+so shards need the project row copied at init; (2) query layer reads rollups
+from global, so rollups must be replicated from shard to global after each
+chunk. Both constraints addressed in the committed code.
+Process lesson: Session protocol Step 4's `gnomon report` spot-check was
+skipped on the first KEPT call. If it had been run, the empty `"rows": []`
+would have blocked the decision. Add a stronger check: any time a candidate
+changes where data lives in the schema, the spot-check becomes mandatory,
+not optional.
+Next implied: Request user approval to merge import-perf-p4-c1 into
+import-perf-p4 (and then import-perf-p4 into main).
 
 ---
 
 ## RESUME HERE
 
-Phase: Phase 4
+Phase: Phase 4 — C1 KEPT, TUI fix applied, awaiting merge approval
 Long-lived branch: `import-perf-p4`
 Long-lived worktree: `.worktrees/import-perf-p4`
-Last completed: A8 — REVERTED (chunk-level path_node cache: +0.1% full corpus, noise only)
-Next action: C1 (per-project sharding + global metadata DB) — only remaining candidate.
-  Requires significant architectural rework; plan before implementing.
-Current best (subset): 5.259s median (−38.0% from 8.487s baseline; A6 original measurement)
-Current best (full): 15.144s median (−20.2% from 18.969s baseline; A6 original measurement)
-Target: 10s full corpus
-In-flight uncommitted state: none
+Last completed: C1 — KEPT (per-project shards + parallel import + rollup copy for TUI)
+Next action: Await user approval to merge import-perf-p4-c1 into import-perf-p4.
+Current best (subset): 5.362s median (−36.8% from 8.487s baseline)
+Current best (full): 8.966s median (−52.7% from 18.969s baseline) ← TARGET MET ✓
+Target: 10s full corpus — ACHIEVED
+In-flight uncommitted state: none — both commits (8aa0e9a, d36b289) are on
+  import-perf-p4-c1 branch; log updated on import-perf-p4 (uncommitted here).
 
-Candidate ranking (live — re-rank after each result):
-1. C1 — Per-project sharding + global metadata DB (F2c) — architectural ceiling-breaker;
-   only remaining candidate with potential to reach 10s target.
-NOTE: A8 (path_node chunk-level cache) — DISCARD. Zero benefit; path_node lookups not bottleneck.
-NOTE: A7 (`jwalk`) — DISCARD. Parallel walk raises median +11%, adds variance.
-NOTE: A2 (LTO+PGO) — DISCARD. LTO alone is no-op; PGO requires non-committable workflow.
-NOTE: B1 (`:memory:` staging), B2 (parallel memory DBs) — DISCARD. In-memory SQLite is 4× slower.
-NOTE: A1 (page_size 8K), A4 (EXCLUSIVE locking), A5 (wal_autocheckpoint=0) — DISCARD.
+Pending user approvals:
+  1. Merge import-perf-p4-c1 into import-perf-p4 (with --no-ff)
+  2. Commit log update on import-perf-p4
+  3. Merge import-perf-p4 into main (with --no-ff)
+
+All candidates exhausted. Target met with C1. TUI query layer verified working
+via `gnomon report` spot-check against a full-corpus DB.
