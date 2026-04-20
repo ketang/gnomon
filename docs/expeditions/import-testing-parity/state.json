@@ -1,32 +1,24 @@
 {
-  "active_task": {
-    "base_head": "b28f983f7bb3f85b117da9252c88358b2e948b10",
-    "branch": "import-testing-parity-02-claude-fixture-corpus",
-    "kind": "task",
-    "number": 2,
-    "slug": "claude-fixture-corpus",
-    "started_at": "2026-04-20T22:56:52Z",
-    "worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity-02-claude-fixture-corpus"
-  },
+  "active_task": null,
   "base_branch": "import-testing-parity",
   "base_worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity",
   "created_at": "2026-04-20T22:51:07Z",
   "expedition": "import-testing-parity",
   "last_completed": {
-    "branch": "import-testing-parity-01-coverage-matrix",
-    "completed_at": "2026-04-20T22:56:34Z",
+    "branch": "import-testing-parity-02-claude-fixture-corpus",
+    "completed_at": "2026-04-20T23:04:17Z",
     "kind": "task",
-    "number": 1,
+    "number": 2,
     "outcome": "kept",
-    "slug": "coverage-matrix",
-    "summary": "Task 01: coverage matrix for Claude vs Codex import tests",
-    "worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity-01-coverage-matrix"
+    "slug": "claude-fixture-corpus",
+    "summary": "Task 02: Claude fixture corpus + provider-aware scan + end-to-end tests",
+    "worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity-02-claude-fixture-corpus"
   },
-  "next_action": "Complete work on `import-testing-parity-02-claude-fixture-corpus` in `/home/ketan/project/gnomon/.worktrees/import-testing-parity-02-claude-fixture-corpus`.",
-  "next_task_number": 2,
+  "next_action": "Create the next task branch from the rebased expedition base branch.",
+  "next_task_number": 3,
   "preserved_experiments": [],
   "primary_branch": "main",
   "schema_version": 1,
-  "status": "task_in_progress",
-  "updated_at": "2026-04-20T22:56:52Z"
+  "status": "ready_for_task",
+  "updated_at": "2026-04-20T23:04:17Z"
 }
