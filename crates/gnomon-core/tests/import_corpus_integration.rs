@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -201,10 +202,10 @@ fn subset_corpus_import_all_matches_expected_database_shape() -> Result<()> {
     assert_eq!(import_report.deferred_failure_count, 0);
     assert!(import_report.deferred_failure_summary.is_none());
 
-    let counts = load_database_counts(database.connection())?;
+    let counts = load_database_counts(database.connection(), &db_path)?;
     assert_database_counts(&counts, SUBSET_EXPECTATIONS);
-    assert_warning_message(database.connection(), &prepared.source_root)?;
-    assert_subset_baseline_signature(database.connection())?;
+    assert_warning_message_shard(&db_path, &prepared.source_root)?;
+    assert_subset_baseline_signature(database.connection(), &db_path)?;
 
     Ok(())
 }
@@ -259,10 +260,10 @@ fn subset_corpus_recent_first_startup_import_defers_every_chunk_and_reaches_same
 
     drop(startup);
 
-    let counts = load_database_counts(database.connection())?;
+    let counts = load_database_counts(database.connection(), &db_path)?;
     assert_database_counts(&counts, SUBSET_EXPECTATIONS);
-    assert_warning_message(database.connection(), &prepared.source_root)?;
-    assert_subset_baseline_signature(database.connection())?;
+    assert_warning_message_shard(&db_path, &prepared.source_root)?;
+    assert_subset_baseline_signature(database.connection(), &db_path)?;
 
     Ok(())
 }
@@ -284,7 +285,7 @@ fn subset_corpus_reimport_is_a_no_op_when_files_are_unchanged() -> Result<()> {
     assert_eq!(first_import_report.deferred_failure_count, 0);
     assert!(first_import_report.deferred_failure_summary.is_none());
 
-    let first_counts = load_database_counts(database.connection())?;
+    let first_counts = load_database_counts(database.connection(), &db_path)?;
     assert_database_counts(&first_counts, SUBSET_EXPECTATIONS);
 
     let second_scan_report = scan_source_manifest(&mut database, &prepared.source_root)?;
@@ -305,10 +306,10 @@ fn subset_corpus_reimport_is_a_no_op_when_files_are_unchanged() -> Result<()> {
     assert_eq!(second_import_report.deferred_failure_count, 0);
     assert!(second_import_report.deferred_failure_summary.is_none());
 
-    let second_counts = load_database_counts(database.connection())?;
+    let second_counts = load_database_counts(database.connection(), &db_path)?;
     assert_eq!(first_counts, second_counts);
-    assert_warning_message(database.connection(), &prepared.source_root)?;
-    assert_subset_baseline_signature(database.connection())?;
+    assert_warning_message_shard(&db_path, &prepared.source_root)?;
+    assert_subset_baseline_signature(database.connection(), &db_path)?;
 
     Ok(())
 }
@@ -326,7 +327,7 @@ fn subset_corpus_reimports_only_the_touched_chunk_when_a_file_mtime_changes() ->
     let first_import_report = import_all(database.connection(), &db_path, &prepared.source_root)?;
     assert_eq!(first_import_report.deferred_chunk_count, 35);
 
-    let original_counts = load_database_counts(database.connection())?;
+    let original_counts = load_database_counts(database.connection(), &db_path)?;
     assert_database_counts(&original_counts, SUBSET_EXPECTATIONS);
     assert_eq!(
         lookup_chunk_publish_seq(database.connection(), MUTATION_TARGET_CHUNK_DAY)?,
@@ -350,14 +351,14 @@ fn subset_corpus_reimports_only_the_touched_chunk_when_a_file_mtime_changes() ->
     assert_eq!(second_import_report.deferred_failure_count, 0);
     assert!(second_import_report.deferred_failure_summary.is_none());
 
-    let final_counts = load_database_counts(database.connection())?;
+    let final_counts = load_database_counts(database.connection(), &db_path)?;
     assert_eq!(final_counts, original_counts);
     assert_eq!(
         lookup_chunk_publish_seq(database.connection(), MUTATION_TARGET_CHUNK_DAY)?,
         36
     );
-    assert_warning_message(database.connection(), &prepared.source_root)?;
-    assert_subset_semantic_totals(database.connection())?;
+    assert_warning_message_shard(&db_path, &prepared.source_root)?;
+    assert_subset_semantic_totals(database.connection(), &db_path)?;
 
     Ok(())
 }
@@ -376,7 +377,7 @@ fn subset_corpus_keeps_prior_rows_when_a_reimported_file_turns_malformed_and_rec
     let first_import_report = import_all(database.connection(), &db_path, &prepared.source_root)?;
     assert_eq!(first_import_report.deferred_chunk_count, 35);
 
-    let baseline_counts = load_database_counts(database.connection())?;
+    let baseline_counts = load_database_counts(database.connection(), &db_path)?;
     assert_database_counts(&baseline_counts, SUBSET_EXPECTATIONS);
     let target_path = prepared.source_root.join(MUTATION_TARGET_RELATIVE_PATH);
     let original_contents = fs::read(&target_path)
@@ -401,7 +402,7 @@ fn subset_corpus_keeps_prior_rows_when_a_reimported_file_turns_malformed_and_rec
     assert_eq!(second_import_report.deferred_failure_count, 0);
     assert!(second_import_report.deferred_failure_summary.is_none());
 
-    let warning_counts = load_database_counts(database.connection())?;
+    let warning_counts = load_database_counts(database.connection(), &db_path)?;
     assert!(warning_counts.conversation_count <= baseline_counts.conversation_count);
     assert!(warning_counts.message_count <= baseline_counts.message_count);
     assert!(warning_counts.message_part_count <= baseline_counts.message_part_count);
@@ -412,7 +413,9 @@ fn subset_corpus_keeps_prior_rows_when_a_reimported_file_turns_malformed_and_rec
         baseline_counts.import_warning_count + 1
     );
 
-    let recent_warning = most_recent_warning_message(database.connection())?;
+    // import_warning is in shard DBs with C1 sharding.
+    let recent_warning =
+        most_recent_shard_warning(&db_path)?.context("no import_warning found in any shard")?;
     assert!(recent_warning.contains(&target_path.display().to_string()));
     assert!(recent_warning.contains("line 2"));
 
@@ -432,10 +435,10 @@ fn subset_corpus_keeps_prior_rows_when_a_reimported_file_turns_malformed_and_rec
     assert_eq!(third_import_report.deferred_failure_count, 0);
     assert!(third_import_report.deferred_failure_summary.is_none());
 
-    let recovered_counts = load_database_counts(database.connection())?;
+    let recovered_counts = load_database_counts(database.connection(), &db_path)?;
     assert_eq!(recovered_counts, baseline_counts);
-    assert_warning_message(database.connection(), &prepared.source_root)?;
-    assert_subset_semantic_totals(database.connection())?;
+    assert_warning_message_shard(&db_path, &prepared.source_root)?;
+    assert_subset_semantic_totals(database.connection(), &db_path)?;
 
     Ok(())
 }
@@ -498,7 +501,7 @@ fn subset_corpus_with_one_recent_file_imports_recent_chunk_before_opening() -> R
 
     drop(startup);
 
-    let counts = load_database_counts(database.connection())?;
+    let counts = load_database_counts(database.connection(), &db_path)?;
     assert_eq!(counts.project_count, SUBSET_EXPECTATIONS.project_count);
     assert_eq!(
         counts.source_file_count,
@@ -543,7 +546,7 @@ fn full_corpus_import_all_matches_expected_database_shape() -> Result<()> {
     assert_eq!(import_report.deferred_failure_count, 0);
     assert!(import_report.deferred_failure_summary.is_none());
 
-    let counts = load_database_counts(database.connection())?;
+    let counts = load_database_counts(database.connection(), &db_path)?;
     assert!(counts.project_count > SUBSET_EXPECTATIONS.project_count);
     assert!(counts.source_file_count > SUBSET_EXPECTATIONS.source_file_count);
     assert_eq!(
@@ -575,7 +578,7 @@ fn full_corpus_import_all_matches_expected_database_shape() -> Result<()> {
     assert_eq!(counts.imported_turn_count_sum, counts.turn_count);
     assert_eq!(counts.imported_source_file_count, counts.source_file_count);
     assert_eq!(counts.source_files_missing_import_metadata_count, 0);
-    assert_warning_message(database.connection(), &prepared.source_root)?;
+    assert_warning_message_shard(&db_path, &prepared.source_root)?;
 
     Ok(())
 }
@@ -651,7 +654,105 @@ fn ensure_command_available(command_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn load_database_counts(conn: &Connection) -> Result<DatabaseCounts> {
+// Aggregate a simple COUNT query across all per-project shard DBs (C1 sharding architecture).
+fn shard_count(db_path: &Path, sql: &str) -> Result<i64> {
+    let shards_dir = db_path
+        .parent()
+        .expect("db_path must have parent")
+        .join("shards");
+    let mut total = 0i64;
+    if shards_dir.exists() {
+        for entry in fs::read_dir(&shards_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("sqlite3") {
+                continue;
+            }
+            let conn = Connection::open(&path)?;
+            total += conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0i64);
+        }
+    }
+    Ok(total)
+}
+
+// Query `SELECT key, COUNT(*) FROM table GROUP BY key` across global DB and all shards.
+fn shard_group_count(db_path: &Path, sql: &str) -> Result<Vec<(Option<String>, i64)>> {
+    let mut totals: HashMap<Option<String>, i64> = HashMap::new();
+
+    // Include global DB (start_startup_import path).
+    let global_conn = Connection::open(db_path)?;
+    if let Ok(mut stmt) = global_conn.prepare(sql) {
+        for row in stmt.query_map([], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?))
+        })? {
+            let (k, v) = row?;
+            *totals.entry(k).or_insert(0) += v;
+        }
+    }
+
+    // Include shard DBs (import_all path).
+    let shards_dir = db_path
+        .parent()
+        .expect("db_path must have parent")
+        .join("shards");
+    if shards_dir.exists() {
+        for entry in fs::read_dir(&shards_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("sqlite3") {
+                continue;
+            }
+            let conn = Connection::open(&path)?;
+            let mut stmt = conn.prepare(sql)?;
+            for row in stmt.query_map([], |r| {
+                Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?))
+            })? {
+                let (k, v) = row?;
+                *totals.entry(k).or_insert(0) += v;
+            }
+        }
+    }
+    let mut result: Vec<(Option<String>, i64)> = totals.into_iter().collect();
+    result.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    Ok(result)
+}
+
+// Find a recent import_warning message — check global DB and all shards.
+fn most_recent_shard_warning(db_path: &Path) -> Result<Option<String>> {
+    // Check global DB first (start_startup_import path writes here).
+    let global_conn = Connection::open(db_path)?;
+    if let Ok(msg) = global_conn.query_row::<String, _, _>(
+        "SELECT message FROM import_warning ORDER BY id DESC LIMIT 1",
+        [],
+        |r| r.get(0),
+    ) {
+        return Ok(Some(msg));
+    }
+
+    // Check shard DBs (import_all path writes here).
+    let shards_dir = db_path
+        .parent()
+        .expect("db_path must have parent")
+        .join("shards");
+    if !shards_dir.exists() {
+        return Ok(None);
+    }
+    for entry in fs::read_dir(&shards_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sqlite3") {
+            continue;
+        }
+        let conn = Connection::open(&path)?;
+        if let Ok(msg) = conn.query_row::<String, _, _>(
+            "SELECT message FROM import_warning ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        ) {
+            return Ok(Some(msg));
+        }
+    }
+    Ok(None)
+}
+
+fn load_database_counts(conn: &Connection, db_path: &Path) -> Result<DatabaseCounts> {
     Ok(DatabaseCounts {
         project_count: query_count(conn, "SELECT COUNT(*) FROM project")?,
         source_file_count: query_count(conn, "SELECT COUNT(*) FROM source_file")?,
@@ -680,15 +781,26 @@ fn load_database_counts(conn: &Connection) -> Result<DatabaseCounts> {
             conn,
             "SELECT COUNT(*) FROM import_chunk WHERE last_attempt_phase = 'startup'",
         )?,
-        conversation_count: query_count(conn, "SELECT COUNT(*) FROM conversation")?,
-        stream_count: query_count(conn, "SELECT COUNT(*) FROM stream")?,
-        record_count: query_count(conn, "SELECT COUNT(*) FROM record")?,
-        message_count: query_count(conn, "SELECT COUNT(*) FROM message")?,
-        message_part_count: query_count(conn, "SELECT COUNT(*) FROM message_part")?,
-        turn_count: query_count(conn, "SELECT COUNT(*) FROM turn")?,
-        action_count: query_count(conn, "SELECT COUNT(*) FROM action")?,
-        history_event_count: query_count(conn, "SELECT COUNT(*) FROM history_event")?,
-        import_warning_count: query_count(conn, "SELECT COUNT(*) FROM import_warning")?,
+        // Data tables may be in the global DB (start_startup_import path) or shard DBs
+        // (import_all path). Sum both to handle either import path in tests.
+        conversation_count: query_count(conn, "SELECT COUNT(*) FROM conversation")?
+            + shard_count(db_path, "SELECT COUNT(*) FROM conversation")?,
+        stream_count: query_count(conn, "SELECT COUNT(*) FROM stream")?
+            + shard_count(db_path, "SELECT COUNT(*) FROM stream")?,
+        record_count: query_count(conn, "SELECT COUNT(*) FROM record")?
+            + shard_count(db_path, "SELECT COUNT(*) FROM record")?,
+        message_count: query_count(conn, "SELECT COUNT(*) FROM message")?
+            + shard_count(db_path, "SELECT COUNT(*) FROM message")?,
+        message_part_count: query_count(conn, "SELECT COUNT(*) FROM message_part")?
+            + shard_count(db_path, "SELECT COUNT(*) FROM message_part")?,
+        turn_count: query_count(conn, "SELECT COUNT(*) FROM turn")?
+            + shard_count(db_path, "SELECT COUNT(*) FROM turn")?,
+        action_count: query_count(conn, "SELECT COUNT(*) FROM action")?
+            + shard_count(db_path, "SELECT COUNT(*) FROM action")?,
+        history_event_count: query_count(conn, "SELECT COUNT(*) FROM history_event")?
+            + shard_count(db_path, "SELECT COUNT(*) FROM history_event")?,
+        import_warning_count: query_count(conn, "SELECT COUNT(*) FROM import_warning")?
+            + shard_count(db_path, "SELECT COUNT(*) FROM import_warning")?,
         imported_record_count_sum: query_count(
             conn,
             "SELECT COALESCE(SUM(imported_record_count), 0) FROM import_chunk",
@@ -806,8 +918,8 @@ fn assert_database_counts(counts: &DatabaseCounts, expectations: CorpusExpectati
     assert_eq!(counts.source_files_missing_import_metadata_count, 0);
 }
 
-fn assert_subset_baseline_signature(conn: &Connection) -> Result<()> {
-    let signature = load_subset_semantic_counts(conn)?;
+fn assert_subset_baseline_signature(conn: &Connection, db_path: &Path) -> Result<()> {
+    let signature = load_subset_semantic_counts(conn, db_path)?;
     assert_eq!(
         signature.chunk_day_sequence,
         SUBSET_CHUNK_DAY_SEQUENCE
@@ -820,8 +932,8 @@ fn assert_subset_baseline_signature(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn assert_subset_semantic_totals(conn: &Connection) -> Result<()> {
-    let signature = load_subset_semantic_counts(conn)?;
+fn assert_subset_semantic_totals(conn: &Connection, db_path: &Path) -> Result<()> {
+    let signature = load_subset_semantic_counts(conn, db_path)?;
     assert_subset_semantic_totals_from_signature(&signature);
 
     Ok(())
@@ -850,8 +962,9 @@ fn assert_subset_semantic_totals_from_signature(signature: &SubsetSemanticCounts
     );
 }
 
-fn assert_warning_message(conn: &Connection, source_root: &Path) -> Result<()> {
-    let warning_message = most_recent_warning_message(conn)?;
+fn assert_warning_message_shard(db_path: &Path, source_root: &Path) -> Result<()> {
+    let warning_message = most_recent_shard_warning(db_path)?
+        .context("unable to load most recent import warning from any shard")?;
 
     assert!(warning_message.contains(&format!("line {WARNING_LINE_NO}")));
     assert!(
@@ -867,15 +980,6 @@ fn assert_warning_message(conn: &Connection, source_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn most_recent_warning_message(conn: &Connection) -> Result<String> {
-    conn.query_row(
-        "SELECT message FROM import_warning ORDER BY id DESC LIMIT 1",
-        [],
-        |row| row.get(0),
-    )
-    .context("unable to load most recent import warning")
-}
-
 fn lookup_chunk_publish_seq(conn: &Connection, chunk_day_local: &str) -> Result<i64> {
     conn.query_row(
         "SELECT publish_seq FROM import_chunk WHERE chunk_day_local = ?1",
@@ -885,7 +989,8 @@ fn lookup_chunk_publish_seq(conn: &Connection, chunk_day_local: &str) -> Result<
     .with_context(|| format!("unable to load publish_seq for chunk {chunk_day_local}"))
 }
 
-fn load_subset_semantic_counts(conn: &Connection) -> Result<SubsetSemanticCounts> {
+// With C1 sharding, action/message/message_part are in shard DBs; import_chunk/source_file/project are global.
+fn load_subset_semantic_counts(conn: &Connection, db_path: &Path) -> Result<SubsetSemanticCounts> {
     let chunk_day_sequence = {
         let mut stmt = conn.prepare(
             "SELECT chunk_day_local FROM import_chunk ORDER BY publish_seq, chunk_day_local",
@@ -894,60 +999,88 @@ fn load_subset_semantic_counts(conn: &Connection) -> Result<SubsetSemanticCounts
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
-    let top_action_signature = {
-        let mut stmt = conn.prepare(
-            "
-            SELECT COALESCE(normalized_action, '<null>'), COUNT(*)
-            FROM action
-            GROUP BY normalized_action
-            ORDER BY COUNT(*) DESC, COALESCE(normalized_action, '<null>')
-            LIMIT 12
-            ",
-        )?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
+    let raw_top = shard_group_count(
+        db_path,
+        "SELECT COALESCE(normalized_action, '<null>'), COUNT(*) FROM action GROUP BY normalized_action",
+    )?;
+    let mut top_action_signature: Vec<(String, i64)> = raw_top
+        .into_iter()
+        .map(|(k, v)| (k.unwrap_or_else(|| "<null>".to_string()), v))
+        .collect();
+    top_action_signature.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    top_action_signature.truncate(12);
 
     Ok(SubsetSemanticCounts {
         chunk_day_sequence,
+        // Sum global DB + shard DBs to handle both import_all and start_startup_import paths.
         classified_action_count: query_count(
             conn,
+            "SELECT COUNT(*) FROM action WHERE classification_state = 'classified'",
+        )? + shard_count(
+            db_path,
             "SELECT COUNT(*) FROM action WHERE classification_state = 'classified'",
         )?,
         mixed_action_count: query_count(
             conn,
             "SELECT COUNT(*) FROM action WHERE classification_state = 'mixed'",
+        )? + shard_count(
+            db_path,
+            "SELECT COUNT(*) FROM action WHERE classification_state = 'mixed'",
         )?,
         unclassified_action_count: query_count(
             conn,
+            "SELECT COUNT(*) FROM action WHERE classification_state = 'unclassified'",
+        )? + shard_count(
+            db_path,
             "SELECT COUNT(*) FROM action WHERE classification_state = 'unclassified'",
         )?,
         tool_use_part_count: query_count(
             conn,
             "SELECT COUNT(*) FROM message_part WHERE part_kind = 'tool_use'",
+        )? + shard_count(
+            db_path,
+            "SELECT COUNT(*) FROM message_part WHERE part_kind = 'tool_use'",
         )?,
         tool_result_part_count: query_count(
             conn,
+            "SELECT COUNT(*) FROM message_part WHERE part_kind = 'tool_result'",
+        )? + shard_count(
+            db_path,
             "SELECT COUNT(*) FROM message_part WHERE part_kind = 'tool_result'",
         )?,
         parts_with_tool_name_count: query_count(
             conn,
             "SELECT COUNT(*) FROM message_part WHERE tool_name IS NOT NULL",
+        )? + shard_count(
+            db_path,
+            "SELECT COUNT(*) FROM message_part WHERE tool_name IS NOT NULL",
         )?,
         parts_with_tool_call_id_count: query_count(
             conn,
+            "SELECT COUNT(*) FROM message_part WHERE tool_call_id IS NOT NULL",
+        )? + shard_count(
+            db_path,
             "SELECT COUNT(*) FROM message_part WHERE tool_call_id IS NOT NULL",
         )?,
         relay_assistant_message_count: query_count(
             conn,
             "SELECT COUNT(*) FROM message WHERE message_kind = 'relay_assistant_message'",
+        )? + shard_count(
+            db_path,
+            "SELECT COUNT(*) FROM message WHERE message_kind = 'relay_assistant_message'",
         )?,
         assistant_message_count: query_count(
             conn,
             "SELECT COUNT(*) FROM message WHERE message_kind = 'assistant_message'",
+        )? + shard_count(
+            db_path,
+            "SELECT COUNT(*) FROM message WHERE message_kind = 'assistant_message'",
         )?,
         actions_with_null_normalized_action_count: query_count(
             conn,
+            "SELECT COUNT(*) FROM action WHERE normalized_action IS NULL",
+        )? + shard_count(
+            db_path,
             "SELECT COUNT(*) FROM action WHERE normalized_action IS NULL",
         )?,
         source_files_with_scan_warnings_count: query_count(
