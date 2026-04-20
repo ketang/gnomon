@@ -34,14 +34,20 @@
 - Base branch rebased onto the primary branch.
 
 
+### 2026-04-20T22:56:52Z — Started task
+- Branch: `import-testing-parity-02-claude-fixture-corpus`.
+- Worktree: `/home/ketan/project/gnomon/.worktrees/import-testing-parity-02-claude-fixture-corpus`.
+- Base head at branch creation: `b28f983f7bb3f85b117da9252c88358b2e948b10`.
+
+
 ## RESUME HERE
 <!-- expedition-resume:start -->
 - Expedition: `import-testing-parity`
-- Status: `ready_for_task`
+- Status: `task_in_progress`
 - Base branch: `import-testing-parity`
 - Base worktree: `/home/ketan/project/gnomon/.worktrees/import-testing-parity`
-- Active task branch: `none`
-- Active task worktree: `none`
+- Active task branch: `import-testing-parity-02-claude-fixture-corpus`
+- Active task worktree: `/home/ketan/project/gnomon/.worktrees/import-testing-parity-02-claude-fixture-corpus`
 - Last completed: `import-testing-parity-01-coverage-matrix (kept)`
-- Next action: Create the next task branch from the rebased expedition base branch.
+- Next action: Complete work on `import-testing-parity-02-claude-fixture-corpus` in `/home/ketan/project/gnomon/.worktrees/import-testing-parity-02-claude-fixture-corpus`.
 <!-- expedition-resume:end -->
