@@ -319,6 +319,39 @@ all Tier 1–2 candidates exhausted. Requires significant architectural rework.
 
 ---
 
+## 2026-04-19 — candidate C1: per-project SQLite shards + parallel import
+
+Branch: import-perf-p4-c1
+Worktree: .worktrees/import-perf-p4-c1
+Hypothesis: The single-DB SQLite writer is the hard ceiling: only one connection holds the write
+lock at a time even with WAL mode. The import pipeline processes 31 projects × ~5 chunks each
+sequentially. If each project gets its own `.sqlite3` shard file, imports across projects can
+run in parallel via rayon with zero write-lock contention between them. Scheduling metadata
+(project, source_file, import_chunk, pending_chunk_rebuild) stays in the global DB and is
+written via per-thread connections serialized by SQLite WAL busy-wait; bulk data tables
+(conversation, stream, message, message_part, turn, action, path_node, rollups, etc.) go to
+per-project shards. With 6 cores and 31 projects, write parallelism is ~6×, reducing the
+~9.5s write phase to ~1.6s theoretical, for a projected total of ~7-9s.
+Implementation: (a) New `import_chunk_sharded(global_db, shard_db, ...)` splitting finalize
+into shard-side (rollups, count queries) and global-side (source_file, import_chunk metadata,
+publish_seq). (b) Modified `import_all_with_perf_logger` groups chunks by project, opens
+per-project shard at `db_path.parent()/shards/{project_id}.sqlite3`, runs all project groups
+via `rayon::par_iter`. (c) Bench harness `count_rows` updated to aggregate from shards.
+Schema: both global and shard DBs use the same full migrations; shards just have the scheduling
+tables empty (FK=OFF so references from shard data tables to global scheduling tables are
+not enforced). Old non-sharded path (startup worker, TUI background import) unchanged.
+Measurements:
+  Subset:       6.543s baseline → TBD
+  Full:         15.144s baseline → TBD
+  Row parity:   TBD
+  Profile shift: TBD
+Decision: PENDING
+Commit:
+Key finding: TBD
+Next implied: TBD
+
+---
+
 ## RESUME HERE
 
 Phase: Phase 4
