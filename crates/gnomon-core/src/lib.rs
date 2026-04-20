@@ -9,6 +9,7 @@ pub mod opportunity;
 pub mod perf;
 pub mod query;
 pub(crate) mod rollup;
+pub mod sources;
 pub mod validation;
 pub mod vcs;
 

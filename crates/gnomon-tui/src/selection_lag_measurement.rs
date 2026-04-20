@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use gnomon_core::sources::ConfiguredSources;
 use serde::Serialize;
 use serde_json::Value;
 use tempfile::tempdir;
@@ -91,6 +92,7 @@ fn selection_move_measurement_trace_is_reproducible() -> Result<()> {
             config_path: temp.path().join("config.toml"),
             db_path: validation.db_path.clone(),
             source_root: validation.source_root.clone(),
+            sources: ConfiguredSources::legacy_claude(&validation.source_root),
             project_identity: Default::default(),
             project_filters: Vec::new(),
             rtk: Default::default(),

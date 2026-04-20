@@ -13,23 +13,24 @@ use gnomon_core::browse_cache::{
 use gnomon_core::config::{ConfigOverrides, RuntimeConfig};
 use gnomon_core::db::{Database, ResetReport};
 use gnomon_core::import::{
-    StartupImportMode, StartupProgressUpdate, StartupWorkerEvent, import_all_with_rtk,
-    scan_source_manifest_with_policy, start_startup_import_with_rtk,
+    StartupImportMode, StartupProgressUpdate, StartupWorkerEvent, import_all_with_sources_and_rtk,
+    scan_sources_manifest_with_policy, start_startup_import_with_sources_and_mode_and_rtk,
 };
 use gnomon_core::opportunity::{OpportunityCategory, OpportunityConfidence, OpportunitySummary};
 use gnomon_core::perf::PerfLogger;
 use gnomon_core::query::{
     ActionKey, BrowseFilters, BrowsePath, BrowseReport, BrowseRequest, ClassificationState,
-    MetricLens, OpportunitiesFilters, QueryEngine, RootView, SkillsPath, SkillsReport,
-    SnapshotBounds, TimeWindowFilter,
+    MetricLens, OpportunitiesFilters, QueryEngine, RootView, SkillsFilters, SkillsPath,
+    SkillsReport, SnapshotBounds, TimeWindowFilter,
 };
+use gnomon_core::sources::SourceProvider;
 use rusqlite::OptionalExtension;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "gnomon",
     version,
-    about = "Analyze Claude session history and explore token usage in the terminal."
+    about = "Analyze Claude and Codex session history and explore token usage in the terminal."
 )]
 struct Cli {
     #[command(flatten)]
@@ -242,6 +243,10 @@ struct ReportArgs {
     #[arg(long)]
     end_at_utc: Option<String>,
 
+    /// Restrict results to a single provider. Omit for the explicit combined view.
+    #[arg(long, value_enum)]
+    provider: Option<ProviderArg>,
+
     /// Restrict rollups to a specific model name.
     #[arg(long)]
     model: Option<String>,
@@ -287,6 +292,10 @@ struct SkillsArgs {
     /// Project id used by skill-project paths.
     #[arg(long)]
     project_id: Option<i64>,
+
+    /// Restrict results to a single provider. Omit for the explicit combined view.
+    #[arg(long, value_enum)]
+    provider: Option<ProviderArg>,
 }
 
 #[derive(Debug, Clone, Args, PartialEq)]
@@ -294,6 +303,10 @@ struct OpportunitiesArgs {
     /// Restrict to a single project by id.
     #[arg(long)]
     project_id: Option<i64>,
+
+    /// Restrict results to a single provider. Omit for the explicit combined view.
+    #[arg(long, value_enum)]
+    provider: Option<ProviderArg>,
 
     /// Only show annotations matching this opportunity category.
     #[arg(long, value_enum)]
@@ -337,6 +350,12 @@ enum OpportunityConfidenceArg {
     Low,
     Medium,
     High,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ProviderArg {
+    Claude,
+    Codex,
 }
 
 impl From<OpportunityCategoryArg> for OpportunityCategory {
@@ -496,16 +515,16 @@ fn run_app(config: &RuntimeConfig, startup_args: StartupArgs) -> Result<()> {
     let perf_logger = PerfLogger::from_env(&config.state_dir)?;
     let mut startup_progress = StartupConsoleProgress::stderr();
     let mut database = Database::open(&config.db_path)?;
-    let _scan_report = scan_source_manifest_with_policy(
+    let _scan_report = scan_sources_manifest_with_policy(
         &mut database,
-        &config.source_root,
+        &config.sources,
         &config.project_identity,
         &config.project_filters,
     )?;
-    let mut startup_import = start_startup_import_with_rtk(
+    let mut startup_import = start_startup_import_with_sources_and_mode_and_rtk(
         database.connection(),
         &config.db_path,
-        &config.source_root,
+        &config.sources,
         startup_args.import_mode(),
         Some(config.rtk.clone()),
         |update| startup_progress.import_progress(update),
@@ -566,16 +585,16 @@ fn run_report_command(config: &RuntimeConfig, args: &ReportArgs) -> Result<()> {
 fn run_snapshot_command(config: &RuntimeConfig, args: &SnapshotArgs) -> Result<()> {
     config.ensure_dirs()?;
     let mut database = Database::open(&config.db_path)?;
-    let _scan_report = scan_source_manifest_with_policy(
+    let _scan_report = scan_sources_manifest_with_policy(
         &mut database,
-        &config.source_root,
+        &config.sources,
         &config.project_identity,
         &config.project_filters,
     )?;
-    let mut startup_import = start_startup_import_with_rtk(
+    let mut startup_import = start_startup_import_with_sources_and_mode_and_rtk(
         database.connection(),
         &config.db_path,
-        &config.source_root,
+        &config.sources,
         StartupImportMode::RecentFirst,
         Some(config.rtk.clone()),
         |_| {},
@@ -635,7 +654,7 @@ fn build_skills_report(
     let database = Database::open(&config.db_path)?;
     let engine = QueryEngine::with_perf(database.connection(), perf_logger);
     let snapshot = engine.latest_snapshot_bounds()?;
-    engine.skills_report(&snapshot, args.build_path()?)
+    engine.skills_report(&snapshot, args.build_path()?, &args.filters())
 }
 
 fn run_opportunities_command(config: &RuntimeConfig, args: &OpportunitiesArgs) -> Result<()> {
@@ -646,6 +665,7 @@ fn run_opportunities_command(config: &RuntimeConfig, args: &OpportunitiesArgs) -
     let snapshot = engine.latest_snapshot_bounds()?;
 
     let filters = OpportunitiesFilters {
+        provider: args.provider.map(Into::into),
         project_id: args.project_id,
         start_at_utc: args.start_at_utc.clone(),
         end_at_utc: args.end_at_utc.clone(),
@@ -714,16 +734,16 @@ fn build_query_benchmark_report(
 fn rebuild_database(config: &RuntimeConfig) -> Result<()> {
     let reset_report = reset_derived_cache_artifacts(&config.db_path, &config.state_dir)?;
     let mut database = Database::open(&config.db_path)?;
-    let scan_report = scan_source_manifest_with_policy(
+    let scan_report = scan_sources_manifest_with_policy(
         &mut database,
-        &config.source_root,
+        &config.sources,
         &config.project_identity,
         &config.project_filters,
     )?;
-    let import_report = import_all_with_rtk(
+    let import_report = import_all_with_sources_and_rtk(
         database.connection(),
         &config.db_path,
-        &config.source_root,
+        &config.sources,
         Some(config.rtk.clone()),
     )?;
     let completed_chunks = count_completed_chunks(&config.db_path)?;
@@ -1320,6 +1340,7 @@ impl ReportArgs {
 
         BrowseFilters {
             time_window,
+            provider: self.provider.map(Into::into),
             model: self.model.clone(),
             project_id: self.project_id,
             action_category: self.filter_category.clone(),
@@ -1384,6 +1405,12 @@ impl ReportArgs {
 }
 
 impl SkillsArgs {
+    fn filters(&self) -> SkillsFilters {
+        SkillsFilters {
+            provider: self.provider.map(Into::into),
+        }
+    }
+
     fn build_path(&self) -> Result<SkillsPath> {
         match self.path {
             SkillsPathArg::Root => Ok(SkillsPath::Root),
@@ -1406,6 +1433,15 @@ impl SkillsArgs {
     fn required_project_id(&self, context: &str) -> Result<i64> {
         self.project_id
             .with_context(|| format!("{context} requires --project-id"))
+    }
+}
+
+impl From<ProviderArg> for SourceProvider {
+    fn from(value: ProviderArg) -> Self {
+        match value {
+            ProviderArg::Claude => SourceProvider::Claude,
+            ProviderArg::Codex => SourceProvider::Codex,
+        }
     }
 }
 
@@ -1827,6 +1863,7 @@ mod tests {
                         path: SkillsPathArg::SkillProject,
                         skill: Some("planner".to_string()),
                         project_id: Some(7),
+                        provider: None,
                     }
                 );
             }
@@ -2339,6 +2376,7 @@ mod tests {
                 parent_path: None,
                 start_at_utc: None,
                 end_at_utc: None,
+                provider: None,
                 model: None,
                 filter_category: None,
                 classification_state: None,
@@ -2385,6 +2423,7 @@ mod tests {
                     uncached_input_reference: 0.0,
                 },
                 item_count: 0,
+                provider_scope: gnomon_core::query::ProviderScope::Claude,
                 opportunities: OpportunitySummary::default(),
                 skill_attribution: None,
                 project_id: Some(1),
@@ -2439,6 +2478,7 @@ mod tests {
                 parent_path: None,
                 start_at_utc: None,
                 end_at_utc: None,
+                provider: None,
                 model: None,
                 filter_category: None,
                 classification_state: None,
@@ -2466,6 +2506,7 @@ mod tests {
             parent_path: None,
             start_at_utc: None,
             end_at_utc: None,
+            provider: None,
             model: None,
             filter_category: None,
             classification_state: None,
@@ -2487,6 +2528,7 @@ mod tests {
             path: SkillsPathArg::Skill,
             skill: None,
             project_id: None,
+            provider: None,
         };
 
         let err = args

@@ -15,12 +15,17 @@ use crate::config::{
     ProjectFilterAction, ProjectFilterContext, ProjectFilterRule, ProjectIdentityPolicy,
 };
 use crate::db::Database;
-use crate::import::SourceFileKind;
 use crate::perf::{PerfLogger, PerfScope};
+use crate::sources::{
+    ConfiguredSource, ConfiguredSourceLocation, ConfiguredSources, SourceDescriptor,
+    SourceFileKind, SourceProvider,
+};
 use crate::vcs::{self, ProjectIdentityKind, ResolvedProject};
 
 const CLAUDE_HISTORY_PROJECT_REASON: &str = "claude history source";
-const CLAUDE_HISTORY_RELATIVE_PATH: &str = "../history.jsonl";
+const CODEX_HISTORY_PROJECT_REASON: &str = "codex history source";
+const CODEX_ROLLOUT_PROJECT_REASON: &str = "codex rollout source";
+const CODEX_SESSION_INDEX_PROJECT_REASON: &str = "codex session-index source";
 const WARNING_INVALID_JSON: &str = "invalid_json";
 const WARNING_MISSING_CWD: &str = "missing_cwd";
 const WARNING_PATH_PROJECT: &str = "path_project";
@@ -53,7 +58,7 @@ impl ScanWarning {
 
 #[derive(Debug, Clone)]
 struct DiscoveredSourceFile {
-    source_kind: SourceFileKind,
+    descriptor: SourceDescriptor,
     project: ResolvedProject,
     relative_path: String,
     modified_at_utc: Option<String>,
@@ -63,6 +68,12 @@ struct DiscoveredSourceFile {
 
 #[derive(Debug, Deserialize)]
 struct SourceRecordHeader {
+    cwd: Option<PathBuf>,
+    payload: Option<SourceRecordPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceRecordPayload {
     cwd: Option<PathBuf>,
 }
 
@@ -86,6 +97,7 @@ struct StoredProject {
 #[derive(Debug)]
 struct StoredSourceFile {
     id: i64,
+    source_provider: String,
     source_kind: String,
     modified_at_utc: Option<String>,
     size_bytes: i64,
@@ -94,7 +106,8 @@ struct StoredSourceFile {
 
 #[derive(Debug, Clone)]
 struct CandidateSourceFile {
-    source_kind: SourceFileKind,
+    descriptor: SourceDescriptor,
+    scan_root_path: String,
     absolute_path: PathBuf,
     relative_path: String,
     modified_at_utc: Option<String>,
@@ -103,7 +116,8 @@ struct CandidateSourceFile {
 
 #[derive(Debug, Clone)]
 struct ScanCacheRecord {
-    source_kind: SourceFileKind,
+    descriptor: SourceDescriptor,
+    scan_root_path: String,
     relative_path: String,
     modified_at_utc: Option<String>,
     size_bytes: i64,
@@ -120,6 +134,7 @@ struct StoredScanCacheRecord {
     raw_cwd_path: Option<String>,
     excluded: bool,
     scan_warnings_json: String,
+    source_provider: String,
     project_identity_kind: Option<String>,
     project_canonical_key: Option<String>,
     project_display_name: Option<String>,
@@ -136,9 +151,10 @@ struct DiscoveryStats {
 }
 
 pub fn scan_source_manifest(database: &mut Database, source_root: &Path) -> Result<ScanReport> {
-    scan_source_manifest_with_policy_and_perf_logger(
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    scan_sources_manifest_with_policy_and_perf_logger(
         database,
-        source_root,
+        &sources,
         &ProjectIdentityPolicy::default(),
         &[],
         None,
@@ -154,27 +170,55 @@ pub fn scan_source_manifest_with_perf_logger(
     source_root: &Path,
     perf_logger: Option<PerfLogger>,
 ) -> Result<ScanReport> {
-    scan_source_manifest_with_policy_and_perf_logger(
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    scan_sources_manifest_with_policy_and_perf_logger(
         database,
-        source_root,
+        &sources,
         &ProjectIdentityPolicy::default(),
         &[],
         perf_logger,
     )
 }
 
-fn scan_source_manifest_with_policy_and_perf_logger(
+pub fn scan_sources_manifest(
     database: &mut Database,
-    source_root: &Path,
+    sources: &ConfiguredSources,
+) -> Result<ScanReport> {
+    scan_sources_manifest_with_policy_and_perf_logger(
+        database,
+        sources,
+        &ProjectIdentityPolicy::default(),
+        &[],
+        None,
+    )
+}
+
+pub fn scan_sources_manifest_with_perf_logger(
+    database: &mut Database,
+    sources: &ConfiguredSources,
+    perf_logger: Option<PerfLogger>,
+) -> Result<ScanReport> {
+    scan_sources_manifest_with_policy_and_perf_logger(
+        database,
+        sources,
+        &ProjectIdentityPolicy::default(),
+        &[],
+        perf_logger,
+    )
+}
+
+fn scan_sources_manifest_with_policy_and_perf_logger(
+    database: &mut Database,
+    sources: &ConfiguredSources,
     identity_policy: &ProjectIdentityPolicy,
     project_filters: &[ProjectFilterRule],
     perf_logger: Option<PerfLogger>,
 ) -> Result<ScanReport> {
     let mut scope = PerfScope::new(perf_logger.clone(), "import.scan_source");
-    scope.field("source_root", source_root.display().to_string());
-    let result = scan_source_manifest_with_policy_inner(
+    scope.field("configured_source_count", sources.iter().count());
+    let result = scan_sources_manifest_with_policy_inner(
         database,
-        source_root,
+        sources,
         identity_policy,
         project_filters,
         perf_logger,
@@ -201,31 +245,53 @@ pub fn scan_source_manifest_with_policy(
     identity_policy: &ProjectIdentityPolicy,
     project_filters: &[ProjectFilterRule],
 ) -> Result<ScanReport> {
-    scan_source_manifest_with_policy_and_perf_logger(
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    scan_sources_manifest_with_policy_and_perf_logger(
         database,
-        source_root,
+        &sources,
         identity_policy,
         project_filters,
         None,
     )
 }
 
-fn scan_source_manifest_with_policy_inner(
+pub fn scan_sources_manifest_with_policy(
     database: &mut Database,
-    source_root: &Path,
+    sources: &ConfiguredSources,
+    identity_policy: &ProjectIdentityPolicy,
+    project_filters: &[ProjectFilterRule],
+) -> Result<ScanReport> {
+    scan_sources_manifest_with_policy_and_perf_logger(
+        database,
+        sources,
+        identity_policy,
+        project_filters,
+        None,
+    )
+}
+
+fn scan_sources_manifest_with_policy_inner(
+    database: &mut Database,
+    sources: &ConfiguredSources,
     identity_policy: &ProjectIdentityPolicy,
     project_filters: &[ProjectFilterRule],
     perf_logger: Option<PerfLogger>,
 ) -> Result<ScanReport> {
-    if source_root.exists() && !source_root.is_dir() {
-        bail!("source root {} is not a directory", source_root.display());
+    for source in sources.iter() {
+        let root = source.location.scan_root();
+        if root.exists()
+            && matches!(source.location, ConfiguredSourceLocation::Directory { .. })
+            && !root.is_dir()
+        {
+            bail!("source root {} is not a directory", root.display());
+        }
     }
 
     let policy_fingerprint = scan_policy_fingerprint(identity_policy, project_filters)
         .context("unable to encode scan source policy fingerprint")?;
-    let discovery = discover_source_files(
+    let discovery = discover_source_files_with_sources(
         database.connection(),
-        source_root,
+        sources,
         identity_policy,
         project_filters,
         &policy_fingerprint,
@@ -246,18 +312,18 @@ fn scan_source_manifest_with_policy_inner(
     for file in &discovery.files {
         let project_id = upsert_project(&tx, &file.project, &mut report)?;
         upsert_source_file(&tx, project_id, file, &mut report)?;
-        seen_files.insert((project_id, file.relative_path.clone()));
+        seen_files.insert((
+            project_id,
+            file.descriptor.provider,
+            file.descriptor.kind,
+            file.relative_path.clone(),
+        ));
     }
 
     let mut cache_scope = PerfScope::new(perf_logger, "import.persist_scan_source_cache");
     cache_scope.field("cache_hit_count", discovery.stats.cache_hit_count);
     cache_scope.field("cache_miss_count", discovery.stats.cache_miss_count);
-    match reconcile_scan_source_cache(
-        &tx,
-        source_root,
-        &policy_fingerprint,
-        &discovery.cache_records,
-    ) {
+    match reconcile_scan_source_cache(&tx, &policy_fingerprint, &discovery.cache_records) {
         Ok(()) => cache_scope.finish_ok(),
         Err(err) => {
             cache_scope.finish_error(&err);
@@ -282,9 +348,29 @@ struct DiscoveryResult {
     stats: DiscoveryStats,
 }
 
+#[cfg(test)]
 fn discover_source_files(
     conn: &rusqlite::Connection,
     source_root: &Path,
+    identity_policy: &ProjectIdentityPolicy,
+    project_filters: &[ProjectFilterRule],
+    policy_fingerprint: &str,
+    perf_logger: Option<PerfLogger>,
+) -> Result<DiscoveryResult> {
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    discover_source_files_with_sources(
+        conn,
+        &sources,
+        identity_policy,
+        project_filters,
+        policy_fingerprint,
+        perf_logger,
+    )
+}
+
+fn discover_source_files_with_sources(
+    conn: &rusqlite::Connection,
+    sources: &ConfiguredSources,
     identity_policy: &ProjectIdentityPolicy,
     project_filters: &[ProjectFilterRule],
     policy_fingerprint: &str,
@@ -294,7 +380,7 @@ fn discover_source_files(
         perf_logger.clone(),
         "import.discover_source_files.collect_candidates",
     );
-    let candidates = collect_candidate_source_files(source_root)?;
+    let candidates = collect_candidate_source_files(sources)?;
     candidate_scope.field("candidate_count", candidates.len());
     candidate_scope.finish_ok();
 
@@ -302,8 +388,22 @@ fn discover_source_files(
         perf_logger.clone(),
         "import.discover_source_files.load_cache",
     );
-    let cached_rows = load_scan_source_cache(conn, source_root, policy_fingerprint)?;
-    cache_scope.field("cached_row_count", cached_rows.len());
+    let mut cached_rows_by_root = HashMap::new();
+    for source in sources.iter() {
+        let root = source.location.scan_root();
+        cached_rows_by_root.insert(
+            path_to_string(root),
+            load_scan_source_cache(conn, root, policy_fingerprint)?,
+        );
+    }
+    cache_scope.field("cached_root_count", cached_rows_by_root.len());
+    cache_scope.field(
+        "cached_row_count",
+        cached_rows_by_root
+            .values()
+            .map(std::collections::HashMap::len)
+            .sum::<usize>(),
+    );
     cache_scope.finish_ok();
 
     let mut discovered_files = Vec::new();
@@ -313,8 +413,17 @@ fn discover_source_files(
     let mut misses = Vec::new();
 
     for candidate in candidates {
+        let cached_rows = cached_rows_by_root
+            .get(&candidate.scan_root_path)
+            .with_context(|| {
+                format!(
+                    "missing cached scan rows for source root {}",
+                    candidate.scan_root_path
+                )
+            })?;
         let cache_key = (
-            candidate.source_kind.as_str().to_string(),
+            candidate.descriptor.provider.as_str().to_string(),
+            candidate.descriptor.kind.as_str().to_string(),
             candidate.relative_path.clone(),
         );
         if let Some(cached_row) = cached_rows.get(&cache_key)
@@ -341,8 +450,7 @@ fn discover_source_files(
         "import.discover_source_files.resolve_cache_misses",
     );
     miss_scope.field("cache_miss_count", misses.len());
-    let resolved_misses =
-        resolve_cache_misses_parallel(source_root, misses, identity_policy, project_filters)?;
+    let resolved_misses = resolve_cache_misses_parallel(misses, identity_policy, project_filters)?;
     for cache_record in resolved_misses {
         if let Some(file) = cache_record.to_discovered_source_file()? {
             discovered_files.push(file);
@@ -353,8 +461,30 @@ fn discover_source_files(
     }
     miss_scope.finish_ok();
 
-    discovered_files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    cache_records.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    discovered_files.sort_by(|left, right| {
+        (
+            left.descriptor.provider.as_str(),
+            left.descriptor.kind.as_str(),
+            left.relative_path.as_str(),
+        )
+            .cmp(&(
+                right.descriptor.provider.as_str(),
+                right.descriptor.kind.as_str(),
+                right.relative_path.as_str(),
+            ))
+    });
+    cache_records.sort_by(|left, right| {
+        (
+            left.descriptor.provider.as_str(),
+            left.descriptor.kind.as_str(),
+            left.relative_path.as_str(),
+        )
+            .cmp(&(
+                right.descriptor.provider.as_str(),
+                right.descriptor.kind.as_str(),
+                right.relative_path.as_str(),
+            ))
+    });
     Ok(DiscoveryResult {
         files: discovered_files,
         cache_records,
@@ -364,62 +494,80 @@ fn discover_source_files(
     })
 }
 
-fn collect_candidate_source_files(source_root: &Path) -> Result<Vec<CandidateSourceFile>> {
+fn collect_candidate_source_files(sources: &ConfiguredSources) -> Result<Vec<CandidateSourceFile>> {
     let mut candidates = Vec::new();
 
-    if source_root.exists() {
-        for entry in WalkDir::new(source_root) {
-            let entry = entry
-                .with_context(|| format!("unable to walk source root {}", source_root.display()))?;
-            if !entry.file_type().is_file() {
-                continue;
+    for configured_source in sources.iter() {
+        match &configured_source.location {
+            ConfiguredSourceLocation::Directory { root } => {
+                if !root.exists() {
+                    continue;
+                }
+                for entry in WalkDir::new(root) {
+                    let entry = entry.with_context(|| {
+                        format!("unable to walk source root {}", root.display())
+                    })?;
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    if entry.path().extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    candidates.push(candidate_source_file(
+                        configured_source,
+                        entry.path(),
+                        root,
+                        entry
+                            .path()
+                            .strip_prefix(root)
+                            .with_context(|| {
+                                format!(
+                                    "unable to express {} relative to {}",
+                                    entry.path().display(),
+                                    root.display()
+                                )
+                            })?
+                            .to_string_lossy()
+                            .into_owned(),
+                    )?);
+                }
             }
-            if entry.path().extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                continue;
+            ConfiguredSourceLocation::File { path } => {
+                if path.is_file() {
+                    candidates.push(candidate_source_file(
+                        configured_source,
+                        path,
+                        path,
+                        configured_source.canonical_relative_path()?,
+                    )?);
+                }
             }
-            candidates.push(candidate_source_file(
-                source_root,
-                entry.path(),
-                SourceFileKind::Transcript,
-            )?);
         }
     }
 
-    if let Some(history_path) = claude_history_path(source_root)
-        && history_path.is_file()
-    {
-        candidates.push(candidate_source_file(
-            source_root,
-            &history_path,
-            SourceFileKind::ClaudeHistory,
-        )?);
-    }
-
-    candidates.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    candidates.sort_by(|left, right| {
+        (
+            left.descriptor.provider.as_str(),
+            left.descriptor.kind.as_str(),
+            left.relative_path.as_str(),
+        )
+            .cmp(&(
+                right.descriptor.provider.as_str(),
+                right.descriptor.kind.as_str(),
+                right.relative_path.as_str(),
+            ))
+    });
     Ok(candidates)
 }
 
 fn candidate_source_file(
-    source_root: &Path,
+    configured_source: &ConfiguredSource,
     source_file_path: &Path,
-    source_kind: SourceFileKind,
+    _scan_root: &Path,
+    relative_path: String,
 ) -> Result<CandidateSourceFile> {
     let metadata = fs::metadata(source_file_path)
         .with_context(|| format!("unable to read metadata for {}", source_file_path.display()))?;
-    let relative_path = match source_kind {
-        SourceFileKind::Transcript => source_file_path
-            .strip_prefix(source_root)
-            .with_context(|| {
-                format!(
-                    "unable to express {} relative to {}",
-                    source_file_path.display(),
-                    source_root.display()
-                )
-            })?
-            .to_string_lossy()
-            .into_owned(),
-        SourceFileKind::ClaudeHistory => CLAUDE_HISTORY_RELATIVE_PATH.to_string(),
-    };
     let size_bytes = i64::try_from(metadata.len())
         .with_context(|| format!("source file {} is too large", source_file_path.display()))?;
     let modified_at_utc = modified_at_utc(&metadata).with_context(|| {
@@ -430,7 +578,8 @@ fn candidate_source_file(
     })?;
 
     Ok(CandidateSourceFile {
-        source_kind,
+        descriptor: configured_source.descriptor,
+        scan_root_path: path_to_string(configured_source.location.scan_root()),
         absolute_path: source_file_path.to_path_buf(),
         relative_path,
         modified_at_utc,
@@ -439,13 +588,11 @@ fn candidate_source_file(
 }
 
 fn resolve_cache_misses_parallel(
-    source_root: &Path,
     misses: Vec<CandidateSourceFile>,
     identity_policy: &ProjectIdentityPolicy,
     project_filters: &[ProjectFilterRule],
 ) -> Result<Vec<ScanCacheRecord>> {
     let resolved_project_cache = Arc::new(Mutex::new(HashMap::<PathBuf, ResolvedProject>::new()));
-    let project_root = source_root.parent().unwrap_or(source_root).to_path_buf();
 
     misses
         .into_par_iter()
@@ -454,7 +601,6 @@ fn resolve_cache_misses_parallel(
                 &candidate,
                 identity_policy,
                 project_filters,
-                &project_root,
                 resolved_project_cache.clone(),
             )
         })
@@ -465,11 +611,13 @@ fn resolve_candidate_source_file(
     candidate: &CandidateSourceFile,
     identity_policy: &ProjectIdentityPolicy,
     project_filters: &[ProjectFilterRule],
-    history_project_root: &Path,
     resolved_project_cache: Arc<Mutex<HashMap<PathBuf, ResolvedProject>>>,
 ) -> Result<ScanCacheRecord> {
-    match candidate.source_kind {
-        SourceFileKind::Transcript => {
+    match candidate.descriptor {
+        SourceDescriptor {
+            provider: SourceProvider::Claude,
+            kind: SourceFileKind::Transcript,
+        } => {
             let ExtractedCwd { cwd, mut warnings } = extract_cwd(&candidate.absolute_path)?;
             let raw_cwd = cwd.clone();
             let project = match cwd {
@@ -497,7 +645,8 @@ fn resolve_candidate_source_file(
             })?;
 
             Ok(ScanCacheRecord {
-                source_kind: candidate.source_kind,
+                descriptor: candidate.descriptor,
+                scan_root_path: candidate.scan_root_path.clone(),
                 relative_path: candidate.relative_path.clone(),
                 modified_at_utc: candidate.modified_at_utc.clone(),
                 size_bytes: candidate.size_bytes,
@@ -507,11 +656,46 @@ fn resolve_candidate_source_file(
                 project: Some(project),
             })
         }
-        SourceFileKind::ClaudeHistory => {
-            let project = vcs::path_project(history_project_root, CLAUDE_HISTORY_PROJECT_REASON);
-            let excluded = should_exclude_project(None, &project, project_filters)?;
+        SourceDescriptor {
+            provider: SourceProvider::Claude,
+            kind: SourceFileKind::History,
+        }
+        | SourceDescriptor {
+            provider: SourceProvider::Codex,
+            kind: SourceFileKind::History,
+        }
+        | SourceDescriptor {
+            provider: SourceProvider::Codex,
+            kind: SourceFileKind::SessionIndex,
+        } => {
+            let project_reason = match candidate.descriptor {
+                SourceDescriptor {
+                    provider: SourceProvider::Claude,
+                    kind: SourceFileKind::History,
+                } => CLAUDE_HISTORY_PROJECT_REASON,
+                SourceDescriptor {
+                    provider: SourceProvider::Codex,
+                    kind: SourceFileKind::History,
+                } => CODEX_HISTORY_PROJECT_REASON,
+                SourceDescriptor {
+                    provider: SourceProvider::Codex,
+                    kind: SourceFileKind::SessionIndex,
+                } => CODEX_SESSION_INDEX_PROJECT_REASON,
+                _ => unreachable!(),
+            };
+            let scan_root = Path::new(&candidate.scan_root_path);
+            let project_root = match candidate.descriptor.kind {
+                SourceFileKind::History | SourceFileKind::SessionIndex => {
+                    scan_root.parent().unwrap_or(scan_root)
+                }
+                SourceFileKind::Transcript | SourceFileKind::Rollout => unreachable!(),
+            };
+            let project = vcs::path_project(project_root, project_reason);
+            let raw_cwd = None;
+            let excluded = should_exclude_project(raw_cwd, &project, project_filters)?;
             Ok(ScanCacheRecord {
-                source_kind: candidate.source_kind,
+                descriptor: candidate.descriptor,
+                scan_root_path: candidate.scan_root_path.clone(),
                 relative_path: candidate.relative_path.clone(),
                 modified_at_utc: candidate.modified_at_utc.clone(),
                 size_bytes: candidate.size_bytes,
@@ -521,6 +705,53 @@ fn resolve_candidate_source_file(
                 project: Some(project),
             })
         }
+        SourceDescriptor {
+            provider: SourceProvider::Codex,
+            kind: SourceFileKind::Rollout,
+        } => {
+            let ExtractedCwd { cwd, mut warnings } = extract_cwd(&candidate.absolute_path)?;
+            let raw_cwd = cwd.clone();
+            let project = match cwd {
+                Some(cwd) => {
+                    resolve_project_with_memo(cwd, identity_policy, &resolved_project_cache)
+                }
+                None => vcs::path_project(&candidate.absolute_path, CODEX_ROLLOUT_PROJECT_REASON),
+            };
+
+            let excluded = (!identity_policy.fallback_path_projects
+                && project.identity_kind == ProjectIdentityKind::Path)
+                || should_exclude_project(raw_cwd.as_deref(), &project, project_filters)?;
+
+            if project.identity_kind == ProjectIdentityKind::Path
+                && let Some(reason) = &project.identity_reason
+            {
+                warnings.push(ScanWarning::new(WARNING_PATH_PROJECT, reason.clone()));
+            }
+
+            let scan_warnings_json = serde_json::to_string(&warnings).with_context(|| {
+                format!(
+                    "unable to serialize scan warnings for {}",
+                    candidate.absolute_path.display()
+                )
+            })?;
+
+            Ok(ScanCacheRecord {
+                descriptor: candidate.descriptor,
+                scan_root_path: candidate.scan_root_path.clone(),
+                relative_path: candidate.relative_path.clone(),
+                modified_at_utc: candidate.modified_at_utc.clone(),
+                size_bytes: candidate.size_bytes,
+                raw_cwd_path: raw_cwd.as_ref().map(|path| path_to_string(path)),
+                excluded,
+                scan_warnings_json,
+                project: Some(project),
+            })
+        }
+        _ => bail!(
+            "unsupported source descriptor provider={} kind={} during source scan",
+            candidate.descriptor.provider.as_str(),
+            candidate.descriptor.kind.as_str()
+        ),
     }
 }
 
@@ -549,7 +780,16 @@ fn resolve_project_with_memo(
 impl StoredScanCacheRecord {
     fn to_cache_record(&self, candidate: &CandidateSourceFile) -> Result<ScanCacheRecord> {
         Ok(ScanCacheRecord {
-            source_kind: candidate.source_kind,
+            descriptor: SourceDescriptor::new(
+                SourceProvider::from_db_value(&self.source_provider).with_context(|| {
+                    format!(
+                        "unsupported cached source provider `{}`",
+                        self.source_provider
+                    )
+                })?,
+                candidate.descriptor.kind,
+            ),
+            scan_root_path: candidate.scan_root_path.clone(),
             relative_path: candidate.relative_path.clone(),
             modified_at_utc: candidate.modified_at_utc.clone(),
             size_bytes: candidate.size_bytes,
@@ -609,7 +849,7 @@ impl ScanCacheRecord {
             .clone()
             .context("included scan source cache row missing project payload")?;
         Ok(Some(DiscoveredSourceFile {
-            source_kind: self.source_kind,
+            descriptor: self.descriptor,
             project,
             relative_path: self.relative_path.clone(),
             modified_at_utc: self.modified_at_utc.clone(),
@@ -631,11 +871,12 @@ fn load_scan_source_cache(
     conn: &rusqlite::Connection,
     source_root: &Path,
     policy_fingerprint: &str,
-) -> Result<HashMap<(String, String), StoredScanCacheRecord>> {
+) -> Result<HashMap<(String, String, String), StoredScanCacheRecord>> {
     let mut stmt = conn
         .prepare(
             "
             SELECT
+                source_provider,
                 source_kind,
                 relative_path,
                 modified_at_utc,
@@ -662,19 +903,21 @@ fn load_scan_source_cache(
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
                     StoredScanCacheRecord {
-                        modified_at_utc: row.get(2)?,
-                        size_bytes: row.get(3)?,
-                        raw_cwd_path: row.get(4)?,
-                        excluded: row.get::<_, i64>(5)? != 0,
-                        scan_warnings_json: row.get(6)?,
-                        project_identity_kind: row.get(7)?,
-                        project_canonical_key: row.get(8)?,
-                        project_display_name: row.get(9)?,
-                        project_root_path: row.get(10)?,
-                        project_git_root_path: row.get(11)?,
-                        project_git_origin: row.get(12)?,
-                        project_identity_reason: row.get(13)?,
+                        modified_at_utc: row.get(3)?,
+                        size_bytes: row.get(4)?,
+                        raw_cwd_path: row.get(5)?,
+                        excluded: row.get::<_, i64>(6)? != 0,
+                        scan_warnings_json: row.get(7)?,
+                        source_provider: row.get(0)?,
+                        project_identity_kind: row.get(8)?,
+                        project_canonical_key: row.get(9)?,
+                        project_display_name: row.get(10)?,
+                        project_root_path: row.get(11)?,
+                        project_git_root_path: row.get(12)?,
+                        project_git_origin: row.get(13)?,
+                        project_identity_reason: row.get(14)?,
                     },
                 ))
             },
@@ -683,9 +926,9 @@ fn load_scan_source_cache(
 
     let mut cache_rows = HashMap::new();
     for row in rows {
-        let (source_kind, relative_path, record) =
+        let (source_provider, source_kind, relative_path, record) =
             row.context("unable to decode a scan source cache row")?;
-        cache_rows.insert((source_kind, relative_path), record);
+        cache_rows.insert((source_provider, source_kind, relative_path), record);
     }
 
     Ok(cache_rows)
@@ -693,20 +936,20 @@ fn load_scan_source_cache(
 
 fn reconcile_scan_source_cache(
     tx: &Transaction<'_>,
-    source_root: &Path,
     policy_fingerprint: &str,
     cache_records: &[ScanCacheRecord],
 ) -> Result<()> {
-    let source_root_path = path_to_string(source_root);
     let mut seen_keys = HashSet::with_capacity(cache_records.len());
 
     for record in cache_records {
+        let source_root_path = record.scan_root_path.clone();
         tx.execute(
             "
             INSERT INTO scan_source_cache (
                 source_root_path,
                 policy_fingerprint,
                 relative_path,
+                source_provider,
                 source_kind,
                 modified_at_utc,
                 size_bytes,
@@ -721,8 +964,8 @@ fn reconcile_scan_source_cache(
                 project_git_origin,
                 project_identity_reason,
                 updated_at_utc
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, CURRENT_TIMESTAMP)
-            ON CONFLICT(source_root_path, policy_fingerprint, source_kind, relative_path)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, CURRENT_TIMESTAMP)
+            ON CONFLICT(source_root_path, policy_fingerprint, source_provider, source_kind, relative_path)
             DO UPDATE SET
                 modified_at_utc = excluded.modified_at_utc,
                 size_bytes = excluded.size_bytes,
@@ -742,7 +985,8 @@ fn reconcile_scan_source_cache(
                 source_root_path,
                 policy_fingerprint,
                 record.relative_path,
-                record.source_kind.as_str(),
+                record.descriptor.provider.as_str(),
+                record.descriptor.kind.as_str(),
                 record.modified_at_utc,
                 record.size_bytes,
                 if record.excluded { 1 } else { 0 },
@@ -769,7 +1013,9 @@ fn reconcile_scan_source_cache(
         )
         .context("unable to upsert a scan source cache row")?;
         seen_keys.insert((
-            record.source_kind.as_str().to_string(),
+            source_root_path,
+            record.descriptor.provider.as_str().to_string(),
+            record.descriptor.kind.as_str().to_string(),
             record.relative_path.clone(),
         ));
     }
@@ -777,15 +1023,20 @@ fn reconcile_scan_source_cache(
     let mut stmt = tx
         .prepare(
             "
-            SELECT source_kind, relative_path
+            SELECT source_root_path, source_provider, source_kind, relative_path
             FROM scan_source_cache
-            WHERE source_root_path = ?1 AND policy_fingerprint = ?2
+            WHERE policy_fingerprint = ?1
             ",
         )
         .context("unable to prepare scan source cache reconciliation query")?;
     let rows = stmt
-        .query_map(params![source_root_path, policy_fingerprint], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        .query_map(params![policy_fingerprint], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
         })
         .context("unable to enumerate existing scan source cache rows")?;
 
@@ -798,18 +1049,20 @@ fn reconcile_scan_source_cache(
     }
     drop(stmt);
 
-    for (source_kind, relative_path) in stale_keys {
+    for (source_root_path, source_provider, source_kind, relative_path) in stale_keys {
         tx.execute(
             "
             DELETE FROM scan_source_cache
             WHERE source_root_path = ?1
               AND policy_fingerprint = ?2
-              AND source_kind = ?3
-              AND relative_path = ?4
+              AND source_provider = ?3
+              AND source_kind = ?4
+              AND relative_path = ?5
             ",
             params![
                 source_root_path,
                 policy_fingerprint,
+                source_provider,
                 source_kind,
                 relative_path
             ],
@@ -818,16 +1071,6 @@ fn reconcile_scan_source_cache(
     }
 
     Ok(())
-}
-
-fn claude_history_path(source_root: &Path) -> Option<PathBuf> {
-    let projects_dir_name = source_root.file_name()?.to_str()?;
-    let claude_dir = source_root.parent()?;
-    let claude_dir_name = claude_dir.file_name()?.to_str()?;
-    if projects_dir_name != "projects" || claude_dir_name != ".claude" {
-        return None;
-    }
-    Some(claude_dir.join("history.jsonl"))
 }
 
 fn should_exclude_project(
@@ -870,7 +1113,10 @@ fn extract_cwd(source_file_path: &Path) -> Result<ExtractedCwd> {
 
         match serde_json::from_str::<SourceRecordHeader>(&line) {
             Ok(record) => {
-                if let Some(cwd) = record.cwd {
+                if let Some(cwd) = record
+                    .cwd
+                    .or_else(|| record.payload.and_then(|payload| payload.cwd))
+                {
                     let mut warnings = Vec::new();
                     if let Some(warning) = first_parse_warning {
                         warnings.push(warning);
@@ -1063,21 +1309,31 @@ fn upsert_source_file(
             "
             SELECT
                 id,
+                source_provider,
                 source_kind,
                 modified_at_utc,
                 size_bytes,
                 scan_warnings_json
             FROM source_file
-            WHERE project_id = ?1 AND relative_path = ?2
+            WHERE project_id = ?1
+              AND source_provider = ?2
+              AND source_kind = ?3
+              AND relative_path = ?4
             ",
-            params![project_id, file.relative_path],
+            params![
+                project_id,
+                file.descriptor.provider.as_str(),
+                file.descriptor.kind.as_str(),
+                file.relative_path
+            ],
             |row| {
                 Ok(StoredSourceFile {
                     id: row.get(0)?,
-                    source_kind: row.get(1)?,
-                    modified_at_utc: row.get(2)?,
-                    size_bytes: row.get(3)?,
-                    scan_warnings_json: row.get(4)?,
+                    source_provider: row.get(1)?,
+                    source_kind: row.get(2)?,
+                    modified_at_utc: row.get(3)?,
+                    size_bytes: row.get(4)?,
+                    scan_warnings_json: row.get(5)?,
                 })
             },
         )
@@ -1091,16 +1347,18 @@ fn upsert_source_file(
                 INSERT INTO source_file (
                     project_id,
                     relative_path,
+                    source_provider,
                     source_kind,
                     modified_at_utc,
                     size_bytes,
                     scan_warnings_json
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                 ",
                 params![
                     project_id,
                     file.relative_path,
-                    file.source_kind.as_str(),
+                    file.descriptor.provider.as_str(),
+                    file.descriptor.kind.as_str(),
                     file.modified_at_utc,
                     file.size_bytes,
                     file.scan_warnings_json,
@@ -1110,7 +1368,8 @@ fn upsert_source_file(
             report.inserted_source_files += 1;
         }
         Some(existing) => {
-            let needs_update = existing.source_kind != file.source_kind.as_str()
+            let needs_update = existing.source_provider != file.descriptor.provider.as_str()
+                || existing.source_kind != file.descriptor.kind.as_str()
                 || existing.modified_at_utc != file.modified_at_utc
                 || existing.size_bytes != file.size_bytes
                 || existing.scan_warnings_json != file.scan_warnings_json;
@@ -1120,15 +1379,17 @@ fn upsert_source_file(
                     "
                     UPDATE source_file
                     SET
-                        source_kind = ?2,
-                        modified_at_utc = ?3,
-                        size_bytes = ?4,
-                        scan_warnings_json = ?5
+                        source_provider = ?2,
+                        source_kind = ?3,
+                        modified_at_utc = ?4,
+                        size_bytes = ?5,
+                        scan_warnings_json = ?6
                     WHERE id = ?1
                     ",
                     params![
                         existing.id,
-                        file.source_kind.as_str(),
+                        file.descriptor.provider.as_str(),
+                        file.descriptor.kind.as_str(),
                         file.modified_at_utc,
                         file.size_bytes,
                         file.scan_warnings_json,
@@ -1145,12 +1406,12 @@ fn upsert_source_file(
 
 fn delete_missing_source_files(
     tx: &Transaction<'_>,
-    seen_files: &HashSet<(i64, String)>,
+    seen_files: &HashSet<(i64, SourceProvider, SourceFileKind, String)>,
 ) -> Result<usize> {
     let mut stmt = tx
         .prepare(
             "
-            SELECT id, project_id, relative_path, imported_modified_at_utc
+            SELECT id, project_id, source_provider, source_kind, relative_path, imported_modified_at_utc
             FROM source_file
             ",
         )
@@ -1161,16 +1422,22 @@ fn delete_missing_source_files(
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })
         .context("unable to enumerate source file manifest rows")?;
 
     let mut delete_rows = Vec::new();
     for row in rows {
-        let (id, project_id, relative_path, imported_modified_at_utc) =
+        let (id, project_id, source_provider, source_kind, relative_path, imported_modified_at_utc) =
             row.context("unable to read a source file manifest row")?;
-        if !seen_files.contains(&(project_id, relative_path)) {
+        let source_provider = SourceProvider::from_db_value(&source_provider)
+            .with_context(|| format!("unsupported stored source provider `{source_provider}`"))?;
+        let source_kind = SourceFileKind::from_db_value(&source_kind)
+            .with_context(|| format!("unsupported stored source kind `{source_kind}`"))?;
+        if !seen_files.contains(&(project_id, source_provider, source_kind, relative_path)) {
             delete_rows.push((id, project_id, imported_modified_at_utc));
         }
     }
@@ -1250,11 +1517,13 @@ mod tests {
     use super::{
         ScanReport, ScanWarning, WARNING_INVALID_JSON, discover_source_files,
         scan_policy_fingerprint, scan_source_manifest, scan_source_manifest_with_policy,
+        scan_sources_manifest_with_policy,
     };
     use crate::config::{
         ProjectFilterAction, ProjectFilterMatchOn, ProjectFilterRule, ProjectIdentityPolicy,
     };
     use crate::db::Database;
+    use crate::sources::{ConfiguredSource, ConfiguredSources, SourceFileKind, SourceProvider};
     use crate::vcs::{PATH_REASON_GIT_ROOT_NOT_FOUND, resolve_project_from_cwd};
 
     #[test]
@@ -1463,7 +1732,8 @@ mod tests {
             equals: None,
         };
         let policy = ProjectIdentityPolicy::default();
-        let policy_fingerprint = scan_policy_fingerprint(&policy, &[exclude_rule.clone()])?;
+        let policy_fingerprint =
+            scan_policy_fingerprint(&policy, std::slice::from_ref(&exclude_rule))?;
         let discovery = discover_source_files(
             db.connection(),
             &source_root,
@@ -1824,8 +2094,161 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        assert_eq!(row.0, "../history.jsonl");
-        assert_eq!(row.1, "claude_history");
+        assert_eq!(row.0, "history.jsonl");
+        assert_eq!(row.1, "history");
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_sources_manifest_distinguishes_provider_and_kind_across_claude_and_codex() -> Result<()>
+    {
+        let temp = tempdir()?;
+        let claude_root = temp.path().join(".claude");
+        let claude_projects = claude_root.join("projects");
+        let claude_history = claude_root.join("history.jsonl");
+        let repo_root = temp.path().join("repo");
+        let repo_cwd = repo_root.join("workspace");
+        fs::create_dir_all(&repo_cwd)?;
+        gix::init(&repo_root)?;
+        write_jsonl(&claude_projects.join("project/session.jsonl"), &repo_cwd)?;
+        fs::create_dir_all(&claude_projects)?;
+        fs::write(
+            &claude_history,
+            "{\"sessionId\":\"claude-history-1\",\"timestamp\":\"2026-04-18T12:00:00Z\",\"display\":\"hello\"}\n",
+        )?;
+
+        let codex_root = codex_fixture_root();
+        let sources = ConfiguredSources::new(vec![
+            ConfiguredSource::directory(
+                SourceProvider::Claude,
+                SourceFileKind::Transcript,
+                claude_projects,
+            ),
+            ConfiguredSource::file(
+                SourceProvider::Claude,
+                SourceFileKind::History,
+                claude_history,
+            ),
+            ConfiguredSource::directory(
+                SourceProvider::Codex,
+                SourceFileKind::Rollout,
+                codex_root.join("sessions"),
+            ),
+            ConfiguredSource::file(
+                SourceProvider::Codex,
+                SourceFileKind::History,
+                codex_root.join("history.jsonl"),
+            ),
+            ConfiguredSource::file(
+                SourceProvider::Codex,
+                SourceFileKind::SessionIndex,
+                codex_root.join("session_index.jsonl"),
+            ),
+        ]);
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let report = scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+
+        assert_eq!(report.discovered_source_files, 5);
+        let rows: Vec<(String, String, String)> = db
+            .connection()
+            .prepare(
+                "
+                SELECT source_provider, source_kind, relative_path
+                FROM source_file
+                ORDER BY source_provider, source_kind, relative_path
+                ",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "claude".to_string(),
+                    "history".to_string(),
+                    "history.jsonl".to_string(),
+                ),
+                (
+                    "claude".to_string(),
+                    "transcript".to_string(),
+                    "project/session.jsonl".to_string(),
+                ),
+                (
+                    "codex".to_string(),
+                    "history".to_string(),
+                    "history.jsonl".to_string(),
+                ),
+                (
+                    "codex".to_string(),
+                    "rollout".to_string(),
+                    "2026/04/18/rollout-2026-04-18T12-00-00Z.jsonl".to_string(),
+                ),
+                (
+                    "codex".to_string(),
+                    "session_index".to_string(),
+                    "session_index.jsonl".to_string(),
+                ),
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_codex_rollout_uses_payload_cwd_for_project_attribution() -> Result<()> {
+        let temp = tempdir()?;
+        let repo_root = temp.path().join("repo");
+        let repo_cwd = repo_root.join("workspace");
+        let rollout_root = temp.path().join(".codex").join("sessions");
+        let rollout_path = rollout_root
+            .join("2026")
+            .join("04")
+            .join("18")
+            .join("rollout.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent should exist"))?;
+        fs::create_dir_all(&repo_cwd)?;
+        gix::init(&repo_root)?;
+        fs::write(
+            &rollout_path,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\",\"cli_version\":\"0.0.0-test\"}}}}\n",
+                repo_cwd.display()
+            ),
+        )?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Codex,
+            SourceFileKind::Rollout,
+            rollout_root,
+        )]);
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+
+        let row: (String, String) = db.connection().query_row(
+            "
+            SELECT p.root_path, sf.relative_path
+            FROM source_file sf
+            JOIN project p ON p.id = sf.project_id
+            WHERE sf.source_provider = 'codex' AND sf.source_kind = 'rollout'
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(row.0, repo_root.display().to_string());
+        assert_eq!(row.1, "2026/04/18/rollout.jsonl");
 
         Ok(())
     }
@@ -2117,6 +2540,13 @@ mod tests {
         fs::write(path, format!("{}\n", json!({ "cwd": cwd })))
             .with_context(|| format!("unable to write {}", path.display()))?;
         Ok(())
+    }
+
+    fn codex_fixture_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("codex")
     }
 
     fn init_git_repo(repo_root: &Path) -> Result<()> {

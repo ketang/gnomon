@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 
-pub const INITIAL_SCHEMA_VERSION: u32 = 14;
+pub const INITIAL_SCHEMA_VERSION: u32 = 18;
 pub const DEFAULT_DB_FILENAME: &str = "usage.sqlite3";
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -329,7 +329,7 @@ mod tests {
         // Insert a source_file referencing a project_id that does not exist.
         // Must fail because PRAGMA foreign_keys = ON is set at open time.
         let result = db.connection().execute(
-            "INSERT INTO source_file (project_id, relative_path) VALUES (99999, 'orphan.jsonl')",
+            "INSERT INTO source_file (project_id, relative_path, source_provider, source_kind) VALUES (99999, 'orphan.jsonl', 'claude', 'transcript')",
             [],
         );
 

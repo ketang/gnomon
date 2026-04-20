@@ -79,9 +79,11 @@ pub struct NormalizedMessage {
 
 mod source;
 
+pub use crate::sources::{ConfiguredSources, SourceDescriptor, SourceFileKind, SourceProvider};
 pub use source::{
     ScanReport, ScanWarning, scan_source_manifest, scan_source_manifest_with_perf_logger,
-    scan_source_manifest_with_policy,
+    scan_source_manifest_with_policy, scan_sources_manifest,
+    scan_sources_manifest_with_perf_logger, scan_sources_manifest_with_policy,
 };
 
 pub const STARTUP_IMPORT_WINDOW_HOURS: i64 = 24;
@@ -117,30 +119,7 @@ pub const IMPORT_CHUNK_UNIT: &str = "project x day";
 /// The `record` table is no longer populated during import. All JSONL lines
 /// are still counted (`imported_record_count`) but individual records are not
 /// persisted. This eliminates ~490K INSERTs per full corpus import.
-pub const IMPORT_SCHEMA_VERSION: i64 = 6;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceFileKind {
-    Transcript,
-    ClaudeHistory,
-}
-
-impl SourceFileKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Transcript => "transcript",
-            Self::ClaudeHistory => "claude_history",
-        }
-    }
-
-    pub fn from_db_value(value: &str) -> Option<Self> {
-        match value {
-            "transcript" => Some(Self::Transcript),
-            "claude_history" => Some(Self::ClaudeHistory),
-            _ => None,
-        }
-    }
-}
+pub const IMPORT_SCHEMA_VERSION: i64 = 10;
 
 /// Stable normalized payload contract for persisted `tool_use` message parts.
 ///
@@ -198,9 +177,11 @@ pub(crate) mod rtk;
 pub use chunk::{
     ImportExecutionReport, StartupImport, StartupImportMode, StartupOpenReason,
     StartupProgressUpdate, StartupWorkerEvent, import_all, import_all_with_perf_logger,
-    import_all_with_rtk, start_startup_import, start_startup_import_with_mode_and_progress,
+    import_all_with_rtk, import_all_with_sources_and_perf_logger, import_all_with_sources_and_rtk,
+    start_startup_import, start_startup_import_with_mode_and_progress,
     start_startup_import_with_perf_logger, start_startup_import_with_progress,
-    start_startup_import_with_rtk,
+    start_startup_import_with_rtk, start_startup_import_with_sources_and_mode_and_progress,
+    start_startup_import_with_sources_and_mode_and_rtk,
 };
 pub use normalize::{
     NormalizeImportWarning, NormalizeJsonlFileOutcome, NormalizeJsonlFileParams,

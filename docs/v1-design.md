@@ -2,7 +2,7 @@
 
 ## Goal
 
-Build a single-binary terminal application that analyzes Claude session history and surfaces the highest-usage patterns so the user can optimize token consumption.
+Build a single-binary terminal application that analyzes Claude and Codex session history and surfaces the highest-usage patterns so the user can optimize token consumption.
 
 ## Product Shape
 
@@ -13,6 +13,9 @@ Build a single-binary terminal application that analyzes Claude session history 
   - `All projects -> action category -> action -> project -> directory/file`
 - Late drill-down only:
   - `session -> turn -> action -> event`
+- Provider filtering is orthogonal to navigation:
+  - every user-facing surface must support `claude`, `codex`, or an explicit combined view
+  - combined rows must stay visibly `mixed` when both providers contribute
 
 ## Metrics
 
@@ -185,6 +188,7 @@ Shell commands do not create path attribution.
   - cached vs uncached proportions = secondary indicators, not color
 - Include:
   - basic current-view filtering
+  - explicit provider filtering for Claude, Codex, or combined results
   - global jump
   - persistent UI state across launches
   - fresh launches start at the top level unless explicit startup drill-down flags are provided
@@ -192,6 +196,13 @@ Shell commands do not create path attribution.
   - optional table columns and filters augment existing rows
   - inspect details explain fired opportunities for the selected row
   - no separate "opportunity tree" is introduced for `v1`
+
+## Provider Model
+
+- Raw Claude and Codex imports stay physically separate.
+- Claude and Codex share the normalized session, message, turn, action, and usage model.
+- Query, report, TUI, and web surfaces must expose provider boundaries explicitly rather than silently collapsing them.
+- Row/detail surfaces should show whether the current scope is `claude`, `codex`, or `mixed`.
 
 ## Default Column Priority
 
