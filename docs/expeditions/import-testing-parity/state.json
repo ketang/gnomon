@@ -1,5 +1,13 @@
 {
-  "active_task": null,
+  "active_task": {
+    "base_head": "a7be7439d88e7504840a6b5399954a6c736eb5b3",
+    "branch": "import-testing-parity-03-codex-startup",
+    "kind": "task",
+    "number": 3,
+    "slug": "codex-startup",
+    "started_at": "2026-04-20T23:30:36Z",
+    "worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity-03-codex-startup"
+  },
   "base_branch": "import-testing-parity",
   "base_worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity",
   "created_at": "2026-04-20T22:51:07Z",
@@ -14,11 +22,11 @@
     "summary": "Task 02: Claude fixture corpus + provider-aware scan + end-to-end tests",
     "worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity-02-claude-fixture-corpus"
   },
-  "next_action": "Create the next task branch from the rebased expedition base branch.",
+  "next_action": "Complete work on `import-testing-parity-03-codex-startup` in `/home/ketan/project/gnomon/.worktrees/import-testing-parity-03-codex-startup`.",
   "next_task_number": 3,
   "preserved_experiments": [],
   "primary_branch": "main",
   "schema_version": 1,
-  "status": "ready_for_task",
-  "updated_at": "2026-04-20T23:04:17Z"
+  "status": "task_in_progress",
+  "updated_at": "2026-04-20T23:30:36Z"
 }
