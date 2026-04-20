@@ -1841,8 +1841,119 @@ fn compute_shard_counts(conn: &Connection, import_chunk_id: i64) -> Result<Chunk
     })
 }
 
+type ActionRollupRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+);
+
+type PathRollupRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+    f64,
+    f64,
+    f64,
+    f64,
+);
+
+struct ShardRollupSnapshot {
+    action_rows: Vec<ActionRollupRow>,
+    path_rows: Vec<PathRollupRow>,
+}
+
+// Read rollup rows for a chunk from its shard into memory. Called BEFORE opening the
+// global transaction so the global write lock isn't held during shard reads.
+fn read_chunk_rollups_from_shard(
+    shard_conn: &Connection,
+    import_chunk_id: i64,
+) -> Result<ShardRollupSnapshot> {
+    let action_rows: Vec<ActionRollupRow> = {
+        let mut sel = shard_conn
+            .prepare_cached(
+                "SELECT display_category, classification_state, normalized_action,
+                        command_family, base_command, input_tokens,
+                        cache_creation_input_tokens, cache_read_input_tokens,
+                        output_tokens, action_count
+                 FROM chunk_action_rollup WHERE import_chunk_id = ?1",
+            )
+            .context("unable to prepare action rollup SELECT from shard")?;
+        sel.query_map([import_chunk_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, i64>(8)?,
+                r.get::<_, i64>(9)?,
+            ))
+        })
+        .context("unable to query action rollup rows from shard")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("unable to collect action rollup rows from shard")?
+    };
+
+    let path_rows: Vec<PathRollupRow> = {
+        let mut sel = shard_conn
+            .prepare_cached(
+                "SELECT display_category, classification_state, normalized_action,
+                        command_family, base_command, parent_path, child_path,
+                        child_label, child_kind, leaf_file_path,
+                        input_tokens, cache_creation_input_tokens,
+                        cache_read_input_tokens, output_tokens
+                 FROM chunk_path_rollup WHERE import_chunk_id = ?1",
+            )
+            .context("unable to prepare path rollup SELECT from shard")?;
+        sel.query_map([import_chunk_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, String>(8)?,
+                r.get::<_, String>(9)?,
+                r.get::<_, f64>(10)?,
+                r.get::<_, f64>(11)?,
+                r.get::<_, f64>(12)?,
+                r.get::<_, f64>(13)?,
+            ))
+        })
+        .context("unable to query path rollup rows from shard")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("unable to collect path rollup rows from shard")?
+    };
+
+    Ok(ShardRollupSnapshot {
+        action_rows,
+        path_rows,
+    })
+}
+
 fn finalize_chunk_global(
     conn: &Connection,
+    rollups: &ShardRollupSnapshot,
     chunk: &PreparedChunk,
     counts: &ChunkCounts,
     _options: &ImportWorkerOptions,
@@ -1888,6 +1999,80 @@ fn finalize_chunk_global(
         ],
     )
     .context("unable to write shard chunk counts to global import_chunk")?;
+
+    // Write rollup rows pre-read from shard so the query layer can see them.
+    conn.execute(
+        "DELETE FROM chunk_action_rollup WHERE import_chunk_id = ?1",
+        [chunk.import_chunk_id],
+    )
+    .context("unable to clear old action rollup rows from global")?;
+    {
+        let mut ins = conn
+            .prepare_cached(
+                "INSERT INTO chunk_action_rollup
+                 (import_chunk_id, display_category, classification_state,
+                  normalized_action, command_family, base_command,
+                  input_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+                  output_tokens, action_count)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            )
+            .context("unable to prepare action rollup INSERT to global")?;
+        for r in &rollups.action_rows {
+            ins.execute(params![
+                chunk.import_chunk_id,
+                r.0,
+                r.1,
+                r.2,
+                r.3,
+                r.4,
+                r.5,
+                r.6,
+                r.7,
+                r.8,
+                r.9
+            ])
+            .context("unable to insert action rollup row into global")?;
+        }
+    }
+
+    conn.execute(
+        "DELETE FROM chunk_path_rollup WHERE import_chunk_id = ?1",
+        [chunk.import_chunk_id],
+    )
+    .context("unable to clear old path rollup rows from global")?;
+    {
+        let mut ins = conn
+            .prepare_cached(
+                "INSERT INTO chunk_path_rollup
+                 (import_chunk_id, display_category, classification_state,
+                  normalized_action, command_family, base_command,
+                  parent_path, child_path, child_label, child_kind, leaf_file_path,
+                  input_tokens, cache_creation_input_tokens,
+                  cache_read_input_tokens, output_tokens)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            )
+            .context("unable to prepare path rollup INSERT to global")?;
+        for r in &rollups.path_rows {
+            ins.execute(params![
+                chunk.import_chunk_id,
+                r.0,
+                r.1,
+                r.2,
+                r.3,
+                r.4,
+                r.5,
+                r.6,
+                r.7,
+                r.8,
+                r.9,
+                r.10,
+                r.11,
+                r.12,
+                r.13
+            ])
+            .context("unable to insert path rollup row into global")?;
+        }
+    }
 
     clear_pending_chunk_rebuild(conn, chunk.project_id, &chunk.chunk_day_local)?;
     publish_import_chunk(conn, chunk)?;
@@ -2141,7 +2326,28 @@ fn import_chunk_sharded(
 
     match shard_result {
         Ok(counts) => {
+            // Read rollup rows from shard BEFORE opening the global transaction, so the
+            // global write lock is not held during shard reads.
             let global_result: Result<()> = (|| {
+                let mut shard_read_scope =
+                    PerfScope::new(options.perf_logger.clone(), "import.read_shard_rollups");
+                shard_read_scope.field("import_chunk_id", chunk.import_chunk_id);
+                let rollups = match read_chunk_rollups_from_shard(
+                    shard_db.connection(),
+                    chunk.import_chunk_id,
+                ) {
+                    Ok(r) => {
+                        shard_read_scope.field("action_rows", r.action_rows.len());
+                        shard_read_scope.field("path_rows", r.path_rows.len());
+                        shard_read_scope.finish_ok();
+                        r
+                    }
+                    Err(err) => {
+                        shard_read_scope.finish_error(&err);
+                        return Err(err);
+                    }
+                };
+
                 let tx = global_db
                     .connection_mut()
                     .transaction()
@@ -2149,7 +2355,7 @@ fn import_chunk_sharded(
                 let mut global_finalize_scope =
                     PerfScope::new(options.perf_logger.clone(), "import.finalize_chunk_global");
                 global_finalize_scope.field("import_chunk_id", chunk.import_chunk_id);
-                let result = finalize_chunk_global(&tx, chunk, &counts, options);
+                let result = finalize_chunk_global(&tx, &rollups, chunk, &counts, options);
                 match &result {
                     Ok(()) => global_finalize_scope.finish_ok(),
                     Err(err) => global_finalize_scope.finish_error(err),
