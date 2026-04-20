@@ -2903,6 +2903,94 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn import_all_with_sources_imports_checked_in_claude_fixture_corpus() -> Result<()> {
+        use crate::import::test_fixtures::claude_fixture_sources;
+
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let sources = claude_fixture_sources();
+
+        let mut db = Database::open(&db_path)?;
+        let scan_report = scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+        assert_eq!(scan_report.discovered_source_files, 2);
+
+        let import_report =
+            import_all_with_sources_and_perf_logger(db.connection(), &db_path, &sources, None)?;
+        assert_eq!(import_report.deferred_failure_count, 0);
+        assert!(import_report.deferred_failure_summary.is_none());
+
+        let counts: (i64, i64, i64, i64) = db.connection().query_row(
+            "
+            SELECT
+                (SELECT COUNT(*) FROM source_file WHERE imported_schema_version = ?1),
+                (SELECT COUNT(*) FROM conversation),
+                (SELECT COUNT(*) FROM message),
+                (SELECT COUNT(*) FROM history_event)
+            ",
+            params![crate::import::IMPORT_SCHEMA_VERSION],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(counts.0, 2, "both fixture files should be imported");
+        assert_eq!(counts.1, 1, "fixture yields a single conversation");
+        assert_eq!(
+            counts.2, 2,
+            "fixture yields one user + one assistant message"
+        );
+        assert_eq!(counts.3, 1, "fixture yields one history event");
+
+        let conversation_row: (String, String, String) = db.connection().query_row(
+            "
+            SELECT sf.source_provider, sf.source_kind, sf.relative_path
+            FROM conversation c
+            JOIN source_file sf ON sf.id = c.source_file_id
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(conversation_row.0, "claude");
+        assert_eq!(conversation_row.1, "transcript");
+        assert_eq!(
+            conversation_row.2,
+            "-tmp-redacted-project-a/session-claude-fixture-01.jsonl"
+        );
+
+        let history_row: (Option<String>, Option<String>) = db.connection().query_row(
+            "
+            SELECT session_id, display_text
+            FROM history_event he
+            JOIN source_file sf ON sf.id = he.source_file_id
+            WHERE sf.source_provider = 'claude' AND sf.source_kind = 'history'
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(history_row.0.as_deref(), Some("claude-fixture-session-01"));
+        assert_eq!(history_row.1.as_deref(), Some("Inspect the project"));
+
+        let reimport_report =
+            import_all_with_sources_and_perf_logger(db.connection(), &db_path, &sources, None)?;
+        assert_eq!(reimport_report.deferred_failure_count, 0);
+        assert!(reimport_report.deferred_failure_summary.is_none());
+        let post_reimport_counts: (i64, i64) = db.connection().query_row(
+            "SELECT (SELECT COUNT(*) FROM conversation), (SELECT COUNT(*) FROM message)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            post_reimport_counts,
+            (1, 2),
+            "reimport is a no-op on unchanged fixture"
+        );
+
+        Ok(())
+    }
+
     fn insert_project(
         conn: &mut Connection,
         canonical_key: &str,

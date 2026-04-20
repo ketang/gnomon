@@ -2254,6 +2254,111 @@ mod tests {
     }
 
     #[test]
+    fn scan_sources_manifest_discovers_checked_in_claude_fixture_corpus() -> Result<()> {
+        use crate::import::test_fixtures::claude_fixture_sources;
+
+        let temp = tempdir()?;
+        let sources = claude_fixture_sources();
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let report = scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+
+        assert_eq!(report.discovered_source_files, 2);
+        let rows: Vec<(String, String, String)> = db
+            .connection()
+            .prepare(
+                "
+                SELECT source_provider, source_kind, relative_path
+                FROM source_file
+                ORDER BY source_provider, source_kind, relative_path
+                ",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "claude".to_string(),
+                    "history".to_string(),
+                    "history.jsonl".to_string(),
+                ),
+                (
+                    "claude".to_string(),
+                    "transcript".to_string(),
+                    "-tmp-redacted-project-a/session-claude-fixture-01.jsonl".to_string(),
+                ),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scan_sources_manifest_discovers_checked_in_mixed_provider_corpus() -> Result<()> {
+        use crate::import::test_fixtures::mixed_fixture_sources;
+
+        let temp = tempdir()?;
+        let sources = mixed_fixture_sources();
+
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let report = scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+
+        assert_eq!(report.discovered_source_files, 5);
+        let rows: Vec<(String, String, String)> = db
+            .connection()
+            .prepare(
+                "
+                SELECT source_provider, source_kind, relative_path
+                FROM source_file
+                ORDER BY source_provider, source_kind, relative_path
+                ",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "claude".to_string(),
+                    "history".to_string(),
+                    "history.jsonl".to_string(),
+                ),
+                (
+                    "claude".to_string(),
+                    "transcript".to_string(),
+                    "-tmp-redacted-project-a/session-claude-fixture-01.jsonl".to_string(),
+                ),
+                (
+                    "codex".to_string(),
+                    "history".to_string(),
+                    "history.jsonl".to_string(),
+                ),
+                (
+                    "codex".to_string(),
+                    "rollout".to_string(),
+                    "2026/04/18/rollout-2026-04-18T12-00-00Z.jsonl".to_string(),
+                ),
+                (
+                    "codex".to_string(),
+                    "session_index".to_string(),
+                    "session_index.jsonl".to_string(),
+                ),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn scan_with_multiple_files_in_same_project_counts_correctly() -> Result<()> {
         let temp = tempdir()?;
         let source_root = temp.path().join("source");
