@@ -1,32 +1,24 @@
 {
-  "active_task": {
-    "base_head": "7f87e9b2b688d4e9ebe42c115b354eee6c3847e6",
-    "branch": "import-testing-parity-04-codex-warnings-reimport",
-    "kind": "task",
-    "number": 4,
-    "slug": "codex-warnings-reimport",
-    "started_at": "2026-04-21T01:41:53Z",
-    "worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity-04-codex-warnings-reimport"
-  },
+  "active_task": null,
   "base_branch": "import-testing-parity",
   "base_worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity",
   "created_at": "2026-04-20T22:51:07Z",
   "expedition": "import-testing-parity",
   "last_completed": {
-    "branch": "import-testing-parity-03-codex-startup",
-    "completed_at": "2026-04-21T00:16:30Z",
+    "branch": "import-testing-parity-04-codex-warnings-reimport",
+    "completed_at": "2026-04-21T02:17:38Z",
     "kind": "task",
-    "number": 3,
+    "number": 4,
     "outcome": "kept",
-    "slug": "codex-startup",
-    "summary": "Task 03: Codex startup import tests (recent-first, timeout, full)",
-    "worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity-03-codex-startup"
+    "slug": "codex-warnings-reimport",
+    "summary": "Task 04: Codex warning, reimport, schema-bump regression tests",
+    "worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity-04-codex-warnings-reimport"
   },
-  "next_action": "Complete work on `import-testing-parity-04-codex-warnings-reimport` in `/home/ketan/project/gnomon/.worktrees/import-testing-parity-04-codex-warnings-reimport`.",
-  "next_task_number": 4,
+  "next_action": "Create the next task branch from the rebased expedition base branch.",
+  "next_task_number": 5,
   "preserved_experiments": [],
   "primary_branch": "main",
   "schema_version": 1,
-  "status": "task_in_progress",
-  "updated_at": "2026-04-21T01:41:53Z"
+  "status": "ready_for_task",
+  "updated_at": "2026-04-21T02:17:38Z"
 }

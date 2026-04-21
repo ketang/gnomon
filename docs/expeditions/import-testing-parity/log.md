@@ -66,14 +66,21 @@
 - Base head at branch creation: `7f87e9b2b688d4e9ebe42c115b354eee6c3847e6`.
 
 
+### 2026-04-21T02:17:38Z — Closed task
+- Branch: `import-testing-parity-04-codex-warnings-reimport`.
+- Outcome: `kept`.
+- Summary: Task 04: Codex warning, reimport, schema-bump regression tests
+- Base branch rebased onto the primary branch.
+
+
 ## RESUME HERE
 <!-- expedition-resume:start -->
 - Expedition: `import-testing-parity`
-- Status: `task_in_progress`
+- Status: `ready_for_task`
 - Base branch: `import-testing-parity`
 - Base worktree: `/home/ketan/project/gnomon/.worktrees/import-testing-parity`
-- Active task branch: `import-testing-parity-04-codex-warnings-reimport`
-- Active task worktree: `/home/ketan/project/gnomon/.worktrees/import-testing-parity-04-codex-warnings-reimport`
-- Last completed: `import-testing-parity-03-codex-startup (kept)`
-- Next action: Complete work on `import-testing-parity-04-codex-warnings-reimport` in `/home/ketan/project/gnomon/.worktrees/import-testing-parity-04-codex-warnings-reimport`.
+- Active task branch: `none`
+- Active task worktree: `none`
+- Last completed: `import-testing-parity-04-codex-warnings-reimport (kept)`
+- Next action: Create the next task branch from the rebased expedition base branch.
 <!-- expedition-resume:end -->
