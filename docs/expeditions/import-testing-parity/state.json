@@ -1,32 +1,24 @@
 {
-  "active_task": {
-    "base_head": "a38ff927bfd88fe62fc9df8e517ccb931c1d71f9",
-    "branch": "import-testing-parity-06-cleanup",
-    "kind": "task",
-    "number": 6,
-    "slug": "cleanup",
-    "started_at": "2026-04-21T02:58:46Z",
-    "worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity-06-cleanup"
-  },
+  "active_task": null,
   "base_branch": "import-testing-parity",
   "base_worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity",
   "created_at": "2026-04-20T22:51:07Z",
   "expedition": "import-testing-parity",
   "last_completed": {
-    "branch": "import-testing-parity-05-rtk-source-aware",
-    "completed_at": "2026-04-21T02:56:27Z",
+    "branch": "import-testing-parity-06-cleanup",
+    "completed_at": "2026-04-21T04:22:29Z",
     "kind": "task",
-    "number": 5,
+    "number": 6,
     "outcome": "kept",
-    "slug": "rtk-source-aware",
-    "summary": "Task 05: RTK-aware *_with_sources_* helpers direct tests",
-    "worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity-05-rtk-source-aware"
+    "slug": "cleanup",
+    "summary": "Task 06: remove legacy-only import tests superseded by provider-aware twins",
+    "worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity-06-cleanup"
   },
-  "next_action": "Complete work on `import-testing-parity-06-cleanup` in `/home/ketan/project/gnomon/.worktrees/import-testing-parity-06-cleanup`.",
-  "next_task_number": 6,
+  "next_action": "Create the next task branch from the rebased expedition base branch.",
+  "next_task_number": 7,
   "preserved_experiments": [],
   "primary_branch": "main",
   "schema_version": 1,
-  "status": "task_in_progress",
-  "updated_at": "2026-04-21T02:58:46Z"
+  "status": "ready_for_task",
+  "updated_at": "2026-04-21T04:22:29Z"
 }
