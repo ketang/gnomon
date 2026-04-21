@@ -86,14 +86,20 @@
 - Base branch rebased onto the primary branch.
 
 
+### 2026-04-21T02:58:46Z — Started task
+- Branch: `import-testing-parity-06-cleanup`.
+- Worktree: `/home/ketan/project/gnomon/.worktrees/import-testing-parity-06-cleanup`.
+- Base head at branch creation: `a38ff927bfd88fe62fc9df8e517ccb931c1d71f9`.
+
+
 ## RESUME HERE
 <!-- expedition-resume:start -->
 - Expedition: `import-testing-parity`
-- Status: `ready_for_task`
+- Status: `task_in_progress`
 - Base branch: `import-testing-parity`
 - Base worktree: `/home/ketan/project/gnomon/.worktrees/import-testing-parity`
-- Active task branch: `none`
-- Active task worktree: `none`
+- Active task branch: `import-testing-parity-06-cleanup`
+- Active task worktree: `/home/ketan/project/gnomon/.worktrees/import-testing-parity-06-cleanup`
 - Last completed: `import-testing-parity-05-rtk-source-aware (kept)`
-- Next action: Create the next task branch from the rebased expedition base branch.
+- Next action: Complete work on `import-testing-parity-06-cleanup` in `/home/ketan/project/gnomon/.worktrees/import-testing-parity-06-cleanup`.
 <!-- expedition-resume:end -->
