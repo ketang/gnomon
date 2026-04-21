@@ -1496,7 +1496,7 @@ mod tests {
         let fixture_path = temp.path().join("session.jsonl");
         std::fs::write(&fixture_path, CLASSIFICATION_FIXTURE)?;
 
-        let mut db = Database::open(&db_path)?;
+        let mut db = Database::open_unsharded(&db_path)?;
         let ids = seed_import_context(db.connection_mut(), "session.jsonl")?;
         let normalized = normalize_jsonl_file(
             db.connection_mut(),
@@ -1580,7 +1580,7 @@ mod tests {
         let fixture_path = temp.path().join("mixed.jsonl");
         std::fs::write(&fixture_path, MIXED_FIXTURE)?;
 
-        let mut db = Database::open(&db_path)?;
+        let mut db = Database::open_unsharded(&db_path)?;
         let ids = seed_import_context(db.connection_mut(), "mixed.jsonl")?;
         let normalized = normalize_jsonl_file(
             db.connection_mut(),
@@ -1656,7 +1656,7 @@ mod tests {
         let fixture_path = temp.path().join("skill-attribution.jsonl");
         std::fs::write(&fixture_path, SKILL_ATTRIBUTION_FIXTURE)?;
 
-        let mut db = Database::open(&db_path)?;
+        let mut db = Database::open_unsharded(&db_path)?;
         let ids = seed_import_context(db.connection_mut(), "skill-attribution.jsonl")?;
         let normalized = normalize_jsonl_file(
             db.connection_mut(),

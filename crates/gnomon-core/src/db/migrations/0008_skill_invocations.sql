@@ -1,5 +1,5 @@
 CREATE TABLE skill_invocation (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     import_chunk_id INTEGER NOT NULL REFERENCES import_chunk(id) ON DELETE CASCADE,
     history_event_id INTEGER NOT NULL REFERENCES history_event(id) ON DELETE CASCADE,
     source_file_id INTEGER NOT NULL REFERENCES source_file(id) ON DELETE CASCADE,

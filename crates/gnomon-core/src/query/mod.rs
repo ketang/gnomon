@@ -5603,7 +5603,7 @@ mod tests {
     #[test]
     fn latest_snapshot_bounds_detects_newer_published_chunks() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         let fixture = seed_query_fixture(conn, temp.path())?;
         let engine = QueryEngine::new(conn);
@@ -5680,7 +5680,7 @@ mod tests {
     #[test]
     fn snapshot_coverage_summary_uses_user_facing_units() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         seed_query_fixture(conn, temp.path())?;
         let engine = QueryEngine::new(conn);
@@ -5703,7 +5703,7 @@ mod tests {
     #[test]
     fn bootstrap_snapshot_has_empty_coverage_summary() -> Result<()> {
         let temp = tempdir()?;
-        let db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let engine = QueryEngine::new(db.connection());
 
         assert_eq!(
@@ -5717,7 +5717,7 @@ mod tests {
     #[test]
     fn history_events_are_queryable_by_session_id_and_timestamp() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         let fixture = seed_query_fixture(conn, temp.path())?;
 
@@ -5814,7 +5814,7 @@ mod tests {
     #[test]
     fn skill_invocations_join_to_sessions_and_preserve_unmatched_rows() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         let fixture = seed_query_fixture(conn, temp.path())?;
         let (matched_conversation_id, matched_transcript_source_file_id): (i64, i64) = conn
@@ -6076,7 +6076,7 @@ mod tests {
     fn skills_report_aggregates_session_associated_metrics_by_skill_project_and_session()
     -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         let fixture = seed_query_fixture(conn, temp.path())?;
 
@@ -6434,7 +6434,7 @@ mod tests {
     #[test]
     fn snapshot_bounds_ignore_incomplete_chunks() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
 
         let project_id = db.connection_mut().query_row(
             "
@@ -6473,7 +6473,7 @@ mod tests {
     #[test]
     fn pinned_snapshot_ignores_newer_chunks_until_refreshed() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         let fixture = seed_query_fixture(conn, temp.path())?;
         let engine = QueryEngine::new(conn);
@@ -6546,7 +6546,7 @@ mod tests {
     #[test]
     fn project_hierarchy_rolls_up_metrics_and_filters() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         let fixture = seed_query_fixture(conn, temp.path())?;
         let engine = QueryEngine::new(conn);
@@ -6624,7 +6624,7 @@ mod tests {
     #[test]
     fn zero_value_aggregate_rows_are_hidden_across_roots_and_filters() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         let fixture = seed_query_fixture(conn, temp.path())?;
         let project_a_root = temp.path().join("project-a");
@@ -6742,7 +6742,7 @@ mod tests {
     #[test]
     fn category_hierarchy_and_path_rollups_respect_explicit_file_refs() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         let fixture = seed_query_fixture(conn, temp.path())?;
         let engine = QueryEngine::new(conn);
@@ -6856,7 +6856,7 @@ mod tests {
     #[test]
     fn project_category_rows_surface_skill_attribution_only_for_attributed_actions() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         let fixture = seed_query_fixture(conn, temp.path())?;
         let project_a_root = temp.path().join("project-a");
@@ -6952,7 +6952,7 @@ mod tests {
     #[test]
     fn project_action_path_rows_surface_skill_attribution_per_attributed_leaf() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         let fixture = seed_query_fixture(conn, temp.path())?;
         let project_a_root = temp.path().join("project-a");
@@ -7055,7 +7055,7 @@ mod tests {
     #[test]
     fn browse_many_matches_individual_non_path_and_path_requests() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         let fixture = seed_query_fixture(conn, temp.path())?;
         let engine = QueryEngine::new(conn);
@@ -7128,7 +7128,7 @@ mod tests {
     #[test]
     fn browse_batch_single_path_matches_individual_browse() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         let fixture = seed_query_fixture(conn, temp.path())?;
         let engine = QueryEngine::new(conn);
@@ -7173,7 +7173,7 @@ mod tests {
     #[test]
     fn browse_batch_multi_parent_path_drill() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         let fixture = seed_query_fixture(conn, temp.path())?;
         let engine = QueryEngine::new(conn);
@@ -7234,7 +7234,7 @@ mod tests {
     #[test]
     fn browse_batch_into_cache_pairs_produces_valid_browse_requests() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         let fixture = seed_query_fixture(conn, temp.path())?;
         let engine = QueryEngine::new(conn);
@@ -7275,7 +7275,7 @@ mod tests {
     #[test]
     fn browse_batch_empty_paths_returns_empty_response() -> Result<()> {
         let temp = tempdir()?;
-        let db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let engine = QueryEngine::new(db.connection());
 
         let batch_response = engine.browse_batch(&BatchBrowseRequest {
@@ -7294,7 +7294,7 @@ mod tests {
     #[test]
     fn verbose_perf_logging_captures_per_node_browse_context() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         let fixture = seed_query_fixture(conn, temp.path())?;
         let log_path = temp.path().join("perf.jsonl");
@@ -7335,7 +7335,7 @@ mod tests {
     #[test]
     fn filter_options_expose_visible_projects_models_categories_and_actions() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         seed_query_fixture(conn, temp.path())?;
         let engine = QueryEngine::new(conn);
@@ -8296,7 +8296,7 @@ mod tests {
     #[test]
     fn browse_batch_multi_parent_grouped_matches_individual() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         let fixture = seed_query_fixture(conn, temp.path())?;
         let engine = QueryEngine::new(conn);
@@ -8341,7 +8341,7 @@ mod tests {
     #[test]
     fn browse_batch_single_element_matches_browse() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         let fixture = seed_query_fixture(conn, temp.path())?;
         let engine = QueryEngine::new(conn);
@@ -8381,7 +8381,7 @@ mod tests {
     #[test]
     fn browse_batch_empty_paths_returns_empty_results() -> Result<()> {
         let temp = tempdir()?;
-        let db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let engine = QueryEngine::new(db.connection());
         let snapshot = SnapshotBounds::bootstrap();
 
@@ -8400,7 +8400,7 @@ mod tests {
     #[test]
     fn browse_batch_path_browse_falls_back_to_individual() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let conn = db.connection_mut();
         let fixture = seed_query_fixture(conn, temp.path())?;
         let engine = QueryEngine::new(conn);

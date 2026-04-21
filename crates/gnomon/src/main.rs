@@ -2100,22 +2100,12 @@ mod tests {
                 .connection()
                 .query_row("SELECT COUNT(*) FROM source_file", [], |row| row.get(0))?;
 
-        // conversation is stored in the per-project shard DB (C1 sharding architecture).
-        let project_id: i64 =
+        // conversation is in a shard; Database::open configures the TEMP VIEW that
+        // surfaces it via the main DB's schema.
+        let conversation_count: i64 =
             database
                 .connection()
-                .query_row("SELECT id FROM project LIMIT 1", [], |row| row.get(0))?;
-        let shard_path = db_path
-            .parent()
-            .expect("db_path must have parent")
-            .join("shards")
-            .join(format!("{project_id}.sqlite3"));
-        let shard_database = Database::open(&shard_path)?;
-        let conversation_count: i64 = shard_database.connection().query_row(
-            "SELECT COUNT(*) FROM conversation",
-            [],
-            |row| row.get(0),
-        )?;
+                .query_row("SELECT COUNT(*) FROM conversation", [], |row| row.get(0))?;
 
         assert_eq!(source_file_count, 1);
         assert_eq!(conversation_count, 1);
@@ -2218,29 +2208,13 @@ mod tests {
         )?;
         assert_eq!(counts, (2, 0));
 
-        // import_warning is stored in per-project shard DBs (C1 sharding architecture).
-        // Search all shards for the warning row since files may span multiple projects.
-        let shards_dir = db_path
-            .parent()
-            .expect("db_path must have parent")
-            .join("shards");
-        let mut warning: Option<(String, String)> = None;
-        for shard_entry in std::fs::read_dir(&shards_dir)? {
-            let shard_path = shard_entry?.path();
-            if shard_path.extension().and_then(|s| s.to_str()) != Some("sqlite3") {
-                continue;
-            }
-            let shard_db = Database::open(&shard_path)?;
-            if let Ok(row) = shard_db.connection().query_row(
-                "SELECT code, message FROM import_warning LIMIT 1",
-                [],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            ) {
-                warning = Some(row);
-                break;
-            }
-        }
-        let warning = warning.context("no import_warning row found in any shard DB")?;
+        // import_warning is in a shard; Database::open configures a TEMP VIEW that
+        // aggregates it under the main DB's schema.
+        let warning: (String, String) = database.connection().query_row(
+            "SELECT code, message FROM import_warning LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
         assert_eq!(warning.0, "invalid_json");
         assert!(warning.1.contains(&bad_path.display().to_string()));
         assert!(warning.1.contains("line 2"));

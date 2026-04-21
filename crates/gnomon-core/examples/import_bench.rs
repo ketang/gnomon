@@ -347,22 +347,16 @@ fn touch_one_jsonl_file(root: &Path, relative_path: &str) -> Result<PathBuf> {
 }
 
 fn count_rows(db_path: &Path) -> Result<Vec<(String, i64)>> {
-    // Global DB: scheduling tables.
-    let global_conn = Connection::open(db_path)
+    // Open the main DB via `Database::open` so the TEMP VIEWs unioning shard data tables
+    // are configured. Unqualified counts (e.g. `SELECT COUNT(*) FROM message`) then resolve
+    // to the view and include rows from all shards.
+    let database = Database::open(db_path)
         .with_context(|| format!("unable to open db for row counts at {}", db_path.display()))?;
-    let global_tables = ["project", "source_file", "import_chunk"];
-    let mut out = Vec::new();
-    for table in global_tables {
-        let count: i64 = global_conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                row.get(0)
-            })
-            .unwrap_or(0);
-        out.push((table.to_string(), count));
-    }
-
-    // Shard DBs: data tables — aggregate across all per-project shards.
-    let shard_tables = [
+    let conn = database.connection();
+    let tables = [
+        "project",
+        "source_file",
+        "import_chunk",
         "conversation",
         "stream",
         "record",
@@ -371,37 +365,14 @@ fn count_rows(db_path: &Path) -> Result<Vec<(String, i64)>> {
         "turn",
         "action",
     ];
-    let mut shard_totals: std::collections::HashMap<&str, i64> =
-        shard_tables.iter().map(|t| (*t, 0i64)).collect();
-    let shards_dir = db_path
-        .parent()
-        .expect("db_path has no parent directory")
-        .join("shards");
-    if shards_dir.exists() {
-        for entry in std::fs::read_dir(&shards_dir).unwrap_or_else(|_| {
-            std::fs::read_dir(std::path::Path::new(".")).expect("fallback dir read failed")
-        }) {
-            let Ok(entry) = entry else { continue };
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("sqlite3") {
-                continue;
-            }
-            let Ok(shard_conn) = Connection::open(&path) else {
-                continue;
-            };
-            for table in shard_tables {
-                let count: i64 = shard_conn
-                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                        row.get(0)
-                    })
-                    .unwrap_or(0);
-                *shard_totals.entry(table).or_insert(0) += count;
-            }
-        }
+    let mut out = Vec::new();
+    for table in tables {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+        out.push((table.to_string(), count));
     }
-    for table in shard_tables {
-        out.push((table.to_string(), shard_totals[table]));
-    }
-
     Ok(out)
 }

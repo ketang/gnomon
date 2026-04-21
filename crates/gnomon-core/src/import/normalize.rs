@@ -2483,7 +2483,7 @@ mod tests {
         let fixture_path = temp.path().join("session.jsonl");
         std::fs::write(&fixture_path, MAIN_SESSION_FIXTURE)?;
 
-        let mut db = Database::open(&db_path)?;
+        let mut db = Database::open_unsharded(&db_path)?;
         let ids = seed_import_context(db.connection_mut(), "session.jsonl")?;
         let result = normalize_jsonl_file(
             db.connection_mut(),
@@ -2579,7 +2579,7 @@ mod tests {
         let fixture_path = temp.path().join("side.jsonl");
         std::fs::write(&fixture_path, SIDECHAIN_FIXTURE)?;
 
-        let mut db = Database::open(&db_path)?;
+        let mut db = Database::open_unsharded(&db_path)?;
         let ids = seed_import_context(db.connection_mut(), "side.jsonl")?;
         let result = normalize_jsonl_file(
             db.connection_mut(),
@@ -2632,7 +2632,7 @@ mod tests {
         let fixture_path = temp.path().join("session.jsonl");
         std::fs::write(&fixture_path, MAIN_SESSION_FIXTURE)?;
 
-        let mut db = Database::open(&db_path)?;
+        let mut db = Database::open_unsharded(&db_path)?;
         let ids = seed_import_context(db.connection_mut(), "session.jsonl")?;
         let result = normalize_jsonl_file(
             db.connection_mut(),
@@ -2850,7 +2850,7 @@ mod tests {
             ),
         )?;
 
-        let mut db = Database::open(&db_path)?;
+        let mut db = Database::open_unsharded(&db_path)?;
         let ids = seed_import_context(db.connection_mut(), "bad.jsonl")?;
         let outcome = normalize_jsonl_file(
             db.connection_mut(),
@@ -2896,7 +2896,7 @@ mod tests {
         let fixture_path = temp.path().join("snapshot-only.jsonl");
         std::fs::write(&fixture_path, SNAPSHOT_ONLY_FIXTURE)?;
 
-        let mut db = Database::open(&db_path)?;
+        let mut db = Database::open_unsharded(&db_path)?;
         let ids = seed_import_context(db.connection_mut(), "snapshot-only.jsonl")?;
         let result = normalize_jsonl_file(
             db.connection_mut(),
@@ -2937,7 +2937,7 @@ mod tests {
         std::fs::write(&first_fixture_path, MAIN_SESSION_FIXTURE)?;
         std::fs::write(&second_fixture_path, MAIN_SESSION_FIXTURE)?;
 
-        let mut db = Database::open(&db_path)?;
+        let mut db = Database::open_unsharded(&db_path)?;
         let first_ids = seed_import_context(db.connection_mut(), "first.jsonl")?;
         let second_ids = seed_second_source_file(
             db.connection_mut(),
@@ -3010,7 +3010,7 @@ mod tests {
         let fixture_path = temp.path().join("history.jsonl");
         std::fs::write(&fixture_path, HISTORY_FIXTURE)?;
 
-        let mut db = Database::open(&db_path)?;
+        let mut db = Database::open_unsharded(&db_path)?;
         let ids = seed_import_context_with_kind(
             db.connection_mut(),
             "history.jsonl",

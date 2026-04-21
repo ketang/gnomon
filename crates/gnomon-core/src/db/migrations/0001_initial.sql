@@ -46,7 +46,7 @@ CREATE INDEX idx_import_chunk_state_publish_seq
     ON import_chunk(state, publish_seq);
 
 CREATE TABLE conversation (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
     source_file_id INTEGER NOT NULL REFERENCES source_file(id) ON DELETE CASCADE,
     external_id TEXT,
@@ -62,7 +62,7 @@ CREATE INDEX idx_conversation_project_started_at
     ON conversation(project_id, started_at_utc);
 
 CREATE TABLE stream (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     conversation_id INTEGER NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
     import_chunk_id INTEGER NOT NULL REFERENCES import_chunk(id) ON DELETE CASCADE,
     external_id TEXT,
@@ -78,7 +78,7 @@ CREATE INDEX idx_stream_chunk_conversation_sequence
     ON stream(import_chunk_id, conversation_id, sequence_no);
 
 CREATE TABLE record (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     import_chunk_id INTEGER NOT NULL REFERENCES import_chunk(id) ON DELETE CASCADE,
     source_file_id INTEGER NOT NULL REFERENCES source_file(id) ON DELETE CASCADE,
     conversation_id INTEGER NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
@@ -98,7 +98,7 @@ CREATE INDEX idx_record_stream_sequence
     ON record(stream_id, sequence_no);
 
 CREATE TABLE message (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     stream_id INTEGER NOT NULL REFERENCES stream(id) ON DELETE CASCADE,
     conversation_id INTEGER NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
     import_chunk_id INTEGER NOT NULL REFERENCES import_chunk(id) ON DELETE CASCADE,
@@ -126,7 +126,7 @@ CREATE INDEX idx_message_conversation_role_sequence
     ON message(conversation_id, role, sequence_no);
 
 CREATE TABLE message_part (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id INTEGER NOT NULL REFERENCES message(id) ON DELETE CASCADE,
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
     part_kind TEXT NOT NULL,
@@ -140,7 +140,7 @@ CREATE TABLE message_part (
 );
 
 CREATE TABLE turn (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     stream_id INTEGER NOT NULL REFERENCES stream(id) ON DELETE CASCADE,
     conversation_id INTEGER NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
     import_chunk_id INTEGER NOT NULL REFERENCES import_chunk(id) ON DELETE CASCADE,
@@ -168,7 +168,7 @@ CREATE TABLE turn_message (
 );
 
 CREATE TABLE action (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     turn_id INTEGER NOT NULL REFERENCES turn(id) ON DELETE CASCADE,
     import_chunk_id INTEGER NOT NULL REFERENCES import_chunk(id) ON DELETE CASCADE,
     sequence_no INTEGER NOT NULL CHECK (sequence_no >= 0),
@@ -198,7 +198,7 @@ CREATE TABLE action_message (
 );
 
 CREATE TABLE path_node (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
     parent_id INTEGER REFERENCES path_node(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
@@ -213,7 +213,7 @@ CREATE INDEX idx_path_node_project_parent
     ON path_node(project_id, parent_id, name);
 
 CREATE TABLE message_path_ref (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id INTEGER NOT NULL REFERENCES message(id) ON DELETE CASCADE,
     message_part_id INTEGER REFERENCES message_part(id) ON DELETE SET NULL,
     path_node_id INTEGER NOT NULL REFERENCES path_node(id) ON DELETE CASCADE,
@@ -226,7 +226,7 @@ CREATE INDEX idx_message_path_ref_path_kind
     ON message_path_ref(path_node_id, ref_kind, message_id);
 
 CREATE TABLE import_warning (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     import_chunk_id INTEGER NOT NULL REFERENCES import_chunk(id) ON DELETE CASCADE,
     source_file_id INTEGER REFERENCES source_file(id) ON DELETE SET NULL,
     conversation_id INTEGER REFERENCES conversation(id) ON DELETE SET NULL,

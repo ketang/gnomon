@@ -1272,7 +1272,7 @@ mod tests {
         write_jsonl(&source_root.join("git/session.jsonl"), &repo_nested)?;
         write_jsonl(&source_root.join("path/session.jsonl"), &non_git_root)?;
 
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let report = scan_source_manifest(&mut db, &source_root)?;
 
         assert_eq!(
@@ -1390,7 +1390,7 @@ mod tests {
         gix::init(&repo_root)?;
         write_jsonl(&source_root.join("project/session.jsonl"), &cwd)?;
 
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let first_scan = scan_source_manifest(&mut db, &source_root)?;
         let second_scan = scan_source_manifest(&mut db, &source_root)?;
 
@@ -1422,7 +1422,7 @@ mod tests {
         gix::init(&repo_root)?;
         write_jsonl(&source_root.join("project/session.jsonl"), &cwd)?;
 
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         scan_source_manifest(&mut db, &source_root)?;
 
         let policy = ProjectIdentityPolicy::default();
@@ -1452,7 +1452,7 @@ mod tests {
         fs::create_dir_all(&tmp_project)?;
         write_jsonl(&source_root.join("tmp/session.jsonl"), &tmp_project)?;
 
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         scan_source_manifest(&mut db, &source_root)?;
 
         let exclude_rule = ProjectFilterRule {
@@ -1508,7 +1508,7 @@ mod tests {
         write_jsonl(&source_root.join("main/session.jsonl"), &main_cwd)?;
         write_jsonl(&source_root.join("worktree/session.jsonl"), &worktree_cwd)?;
 
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let report = scan_source_manifest(&mut db, &source_root)?;
         assert_eq!(report.discovered_source_files, 2);
 
@@ -1568,7 +1568,7 @@ mod tests {
             worktree_root.to_str().context("non-utf8 worktree path")?,
         ])?;
 
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let report = scan_source_manifest(&mut db, &source_root)?;
         assert_eq!(report.discovered_source_files, 1);
 
@@ -1617,7 +1617,7 @@ mod tests {
         write_jsonl(&source_root.join("clone-a/session.jsonl"), &clone_a_cwd)?;
         write_jsonl(&source_root.join("clone-b/session.jsonl"), &clone_b_cwd)?;
 
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let report = scan_source_manifest(&mut db, &source_root)?;
         assert_eq!(report.discovered_source_files, 2);
 
@@ -1655,7 +1655,7 @@ mod tests {
         write_jsonl(&source_root.join("a/session.jsonl"), &missing_a)?;
         write_jsonl(&source_root.join("b/session.jsonl"), &missing_b)?;
 
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let report = scan_source_manifest(&mut db, &source_root)?;
         assert_eq!(report.discovered_source_files, 2);
 
@@ -1735,7 +1735,7 @@ mod tests {
         write_jsonl(&source_root.join("a/session.jsonl"), &worktree_a_cwd)?;
         write_jsonl(&source_root.join("b/session.jsonl"), &worktree_b_cwd)?;
 
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let report = scan_source_manifest(&mut db, &source_root)?;
         assert_eq!(report.discovered_source_files, 2);
 
@@ -1796,7 +1796,7 @@ mod tests {
         let source_root = temp.path().join("source");
         fs::create_dir_all(&source_root)?;
 
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let report = scan_source_manifest(&mut db, &source_root)?;
 
         assert_eq!(report, ScanReport::default());
@@ -1814,7 +1814,7 @@ mod tests {
             "{\"sessionId\":\"session-1\",\"timestamp\":\"2026-03-26T08:00:00Z\",\"display\":\"hello\"}\n",
         )?;
 
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let report = scan_source_manifest(&mut db, &source_root)?;
 
         assert_eq!(report.discovered_source_files, 1);
@@ -1844,7 +1844,7 @@ mod tests {
         write_jsonl(&source_root.join("session2.jsonl"), &cwd)?;
         write_jsonl(&source_root.join("session3.jsonl"), &cwd)?;
 
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let report = scan_source_manifest(&mut db, &source_root)?;
 
         assert_eq!(report.discovered_source_files, 3);
@@ -1873,7 +1873,7 @@ mod tests {
         write_jsonl(&file1, &cwd)?;
         write_jsonl(&file2, &cwd)?;
 
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let first = scan_source_manifest(&mut db, &source_root)?;
         assert_eq!(first.inserted_source_files, 2);
 
@@ -1904,7 +1904,7 @@ mod tests {
         fs::create_dir_all(&cwd)?;
         write_jsonl(&source_root.join("session1.jsonl"), &cwd)?;
 
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let first = scan_source_manifest(&mut db, &source_root)?;
         assert_eq!(first.inserted_projects, 1);
         assert_eq!(first.inserted_source_files, 1);
@@ -1939,7 +1939,7 @@ mod tests {
         write_jsonl(&source_file_path, &cwd)?;
         write_jsonl(&sibling_file_path, &cwd)?;
 
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let first = scan_source_manifest(&mut db, &source_root)?;
         assert_eq!(first.inserted_source_files, 2);
 
@@ -1983,7 +1983,7 @@ mod tests {
 
         write_jsonl(&source_file_path, &stale_cwd)?;
 
-        let mut db = Database::open(&db_path)?;
+        let mut db = Database::open_unsharded(&db_path)?;
         let first = scan_source_manifest(&mut db, &source_root)?;
         assert_eq!(first.inserted_projects, 1);
         assert_eq!(first.inserted_source_files, 1);
@@ -2046,7 +2046,7 @@ mod tests {
         // Write a file whose only line is not valid JSON.
         fs::write(source_root.join("bad.jsonl"), "not valid json at all\n")?;
 
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let report = scan_source_manifest(&mut db, &source_root)?;
 
         // The file is discovered and stored, but with warnings.
@@ -2080,7 +2080,7 @@ mod tests {
         write_jsonl(&source_root.join("tmp/session.jsonl"), &tmp_project)?;
         write_jsonl(&source_root.join("repo/session.jsonl"), &repo_cwd)?;
 
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let report = scan_source_manifest_with_policy(
             &mut db,
             &source_root,
