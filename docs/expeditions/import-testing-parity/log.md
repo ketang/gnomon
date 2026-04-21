@@ -53,14 +53,21 @@
 - Base head at branch creation: `a7be7439d88e7504840a6b5399954a6c736eb5b3`.
 
 
+### 2026-04-21T00:16:30Z — Closed task
+- Branch: `import-testing-parity-03-codex-startup`.
+- Outcome: `kept`.
+- Summary: Task 03: Codex startup import tests (recent-first, timeout, full)
+- Base branch rebased onto the primary branch.
+
+
 ## RESUME HERE
 <!-- expedition-resume:start -->
 - Expedition: `import-testing-parity`
-- Status: `task_in_progress`
+- Status: `ready_for_task`
 - Base branch: `import-testing-parity`
 - Base worktree: `/home/ketan/project/gnomon/.worktrees/import-testing-parity`
-- Active task branch: `import-testing-parity-03-codex-startup`
-- Active task worktree: `/home/ketan/project/gnomon/.worktrees/import-testing-parity-03-codex-startup`
-- Last completed: `import-testing-parity-02-claude-fixture-corpus (kept)`
-- Next action: Complete work on `import-testing-parity-03-codex-startup` in `/home/ketan/project/gnomon/.worktrees/import-testing-parity-03-codex-startup`.
+- Active task branch: `none`
+- Active task worktree: `none`
+- Last completed: `import-testing-parity-03-codex-startup (kept)`
+- Next action: Create the next task branch from the rebased expedition base branch.
 <!-- expedition-resume:end -->
