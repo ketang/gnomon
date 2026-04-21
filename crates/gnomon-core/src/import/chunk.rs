@@ -3468,4 +3468,697 @@ mod tests {
         )
         .context("unable to insert a seeded codex rollout source file")
     }
+
+    fn write_truncated_codex_rollout_fixture(path: &Path) -> Result<i64> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let source_path = codex_fixture_root()
+            .join("sessions")
+            .join("2026")
+            .join("04")
+            .join("18")
+            .join("rollout-2026-04-18T12-00-00Z.jsonl");
+        let contents = fs::read_to_string(&source_path).with_context(|| {
+            format!(
+                "unable to read codex rollout fixture {}",
+                source_path.display()
+            )
+        })?;
+        let lines: Vec<&str> = contents.split_inclusive('\n').collect();
+        if lines.len() < 3 {
+            anyhow::bail!(
+                "codex rollout fixture {} is unexpectedly short; task 04 truncation helper needs \
+                 at least three lines to keep a valid prefix before the truncated line",
+                source_path.display()
+            );
+        }
+        let prefix: String = lines[..2].concat();
+        let truncated_tail = "{\"type\":\"user_message\",\"id\":\"user-truncated";
+        let written = format!("{prefix}{truncated_tail}");
+        fs::write(path, &written).with_context(|| format!("unable to write {}", path.display()))?;
+        i64::try_from(written.len()).context("truncated codex rollout fixture size exceeded i64")
+    }
+
+    fn write_codex_rollout_without_session_meta_fixture(path: &Path) -> Result<i64> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let source_path = codex_fixture_root()
+            .join("sessions")
+            .join("2026")
+            .join("04")
+            .join("18")
+            .join("rollout-2026-04-18T12-00-00Z.jsonl");
+        let contents = fs::read_to_string(&source_path).with_context(|| {
+            format!(
+                "unable to read codex rollout fixture {}",
+                source_path.display()
+            )
+        })?;
+        let lines: Vec<&str> = contents.split_inclusive('\n').collect();
+        if lines.is_empty() || !lines[0].contains("\"type\":\"session_meta\"") {
+            anyhow::bail!(
+                "codex rollout fixture {} did not start with a session_meta record; task 04 helper \
+                 relies on dropping the first line to remove session metadata",
+                source_path.display()
+            );
+        }
+        let written: String = lines[1..].concat();
+        fs::write(path, &written).with_context(|| format!("unable to write {}", path.display()))?;
+        i64::try_from(written.len())
+            .context("session-meta-less codex rollout fixture size exceeded i64")
+    }
+
+    fn write_malformed_codex_session_index_fixture(path: &Path) -> Result<i64> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = concat!(
+            "{\"session_id\":\"codex-session-1\",\"rollout_path\":\"sessions/2026/04/18/",
+            "rollout-2026-04-18T12-00-00Z.jsonl\",\"ts\":\"2026-04-18T12:00:00Z\"}\n",
+            "{\"session_id\":\"codex-session-2\",\"rollout_path\":\"sessions/2026/04/18/",
+            "rollout-2026-04-18T12-30-00Z.jsonl\",\"ts\":",
+        );
+        fs::write(path, content).with_context(|| format!("unable to write {}", path.display()))?;
+        i64::try_from(content.len()).context("malformed session index fixture size exceeded i64")
+    }
+
+    fn write_minimal_codex_rollout_fixture(path: &Path, session_id: &str) -> Result<i64> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = format!(
+            concat!(
+                "{{\"type\":\"session_meta\",\"session_id\":\"{session_id}\",",
+                "\"cli_version\":\"0.0.0-minimal\",\"cwd\":\"/tmp/redacted/project-a\",",
+                "\"model\":\"gpt-5.4-codex\"}}\n",
+                "{{\"type\":\"user_message\",\"id\":\"{session_id}-user\",",
+                "\"text\":\"rewritten content\"}}\n",
+            ),
+            session_id = session_id,
+        );
+        fs::write(path, &content).with_context(|| format!("unable to write {}", path.display()))?;
+        i64::try_from(content.len()).context("minimal codex rollout fixture size exceeded i64")
+    }
+
+    fn codex_rollout_event_counts_by_relative_path(
+        conn: &Connection,
+    ) -> Result<BTreeMap<String, i64>> {
+        let mut stmt = conn.prepare(
+            "
+            SELECT source_file.relative_path, COUNT(codex_rollout_event.id)
+            FROM source_file
+            LEFT JOIN codex_rollout_event
+                ON codex_rollout_event.source_file_id = source_file.id
+            WHERE source_file.source_provider = 'codex'
+                AND source_file.source_kind = 'rollout'
+            GROUP BY source_file.relative_path
+            ORDER BY source_file.relative_path
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<BTreeMap<_, _>>>()
+            .context("unable to collect codex rollout event counts by relative path")
+    }
+
+    #[test]
+    fn codex_import_completes_when_rollout_is_truncated_and_records_warning() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let sessions_root = source_root.join("sessions");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root)?;
+
+        let relative_path = "2026/04/18/rollout-codex-truncated.jsonl";
+        let rollout_path = sessions_root.join(relative_path);
+        let size_bytes = write_truncated_codex_rollout_fixture(&rollout_path)?;
+
+        let recent = Timestamp::now()
+            .checked_sub(1_i64.hours())
+            .context("unable to construct recent codex truncated test timestamp")?
+            .to_string();
+
+        let mut db = Database::open(&db_path)?;
+        let project_id = insert_project_with_root(
+            db.connection_mut(),
+            "path:/codex-truncated",
+            "codex-truncated",
+            &project_root,
+        )?;
+        let _ = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            relative_path,
+            &recent,
+            size_bytes,
+        )?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Codex,
+            SourceFileKind::Rollout,
+            sessions_root,
+        )]);
+
+        let startup = start_startup_import_with_options_and_sources(
+            db.connection(),
+            &db_path,
+            &sources,
+            Duration::from_secs(2),
+            StartupImportMode::RecentFirst,
+            ImportWorkerOptions::default(),
+            None,
+        )?;
+        startup.wait_for_completion()?;
+
+        let counts: (i64, i64) = db.connection().query_row(
+            "
+            SELECT
+                COUNT(*) FILTER (WHERE state = 'complete'),
+                COUNT(*) FILTER (WHERE state = 'failed')
+            FROM import_chunk
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(counts, (1, 0));
+
+        let warnings: Vec<String> = {
+            let mut stmt = db
+                .connection()
+                .prepare("SELECT message FROM import_warning ORDER BY id")?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains(&rollout_path.display().to_string()),
+            "warning should mention the truncated rollout path; got: {}",
+            warnings[0]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_import_completes_when_session_index_is_malformed_and_records_warning() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let sessions_root = source_root.join("sessions");
+        let session_index_path = source_root.join("session_index.jsonl");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root)?;
+
+        let rollout_relative_path = "2026/04/18/rollout-codex-good-alongside-bad-index.jsonl";
+        let rollout_path = sessions_root.join(rollout_relative_path);
+        let rollout_size = copy_codex_rollout_fixture(&rollout_path)?;
+        let _ = write_malformed_codex_session_index_fixture(&session_index_path)?;
+
+        let recent = Timestamp::now()
+            .checked_sub(1_i64.hours())
+            .context("unable to construct recent codex session-index test timestamp")?
+            .to_string();
+
+        let mut db = Database::open(&db_path)?;
+        let project_id = insert_project_with_root(
+            db.connection_mut(),
+            "path:/codex-session-index-malformed",
+            "codex-session-index-malformed",
+            &project_root,
+        )?;
+        let _ = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            rollout_relative_path,
+            &recent,
+            rollout_size,
+        )?;
+
+        let sources = ConfiguredSources::new(vec![
+            ConfiguredSource::directory(
+                SourceProvider::Codex,
+                SourceFileKind::Rollout,
+                sessions_root,
+            ),
+            ConfiguredSource::file(
+                SourceProvider::Codex,
+                SourceFileKind::SessionIndex,
+                session_index_path.clone(),
+            ),
+        ]);
+
+        scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+        let report =
+            import_all_with_sources_and_perf_logger(db.connection(), &db_path, &sources, None)?;
+        assert_eq!(report.deferred_failure_count, 0);
+
+        let failed_count: i64 = db.connection().query_row(
+            "SELECT COUNT(*) FROM import_chunk WHERE state = 'failed'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(failed_count, 0);
+
+        let warnings: Vec<String> = {
+            let mut stmt = db
+                .connection()
+                .prepare("SELECT message FROM import_warning ORDER BY id")?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mentions_index = warnings
+            .iter()
+            .any(|w| w.contains(&session_index_path.display().to_string()));
+        assert!(
+            mentions_index,
+            "expected an import_warning mentioning {}; saw: {:?}",
+            session_index_path.display(),
+            warnings
+        );
+
+        let rollout_session_count: i64 =
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM codex_rollout_session", [], |row| {
+                    row.get(0)
+                })?;
+        assert_eq!(
+            rollout_session_count, 1,
+            "rollout should still import when the session index is malformed"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_import_tolerates_rollout_missing_session_meta() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let sessions_root = source_root.join("sessions");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root)?;
+
+        let relative_path = "2026/04/18/rollout-codex-without-session-meta.jsonl";
+        let rollout_path = sessions_root.join(relative_path);
+        let size_bytes = write_codex_rollout_without_session_meta_fixture(&rollout_path)?;
+
+        let recent = Timestamp::now()
+            .checked_sub(1_i64.hours())
+            .context("unable to construct recent codex missing-meta test timestamp")?
+            .to_string();
+
+        let mut db = Database::open(&db_path)?;
+        let project_id = insert_project_with_root(
+            db.connection_mut(),
+            "path:/codex-missing-session-meta",
+            "codex-missing-session-meta",
+            &project_root,
+        )?;
+        let _ = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            relative_path,
+            &recent,
+            size_bytes,
+        )?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Codex,
+            SourceFileKind::Rollout,
+            sessions_root,
+        )]);
+
+        let startup = start_startup_import_with_options_and_sources(
+            db.connection(),
+            &db_path,
+            &sources,
+            Duration::from_secs(2),
+            StartupImportMode::RecentFirst,
+            ImportWorkerOptions::default(),
+            None,
+        )?;
+        startup.wait_for_completion()?;
+
+        let counts: (i64, i64) = db.connection().query_row(
+            "
+            SELECT
+                COUNT(*) FILTER (WHERE state = 'complete'),
+                COUNT(*) FILTER (WHERE state = 'failed')
+            FROM import_chunk
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(counts, (1, 0));
+
+        let session_row: (
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = db.connection().query_row(
+            "
+                SELECT COUNT(*), MAX(cli_version), MAX(originator), MAX(model_provider), \
+                 MAX(model_name)
+                FROM codex_rollout_session
+                ",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(
+            session_row.0, 1,
+            "rollout without session_meta should still yield one codex_rollout_session row"
+        );
+        assert!(
+            session_row.1.is_none()
+                && session_row.2.is_none()
+                && session_row.3.is_none()
+                && session_row.4.is_none(),
+            "session metadata fields should be NULL when session_meta is absent; got {session_row:?}"
+        );
+
+        let event_count: i64 =
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM codex_rollout_event", [], |row| {
+                    row.get(0)
+                })?;
+        assert!(
+            event_count >= 1,
+            "remaining non-meta rollout lines should import as events; got {event_count}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_import_plan_reimports_rollouts_when_import_schema_version_changes() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let tz = TimeZone::get("America/Chicago")?;
+        let now: Timestamp = "2026-04-18T18:00:00Z".parse()?;
+
+        let project_id = insert_project(
+            db.connection_mut(),
+            "path:/codex-schema-bump",
+            "codex-schema-bump",
+        )?;
+        let relative_path = "2026/04/18/rollout-codex-schema.jsonl";
+        let modified_at_utc = "2026-04-18T15:00:00Z";
+        let source_file_id = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            relative_path,
+            modified_at_utc,
+            4096,
+        )?;
+
+        db.connection_mut().execute(
+            "
+            UPDATE source_file
+            SET
+                imported_size_bytes = size_bytes,
+                imported_modified_at_utc = modified_at_utc,
+                imported_schema_version = 0
+            WHERE id = ?1
+            ",
+            [source_file_id],
+        )?;
+
+        let plan = build_import_plan(db.connection(), now, &tz)?;
+        let planned_projects: Vec<i64> = plan
+            .startup_chunks
+            .iter()
+            .map(|chunk| chunk.project_id)
+            .chain(plan.deferred_chunks.iter().map(|chunk| chunk.project_id))
+            .collect();
+        assert!(
+            planned_projects.contains(&project_id),
+            "codex rollout should be replanned when imported_schema_version is stale; \
+             plan: {planned_projects:?}"
+        );
+
+        db.connection_mut().execute(
+            "
+            UPDATE source_file
+            SET imported_schema_version = ?2
+            WHERE id = ?1
+            ",
+            params![source_file_id, crate::import::IMPORT_SCHEMA_VERSION],
+        )?;
+
+        let settled_plan = build_import_plan(db.connection(), now, &tz)?;
+        assert!(settled_plan.startup_chunks.is_empty());
+        assert!(settled_plan.deferred_chunks.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_import_reimports_rollout_when_mtime_changes_and_preserves_unchanged_rollouts()
+    -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let sessions_root = source_root.join("sessions");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root)?;
+
+        let first_relative_path = "2026/04/18/rollout-codex-mtime-first.jsonl";
+        let second_relative_path = "2026/04/18/rollout-codex-mtime-second.jsonl";
+        let first_path = sessions_root.join(first_relative_path);
+        let second_path = sessions_root.join(second_relative_path);
+        let _ = copy_codex_rollout_fixture(&first_path)?;
+        let _ = copy_codex_rollout_fixture(&second_path)?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Codex,
+            SourceFileKind::Rollout,
+            sessions_root.clone(),
+        )]);
+
+        let mut db = Database::open(&db_path)?;
+        scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+        let initial_report =
+            import_all_with_sources_and_perf_logger(db.connection(), &db_path, &sources, None)?;
+        assert_eq!(initial_report.deferred_failure_count, 0);
+
+        let original_counts = codex_rollout_event_counts_by_relative_path(db.connection())?;
+        let original_first = original_counts
+            .get(first_relative_path)
+            .copied()
+            .expect("first rollout event count row should exist after initial import");
+        let original_second = original_counts
+            .get(second_relative_path)
+            .copied()
+            .expect("second rollout event count row should exist after initial import");
+        assert_eq!(
+            (original_first, original_second),
+            (9, 9),
+            "both rollouts should import all nine events from the checked-in fixture"
+        );
+
+        thread::sleep(Duration::from_millis(1100));
+        let _ = write_minimal_codex_rollout_fixture(&first_path, "codex-mtime-rewritten")?;
+
+        scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+        let second_report =
+            import_all_with_sources_and_perf_logger(db.connection(), &db_path, &sources, None)?;
+        assert_eq!(second_report.deferred_failure_count, 0);
+
+        let updated_counts = codex_rollout_event_counts_by_relative_path(db.connection())?;
+        assert_eq!(
+            updated_counts.get(first_relative_path).copied(),
+            Some(2),
+            "rewritten rollout should be reimported with only the two new records as events; full \
+             counts: {updated_counts:?}"
+        );
+        assert_eq!(
+            updated_counts.get(second_relative_path).copied(),
+            Some(original_second),
+            "untouched rollout should keep its nine event rows; full counts: {updated_counts:?}"
+        );
+
+        let rewritten_session_id: Option<String> = db.connection().query_row(
+            "
+            SELECT crs.session_id
+            FROM codex_rollout_session crs
+            JOIN source_file sf ON sf.id = crs.source_file_id
+            WHERE sf.relative_path = ?1
+            ",
+            [first_relative_path],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            rewritten_session_id.as_deref(),
+            Some("codex-mtime-rewritten"),
+            "rewritten rollout's session_id should reflect the new session_meta record"
+        );
+
+        let _ = original_first;
+        let warnings: Vec<String> = {
+            let mut stmt = db
+                .connection()
+                .prepare("SELECT message FROM import_warning ORDER BY id")?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        assert!(
+            warnings
+                .iter()
+                .all(|w| !w.contains(&first_path.display().to_string())),
+            "rewritten valid rollout should not emit warnings for {}; saw: {:?}",
+            first_path.display(),
+            warnings
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_deferred_import_records_warnings_without_failure_status_updates() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let sessions_root = source_root.join("sessions");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root)?;
+
+        let startup_relative_path = "2026/04/18/rollout-codex-deferred-startup-bad.jsonl";
+        let deferred_one_relative_path = "2026/04/15/rollout-codex-deferred-older-one-bad.jsonl";
+        let deferred_two_relative_path = "2026/04/15/rollout-codex-deferred-older-two-bad.jsonl";
+        let startup_source_path = sessions_root.join(startup_relative_path);
+        let deferred_one_source_path = sessions_root.join(deferred_one_relative_path);
+        let deferred_two_source_path = sessions_root.join(deferred_two_relative_path);
+        let startup_size = write_truncated_codex_rollout_fixture(&startup_source_path)?;
+        let deferred_one_size = write_truncated_codex_rollout_fixture(&deferred_one_source_path)?;
+        let deferred_two_size = write_truncated_codex_rollout_fixture(&deferred_two_source_path)?;
+
+        let recent = Timestamp::now()
+            .checked_sub(1_i64.hours())
+            .context("unable to construct recent codex deferred-isolation timestamp")?
+            .to_string();
+        let older_one = Timestamp::now()
+            .checked_sub(72_i64.hours())
+            .context("unable to construct older codex deferred-isolation timestamp")?
+            .to_string();
+        let older_two = Timestamp::now()
+            .checked_sub(96_i64.hours())
+            .context("unable to construct second older codex deferred-isolation timestamp")?
+            .to_string();
+
+        let mut db = Database::open(&db_path)?;
+        let project_id = insert_project_with_root(
+            db.connection_mut(),
+            "path:/codex-deferred-isolation",
+            "codex-deferred-isolation",
+            &project_root,
+        )?;
+        let _ = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            startup_relative_path,
+            &recent,
+            startup_size,
+        )?;
+        let _ = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            deferred_one_relative_path,
+            &older_one,
+            deferred_one_size,
+        )?;
+        let _ = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            deferred_two_relative_path,
+            &older_two,
+            deferred_two_size,
+        )?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Codex,
+            SourceFileKind::Rollout,
+            sessions_root,
+        )]);
+
+        let mut startup = start_startup_import_with_options_and_sources(
+            db.connection(),
+            &db_path,
+            &sources,
+            Duration::from_secs(2),
+            StartupImportMode::RecentFirst,
+            ImportWorkerOptions::default(),
+            None,
+        )?;
+        let status_updates = startup
+            .take_status_updates()
+            .context("missing deferred status update receiver")?;
+        loop {
+            match status_updates.recv_timeout(Duration::from_secs(2))? {
+                StartupWorkerEvent::DeferredFailures { .. } => {
+                    panic!("unexpected deferred failure update for codex warning-only imports")
+                }
+                StartupWorkerEvent::Finished => break,
+                StartupWorkerEvent::Progress { .. } | StartupWorkerEvent::StartupSettled { .. } => {
+                    continue;
+                }
+            }
+        }
+        startup.wait_for_completion()?;
+
+        let counts: (i64, i64) = db.connection().query_row(
+            "
+            SELECT
+                COUNT(*) FILTER (WHERE state = 'complete'),
+                COUNT(*) FILTER (WHERE state = 'failed')
+            FROM import_chunk
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(counts, (3, 0));
+
+        let warnings: Vec<String> = {
+            let mut stmt = db
+                .connection()
+                .prepare("SELECT message FROM import_warning ORDER BY id")?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mention_count = |needle: &Path| {
+            let needle = needle.display().to_string();
+            warnings.iter().filter(|w| w.contains(&needle)).count()
+        };
+        assert_eq!(mention_count(&startup_source_path), 1);
+        assert_eq!(mention_count(&deferred_one_source_path), 1);
+        assert_eq!(mention_count(&deferred_two_source_path), 1);
+
+        Ok(())
+    }
 }
