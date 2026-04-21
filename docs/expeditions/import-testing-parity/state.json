@@ -1,32 +1,24 @@
 {
-  "active_task": {
-    "base_head": "4cc56590c6b91346183e2f3af4d9bf47626183c2",
-    "branch": "import-testing-parity-05-rtk-source-aware",
-    "kind": "task",
-    "number": 5,
-    "slug": "rtk-source-aware",
-    "started_at": "2026-04-21T02:21:59Z",
-    "worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity-05-rtk-source-aware"
-  },
+  "active_task": null,
   "base_branch": "import-testing-parity",
   "base_worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity",
   "created_at": "2026-04-20T22:51:07Z",
   "expedition": "import-testing-parity",
   "last_completed": {
-    "branch": "import-testing-parity-04-codex-warnings-reimport",
-    "completed_at": "2026-04-21T02:17:38Z",
+    "branch": "import-testing-parity-05-rtk-source-aware",
+    "completed_at": "2026-04-21T02:56:27Z",
     "kind": "task",
-    "number": 4,
+    "number": 5,
     "outcome": "kept",
-    "slug": "codex-warnings-reimport",
-    "summary": "Task 04: Codex warning, reimport, schema-bump regression tests",
-    "worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity-04-codex-warnings-reimport"
+    "slug": "rtk-source-aware",
+    "summary": "Task 05: RTK-aware *_with_sources_* helpers direct tests",
+    "worktree": "/home/ketan/project/gnomon/.worktrees/import-testing-parity-05-rtk-source-aware"
   },
-  "next_action": "Complete work on `import-testing-parity-05-rtk-source-aware` in `/home/ketan/project/gnomon/.worktrees/import-testing-parity-05-rtk-source-aware`.",
-  "next_task_number": 5,
+  "next_action": "Create the next task branch from the rebased expedition base branch.",
+  "next_task_number": 6,
   "preserved_experiments": [],
   "primary_branch": "main",
   "schema_version": 1,
-  "status": "task_in_progress",
-  "updated_at": "2026-04-21T02:21:59Z"
+  "status": "ready_for_task",
+  "updated_at": "2026-04-21T02:56:27Z"
 }

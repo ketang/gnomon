@@ -79,14 +79,21 @@
 - Base head at branch creation: `4cc56590c6b91346183e2f3af4d9bf47626183c2`.
 
 
+### 2026-04-21T02:56:27Z — Closed task
+- Branch: `import-testing-parity-05-rtk-source-aware`.
+- Outcome: `kept`.
+- Summary: Task 05: RTK-aware *_with_sources_* helpers direct tests
+- Base branch rebased onto the primary branch.
+
+
 ## RESUME HERE
 <!-- expedition-resume:start -->
 - Expedition: `import-testing-parity`
-- Status: `task_in_progress`
+- Status: `ready_for_task`
 - Base branch: `import-testing-parity`
 - Base worktree: `/home/ketan/project/gnomon/.worktrees/import-testing-parity`
-- Active task branch: `import-testing-parity-05-rtk-source-aware`
-- Active task worktree: `/home/ketan/project/gnomon/.worktrees/import-testing-parity-05-rtk-source-aware`
-- Last completed: `import-testing-parity-04-codex-warnings-reimport (kept)`
-- Next action: Complete work on `import-testing-parity-05-rtk-source-aware` in `/home/ketan/project/gnomon/.worktrees/import-testing-parity-05-rtk-source-aware`.
+- Active task branch: `none`
+- Active task worktree: `none`
+- Last completed: `import-testing-parity-05-rtk-source-aware (kept)`
+- Next action: Create the next task branch from the rebased expedition base branch.
 <!-- expedition-resume:end -->

@@ -3,9 +3,9 @@
 - Expedition: `import-testing-parity`
 - Base branch: `import-testing-parity`
 - Base worktree: `/home/ketan/project/gnomon/.worktrees/import-testing-parity`
-- Status: `task_in_progress`
-- Active task branch: `import-testing-parity-05-rtk-source-aware`
-- Active task worktree: `/home/ketan/project/gnomon/.worktrees/import-testing-parity-05-rtk-source-aware`
-- Last completed: `import-testing-parity-04-codex-warnings-reimport (kept)`
-- Next action: Complete work on `import-testing-parity-05-rtk-source-aware` in `/home/ketan/project/gnomon/.worktrees/import-testing-parity-05-rtk-source-aware`.
+- Status: `ready_for_task`
+- Active task branch: `none`
+- Active task worktree: `none`
+- Last completed: `import-testing-parity-05-rtk-source-aware (kept)`
+- Next action: Create the next task branch from the rebased expedition base branch.
 - Primary branch: `main`
