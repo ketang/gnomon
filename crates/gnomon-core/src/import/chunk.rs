@@ -1915,9 +1915,11 @@ mod tests {
     use super::{
         ImportWorkerOptions, StartupImportMode, StartupOpenReason, StartupWorkerEvent,
         build_import_plan, import_all, import_all_with_sources_and_perf_logger,
-        start_startup_import_with_options, start_startup_import_with_options_and_sources,
+        import_all_with_sources_and_rtk, start_startup_import_with_options,
+        start_startup_import_with_options_and_sources,
+        start_startup_import_with_sources_and_mode_and_rtk,
     };
-    use crate::config::ProjectIdentityPolicy;
+    use crate::config::{ProjectIdentityPolicy, RtkConfig};
     use crate::db::Database;
     use crate::import::{scan_source_manifest, scan_sources_manifest_with_policy};
     use crate::sources::{ConfiguredSource, ConfiguredSources, SourceFileKind, SourceProvider};
@@ -4158,6 +4160,472 @@ mod tests {
         assert_eq!(mention_count(&startup_source_path), 1);
         assert_eq!(mention_count(&deferred_one_source_path), 1);
         assert_eq!(mention_count(&deferred_two_source_path), 1);
+
+        Ok(())
+    }
+
+    // --- Task 05: RTK-aware `*_with_sources_*` helpers -----------------------
+
+    const RTK_BASH_COMMAND: &str = "cargo test";
+    const RTK_SAVED_TOKENS: i64 = 512;
+    const RTK_SAVINGS_PCT: f64 = 42.5;
+    const RTK_EXEC_TIME_MS: i64 = 137;
+
+    struct RtkTestTimestamps {
+        tool_use: String,
+        tool_result: String,
+        rtk_row: String,
+    }
+
+    /// Builds a triple of event timestamps all pinned to the same local
+    /// calendar day as the test run. The RTK match pipeline derives
+    /// `chunk_day_local` from each source file's filesystem mtime; by using
+    /// timestamps on today's local date for every moving part (action events,
+    /// RTK row, and file mtime — which fs::write sets to "now"), we keep the
+    /// match window aligned regardless of the system time zone.
+    fn rtk_test_timestamps() -> RtkTestTimestamps {
+        let local_date = Timestamp::now()
+            .to_zoned(TimeZone::system())
+            .date()
+            .to_string();
+        RtkTestTimestamps {
+            tool_use: format!("{local_date}T12:00:01Z"),
+            tool_result: format!("{local_date}T12:00:02Z"),
+            rtk_row: format!("{local_date}T12:00:02.500+00:00"),
+        }
+    }
+
+    struct RtkSeedRow {
+        timestamp: String,
+        original_cmd: String,
+        saved_tokens: i64,
+        savings_pct: f64,
+        exec_time_ms: i64,
+        project_path: String,
+    }
+
+    fn write_claude_bash_session_fixture(
+        path: &Path,
+        session_id: &str,
+        cwd: &Path,
+        tool_use_timestamp: &str,
+        tool_result_timestamp: &str,
+        command: &str,
+    ) -> Result<i64> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let content = format!(
+            concat!(
+                "{{\"type\":\"user\",\"uuid\":\"{session_id}-user\",\"timestamp\":\"{user_ts}\",\"sessionId\":\"{session_id}\",\"cwd\":\"{cwd}\",\"message\":{{\"role\":\"user\",\"content\":\"Run the tests\"}}}}\n",
+                "{{\"type\":\"assistant\",\"uuid\":\"{session_id}-assistant\",\"timestamp\":\"{tool_use_ts}\",\"sessionId\":\"{session_id}\",\"message\":{{\"id\":\"msg-{session_id}\",\"role\":\"assistant\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu-{session_id}\",\"name\":\"Bash\",\"input\":{{\"command\":\"{command}\"}}}}],\"usage\":{{\"input_tokens\":3,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":1}},\"model\":\"claude-haiku\",\"stop_reason\":\"tool_use\"}}}}\n",
+                "{{\"type\":\"user\",\"uuid\":\"{session_id}-tool-result\",\"timestamp\":\"{tool_result_ts}\",\"sessionId\":\"{session_id}\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"toolu-{session_id}\",\"content\":\"ok\",\"is_error\":false}}]}}}}\n"
+            ),
+            session_id = session_id,
+            cwd = cwd.display(),
+            user_ts = tool_use_timestamp,
+            tool_use_ts = tool_use_timestamp,
+            tool_result_ts = tool_result_timestamp,
+            command = command,
+        );
+
+        fs::write(path, &content).with_context(|| format!("unable to write {}", path.display()))?;
+        i64::try_from(content.len()).context("fixture size exceeded i64")
+    }
+
+    fn seed_rtk_history_db(rtk_db_path: &Path, rows: &[RtkSeedRow]) -> Result<()> {
+        if let Some(parent) = rtk_db_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let conn = Connection::open(rtk_db_path)
+            .with_context(|| format!("unable to open rtk db at {}", rtk_db_path.display()))?;
+        conn.execute_batch(
+            "
+            CREATE TABLE commands (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp     TEXT NOT NULL,
+                original_cmd  TEXT NOT NULL,
+                saved_tokens  INTEGER NOT NULL,
+                savings_pct   REAL    NOT NULL,
+                exec_time_ms  INTEGER NOT NULL,
+                project_path  TEXT NOT NULL
+            );
+            ",
+        )?;
+        for row in rows {
+            conn.execute(
+                "INSERT INTO commands
+                    (timestamp, original_cmd, saved_tokens, savings_pct, exec_time_ms, project_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    row.timestamp,
+                    row.original_cmd,
+                    row.saved_tokens,
+                    row.savings_pct,
+                    row.exec_time_ms,
+                    row.project_path,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn rtk_config_for_path(rtk_db_path: &Path) -> RtkConfig {
+        RtkConfig {
+            enabled: true,
+            db_path: rtk_db_path.display().to_string(),
+            pre_slack_ms: 2000,
+            post_slack_ms: 30000,
+        }
+    }
+
+    fn fetch_action_rtk_match_rows(conn: &Connection) -> Result<Vec<(i64, i64, f64, i64)>> {
+        let mut stmt = conn.prepare(
+            "SELECT rtk_row_id, saved_tokens, savings_pct, exec_time_ms
+             FROM action_rtk_match
+             ORDER BY action_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    #[test]
+    fn import_all_with_sources_and_rtk_matches_bash_commands_via_configured_sources() -> Result<()>
+    {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let claude_projects = temp.path().join("claude").join("projects");
+        let project_root = temp.path().join("project");
+        let project_cwd = project_root.join("workspace");
+        fs::create_dir_all(&project_cwd)?;
+        gix::init(&project_root)?;
+
+        let ts = rtk_test_timestamps();
+        let _ = write_claude_bash_session_fixture(
+            &claude_projects.join("project/session.jsonl"),
+            "claude-rtk-session",
+            &project_cwd,
+            &ts.tool_use,
+            &ts.tool_result,
+            RTK_BASH_COMMAND,
+        )?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Claude,
+            SourceFileKind::Transcript,
+            claude_projects,
+        )]);
+
+        let rtk_db_path = temp.path().join("rtk").join("history.db");
+        seed_rtk_history_db(
+            &rtk_db_path,
+            &[RtkSeedRow {
+                timestamp: ts.rtk_row.clone(),
+                original_cmd: RTK_BASH_COMMAND.to_string(),
+                saved_tokens: RTK_SAVED_TOKENS,
+                savings_pct: RTK_SAVINGS_PCT,
+                exec_time_ms: RTK_EXEC_TIME_MS,
+                project_path: project_root.display().to_string(),
+            }],
+        )?;
+
+        let mut db = Database::open(&db_path)?;
+        scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+
+        let rtk_config = rtk_config_for_path(&rtk_db_path);
+        let report =
+            import_all_with_sources_and_rtk(db.connection(), &db_path, &sources, Some(rtk_config))?;
+        assert_eq!(report.deferred_failure_count, 0);
+        assert!(report.deferred_failure_summary.is_none());
+
+        let matches = fetch_action_rtk_match_rows(db.connection())?;
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one RTK match for the Claude Bash action via non-legacy \
+             ConfiguredSources"
+        );
+        let (rtk_row_id, saved_tokens, savings_pct, exec_time_ms) = matches[0];
+        assert_eq!(rtk_row_id, 1);
+        assert_eq!(saved_tokens, RTK_SAVED_TOKENS);
+        assert!((savings_pct - RTK_SAVINGS_PCT).abs() < f64::EPSILON);
+        assert_eq!(exec_time_ms, RTK_EXEC_TIME_MS);
+
+        Ok(())
+    }
+
+    #[test]
+    fn import_all_with_sources_and_rtk_no_ops_when_config_disabled_via_configured_sources()
+    -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let claude_projects = temp.path().join("claude").join("projects");
+        let project_root = temp.path().join("project");
+        let project_cwd = project_root.join("workspace");
+        fs::create_dir_all(&project_cwd)?;
+        gix::init(&project_root)?;
+
+        let ts = rtk_test_timestamps();
+        let _ = write_claude_bash_session_fixture(
+            &claude_projects.join("project/session.jsonl"),
+            "claude-rtk-disabled",
+            &project_cwd,
+            &ts.tool_use,
+            &ts.tool_result,
+            RTK_BASH_COMMAND,
+        )?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Claude,
+            SourceFileKind::Transcript,
+            claude_projects,
+        )]);
+
+        let rtk_db_path = temp.path().join("rtk").join("history.db");
+        seed_rtk_history_db(
+            &rtk_db_path,
+            &[RtkSeedRow {
+                timestamp: ts.rtk_row.clone(),
+                original_cmd: RTK_BASH_COMMAND.to_string(),
+                saved_tokens: RTK_SAVED_TOKENS,
+                savings_pct: RTK_SAVINGS_PCT,
+                exec_time_ms: RTK_EXEC_TIME_MS,
+                project_path: project_root.display().to_string(),
+            }],
+        )?;
+
+        let mut db = Database::open(&db_path)?;
+        scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+
+        let mut disabled_config = rtk_config_for_path(&rtk_db_path);
+        disabled_config.enabled = false;
+        let report = import_all_with_sources_and_rtk(
+            db.connection(),
+            &db_path,
+            &sources,
+            Some(disabled_config),
+        )?;
+        assert_eq!(report.deferred_failure_count, 0);
+
+        let matches = fetch_action_rtk_match_rows(db.connection())?;
+        assert!(
+            matches.is_empty(),
+            "disabled RtkConfig must leave action_rtk_match empty even when the RTK db and a \
+             matching action exist"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn start_startup_import_with_sources_and_mode_and_rtk_matches_bash_commands_via_configured_sources()
+    -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let claude_projects = temp.path().join("claude").join("projects");
+        let project_root = temp.path().join("project");
+        let project_cwd = project_root.join("workspace");
+        fs::create_dir_all(&project_cwd)?;
+        gix::init(&project_root)?;
+
+        let ts = rtk_test_timestamps();
+        let _ = write_claude_bash_session_fixture(
+            &claude_projects.join("project/session.jsonl"),
+            "claude-startup-rtk",
+            &project_cwd,
+            &ts.tool_use,
+            &ts.tool_result,
+            RTK_BASH_COMMAND,
+        )?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Claude,
+            SourceFileKind::Transcript,
+            claude_projects,
+        )]);
+
+        let rtk_db_path = temp.path().join("rtk").join("history.db");
+        seed_rtk_history_db(
+            &rtk_db_path,
+            &[RtkSeedRow {
+                timestamp: ts.rtk_row.clone(),
+                original_cmd: RTK_BASH_COMMAND.to_string(),
+                saved_tokens: RTK_SAVED_TOKENS,
+                savings_pct: RTK_SAVINGS_PCT,
+                exec_time_ms: RTK_EXEC_TIME_MS,
+                project_path: project_root.display().to_string(),
+            }],
+        )?;
+
+        let mut db = Database::open(&db_path)?;
+        scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+
+        let rtk_config = rtk_config_for_path(&rtk_db_path);
+        let startup = start_startup_import_with_sources_and_mode_and_rtk(
+            db.connection(),
+            &db_path,
+            &sources,
+            StartupImportMode::Full,
+            Some(rtk_config),
+            |_| {},
+        )?;
+        startup.wait_for_completion()?;
+
+        let matches = fetch_action_rtk_match_rows(db.connection())?;
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected one RTK match after startup import via \
+             start_startup_import_with_sources_and_mode_and_rtk"
+        );
+        let (rtk_row_id, saved_tokens, savings_pct, exec_time_ms) = matches[0];
+        assert_eq!(rtk_row_id, 1);
+        assert_eq!(saved_tokens, RTK_SAVED_TOKENS);
+        assert!((savings_pct - RTK_SAVINGS_PCT).abs() < f64::EPSILON);
+        assert_eq!(exec_time_ms, RTK_EXEC_TIME_MS);
+
+        Ok(())
+    }
+
+    #[test]
+    fn import_all_with_sources_and_rtk_imports_mixed_provider_sources_end_to_end() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let claude_projects = temp.path().join("claude").join("projects");
+        let claude_history = temp.path().join("claude").join("history.jsonl");
+        let project_root = temp.path().join("project");
+        let project_cwd = project_root.join("workspace");
+        fs::create_dir_all(&project_cwd)?;
+        gix::init(&project_root)?;
+
+        let ts = rtk_test_timestamps();
+        let _ = write_claude_bash_session_fixture(
+            &claude_projects.join("project/session.jsonl"),
+            "mixed-claude-session",
+            &project_cwd,
+            &ts.tool_use,
+            &ts.tool_result,
+            RTK_BASH_COMMAND,
+        )?;
+        fs::write(
+            &claude_history,
+            "{\"sessionId\":\"mixed-claude-history\",\"timestamp\":\"2026-03-26T11:00:00Z\",\"display\":\"hello\"}\n",
+        )?;
+
+        let codex_root = codex_fixture_root();
+        let sources = ConfiguredSources::new(vec![
+            ConfiguredSource::directory(
+                SourceProvider::Claude,
+                SourceFileKind::Transcript,
+                claude_projects,
+            ),
+            ConfiguredSource::file(
+                SourceProvider::Claude,
+                SourceFileKind::History,
+                claude_history,
+            ),
+            ConfiguredSource::directory(
+                SourceProvider::Codex,
+                SourceFileKind::Rollout,
+                codex_root.join("sessions"),
+            ),
+            ConfiguredSource::file(
+                SourceProvider::Codex,
+                SourceFileKind::History,
+                codex_root.join("history.jsonl"),
+            ),
+            ConfiguredSource::file(
+                SourceProvider::Codex,
+                SourceFileKind::SessionIndex,
+                codex_root.join("session_index.jsonl"),
+            ),
+        ]);
+
+        let rtk_db_path = temp.path().join("rtk").join("history.db");
+        seed_rtk_history_db(
+            &rtk_db_path,
+            &[RtkSeedRow {
+                timestamp: ts.rtk_row.clone(),
+                original_cmd: RTK_BASH_COMMAND.to_string(),
+                saved_tokens: RTK_SAVED_TOKENS,
+                savings_pct: RTK_SAVINGS_PCT,
+                exec_time_ms: RTK_EXEC_TIME_MS,
+                project_path: project_root.display().to_string(),
+            }],
+        )?;
+
+        let mut db = Database::open(&db_path)?;
+        let scan_report = scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+        assert_eq!(scan_report.discovered_source_files, 5);
+
+        let rtk_config = rtk_config_for_path(&rtk_db_path);
+        let report =
+            import_all_with_sources_and_rtk(db.connection(), &db_path, &sources, Some(rtk_config))?;
+        assert_eq!(report.deferred_failure_count, 0);
+        assert!(report.deferred_failure_summary.is_none());
+
+        let counts: (i64, i64, i64, i64, i64) = db.connection().query_row(
+            "
+            SELECT
+                (SELECT COUNT(*) FROM source_file WHERE imported_schema_version = ?1),
+                (SELECT COUNT(*) FROM conversation),
+                (SELECT COUNT(*) FROM history_event),
+                (SELECT COUNT(*) FROM codex_rollout_session),
+                (SELECT COUNT(*) FROM codex_session_index_entry)
+            ",
+            params![crate::import::IMPORT_SCHEMA_VERSION],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(counts.0, 5, "all five mixed-provider source files imported");
+        assert_eq!(counts.1, 2, "one Claude + one Codex rollout conversation");
+        assert_eq!(counts.2, 2, "one Claude + one Codex history event");
+        assert_eq!(counts.3, 1, "codex rollout session recorded");
+        assert_eq!(counts.4, 1, "codex session index entry recorded");
+
+        let matches = fetch_action_rtk_match_rows(db.connection())?;
+        assert_eq!(
+            matches.len(),
+            1,
+            "only the Claude Bash action should match the seeded RTK row even when Codex sources \
+             are imported alongside Claude"
+        );
+        let (rtk_row_id, saved_tokens, _savings_pct, exec_time_ms) = matches[0];
+        assert_eq!(rtk_row_id, 1);
+        assert_eq!(saved_tokens, RTK_SAVED_TOKENS);
+        assert_eq!(exec_time_ms, RTK_EXEC_TIME_MS);
 
         Ok(())
     }
