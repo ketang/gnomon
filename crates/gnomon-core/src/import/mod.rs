@@ -174,6 +174,9 @@ mod chunk;
 mod normalize;
 pub(crate) mod rtk;
 
+#[cfg(test)]
+mod test_fixtures;
+
 pub use chunk::{
     ImportExecutionReport, StartupImport, StartupImportMode, StartupOpenReason,
     StartupProgressUpdate, StartupWorkerEvent, import_all, import_all_with_perf_logger,
