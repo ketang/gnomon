@@ -1915,7 +1915,7 @@ mod tests {
     use super::{
         ImportWorkerOptions, StartupImportMode, StartupOpenReason, StartupWorkerEvent,
         build_import_plan, import_all, import_all_with_sources_and_perf_logger,
-        start_startup_import_with_options,
+        start_startup_import_with_options, start_startup_import_with_options_and_sources,
     };
     use crate::config::ProjectIdentityPolicy;
     use crate::db::Database;
@@ -2287,6 +2287,274 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(complete_count, 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_startup_import_opens_when_last_24h_slice_is_ready() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let sessions_root = source_root.join("sessions");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root)?;
+
+        let relative_path = "2026/04/18/rollout-codex-startup-ready.jsonl";
+        let rollout_path = sessions_root.join(relative_path);
+        let size_bytes = copy_codex_rollout_fixture(&rollout_path)?;
+
+        let recent = Timestamp::now()
+            .checked_sub(1_i64.hours())
+            .context("unable to construct recent codex startup test timestamp")?
+            .to_string();
+
+        let mut db = Database::open(&db_path)?;
+        let project_id = insert_project_with_root(
+            db.connection_mut(),
+            "path:/codex-startup-ready",
+            "codex-startup-ready",
+            &project_root,
+        )?;
+        let _ = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            relative_path,
+            &recent,
+            size_bytes,
+        )?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Codex,
+            SourceFileKind::Rollout,
+            sessions_root,
+        )]);
+
+        let startup = start_startup_import_with_options_and_sources(
+            db.connection(),
+            &db_path,
+            &sources,
+            Duration::from_secs(2),
+            StartupImportMode::RecentFirst,
+            ImportWorkerOptions::default(),
+            None,
+        )?;
+
+        assert_eq!(startup.open_reason, StartupOpenReason::Last24hReady);
+        assert_eq!(startup.snapshot.max_publish_seq, 1);
+        assert_eq!(startup.startup_status_message, None);
+        startup.wait_for_completion()?;
+
+        let state: (String, Option<i64>) = db.connection().query_row(
+            "SELECT state, publish_seq FROM import_chunk",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(state.0, "complete");
+        assert_eq!(state.1, Some(1));
+
+        let rollout_counts: (i64, i64) = db.connection().query_row(
+            "
+            SELECT
+                (SELECT COUNT(*) FROM codex_rollout_session),
+                (SELECT COUNT(*) FROM codex_rollout_event)
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            rollout_counts,
+            (1, 9),
+            "checked-in fixture has one session and nine rollout events"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_startup_timeout_still_allows_background_import_to_finish() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let sessions_root = source_root.join("sessions");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root)?;
+
+        let recent_relative_path = "2026/04/18/rollout-codex-startup-timeout-recent.jsonl";
+        let older_relative_path = "2026/04/15/rollout-codex-startup-timeout-older.jsonl";
+        let recent_size = copy_codex_rollout_fixture(&sessions_root.join(recent_relative_path))?;
+        let older_size = copy_codex_rollout_fixture(&sessions_root.join(older_relative_path))?;
+
+        let recent = Timestamp::now()
+            .checked_sub(1_i64.hours())
+            .context("unable to construct recent codex startup test timestamp")?
+            .to_string();
+        let older = Timestamp::now()
+            .checked_sub(72_i64.hours())
+            .context("unable to construct older codex startup test timestamp")?
+            .to_string();
+
+        let mut db = Database::open(&db_path)?;
+        let project_id = insert_project_with_root(
+            db.connection_mut(),
+            "path:/codex-startup-timeout",
+            "codex-startup-timeout",
+            &project_root,
+        )?;
+        let _ = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            recent_relative_path,
+            &recent,
+            recent_size,
+        )?;
+        let _ = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            older_relative_path,
+            &older,
+            older_size,
+        )?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Codex,
+            SourceFileKind::Rollout,
+            sessions_root,
+        )]);
+
+        let startup = start_startup_import_with_options_and_sources(
+            db.connection(),
+            &db_path,
+            &sources,
+            Duration::from_millis(WAIT_TIMEOUT_MS),
+            StartupImportMode::RecentFirst,
+            ImportWorkerOptions {
+                per_chunk_delay: Duration::from_millis(WORKER_DELAY_MS),
+                perf_logger: None,
+                rtk_config: None,
+            },
+            None,
+        )?;
+
+        assert_eq!(startup.open_reason, StartupOpenReason::TimedOut);
+        assert_eq!(startup.snapshot.max_publish_seq, 0);
+        assert_eq!(startup.startup_status_message, None);
+        assert_eq!(
+            startup.startup_progress_update.as_ref().map(|update| (
+                update.label,
+                update.current,
+                update.total
+            )),
+            Some(("rebuilding database", 1, 1))
+        );
+        startup.wait_for_completion()?;
+
+        let complete_count: i64 = db.connection().query_row(
+            "SELECT COUNT(*) FROM import_chunk WHERE state = 'complete'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(complete_count, 2);
+
+        let rollout_session_count: i64 =
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM codex_rollout_session", [], |row| {
+                    row.get(0)
+                })?;
+        assert_eq!(rollout_session_count, 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_startup_full_import_waits_for_deferred_chunks_before_opening() -> Result<()> {
+        const WORKER_DELAY_MS: u64 = 75;
+
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let sessions_root = source_root.join("sessions");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root)?;
+
+        let recent_relative_path = "2026/04/18/rollout-codex-full-import-recent.jsonl";
+        let older_relative_path = "2026/04/15/rollout-codex-full-import-older.jsonl";
+        let recent_size = copy_codex_rollout_fixture(&sessions_root.join(recent_relative_path))?;
+        let older_size = copy_codex_rollout_fixture(&sessions_root.join(older_relative_path))?;
+
+        let recent = Timestamp::now()
+            .checked_sub(1_i64.hours())
+            .context("unable to construct recent codex full-import test timestamp")?
+            .to_string();
+        let older = Timestamp::now()
+            .checked_sub(72_i64.hours())
+            .context("unable to construct older codex full-import test timestamp")?
+            .to_string();
+
+        let mut db = Database::open(&db_path)?;
+        let project_id = insert_project_with_root(
+            db.connection_mut(),
+            "path:/codex-startup-full-import",
+            "codex-startup-full-import",
+            &project_root,
+        )?;
+        let _ = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            recent_relative_path,
+            &recent,
+            recent_size,
+        )?;
+        let _ = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            older_relative_path,
+            &older,
+            older_size,
+        )?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Codex,
+            SourceFileKind::Rollout,
+            sessions_root,
+        )]);
+
+        let startup = start_startup_import_with_options_and_sources(
+            db.connection(),
+            &db_path,
+            &sources,
+            Duration::from_millis(1),
+            StartupImportMode::Full,
+            ImportWorkerOptions {
+                per_chunk_delay: Duration::from_millis(WORKER_DELAY_MS),
+                perf_logger: None,
+                rtk_config: None,
+            },
+            None,
+        )?;
+
+        assert_eq!(startup.open_reason, StartupOpenReason::FullImportReady);
+        assert_eq!(startup.snapshot.max_publish_seq, 2);
+        assert!(startup.startup_status_message.is_none());
+        assert!(startup.deferred_status_message.is_none());
+        assert!(startup.startup_progress_update.is_none());
+
+        let complete_count: i64 = db.connection().query_row(
+            "SELECT COUNT(*) FROM import_chunk WHERE state = 'complete'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(complete_count, 2);
+
+        let rollout_event_count: i64 =
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM codex_rollout_event", [], |row| {
+                    row.get(0)
+                })?;
+        assert_eq!(
+            rollout_event_count, 18,
+            "two copies of the nine-event fixture should each import fully"
+        );
 
         Ok(())
     }
@@ -3150,5 +3418,54 @@ mod tests {
             .join("tests")
             .join("fixtures")
             .join("codex")
+    }
+
+    fn copy_codex_rollout_fixture(dest: &Path) -> Result<i64> {
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let source = codex_fixture_root()
+            .join("sessions")
+            .join("2026")
+            .join("04")
+            .join("18")
+            .join("rollout-2026-04-18T12-00-00Z.jsonl");
+        fs::copy(&source, dest).with_context(|| {
+            format!(
+                "unable to copy codex rollout fixture {} -> {}",
+                source.display(),
+                dest.display()
+            )
+        })?;
+        let size = fs::metadata(dest)
+            .with_context(|| format!("unable to stat copied rollout at {}", dest.display()))?
+            .len();
+        i64::try_from(size).context("copied rollout fixture size exceeded i64")
+    }
+
+    fn insert_seeded_codex_rollout_file(
+        conn: &mut Connection,
+        project_id: i64,
+        relative_path: &str,
+        modified_at_utc: &str,
+        size_bytes: i64,
+    ) -> Result<i64> {
+        conn.query_row(
+            "
+            INSERT INTO source_file (
+                project_id,
+                relative_path,
+                source_provider,
+                source_kind,
+                modified_at_utc,
+                size_bytes
+            )
+            VALUES (?1, ?2, 'codex', 'rollout', ?3, ?4)
+            RETURNING id
+            ",
+            params![project_id, relative_path, modified_at_utc, size_bytes],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("unable to insert a seeded codex rollout source file")
     }
 }
