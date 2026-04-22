@@ -518,96 +518,80 @@ fn subset_corpus_reimports_only_the_touched_chunk_when_a_file_mtime_changes() ->
 #[ignore = "requires local import corpus fixture tarballs"]
 fn subset_corpus_keeps_prior_rows_when_a_reimported_file_turns_malformed_and_recovers_after_restore()
 -> Result<()> {
-    // TODO(import-perf-p4-c1): under the parallel sharded-import architecture
-    // the corrupt→restore cycle leaves ~1 duplicate conversation's worth of
-    // data behind (stream/message/turn/action counts drift upward after the
-    // restore reimport even though purge_existing_import drains every
-    // conversation keyed by source_file_id). The path-rollup and shard-delete
-    // fixes landed with this commit address the bugs this test surfaced, but
-    // the duplicate-on-restore behaviour is a distinct pre-existing issue
-    // that this corpus is the first to exercise. The other six integration
-    // tests cover the end-to-end correctness claim the redesign needs.
-    return Ok(());
-    #[allow(unreachable_code)]
-    {
-        let prepared = extract_corpus_archive("subset.tar.zst")?;
-        let db_temp = TempDir::new().context("unable to create malformed-file db tempdir")?;
-        let db_path = db_temp.path().join("usage.sqlite3");
-        let mut database = Database::open(&db_path)?;
+    let prepared = extract_corpus_archive("subset.tar.zst")?;
+    let db_temp = TempDir::new().context("unable to create malformed-file db tempdir")?;
+    let db_path = db_temp.path().join("usage.sqlite3");
+    let mut database = Database::open(&db_path)?;
 
-        let first_scan_report = scan_source_manifest(&mut database, &prepared.source_root)?;
-        assert_scan_report(&first_scan_report, SUBSET_EXPECTATIONS);
-        let first_import_report =
-            import_all(database.connection(), &db_path, &prepared.source_root)?;
-        assert_eq!(
-            first_import_report.deferred_chunk_count as i64,
-            SUBSET_EXPECTATIONS.deferred_chunk_count
-        );
+    let first_scan_report = scan_source_manifest(&mut database, &prepared.source_root)?;
+    assert_scan_report(&first_scan_report, SUBSET_EXPECTATIONS);
+    let first_import_report = import_all(database.connection(), &db_path, &prepared.source_root)?;
+    assert_eq!(
+        first_import_report.deferred_chunk_count as i64,
+        SUBSET_EXPECTATIONS.deferred_chunk_count
+    );
 
-        let baseline_counts = load_database_counts(database.connection(), &db_path)?;
-        assert_database_counts(&baseline_counts, SUBSET_EXPECTATIONS);
-        let target_path = prepared.source_root.join(MUTATION_TARGET_RELATIVE_PATH);
-        let original_contents = fs::read(&target_path)
-            .with_context(|| format!("unable to read {}", target_path.display()))?;
+    let baseline_counts = load_database_counts(database.connection(), &db_path)?;
+    assert_database_counts(&baseline_counts, SUBSET_EXPECTATIONS);
+    let target_path = prepared.source_root.join(MUTATION_TARGET_RELATIVE_PATH);
+    let original_contents = fs::read(&target_path)
+        .with_context(|| format!("unable to read {}", target_path.display()))?;
 
-        fs::write(
+    fs::write(
         &target_path,
         b"{\"type\":\"user\",\"uuid\":\"broken\",\"message\":{\"role\":\"user\",\"content\":\"oops\"}}\nnot-json\n",
     )
     .with_context(|| format!("unable to corrupt {}", target_path.display()))?;
-        set_file_mtime_rfc3339(&target_path, MUTATION_TARGET_SHIFTED_TIMESTAMP)?;
+    set_file_mtime_rfc3339(&target_path, MUTATION_TARGET_SHIFTED_TIMESTAMP)?;
 
-        let second_scan_report = scan_source_manifest(&mut database, &prepared.source_root)?;
-        assert_eq!(
-            second_scan_report.discovered_source_files,
-            SUBSET_EXPECTATIONS.discovered_source_files
-        );
+    let second_scan_report = scan_source_manifest(&mut database, &prepared.source_root)?;
+    assert_eq!(
+        second_scan_report.discovered_source_files,
+        SUBSET_EXPECTATIONS.discovered_source_files
+    );
 
-        let second_import_report =
-            import_all(database.connection(), &db_path, &prepared.source_root)?;
-        assert_eq!(second_import_report.startup_chunk_count, 0);
-        assert!(second_import_report.deferred_chunk_count > 0);
-        assert_eq!(second_import_report.deferred_failure_count, 0);
-        assert!(second_import_report.deferred_failure_summary.is_none());
+    let second_import_report = import_all(database.connection(), &db_path, &prepared.source_root)?;
+    assert_eq!(second_import_report.startup_chunk_count, 0);
+    assert!(second_import_report.deferred_chunk_count > 0);
+    assert_eq!(second_import_report.deferred_failure_count, 0);
+    assert!(second_import_report.deferred_failure_summary.is_none());
 
-        let warning_counts = load_database_counts(database.connection(), &db_path)?;
-        assert!(warning_counts.conversation_count <= baseline_counts.conversation_count);
-        assert!(warning_counts.message_count <= baseline_counts.message_count);
-        assert!(warning_counts.message_part_count <= baseline_counts.message_part_count);
-        assert!(warning_counts.turn_count <= baseline_counts.turn_count);
-        assert!(warning_counts.action_count <= baseline_counts.action_count);
-        assert_eq!(
-            warning_counts.import_warning_count,
-            baseline_counts.import_warning_count + 1
-        );
+    let warning_counts = load_database_counts(database.connection(), &db_path)?;
+    assert!(warning_counts.conversation_count <= baseline_counts.conversation_count);
+    assert!(warning_counts.message_count <= baseline_counts.message_count);
+    assert!(warning_counts.message_part_count <= baseline_counts.message_part_count);
+    assert!(warning_counts.turn_count <= baseline_counts.turn_count);
+    assert!(warning_counts.action_count <= baseline_counts.action_count);
+    assert_eq!(
+        warning_counts.import_warning_count,
+        baseline_counts.import_warning_count + 1
+    );
 
-        let recent_warning = most_recent_warning_message(database.connection())?;
-        assert!(recent_warning.contains(&target_path.display().to_string()));
-        assert!(recent_warning.contains("line 2"));
+    let recent_warning = most_recent_warning_message(database.connection())?;
+    assert!(recent_warning.contains(&target_path.display().to_string()));
+    assert!(recent_warning.contains("line 2"));
 
-        fs::write(&target_path, &original_contents)
-            .with_context(|| format!("unable to restore {}", target_path.display()))?;
-        set_file_mtime_rfc3339(&target_path, MUTATION_TARGET_SHIFTED_TIMESTAMP)?;
+    fs::write(&target_path, &original_contents)
+        .with_context(|| format!("unable to restore {}", target_path.display()))?;
+    set_file_mtime_rfc3339(&target_path, MUTATION_TARGET_SHIFTED_TIMESTAMP)?;
 
-        let third_scan_report = scan_source_manifest(&mut database, &prepared.source_root)?;
-        assert_eq!(
-            third_scan_report.discovered_source_files,
-            SUBSET_EXPECTATIONS.discovered_source_files
-        );
+    let third_scan_report = scan_source_manifest(&mut database, &prepared.source_root)?;
+    assert_eq!(
+        third_scan_report.discovered_source_files,
+        SUBSET_EXPECTATIONS.discovered_source_files
+    );
 
-        let third_import_report =
-            import_all(database.connection(), &db_path, &prepared.source_root)?;
-        assert_eq!(third_import_report.startup_chunk_count, 0);
-        assert!(third_import_report.deferred_chunk_count > 0);
-        assert_eq!(third_import_report.deferred_failure_count, 0);
-        assert!(third_import_report.deferred_failure_summary.is_none());
+    let third_import_report = import_all(database.connection(), &db_path, &prepared.source_root)?;
+    assert_eq!(third_import_report.startup_chunk_count, 0);
+    assert!(third_import_report.deferred_chunk_count > 0);
+    assert_eq!(third_import_report.deferred_failure_count, 0);
+    assert!(third_import_report.deferred_failure_summary.is_none());
 
-        let recovered_counts = load_database_counts(database.connection(), &db_path)?;
-        assert_eq!(recovered_counts, baseline_counts);
-        assert_subset_semantic_totals(database.connection(), &db_path)?;
+    let recovered_counts = load_database_counts(database.connection(), &db_path)?;
+    assert_eq!(recovered_counts, baseline_counts);
+    assert_subset_semantic_totals(database.connection(), &db_path)?;
 
-        Ok(())
-    }
+    Ok(())
 }
 
 #[test]

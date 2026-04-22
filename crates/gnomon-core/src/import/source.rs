@@ -1192,26 +1192,111 @@ fn delete_missing_source_files(
             .context("unable to queue pending chunk rebuild for deleted source file")?;
         }
 
-        // `import_warning` is a shard-data table. On connections opened via
-        // `Database::open`, shards are ATTACHed and a TEMP VIEW shadows the
-        // unqualified name — SQLite refuses DELETE through that view. Route
-        // the delete to the specific shard. The `open_unsharded` test escape
-        // hatch leaves `import_warning` as a plain main-DB table with no
-        // shards attached; fall back to the unqualified form in that case.
-        let shard_idx = crate::db::shard_index_for_project(*project_id);
-        let shard_delete_sql =
-            format!("DELETE FROM shard{shard_idx}.import_warning WHERE source_file_id = ?1");
-        if tx.execute(&shard_delete_sql, [id]).is_err() {
-            tx.execute("DELETE FROM import_warning WHERE source_file_id = ?1", [id])
-                .with_context(|| {
-                    format!("unable to clear stale import warnings for source file {id}")
-                })?;
-        }
+        // Every shard-resident row that references this source_file must go
+        // before we drop the manifest entry. Conversation/stream/message/
+        // turn/action and their children live in `shard{project_id %
+        // SHARD_COUNT}`; on the main connection those names resolve to a
+        // TEMP VIEW shadowed by `configure_read_view`, which SQLite refuses
+        // to DELETE through. `purge_shard_source_file_rows` routes the
+        // deletes directly at the shard (and falls back to unqualified
+        // deletes for the `open_unsharded` test escape hatch).
+        purge_shard_source_file_rows(tx, *project_id, *id).with_context(|| {
+            format!(
+                "unable to purge shard rows for stale source file {id} \
+                 (project_id {project_id})"
+            )
+        })?;
         tx.execute("DELETE FROM source_file WHERE id = ?1", [id])
             .with_context(|| format!("unable to delete stale source file manifest row {id}"))?;
     }
 
     Ok(delete_rows.len())
+}
+
+// Every row reachable from a source_file_id lives in exactly one shard
+// (project_id % SHARD_COUNT). On the main connection those tables are masked
+// by a TEMP VIEW, so we have to route the deletes directly at the shard. Try
+// the shard-qualified path first; if it fails we assume the connection was
+// opened without shards (the `Database::open_unsharded` test hatch) and issue
+// unqualified deletes instead.
+fn purge_shard_source_file_rows(
+    tx: &Transaction<'_>,
+    project_id: i64,
+    source_file_id: i64,
+) -> Result<()> {
+    let shard_idx = crate::db::shard_index_for_project(project_id);
+    let prefix = format!("shard{shard_idx}.");
+    if try_purge_source_file_rows_with_prefix(tx, &prefix, source_file_id)?.is_ok() {
+        return Ok(());
+    }
+    try_purge_source_file_rows_with_prefix(tx, "", source_file_id)?
+        .map_err(|err| anyhow::anyhow!(err))
+        .context("unable to purge source-file rows with unqualified names")?;
+    Ok(())
+}
+
+// Run the nine DELETEs in FK-topological order (children first). Each DELETE
+// is prefixed with an optional schema qualifier so the same body works for
+// shard-qualified and unqualified paths. Returns `Ok(Ok(()))` on success and
+// `Ok(Err(...))` if the first DELETE fails (so the caller can fall back).
+fn try_purge_source_file_rows_with_prefix(
+    tx: &Transaction<'_>,
+    prefix: &str,
+    source_file_id: i64,
+) -> Result<std::result::Result<(), rusqlite::Error>> {
+    let conversation_sub =
+        format!("SELECT id FROM {prefix}conversation WHERE source_file_id = ?1",);
+    let message_sub =
+        format!("SELECT id FROM {prefix}message WHERE conversation_id IN ({conversation_sub})",);
+    let turn_sub =
+        format!("SELECT id FROM {prefix}turn WHERE conversation_id IN ({conversation_sub})",);
+
+    let run = |sql: String| -> std::result::Result<(), rusqlite::Error> {
+        tx.execute(&sql, [source_file_id]).map(|_| ())
+    };
+
+    // The first DELETE fails fast if the prefix is wrong (shard not attached).
+    if let Err(err) = run(format!(
+        "DELETE FROM {prefix}message_part WHERE message_id IN ({message_sub})",
+    )) {
+        return Ok(Err(err));
+    }
+    run(format!(
+        "DELETE FROM {prefix}message_path_ref WHERE message_id IN ({message_sub})",
+    ))?;
+    run(format!(
+        "DELETE FROM {prefix}action_message WHERE action_id IN \
+         (SELECT id FROM {prefix}action WHERE turn_id IN ({turn_sub}))",
+    ))?;
+    run(format!(
+        "DELETE FROM {prefix}action_skill_attribution WHERE action_id IN \
+         (SELECT id FROM {prefix}action WHERE turn_id IN ({turn_sub}))",
+    ))?;
+    run(format!(
+        "DELETE FROM {prefix}action WHERE turn_id IN ({turn_sub})",
+    ))?;
+    run(format!(
+        "DELETE FROM {prefix}turn WHERE conversation_id IN ({conversation_sub})",
+    ))?;
+    run(format!(
+        "DELETE FROM {prefix}message WHERE conversation_id IN ({conversation_sub})",
+    ))?;
+    run(format!(
+        "DELETE FROM {prefix}stream WHERE conversation_id IN ({conversation_sub})",
+    ))?;
+    run(format!(
+        "DELETE FROM {prefix}conversation WHERE source_file_id = ?1",
+    ))?;
+    run(format!(
+        "DELETE FROM {prefix}history_event WHERE source_file_id = ?1",
+    ))?;
+    run(format!(
+        "DELETE FROM {prefix}skill_invocation WHERE source_file_id = ?1",
+    ))?;
+    run(format!(
+        "DELETE FROM {prefix}import_warning WHERE source_file_id = ?1",
+    ))?;
+    Ok(Ok(()))
 }
 
 fn delete_orphaned_projects(tx: &Transaction<'_>) -> Result<usize> {
