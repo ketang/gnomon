@@ -1137,27 +1137,33 @@ fn purge_source_file_from_chunk(
     import_chunk_id: i64,
     source_file_id: i64,
 ) -> Result<()> {
-    conn.prepare_cached(
-        "
-        DELETE FROM conversation
-        WHERE source_file_id = ?1
-          AND id IN (
-              SELECT DISTINCT conversation_id
-              FROM stream
-              WHERE import_chunk_id = ?2
-              UNION
-              SELECT DISTINCT conversation_id
-              FROM message
-              WHERE import_chunk_id = ?2
-              UNION
-              SELECT DISTINCT conversation_id
-              FROM turn
-              WHERE import_chunk_id = ?2
-          )
-        ",
-    )
-    .and_then(|mut stmt| stmt.execute(params![source_file_id, import_chunk_id]))
-    .context("unable to purge chunk-scoped conversation state for source file")?;
+    // Collect every conversation row that belongs to this source file and
+    // participates in this chunk, then hand each one to the shared subtree
+    // purge helper so stream/message/turn/action (and their children) all go
+    // along with it. Import connections disable FKs for throughput, so we
+    // cannot rely on cascades to clean up here.
+    let conversation_ids: Vec<i64> = conn
+        .prepare_cached(
+            "
+            SELECT id FROM conversation
+            WHERE source_file_id = ?1
+              AND id IN (
+                  SELECT DISTINCT conversation_id FROM stream WHERE import_chunk_id = ?2
+                  UNION
+                  SELECT DISTINCT conversation_id FROM message WHERE import_chunk_id = ?2
+                  UNION
+                  SELECT DISTINCT conversation_id FROM turn WHERE import_chunk_id = ?2
+              )
+            ",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(params![source_file_id, import_chunk_id], |row| row.get(0))
+                .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+        })
+        .context("unable to list conversations for chunk-scoped purge")?;
+    for conversation_id in conversation_ids {
+        super::normalize::purge_conversation_subtree(conn, conversation_id)?;
+    }
 
     conn.prepare_cached(
         "

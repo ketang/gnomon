@@ -1059,18 +1059,19 @@ pub(super) fn purge_existing_import(
     conn: &Connection,
     params: &NormalizeJsonlFileParams,
 ) -> Result<()> {
-    let existing_conversation_id: Option<i64> = conn
+    // There should normally be a single conversation per source_file, but under
+    // parallel sharded imports a partial-write path can leave more than one
+    // behind. Drain every matching conversation row so reimports are idempotent.
+    let existing_conversation_ids: Vec<i64> = conn
         .prepare_cached("SELECT id FROM conversation WHERE source_file_id = ?1")
         .and_then(|mut stmt| {
-            stmt.query_row([params.source_file_id], |row| row.get(0))
-                .optional()
+            stmt.query_map([params.source_file_id], |row| row.get::<_, i64>(0))
+                .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
         })
-        .context("unable to look up existing conversation for source file")?;
+        .context("unable to look up existing conversations for source file")?;
 
-    if let Some(conversation_id) = existing_conversation_id {
-        conn.prepare_cached("DELETE FROM conversation WHERE id = ?1")
-            .and_then(|mut stmt| stmt.execute([conversation_id]))
-            .context("unable to purge existing normalized conversation state")?;
+    for conversation_id in existing_conversation_ids {
+        purge_conversation_subtree(conn, conversation_id)?;
     }
 
     conn.prepare_cached("DELETE FROM history_event WHERE source_file_id = ?1")
@@ -1089,6 +1090,84 @@ pub(super) fn purge_existing_import(
     )
     .and_then(|mut stmt| stmt.execute(params![params.import_chunk_id, params.source_file_id]))
     .context("unable to clear prior import warnings for source file")?;
+
+    Ok(())
+}
+
+// Import connections run with `PRAGMA foreign_keys = OFF` for throughput
+// (migration `0014`/A3-era optimization), so `ON DELETE CASCADE` does not fire
+// when a conversation row is removed. Explicit topological deletes keep
+// reimports idempotent — without them, stream/message/turn/action rows for
+// the old conversation become orphans and duplicate into the counts.
+pub(super) fn purge_conversation_subtree(conn: &Connection, conversation_id: i64) -> Result<()> {
+    conn.prepare_cached(
+        "
+        DELETE FROM message_part
+        WHERE message_id IN (SELECT id FROM message WHERE conversation_id = ?1)
+        ",
+    )
+    .and_then(|mut stmt| stmt.execute([conversation_id]))
+    .context("unable to purge message_part rows for conversation subtree")?;
+
+    conn.prepare_cached(
+        "
+        DELETE FROM message_path_ref
+        WHERE message_id IN (SELECT id FROM message WHERE conversation_id = ?1)
+        ",
+    )
+    .and_then(|mut stmt| stmt.execute([conversation_id]))
+    .context("unable to purge message_path_ref rows for conversation subtree")?;
+
+    conn.prepare_cached(
+        "
+        DELETE FROM action_message
+        WHERE action_id IN (
+            SELECT a.id FROM action a
+            JOIN turn t ON t.id = a.turn_id
+            WHERE t.conversation_id = ?1
+        )
+        ",
+    )
+    .and_then(|mut stmt| stmt.execute([conversation_id]))
+    .context("unable to purge action_message rows for conversation subtree")?;
+
+    conn.prepare_cached(
+        "
+        DELETE FROM action_skill_attribution
+        WHERE action_id IN (
+            SELECT a.id FROM action a
+            JOIN turn t ON t.id = a.turn_id
+            WHERE t.conversation_id = ?1
+        )
+        ",
+    )
+    .and_then(|mut stmt| stmt.execute([conversation_id]))
+    .context("unable to purge action_skill_attribution rows for conversation subtree")?;
+
+    conn.prepare_cached(
+        "
+        DELETE FROM action
+        WHERE turn_id IN (SELECT id FROM turn WHERE conversation_id = ?1)
+        ",
+    )
+    .and_then(|mut stmt| stmt.execute([conversation_id]))
+    .context("unable to purge action rows for conversation subtree")?;
+
+    conn.prepare_cached("DELETE FROM turn WHERE conversation_id = ?1")
+        .and_then(|mut stmt| stmt.execute([conversation_id]))
+        .context("unable to purge turn rows for conversation subtree")?;
+
+    conn.prepare_cached("DELETE FROM message WHERE conversation_id = ?1")
+        .and_then(|mut stmt| stmt.execute([conversation_id]))
+        .context("unable to purge message rows for conversation subtree")?;
+
+    conn.prepare_cached("DELETE FROM stream WHERE conversation_id = ?1")
+        .and_then(|mut stmt| stmt.execute([conversation_id]))
+        .context("unable to purge stream rows for conversation subtree")?;
+
+    conn.prepare_cached("DELETE FROM conversation WHERE id = ?1")
+        .and_then(|mut stmt| stmt.execute([conversation_id]))
+        .context("unable to purge conversation row")?;
 
     Ok(())
 }

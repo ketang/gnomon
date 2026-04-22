@@ -1192,10 +1192,21 @@ fn delete_missing_source_files(
             .context("unable to queue pending chunk rebuild for deleted source file")?;
         }
 
-        tx.execute("DELETE FROM import_warning WHERE source_file_id = ?1", [id])
-            .with_context(|| {
-                format!("unable to clear stale import warnings for source file {id}")
-            })?;
+        // `import_warning` is a shard-data table. On connections opened via
+        // `Database::open`, shards are ATTACHed and a TEMP VIEW shadows the
+        // unqualified name — SQLite refuses DELETE through that view. Route
+        // the delete to the specific shard. The `open_unsharded` test escape
+        // hatch leaves `import_warning` as a plain main-DB table with no
+        // shards attached; fall back to the unqualified form in that case.
+        let shard_idx = crate::db::shard_index_for_project(*project_id);
+        let shard_delete_sql =
+            format!("DELETE FROM shard{shard_idx}.import_warning WHERE source_file_id = ?1");
+        if tx.execute(&shard_delete_sql, [id]).is_err() {
+            tx.execute("DELETE FROM import_warning WHERE source_file_id = ?1", [id])
+                .with_context(|| {
+                    format!("unable to clear stale import warnings for source file {id}")
+                })?;
+        }
         tx.execute("DELETE FROM source_file WHERE id = ?1", [id])
             .with_context(|| format!("unable to delete stale source file manifest row {id}"))?;
     }
