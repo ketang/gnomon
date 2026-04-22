@@ -1,11 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::classify::{BuildActionsParams, build_actions_in_tx_with_messages};
-use crate::db::Database;
+use crate::db::{Database, shard_index_for_project};
 use crate::perf::{PerfLogger, PerfScope};
 use crate::query::SnapshotBounds;
 use crate::rollup::{rebuild_chunk_action_rollups, rebuild_chunk_path_rollups};
@@ -197,6 +198,79 @@ pub struct ImportExecutionReport {
     pub deferred_failure_summary: Option<String>,
 }
 
+// Sharded-import helpers. Data tables live in 9 fixed shards alongside the main DB;
+// reads go through TEMP VIEWs that UNION ALL each shard's table. See db/mod.rs for the
+// shard layout and AUTOINCREMENT seeding that keeps ids globally unique.
+
+struct ShardImportGroup {
+    shard_idx: usize,
+    // Projects assigned to this shard, with their chunks for the current phase.
+    projects: Vec<ShardProjectEntry>,
+}
+
+struct ShardProjectEntry {
+    project_id: i64,
+    project_key: String,
+    chunks: Vec<PreparedChunk>,
+}
+
+// Copy a project's metadata row from the main DB into a shard DB. The shard's `project`
+// table mirrors the main DB's so that queries running on a shard connection (e.g. the
+// classify pipeline's `load_conversation_context` JOIN) still find root_path and siblings.
+fn initialize_shard_project_row(
+    global_conn: &Connection,
+    shard_conn: &Connection,
+    project_id: i64,
+) -> Result<()> {
+    let (identity_kind, canonical_key, display_name, root_path, git_root_path, git_origin): (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = global_conn
+        .query_row(
+            "SELECT identity_kind, canonical_key, display_name, root_path,
+                    git_root_path, git_origin
+             FROM project WHERE id = ?1",
+            [project_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .with_context(|| {
+            format!("unable to read project row {project_id} from main DB for shard init")
+        })?;
+
+    shard_conn
+        .execute(
+            "INSERT OR IGNORE INTO project
+             (id, identity_kind, canonical_key, display_name, root_path,
+              git_root_path, git_origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                project_id,
+                identity_kind,
+                canonical_key,
+                display_name,
+                root_path,
+                git_root_path,
+                git_origin,
+            ],
+        )
+        .with_context(|| format!("unable to copy project row {project_id} to shard DB"))?;
+
+    Ok(())
+}
+
 pub fn start_startup_import(
     conn: &Connection,
     db_path: &Path,
@@ -332,61 +406,33 @@ pub fn import_all_with_perf_logger(
         }
     };
 
-    let open_scope = PerfScope::new(perf_logger.clone(), "import.open_database");
-    let mut database = match Database::open_for_import(db_path) {
-        Ok(database) => {
-            open_scope.finish_ok();
-            database
-        }
-        Err(err) => {
-            open_scope.finish_error(&err);
-            return Err(err).with_context(|| format!("unable to open {}", db_path.display()));
-        }
-    };
+    let startup_chunk_count = prepared.startup_chunks.len();
+    let deferred_chunk_count = prepared.deferred_chunks.len();
 
     let options = ImportWorkerOptions {
         perf_logger,
         ..ImportWorkerOptions::default()
     };
 
-    for chunk in &prepared.startup_chunks {
-        import_chunk(
-            &mut database,
-            source_root,
-            chunk,
-            ImportPhase::Startup,
-            &options,
-        )
-        .with_context(|| {
-            format!(
-                "unable to import startup chunk {}:{}",
-                chunk.project_key, chunk.chunk_day_local
-            )
-        })?;
-    }
+    // Bench/rebuild path: no progress events; startup chunk failures are fatal.
+    let (startup_failures, deferred_failures) =
+        match run_sharded_import(db_path, source_root, prepared, &options, None) {
+            Ok(result) => result,
+            Err(err) => {
+                import_scope.finish_error(&err);
+                return Err(err);
+            }
+        };
 
-    let mut deferred_failures = Vec::new();
-    for chunk in &prepared.deferred_chunks {
-        if let Err(err) = import_chunk(
-            &mut database,
-            source_root,
-            chunk,
-            ImportPhase::Deferred,
-            &options,
-        )
-        .with_context(|| {
-            format!(
-                "unable to import deferred chunk {}:{}",
-                chunk.project_key, chunk.chunk_day_local
-            )
-        }) {
-            deferred_failures.push(compact_status_text(format!("{err:#}")));
-        }
+    if let Some(first) = startup_failures.first() {
+        let err = anyhow!("startup chunk failed: {first}");
+        import_scope.finish_error(&err);
+        return Err(err);
     }
 
     let report = ImportExecutionReport {
-        startup_chunk_count: prepared.startup_chunks.len(),
-        deferred_chunk_count: prepared.deferred_chunks.len(),
+        startup_chunk_count,
+        deferred_chunk_count,
         deferred_failure_count: deferred_failures.len(),
         deferred_failure_summary: summarize_deferred_failures(&deferred_failures),
     };
@@ -478,7 +524,7 @@ fn start_startup_import_with_options(
             run_import_worker(
                 &db_path,
                 &source_root,
-                &prepared_for_worker,
+                prepared_for_worker,
                 sender_for_worker,
                 &worker_options,
             )
@@ -952,90 +998,31 @@ fn mark_chunks_failed(
     Ok(())
 }
 
+// TUI background worker. Delegates all chunk orchestration to the shared `run_sharded_import`
+// (which emits Progress/StartupSettled/DeferredFailures events) and emits the final
+// Finished event.
 fn run_import_worker(
     db_path: &Path,
     source_root: &Path,
-    plan: &PreparedImportPlan,
+    plan: PreparedImportPlan,
     sender: mpsc::Sender<StartupWorkerEvent>,
     options: &ImportWorkerOptions,
 ) -> Result<()> {
     let mut worker_scope = PerfScope::new(options.perf_logger.clone(), "import.worker_total");
-    let open_scope = PerfScope::new(options.perf_logger.clone(), "import.open_database");
-    let mut database = match Database::open_for_import(db_path) {
-        Ok(database) => {
-            open_scope.finish_ok();
-            database
+
+    let result = run_sharded_import(db_path, source_root, plan, options, Some(&sender));
+
+    match &result {
+        Ok((startup_failures, deferred_failures)) => {
+            worker_scope.field("startup_failure_count", startup_failures.len());
+            worker_scope.field("deferred_failure_count", deferred_failures.len());
+            worker_scope.finish_ok();
         }
-        Err(err) => {
-            open_scope.finish_error(&err);
-            worker_scope.finish_error(&err);
-            return Err(err).with_context(|| format!("unable to open {}", db_path.display()));
-        }
-    };
-    let mut startup_failures = Vec::new();
-    let mut deferred_failures = Vec::new();
-
-    if plan.startup_chunks.is_empty() {
-        let _ = sender.send(StartupWorkerEvent::StartupSettled {
-            startup_status_message: None,
-        });
+        Err(err) => worker_scope.finish_error(err),
     }
 
-    for (index, chunk) in plan.startup_chunks.iter().enumerate() {
-        send_progress(
-            &sender,
-            "rebuilding database",
-            index + 1,
-            plan.startup_chunks.len(),
-            chunk,
-        );
-        if let Err(err) = import_chunk(
-            &mut database,
-            source_root,
-            chunk,
-            ImportPhase::Startup,
-            options,
-        ) {
-            startup_failures.push(compact_status_text(format!("{err:#}")));
-        }
-    }
-
-    if !plan.startup_chunks.is_empty() {
-        let _ = sender.send(StartupWorkerEvent::StartupSettled {
-            startup_status_message: summarize_startup_failures(&startup_failures),
-        });
-    }
-
-    for (index, chunk) in plan.deferred_chunks.iter().enumerate() {
-        send_progress(
-            &sender,
-            "importing older history",
-            index + 1,
-            plan.deferred_chunks.len(),
-            chunk,
-        );
-        if let Err(err) = import_chunk(
-            &mut database,
-            source_root,
-            chunk,
-            ImportPhase::Deferred,
-            options,
-        ) {
-            deferred_failures.push(compact_status_text(format!("{err:#}")));
-        }
-    }
-
-    if !deferred_failures.is_empty() {
-        let _ = sender.send(StartupWorkerEvent::DeferredFailures {
-            deferred_status_message: summarize_deferred_failures(&deferred_failures),
-        });
-    }
-    worker_scope.field("startup_failure_count", startup_failures.len());
-    worker_scope.field("deferred_failure_count", deferred_failures.len());
-    worker_scope.finish_ok();
     let _ = sender.send(StartupWorkerEvent::Finished);
-
-    Ok(())
+    result.map(|_| ())
 }
 fn send_progress(
     sender: &mpsc::Sender<StartupWorkerEvent>,
@@ -1075,270 +1062,6 @@ fn summarize_failures(prefix: &str, failures: &[String]) -> Option<String> {
 
 fn compact_status_text(text: impl Into<String>) -> String {
     text.into().split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn import_chunk(
-    database: &mut Database,
-    source_root: &Path,
-    chunk: &PreparedChunk,
-    phase: ImportPhase,
-    options: &ImportWorkerOptions,
-) -> Result<()> {
-    begin_chunk_import(
-        database.connection_mut(),
-        chunk,
-        options.perf_logger.clone(),
-    )?;
-
-    if options.per_chunk_delay > Duration::ZERO {
-        thread::sleep(options.per_chunk_delay);
-    }
-
-    let mut scope = PerfScope::new(options.perf_logger.clone(), "import.chunk");
-    scope.field("project_key", chunk.project_key.as_str());
-    scope.field("chunk_day_local", chunk.chunk_day_local.as_str());
-    scope.field(
-        "source_file_count",
-        chunk.import_source_files.len() + chunk.remove_only_source_files.len(),
-    );
-    scope.field("import_source_file_count", chunk.import_source_files.len());
-    scope.field(
-        "remove_only_source_file_count",
-        chunk.remove_only_source_files.len(),
-    );
-    scope.field("phase", phase.as_str());
-
-    let import_result = (|| {
-        let mut tx = database
-            .connection_mut()
-            .transaction()
-            .context("unable to start chunk-level import transaction")?;
-
-        for source_file in &chunk.remove_only_source_files {
-            purge_source_file_from_chunk(&tx, chunk.import_chunk_id, source_file.source_file_id)?;
-        }
-
-        // Phase 1: Parse all JSONL files in parallel (CPU-only, no DB access).
-        // rayon's par_iter preserves input ordering in the collected Vec.
-        let mut parse_scope = PerfScope::new(options.perf_logger.clone(), "import.parse_phase");
-        let parsed_files: Vec<ParseResult> = chunk
-            .import_source_files
-            .par_iter()
-            .map(|source_file| {
-                let path = source_root.join(&source_file.relative_path);
-                parse_jsonl_file(&path, source_file.source_kind)
-            })
-            .collect();
-        let mut parsed_file_count = 0usize;
-        let mut warning_file_count = 0usize;
-        let mut sessionless_metadata_file_count = 0usize;
-        let mut parsed_record_count = 0usize;
-        for parse_result in &parsed_files {
-            match parse_result {
-                ParseResult::Parsed(parsed_file) => {
-                    parsed_file_count += 1;
-                    parsed_record_count += parsed_file.records.len();
-                }
-                ParseResult::Warning(_) => {
-                    warning_file_count += 1;
-                }
-                ParseResult::SessionlessMetadata => {
-                    sessionless_metadata_file_count += 1;
-                }
-            }
-        }
-        parse_scope.field("parsed_file_count", parsed_file_count);
-        parse_scope.field("warning_file_count", warning_file_count);
-        parse_scope.field(
-            "sessionless_metadata_file_count",
-            sessionless_metadata_file_count,
-        );
-        parse_scope.field("parsed_record_count", parsed_record_count);
-        parse_scope.finish_ok();
-
-        // Phase 2: Write pre-parsed data to DB serially (single writer).
-        for (source_file, parse_result) in chunk.import_source_files.iter().zip(parsed_files) {
-            match parse_result {
-                ParseResult::Warning(warning) => {
-                    insert_import_warning(
-                        &tx,
-                        chunk.import_chunk_id,
-                        source_file.source_file_id,
-                        &warning,
-                    )?;
-                }
-                ParseResult::SessionlessMetadata => {
-                    // Nothing to write — file had no session ID and contained
-                    // only metadata records. Create + immediately release a
-                    // savepoint so the per-file purge still runs.
-                    let mut savepoint_open_scope =
-                        PerfScope::new(options.perf_logger.clone(), "import.savepoint_open");
-                    savepoint_open_scope.field("source_file_id", source_file.source_file_id);
-                    let sp = match tx.savepoint() {
-                        Ok(sp) => {
-                            savepoint_open_scope.finish_ok();
-                            sp
-                        }
-                        Err(err) => {
-                            savepoint_open_scope.finish_error(&err);
-                            return Err(err).context("unable to create per-file savepoint");
-                        }
-                    };
-                    let params = NormalizeJsonlFileParams {
-                        project_id: chunk.project_id,
-                        source_file_id: source_file.source_file_id,
-                        import_chunk_id: chunk.import_chunk_id,
-                        path: source_root.join(&source_file.relative_path),
-                        perf_logger: options.perf_logger.clone(),
-                    };
-                    super::normalize::purge_existing_import(&sp, &params)?;
-                    let mut savepoint_release_scope =
-                        PerfScope::new(options.perf_logger.clone(), "import.savepoint_release");
-                    savepoint_release_scope.field("source_file_id", source_file.source_file_id);
-                    match sp.commit() {
-                        Ok(()) => savepoint_release_scope.finish_ok(),
-                        Err(err) => {
-                            savepoint_release_scope.finish_error(&err);
-                            return Err(err).context("unable to release per-file savepoint");
-                        }
-                    }
-                }
-                ParseResult::Parsed(parsed_file) => {
-                    let mut savepoint_open_scope =
-                        PerfScope::new(options.perf_logger.clone(), "import.savepoint_open");
-                    savepoint_open_scope.field("source_file_id", source_file.source_file_id);
-                    let sp = match tx.savepoint() {
-                        Ok(sp) => {
-                            savepoint_open_scope.finish_ok();
-                            sp
-                        }
-                        Err(err) => {
-                            savepoint_open_scope.finish_error(&err);
-                            return Err(err).context("unable to create per-file savepoint");
-                        }
-                    };
-                    let params = NormalizeJsonlFileParams {
-                        project_id: chunk.project_id,
-                        source_file_id: source_file.source_file_id,
-                        import_chunk_id: chunk.import_chunk_id,
-                        path: source_root.join(&source_file.relative_path),
-                        perf_logger: options.perf_logger.clone(),
-                    };
-
-                    let (outcome, normalized_messages) =
-                        write_parsed_file_in_tx(&sp, &params, parsed_file, source_file.source_kind)
-                            .with_context(|| {
-                                format!(
-                                    "unable to normalize source file {}",
-                                    source_root.join(&source_file.relative_path).display()
-                                )
-                            })?;
-
-                    match outcome {
-                        NormalizeJsonlFileOutcome::Imported(result) => {
-                            if let Some(conversation_id) = result.conversation_id {
-                                let _ = build_actions_in_tx_with_messages(
-                                    &sp,
-                                    &BuildActionsParams {
-                                        conversation_id,
-                                        perf_logger: options.perf_logger.clone(),
-                                    },
-                                    normalized_messages,
-                                )
-                                .with_context(|| {
-                                    format!(
-                                        "unable to build actions for source file {}",
-                                        source_root.join(&source_file.relative_path).display()
-                                    )
-                                })?;
-                            }
-                            let mut savepoint_release_scope = PerfScope::new(
-                                options.perf_logger.clone(),
-                                "import.savepoint_release",
-                            );
-                            savepoint_release_scope
-                                .field("source_file_id", source_file.source_file_id);
-                            match sp.commit() {
-                                Ok(()) => savepoint_release_scope.finish_ok(),
-                                Err(err) => {
-                                    savepoint_release_scope.finish_error(&err);
-                                    return Err(err)
-                                        .context("unable to release per-file savepoint");
-                                }
-                            }
-                        }
-                        NormalizeJsonlFileOutcome::Skipped => {
-                            let mut savepoint_release_scope = PerfScope::new(
-                                options.perf_logger.clone(),
-                                "import.savepoint_release",
-                            );
-                            savepoint_release_scope
-                                .field("source_file_id", source_file.source_file_id);
-                            match sp.commit() {
-                                Ok(()) => savepoint_release_scope.finish_ok(),
-                                Err(err) => {
-                                    savepoint_release_scope.finish_error(&err);
-                                    return Err(err)
-                                        .context("unable to release per-file savepoint");
-                                }
-                            }
-                        }
-                        NormalizeJsonlFileOutcome::Warning(warning) => {
-                            let mut savepoint_rollback_scope = PerfScope::new(
-                                options.perf_logger.clone(),
-                                "import.savepoint_rollback",
-                            );
-                            savepoint_rollback_scope
-                                .field("source_file_id", source_file.source_file_id);
-                            drop(sp);
-                            savepoint_rollback_scope.finish_ok();
-                            insert_import_warning(
-                                &tx,
-                                chunk.import_chunk_id,
-                                source_file.source_file_id,
-                                &warning,
-                            )?;
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut finalize_scope =
-            PerfScope::new(options.perf_logger.clone(), "import.finalize_chunk");
-        finalize_scope.field("import_chunk_id", chunk.import_chunk_id);
-        let finalize_result = finalize_chunk_import_core(&tx, chunk, options);
-        match &finalize_result {
-            Ok(()) => finalize_scope.finish_ok(),
-            Err(err) => finalize_scope.finish_error(err),
-        }
-        finalize_result?;
-
-        let mut commit_scope = PerfScope::new(options.perf_logger.clone(), "import.chunk_commit");
-        commit_scope.field("import_chunk_id", chunk.import_chunk_id);
-        match tx.commit() {
-            Ok(()) => commit_scope.finish_ok(),
-            Err(err) => {
-                commit_scope.finish_error(&err);
-                return Err(err).context("unable to commit chunk-level import transaction");
-            }
-        }
-        Ok(())
-    })();
-
-    if let Err(err) = import_result {
-        let error_message = compact_status_text(format!("{err:#}"));
-        let _ = mark_chunk_failed(
-            database.connection_mut(),
-            chunk.import_chunk_id,
-            &error_message,
-        );
-        scope.finish_error(&err);
-        return Err(err);
-    }
-
-    scope.finish_ok();
-    Ok(())
 }
 
 fn begin_chunk_import(
@@ -1414,27 +1137,33 @@ fn purge_source_file_from_chunk(
     import_chunk_id: i64,
     source_file_id: i64,
 ) -> Result<()> {
-    conn.prepare_cached(
-        "
-        DELETE FROM conversation
-        WHERE source_file_id = ?1
-          AND id IN (
-              SELECT DISTINCT conversation_id
-              FROM stream
-              WHERE import_chunk_id = ?2
-              UNION
-              SELECT DISTINCT conversation_id
-              FROM message
-              WHERE import_chunk_id = ?2
-              UNION
-              SELECT DISTINCT conversation_id
-              FROM turn
-              WHERE import_chunk_id = ?2
-          )
-        ",
-    )
-    .and_then(|mut stmt| stmt.execute(params![source_file_id, import_chunk_id]))
-    .context("unable to purge chunk-scoped conversation state for source file")?;
+    // Collect every conversation row that belongs to this source file and
+    // participates in this chunk, then hand each one to the shared subtree
+    // purge helper so stream/message/turn/action (and their children) all go
+    // along with it. Import connections disable FKs for throughput, so we
+    // cannot rely on cascades to clean up here.
+    let conversation_ids: Vec<i64> = conn
+        .prepare_cached(
+            "
+            SELECT id FROM conversation
+            WHERE source_file_id = ?1
+              AND id IN (
+                  SELECT DISTINCT conversation_id FROM stream WHERE import_chunk_id = ?2
+                  UNION
+                  SELECT DISTINCT conversation_id FROM message WHERE import_chunk_id = ?2
+                  UNION
+                  SELECT DISTINCT conversation_id FROM turn WHERE import_chunk_id = ?2
+              )
+            ",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(params![source_file_id, import_chunk_id], |row| row.get(0))
+                .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+        })
+        .context("unable to list conversations for chunk-scoped purge")?;
+    for conversation_id in conversation_ids {
+        super::normalize::purge_conversation_subtree(conn, conversation_id)?;
+    }
 
     conn.prepare_cached(
         "
@@ -1463,91 +1192,6 @@ fn purge_source_file_from_chunk(
     .and_then(|mut stmt| stmt.execute(params![import_chunk_id, source_file_id]))
     .context("unable to purge chunk-scoped import warnings for source file")?;
 
-    Ok(())
-}
-
-fn finalize_chunk_import_core(
-    conn: &Connection,
-    chunk: &PreparedChunk,
-    options: &ImportWorkerOptions,
-) -> Result<()> {
-    for source_file in &chunk.import_source_files {
-        conn.execute(
-            "
-            UPDATE source_file
-            SET
-                imported_size_bytes = size_bytes,
-                imported_modified_at_utc = modified_at_utc,
-                imported_schema_version = ?2
-            WHERE id = ?1
-            ",
-            params![source_file.source_file_id, IMPORT_SCHEMA_VERSION],
-        )
-        .with_context(|| {
-            format!(
-                "unable to mark source file {} as imported",
-                source_file.relative_path
-            )
-        })?;
-    }
-
-    recompute_chunk_counts(conn, chunk.import_chunk_id)?;
-    rebuild_chunk_action_rollups(conn, chunk.import_chunk_id, options.perf_logger.clone())?;
-    rebuild_chunk_path_rollups(conn, chunk.import_chunk_id, options.perf_logger.clone())?;
-    clear_pending_chunk_rebuild(conn, chunk.project_id, &chunk.chunk_day_local)?;
-
-    publish_import_chunk(conn, chunk)?;
-
-    Ok(())
-}
-
-fn recompute_chunk_counts(conn: &Connection, import_chunk_id: i64) -> Result<()> {
-    conn.execute(
-        "
-        UPDATE import_chunk
-        SET
-            imported_record_count = (
-                SELECT COUNT(*)
-                FROM history_event
-                WHERE import_chunk_id = ?1
-            ),
-            imported_message_count = (
-                SELECT COUNT(*)
-                FROM message
-                WHERE import_chunk_id = ?1
-            ),
-            imported_action_count = (
-                SELECT COUNT(*)
-                FROM action
-                WHERE import_chunk_id = ?1
-            ),
-            imported_conversation_count = (
-                SELECT COUNT(*)
-                FROM conversation
-                WHERE id IN (
-                    SELECT DISTINCT conversation_id
-                    FROM stream
-                    WHERE import_chunk_id = ?1
-                    UNION
-                    SELECT DISTINCT conversation_id
-                    FROM message
-                    WHERE import_chunk_id = ?1
-                    UNION
-                    SELECT DISTINCT conversation_id
-                    FROM turn
-                    WHERE import_chunk_id = ?1
-                )
-            ),
-            imported_turn_count = (
-                SELECT COUNT(*)
-                FROM turn
-                WHERE import_chunk_id = ?1
-            )
-        WHERE id = ?1
-        ",
-        [import_chunk_id],
-    )
-    .context("unable to recompute chunk counts")?;
     Ok(())
 }
 
@@ -1619,6 +1263,582 @@ fn mark_chunk_failed(
     Ok(())
 }
 
+// Row counts computed from a shard at the end of a chunk import; written back to the
+// main DB's import_chunk row as part of `finalize_chunk_global`.
+struct ChunkCounts {
+    record_count: i64,
+    message_count: i64,
+    action_count: i64,
+    conversation_count: i64,
+    turn_count: i64,
+}
+
+fn compute_shard_counts(conn: &Connection, import_chunk_id: i64) -> Result<ChunkCounts> {
+    let record_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM history_event WHERE import_chunk_id = ?1",
+            [import_chunk_id],
+            |row| row.get(0),
+        )
+        .context("unable to count history_event rows for shard chunk")?;
+
+    let message_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM message WHERE import_chunk_id = ?1",
+            [import_chunk_id],
+            |row| row.get(0),
+        )
+        .context("unable to count message rows for shard chunk")?;
+
+    let action_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM action WHERE import_chunk_id = ?1",
+            [import_chunk_id],
+            |row| row.get(0),
+        )
+        .context("unable to count action rows for shard chunk")?;
+
+    let conversation_count: i64 = conn
+        .query_row(
+            "
+            SELECT COUNT(*)
+            FROM conversation
+            WHERE id IN (
+                SELECT DISTINCT conversation_id FROM stream  WHERE import_chunk_id = ?1
+                UNION
+                SELECT DISTINCT conversation_id FROM message WHERE import_chunk_id = ?1
+                UNION
+                SELECT DISTINCT conversation_id FROM turn    WHERE import_chunk_id = ?1
+            )
+            ",
+            [import_chunk_id],
+            |row| row.get(0),
+        )
+        .context("unable to count conversation rows for shard chunk")?;
+
+    let turn_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM turn WHERE import_chunk_id = ?1",
+            [import_chunk_id],
+            |row| row.get(0),
+        )
+        .context("unable to count turn rows for shard chunk")?;
+
+    Ok(ChunkCounts {
+        record_count,
+        message_count,
+        action_count,
+        conversation_count,
+        turn_count,
+    })
+}
+
+// Update the main DB with per-chunk metadata. Rollup rows stay in the shard — readers
+// see them via the UNION-ALL views created by `configure_read_view`.
+fn finalize_chunk_global(
+    conn: &Connection,
+    chunk: &PreparedChunk,
+    counts: &ChunkCounts,
+    _options: &ImportWorkerOptions,
+) -> Result<()> {
+    for source_file in &chunk.import_source_files {
+        conn.execute(
+            "
+            UPDATE source_file
+            SET
+                imported_size_bytes = size_bytes,
+                imported_modified_at_utc = modified_at_utc,
+                imported_schema_version = ?2
+            WHERE id = ?1
+            ",
+            params![source_file.source_file_id, IMPORT_SCHEMA_VERSION],
+        )
+        .with_context(|| {
+            format!(
+                "unable to mark source file {} as imported",
+                source_file.relative_path
+            )
+        })?;
+    }
+
+    conn.execute(
+        "
+        UPDATE import_chunk
+        SET
+            imported_record_count       = ?2,
+            imported_message_count      = ?3,
+            imported_action_count       = ?4,
+            imported_conversation_count = ?5,
+            imported_turn_count         = ?6
+        WHERE id = ?1
+        ",
+        params![
+            chunk.import_chunk_id,
+            counts.record_count,
+            counts.message_count,
+            counts.action_count,
+            counts.conversation_count,
+            counts.turn_count,
+        ],
+    )
+    .context("unable to write shard chunk counts to main import_chunk")?;
+
+    clear_pending_chunk_rebuild(conn, chunk.project_id, &chunk.chunk_day_local)?;
+    publish_import_chunk(conn, chunk)?;
+
+    Ok(())
+}
+
+// Import one chunk: bulk data + rollups into the per-project shard, metadata into the main DB.
+// `global_db` points at the main DB (for begin/finalize metadata writes); `shard_db` points at
+// the shard assigned to this chunk's project (for bulk data writes).
+fn import_chunk(
+    global_db: &mut Database,
+    shard_db: &mut Database,
+    source_root: &Path,
+    chunk: &PreparedChunk,
+    phase: ImportPhase,
+    options: &ImportWorkerOptions,
+) -> Result<()> {
+    begin_chunk_import(
+        global_db.connection_mut(),
+        chunk,
+        options.perf_logger.clone(),
+    )?;
+
+    if options.per_chunk_delay > Duration::ZERO {
+        thread::sleep(options.per_chunk_delay);
+    }
+
+    let mut scope = PerfScope::new(options.perf_logger.clone(), "import.chunk");
+    scope.field("project_key", chunk.project_key.as_str());
+    scope.field("chunk_day_local", chunk.chunk_day_local.as_str());
+    scope.field(
+        "source_file_count",
+        chunk.import_source_files.len() + chunk.remove_only_source_files.len(),
+    );
+    scope.field("import_source_file_count", chunk.import_source_files.len());
+    scope.field(
+        "remove_only_source_file_count",
+        chunk.remove_only_source_files.len(),
+    );
+    scope.field("phase", phase.as_str());
+
+    let shard_result: Result<ChunkCounts> = (|| {
+        let mut tx = shard_db
+            .connection_mut()
+            .transaction()
+            .context("unable to start chunk-level shard import transaction")?;
+
+        for source_file in &chunk.remove_only_source_files {
+            purge_source_file_from_chunk(&tx, chunk.import_chunk_id, source_file.source_file_id)?;
+        }
+
+        // Phase 1: Parse all JSONL files in parallel (CPU-only, no DB access).
+        let mut parse_scope = PerfScope::new(options.perf_logger.clone(), "import.parse_phase");
+        let parsed_files: Vec<ParseResult> = chunk
+            .import_source_files
+            .par_iter()
+            .map(|source_file| {
+                let path = source_root.join(&source_file.relative_path);
+                parse_jsonl_file(&path, source_file.source_kind)
+            })
+            .collect();
+        let mut parsed_file_count = 0usize;
+        let mut warning_file_count = 0usize;
+        let mut sessionless_metadata_file_count = 0usize;
+        let mut parsed_record_count = 0usize;
+        for parse_result in &parsed_files {
+            match parse_result {
+                ParseResult::Parsed(parsed_file) => {
+                    parsed_file_count += 1;
+                    parsed_record_count += parsed_file.records.len();
+                }
+                ParseResult::Warning(_) => warning_file_count += 1,
+                ParseResult::SessionlessMetadata => sessionless_metadata_file_count += 1,
+            }
+        }
+        parse_scope.field("parsed_file_count", parsed_file_count);
+        parse_scope.field("warning_file_count", warning_file_count);
+        parse_scope.field(
+            "sessionless_metadata_file_count",
+            sessionless_metadata_file_count,
+        );
+        parse_scope.field("parsed_record_count", parsed_record_count);
+        parse_scope.finish_ok();
+
+        // Phase 2: Write pre-parsed data to the shard serially (one writer per shard).
+        for (source_file, parse_result) in chunk.import_source_files.iter().zip(parsed_files) {
+            match parse_result {
+                ParseResult::Warning(warning) => {
+                    insert_import_warning(
+                        &tx,
+                        chunk.import_chunk_id,
+                        source_file.source_file_id,
+                        &warning,
+                    )?;
+                }
+                ParseResult::SessionlessMetadata => {
+                    let mut savepoint_open_scope =
+                        PerfScope::new(options.perf_logger.clone(), "import.savepoint_open");
+                    savepoint_open_scope.field("source_file_id", source_file.source_file_id);
+                    let sp = match tx.savepoint() {
+                        Ok(sp) => {
+                            savepoint_open_scope.finish_ok();
+                            sp
+                        }
+                        Err(err) => {
+                            savepoint_open_scope.finish_error(&err);
+                            return Err(err).context("unable to create per-file savepoint");
+                        }
+                    };
+                    let params = NormalizeJsonlFileParams {
+                        project_id: chunk.project_id,
+                        source_file_id: source_file.source_file_id,
+                        import_chunk_id: chunk.import_chunk_id,
+                        path: source_root.join(&source_file.relative_path),
+                        perf_logger: options.perf_logger.clone(),
+                    };
+                    super::normalize::purge_existing_import(&sp, &params)?;
+                    let mut savepoint_release_scope =
+                        PerfScope::new(options.perf_logger.clone(), "import.savepoint_release");
+                    savepoint_release_scope.field("source_file_id", source_file.source_file_id);
+                    match sp.commit() {
+                        Ok(()) => savepoint_release_scope.finish_ok(),
+                        Err(err) => {
+                            savepoint_release_scope.finish_error(&err);
+                            return Err(err).context("unable to release per-file savepoint");
+                        }
+                    }
+                }
+                ParseResult::Parsed(parsed_file) => {
+                    let mut savepoint_open_scope =
+                        PerfScope::new(options.perf_logger.clone(), "import.savepoint_open");
+                    savepoint_open_scope.field("source_file_id", source_file.source_file_id);
+                    let sp = match tx.savepoint() {
+                        Ok(sp) => {
+                            savepoint_open_scope.finish_ok();
+                            sp
+                        }
+                        Err(err) => {
+                            savepoint_open_scope.finish_error(&err);
+                            return Err(err).context("unable to create per-file savepoint");
+                        }
+                    };
+                    let params = NormalizeJsonlFileParams {
+                        project_id: chunk.project_id,
+                        source_file_id: source_file.source_file_id,
+                        import_chunk_id: chunk.import_chunk_id,
+                        path: source_root.join(&source_file.relative_path),
+                        perf_logger: options.perf_logger.clone(),
+                    };
+                    let (outcome, normalized_messages) =
+                        write_parsed_file_in_tx(&sp, &params, parsed_file, source_file.source_kind)
+                            .with_context(|| {
+                                format!(
+                                    "unable to normalize source file {}",
+                                    source_root.join(&source_file.relative_path).display()
+                                )
+                            })?;
+                    match outcome {
+                        NormalizeJsonlFileOutcome::Imported(result) => {
+                            if let Some(conversation_id) = result.conversation_id {
+                                let _ = build_actions_in_tx_with_messages(
+                                    &sp,
+                                    &BuildActionsParams {
+                                        conversation_id,
+                                        perf_logger: options.perf_logger.clone(),
+                                    },
+                                    normalized_messages,
+                                )
+                                .with_context(|| {
+                                    format!(
+                                        "unable to build actions for source file {}",
+                                        source_root.join(&source_file.relative_path).display()
+                                    )
+                                })?;
+                            }
+                            let mut savepoint_release_scope = PerfScope::new(
+                                options.perf_logger.clone(),
+                                "import.savepoint_release",
+                            );
+                            savepoint_release_scope
+                                .field("source_file_id", source_file.source_file_id);
+                            match sp.commit() {
+                                Ok(()) => savepoint_release_scope.finish_ok(),
+                                Err(err) => {
+                                    savepoint_release_scope.finish_error(&err);
+                                    return Err(err)
+                                        .context("unable to release per-file savepoint");
+                                }
+                            }
+                        }
+                        NormalizeJsonlFileOutcome::Skipped => {
+                            let mut savepoint_release_scope = PerfScope::new(
+                                options.perf_logger.clone(),
+                                "import.savepoint_release",
+                            );
+                            savepoint_release_scope
+                                .field("source_file_id", source_file.source_file_id);
+                            match sp.commit() {
+                                Ok(()) => savepoint_release_scope.finish_ok(),
+                                Err(err) => {
+                                    savepoint_release_scope.finish_error(&err);
+                                    return Err(err)
+                                        .context("unable to release per-file savepoint");
+                                }
+                            }
+                        }
+                        NormalizeJsonlFileOutcome::Warning(warning) => {
+                            let mut savepoint_rollback_scope = PerfScope::new(
+                                options.perf_logger.clone(),
+                                "import.savepoint_rollback",
+                            );
+                            savepoint_rollback_scope
+                                .field("source_file_id", source_file.source_file_id);
+                            drop(sp);
+                            savepoint_rollback_scope.finish_ok();
+                            insert_import_warning(
+                                &tx,
+                                chunk.import_chunk_id,
+                                source_file.source_file_id,
+                                &warning,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Shard-side finalization: rollups + counts. Rollups stay in the shard; the TUI
+        // query layer sees them via the UNION-ALL TEMP VIEWs configured on every read
+        // connection in `configure_read_view`.
+        let mut shard_finalize_scope =
+            PerfScope::new(options.perf_logger.clone(), "import.finalize_chunk_shard");
+        shard_finalize_scope.field("import_chunk_id", chunk.import_chunk_id);
+        rebuild_chunk_action_rollups(&tx, chunk.import_chunk_id, options.perf_logger.clone())?;
+        rebuild_chunk_path_rollups(&tx, chunk.import_chunk_id, options.perf_logger.clone())?;
+        let counts = compute_shard_counts(&tx, chunk.import_chunk_id)?;
+        shard_finalize_scope.finish_ok();
+
+        let mut commit_scope =
+            PerfScope::new(options.perf_logger.clone(), "import.chunk_shard_commit");
+        commit_scope.field("import_chunk_id", chunk.import_chunk_id);
+        match tx.commit() {
+            Ok(()) => commit_scope.finish_ok(),
+            Err(err) => {
+                commit_scope.finish_error(&err);
+                return Err(err).context("unable to commit chunk-level shard import transaction");
+            }
+        }
+        Ok(counts)
+    })();
+
+    match shard_result {
+        Ok(counts) => {
+            let global_result: Result<()> = (|| {
+                let tx = global_db
+                    .connection_mut()
+                    .transaction()
+                    .context("unable to start chunk-level global finalize transaction")?;
+                let mut global_finalize_scope =
+                    PerfScope::new(options.perf_logger.clone(), "import.finalize_chunk_global");
+                global_finalize_scope.field("import_chunk_id", chunk.import_chunk_id);
+                let result = finalize_chunk_global(&tx, chunk, &counts, options);
+                match &result {
+                    Ok(()) => global_finalize_scope.finish_ok(),
+                    Err(err) => global_finalize_scope.finish_error(err),
+                }
+                result?;
+                tx.commit()
+                    .context("unable to commit chunk-level global finalize transaction")?;
+                Ok(())
+            })();
+            if let Err(err) = global_result {
+                let error_message = compact_status_text(format!("{err:#}"));
+                let _ = mark_chunk_failed(
+                    global_db.connection_mut(),
+                    chunk.import_chunk_id,
+                    &error_message,
+                );
+                scope.finish_error(&err);
+                return Err(err);
+            }
+            scope.finish_ok();
+            Ok(())
+        }
+        Err(err) => {
+            let error_message = compact_status_text(format!("{err:#}"));
+            let _ = mark_chunk_failed(
+                global_db.connection_mut(),
+                chunk.import_chunk_id,
+                &error_message,
+            );
+            scope.finish_error(&err);
+            Err(err)
+        }
+    }
+}
+
+// Unified sharded import orchestrator. Runs startup chunks first, then deferred chunks.
+// Within each phase, chunks are grouped by the shard their project hashes to; all 9 shards
+// process their assigned chunks in parallel via rayon. Within a shard, chunks serialize
+// through a single writer. The main DB metadata writes serialize via SQLite's WAL lock.
+// When `progress_sender` is Some, emits per-chunk Progress events plus StartupSettled after
+// phase 1 and DeferredFailures after phase 2.
+fn run_sharded_import(
+    main_db_path: &Path,
+    source_root: &Path,
+    prepared: PreparedImportPlan,
+    options: &ImportWorkerOptions,
+    progress_sender: Option<&mpsc::Sender<StartupWorkerEvent>>,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let startup_failures = run_phase_sharded(
+        main_db_path,
+        source_root,
+        prepared.startup_chunks,
+        ImportPhase::Startup,
+        "rebuilding database",
+        options,
+        progress_sender,
+    )?;
+    if let Some(sender) = progress_sender {
+        let _ = sender.send(StartupWorkerEvent::StartupSettled {
+            startup_status_message: summarize_startup_failures(&startup_failures),
+        });
+    }
+
+    let deferred_failures = run_phase_sharded(
+        main_db_path,
+        source_root,
+        prepared.deferred_chunks,
+        ImportPhase::Deferred,
+        "importing older history",
+        options,
+        progress_sender,
+    )?;
+    if let Some(sender) = progress_sender
+        && !deferred_failures.is_empty()
+    {
+        let _ = sender.send(StartupWorkerEvent::DeferredFailures {
+            deferred_status_message: summarize_deferred_failures(&deferred_failures),
+        });
+    }
+
+    Ok((startup_failures, deferred_failures))
+}
+
+// Execute one phase. Groups chunks by shard_idx (projects hashed to the same shard share
+// a writer) and runs the groups in parallel. Each shard thread opens its shard DB once
+// and reuses it across the phase's chunks for that shard.
+fn run_phase_sharded(
+    main_db_path: &Path,
+    source_root: &Path,
+    chunks: Vec<PreparedChunk>,
+    phase: ImportPhase,
+    progress_label: &'static str,
+    options: &ImportWorkerOptions,
+    progress_sender: Option<&mpsc::Sender<StartupWorkerEvent>>,
+) -> Result<Vec<String>> {
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let total = chunks.len();
+
+    // Group chunks by shard_idx → project_id.
+    let mut shard_groups: HashMap<usize, ShardImportGroup> = HashMap::new();
+    for chunk in chunks {
+        let shard_idx = shard_index_for_project(chunk.project_id);
+        let group = shard_groups
+            .entry(shard_idx)
+            .or_insert_with(|| ShardImportGroup {
+                shard_idx,
+                projects: Vec::new(),
+            });
+        let project_entry = group
+            .projects
+            .iter_mut()
+            .find(|p| p.project_id == chunk.project_id);
+        match project_entry {
+            Some(entry) => entry.chunks.push(chunk),
+            None => group.projects.push(ShardProjectEntry {
+                project_id: chunk.project_id,
+                project_key: chunk.project_key.clone(),
+                chunks: vec![chunk],
+            }),
+        }
+    }
+
+    let counter = AtomicUsize::new(0);
+    let groups: Vec<ShardImportGroup> = shard_groups.into_values().collect();
+
+    let results: Vec<Result<Vec<String>>> = groups
+        .into_par_iter()
+        .map(|group| {
+            // Both connections are created inside the rayon thread because Connection is !Send.
+            let mut global_db = Database::open_for_import(main_db_path).with_context(|| {
+                format!(
+                    "unable to open main db for import {}",
+                    main_db_path.display()
+                )
+            })?;
+            let mut shard_db = Database::open_shard_for_import(main_db_path, group.shard_idx)
+                .with_context(|| {
+                    format!("unable to open shard{} db for import", group.shard_idx)
+                })?;
+            for project in &group.projects {
+                initialize_shard_project_row(
+                    global_db.connection(),
+                    shard_db.connection(),
+                    project.project_id,
+                )
+                .with_context(|| {
+                    format!(
+                        "unable to initialize shard project row for project {}",
+                        project.project_key
+                    )
+                })?;
+            }
+
+            let mut group_failures: Vec<String> = Vec::new();
+            for project in &group.projects {
+                for chunk in &project.chunks {
+                    let result = import_chunk(
+                        &mut global_db,
+                        &mut shard_db,
+                        source_root,
+                        chunk,
+                        phase,
+                        options,
+                    );
+
+                    let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    if let Some(sender) = progress_sender {
+                        send_progress(sender, progress_label, n, total, chunk);
+                    }
+
+                    if let Err(err) = result {
+                        let contextualized = err.context(format!(
+                            "unable to import {} chunk {}:{}",
+                            phase.as_str(),
+                            chunk.project_key,
+                            chunk.chunk_day_local
+                        ));
+                        group_failures.push(compact_status_text(format!("{contextualized:#}")));
+                    }
+                }
+            }
+            Ok::<_, anyhow::Error>(group_failures)
+        })
+        .collect();
+
+    let mut all_failures: Vec<String> = Vec::new();
+    for result in results {
+        all_failures.extend(result?);
+    }
+    Ok(all_failures)
+}
+
 fn join_worker(worker: Option<JoinHandle<Result<()>>>) -> Result<()> {
     let Some(worker) = worker else {
         return Ok(());
@@ -1656,7 +1876,7 @@ mod tests {
     #[test]
     fn import_plan_uses_local_days_and_round_robins_by_project() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let tz = TimeZone::get("America/Chicago")?;
         let now: Timestamp = "2026-03-26T18:00:00Z".parse()?;
 
@@ -1742,7 +1962,7 @@ mod tests {
     #[test]
     fn import_plan_marks_old_chunk_for_remove_only_when_file_moves_days() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let tz = TimeZone::get("America/Chicago")?;
         let now: Timestamp = "2026-03-26T18:00:00Z".parse()?;
 
@@ -1809,7 +2029,7 @@ mod tests {
             .context("unable to construct recent test timestamp")?
             .to_string();
 
-        let mut db = Database::open(&db_path)?;
+        let mut db = Database::open_unsharded(&db_path)?;
         let project_id = insert_project_with_root(
             db.connection_mut(),
             "path:/startup-ready",
@@ -1878,7 +2098,7 @@ mod tests {
             .context("unable to construct older startup test timestamp")?
             .to_string();
 
-        let mut db = Database::open(&db_path)?;
+        let mut db = Database::open_unsharded(&db_path)?;
         let project_id = insert_project_with_root(
             db.connection_mut(),
             "path:/startup-timeout",
@@ -1966,7 +2186,7 @@ mod tests {
             .context("unable to construct older startup test timestamp")?
             .to_string();
 
-        let mut db = Database::open(&db_path)?;
+        let mut db = Database::open_unsharded(&db_path)?;
         let project_id = insert_project_with_root(
             db.connection_mut(),
             "path:/startup-full-import",
@@ -2299,6 +2519,8 @@ mod tests {
         )?;
         assert_eq!(counts, (2, 0));
 
+        // import_warning lives in a shard; the main DB's TEMP VIEWs surface it.
+        let _ = project_id;
         let warning: String =
             db.connection()
                 .query_row("SELECT message FROM import_warning LIMIT 1", [], |row| {
@@ -2313,7 +2535,7 @@ mod tests {
     #[test]
     fn import_plan_reimports_files_when_import_schema_version_changes() -> Result<()> {
         let temp = tempdir()?;
-        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let mut db = Database::open_unsharded(temp.path().join("usage.sqlite3"))?;
         let tz = TimeZone::get("America/Chicago")?;
         let now: Timestamp = "2026-03-26T18:00:00Z".parse()?;
 
@@ -2549,14 +2771,14 @@ mod tests {
         i64::try_from(content.len()).context("fixture size exceeded i64")
     }
 
+    // Views (configured by Database::open) shadow main-DB data tables with UNION ALL across
+    // shards, so the single-connection JOIN works transparently.
     fn conversation_ids_by_relative_path(conn: &Connection) -> Result<BTreeMap<String, i64>> {
         let mut stmt = conn.prepare(
-            "
-            SELECT source_file.relative_path, conversation.id
-            FROM conversation
-            JOIN source_file ON source_file.id = conversation.source_file_id
-            ORDER BY source_file.relative_path
-            ",
+            "SELECT source_file.relative_path, conversation.id
+             FROM conversation
+             JOIN source_file ON source_file.id = conversation.source_file_id
+             ORDER BY source_file.relative_path",
         )?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<rusqlite::Result<BTreeMap<_, _>>>()

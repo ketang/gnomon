@@ -298,8 +298,33 @@ ln -s /home/ketan/project/gnomon/tests/fixtures/import-corpus/subset.tar.zst .
 
 ### Decision criteria
 
-- **KEPT:** subset improves AND full corpus confirms; row parity PASS; quality gates pass.
-- **REVERTED:** any regression on full corpus; parity failure; or marginal gain (<2%) not worth the complexity.
+- **KEPT:** subset improves AND full corpus confirms; row parity PASS; quality gates pass;
+  **query layer PASS**; **no divergent write paths**.
+- **REVERTED:** any regression on full corpus; parity failure; or marginal gain (<2%) not
+  worth the complexity.
+
+**Query layer PASS** requires at least one of:
+- An automated test that runs `QueryEngine::filter_options` / `browse` against the kept-db
+  and asserts the top-level project rows are non-empty and sum to the expected action count.
+- A manual spot-check of `cargo run -p gnomon -- --db <kept-db> report` showing a non-empty
+  `rows` array whose per-project `item_count` values sum to the bench's action row count.
+
+The automated test is preferred. The manual spot-check is acceptable only when the candidate
+doesn't move data between schemas or tables — once a candidate changes *where data lives*
+(sharding, view-based reads, etc.), automated query-layer coverage is mandatory.
+
+**No divergent write paths** means: if the candidate changes how imports write data (new
+tables, new shards, new ordering), every production entry point (`import_all`, `run_import_worker`,
+anything called from the TUI or the CLI) must use the new path. Keeping one path on the old
+architecture and another on the new one creates a correctness hazard (data from the TUI path
+may become invisible through the CLI path or vice versa). Audit by: `grep -rn "Database::open_for_import\|fn import_chunk"` and verify there is a single write path.
+
+Decision rationale for the first attempt at candidate C1 (committed as 8aa0e9a + d36b289,
+later superseded): declared KEPT with the above criteria absent. `gnomon report` returned
+`"rows": []` because the query layer read rollups from the main DB, but rollups lived in
+shards only. The failing integration tests masked this by panicking on a pre-existing
+`imported_record_count_sum = 0` bug *before* reaching any query-layer assertion. The
+revised criteria above are the direct response.
 
 ### After a KEPT result
 

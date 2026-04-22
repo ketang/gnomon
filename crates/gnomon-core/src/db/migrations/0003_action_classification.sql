@@ -3,7 +3,7 @@ DROP INDEX IF EXISTS idx_action_chunk_category_label;
 DROP TABLE IF EXISTS action;
 
 CREATE TABLE action (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     turn_id INTEGER NOT NULL REFERENCES turn(id) ON DELETE CASCADE,
     import_chunk_id INTEGER NOT NULL REFERENCES import_chunk(id) ON DELETE CASCADE,
     sequence_no INTEGER NOT NULL CHECK (sequence_no >= 0),

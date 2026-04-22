@@ -2099,6 +2099,9 @@ mod tests {
             database
                 .connection()
                 .query_row("SELECT COUNT(*) FROM source_file", [], |row| row.get(0))?;
+
+        // conversation is in a shard; Database::open configures the TEMP VIEW that
+        // surfaces it via the main DB's schema.
         let conversation_count: i64 =
             database
                 .connection()
@@ -2205,10 +2208,12 @@ mod tests {
         )?;
         assert_eq!(counts, (2, 0));
 
+        // import_warning is in a shard; Database::open configures a TEMP VIEW that
+        // aggregates it under the main DB's schema.
         let warning: (String, String) = database.connection().query_row(
             "SELECT code, message FROM import_warning LIMIT 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )?;
         assert_eq!(warning.0, "invalid_json");
         assert!(warning.1.contains(&bad_path.display().to_string()));

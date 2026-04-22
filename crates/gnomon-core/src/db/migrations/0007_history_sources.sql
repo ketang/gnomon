@@ -3,7 +3,7 @@ ALTER TABLE source_file
         CHECK (source_kind IN ('transcript', 'claude_history'));
 
 CREATE TABLE history_event (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     import_chunk_id INTEGER NOT NULL REFERENCES import_chunk(id) ON DELETE CASCADE,
     source_file_id INTEGER NOT NULL REFERENCES source_file(id) ON DELETE CASCADE,
     source_line_no INTEGER NOT NULL CHECK (source_line_no > 0),

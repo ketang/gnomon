@@ -347,8 +347,12 @@ fn touch_one_jsonl_file(root: &Path, relative_path: &str) -> Result<PathBuf> {
 }
 
 fn count_rows(db_path: &Path) -> Result<Vec<(String, i64)>> {
-    let conn = Connection::open(db_path)
+    // Open the main DB via `Database::open` so the TEMP VIEWs unioning shard data tables
+    // are configured. Unqualified counts (e.g. `SELECT COUNT(*) FROM message`) then resolve
+    // to the view and include rows from all shards.
+    let database = Database::open(db_path)
         .with_context(|| format!("unable to open db for row counts at {}", db_path.display()))?;
+    let conn = database.connection();
     let tables = [
         "project",
         "source_file",

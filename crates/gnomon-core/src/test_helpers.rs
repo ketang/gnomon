@@ -12,7 +12,7 @@ use crate::db::{DEFAULT_DB_FILENAME, Database};
 /// The caller must keep the returned `TempDir` alive for as long as the `Database` is used.
 pub(crate) fn make_temp_db() -> Result<(TempDir, Database)> {
     let dir = tempdir()?;
-    let db = Database::open(dir.path().join(DEFAULT_DB_FILENAME))?;
+    let db = Database::open_unsharded(dir.path().join(DEFAULT_DB_FILENAME))?;
     Ok((dir, db))
 }
 

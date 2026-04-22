@@ -82,15 +82,19 @@ const LOAD_CHUNK_PATH_FACTS_SQL: &str = "
             WHERE ref_count.message_id = message.id
         ) AS ref_count
     FROM action
-    JOIN import_chunk ON import_chunk.id = action.import_chunk_id
-    JOIN project ON project.id = import_chunk.project_id
     JOIN action_message ON action_message.action_id = action.id
     JOIN message ON message.id = action_message.message_id
+    JOIN conversation ON conversation.id = message.conversation_id
+    JOIN project ON project.id = conversation.project_id
     JOIN message_path_ref ON message_path_ref.message_id = message.id
     JOIN path_node ON path_node.id = message_path_ref.path_node_id
     WHERE action.import_chunk_id = ?1
       AND path_node.node_kind = 'file'
 ";
+// Invariant: this query runs on a shard transaction during import finalization.
+// Every JOIN target must be a shard-resident table. `import_chunk` and
+// `source_file` live only in the main DB under p4-c1 sharding — do not add
+// JOINs to them here.
 
 const INSERT_CHUNK_PATH_ROLLUP_SQL: &str = "
     INSERT INTO chunk_path_rollup (
