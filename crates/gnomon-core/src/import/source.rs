@@ -24,6 +24,7 @@ const CLAUDE_HISTORY_RELATIVE_PATH: &str = "../history.jsonl";
 const WARNING_INVALID_JSON: &str = "invalid_json";
 const WARNING_MISSING_CWD: &str = "missing_cwd";
 const WARNING_PATH_PROJECT: &str = "path_project";
+const WARNING_REUSED_CACHED_PROJECT: &str = "reused_cached_project";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ScanReport {
@@ -341,8 +342,13 @@ fn discover_source_files(
         "import.discover_source_files.resolve_cache_misses",
     );
     miss_scope.field("cache_miss_count", misses.len());
-    let resolved_misses =
-        resolve_cache_misses_parallel(source_root, misses, identity_policy, project_filters)?;
+    let resolved_misses = resolve_cache_misses_parallel(
+        source_root,
+        misses,
+        identity_policy,
+        project_filters,
+        &cached_rows,
+    )?;
     for cache_record in resolved_misses {
         if let Some(file) = cache_record.to_discovered_source_file()? {
             discovered_files.push(file);
@@ -443,6 +449,7 @@ fn resolve_cache_misses_parallel(
     misses: Vec<CandidateSourceFile>,
     identity_policy: &ProjectIdentityPolicy,
     project_filters: &[ProjectFilterRule],
+    cached_rows: &HashMap<(String, String), StoredScanCacheRecord>,
 ) -> Result<Vec<ScanCacheRecord>> {
     let resolved_project_cache = Arc::new(Mutex::new(HashMap::<PathBuf, ResolvedProject>::new()));
     let project_root = source_root.parent().unwrap_or(source_root).to_path_buf();
@@ -450,12 +457,18 @@ fn resolve_cache_misses_parallel(
     misses
         .into_par_iter()
         .map(|candidate| {
+            let cache_key = (
+                candidate.source_kind.as_str().to_string(),
+                candidate.relative_path.clone(),
+            );
+            let previous = cached_rows.get(&cache_key);
             resolve_candidate_source_file(
                 &candidate,
                 identity_policy,
                 project_filters,
                 &project_root,
                 resolved_project_cache.clone(),
+                previous,
             )
         })
         .collect()
@@ -467,16 +480,38 @@ fn resolve_candidate_source_file(
     project_filters: &[ProjectFilterRule],
     history_project_root: &Path,
     resolved_project_cache: Arc<Mutex<HashMap<PathBuf, ResolvedProject>>>,
+    previous: Option<&StoredScanCacheRecord>,
 ) -> Result<ScanCacheRecord> {
     match candidate.source_kind {
         SourceFileKind::Transcript => {
             let ExtractedCwd { cwd, mut warnings } = extract_cwd(&candidate.absolute_path)?;
             let raw_cwd = cwd.clone();
+            let mut reused_previous_identity = false;
             let project = match cwd {
                 Some(cwd) => {
                     resolve_project_with_memo(cwd, identity_policy, &resolved_project_cache)
                 }
-                None => vcs::path_project(&candidate.absolute_path, vcs::PATH_REASON_MISSING_CWD),
+                None => {
+                    // When the current content no longer yields a cwd (the
+                    // file was truncated, corrupted, or is a partial write),
+                    // prefer the previously-scanned identity over a fresh
+                    // path-fallback. Otherwise a transient corruption flips
+                    // the file from project X (git-backed) to a new
+                    // path-only project Y — the source_file manifest row
+                    // gets reinserted under Y, every shard-resident row
+                    // that referenced the old source_file_id becomes
+                    // orphan work for the delete-missing cleanup, and
+                    // TUI readers mid-scan see the transient project.
+                    // Reusing the cached identity keeps the manifest row
+                    // stable until content recovers (or another scan
+                    // proves the identity truly changed).
+                    if let Some(cached) = previous.and_then(cached_git_project) {
+                        reused_previous_identity = true;
+                        cached
+                    } else {
+                        vcs::path_project(&candidate.absolute_path, vcs::PATH_REASON_MISSING_CWD)
+                    }
+                }
             };
 
             let excluded = (!identity_policy.fallback_path_projects
@@ -487,6 +522,14 @@ fn resolve_candidate_source_file(
                 && let Some(reason) = &project.identity_reason
             {
                 warnings.push(ScanWarning::new(WARNING_PATH_PROJECT, reason.clone()));
+            }
+            if reused_previous_identity {
+                warnings.push(ScanWarning::new(
+                    WARNING_REUSED_CACHED_PROJECT,
+                    "current scan could not extract a cwd; reusing the identity from \
+                     the previous successful scan"
+                        .to_string(),
+                ));
             }
 
             let scan_warnings_json = serde_json::to_string(&warnings).with_context(|| {
@@ -522,6 +565,30 @@ fn resolve_candidate_source_file(
             })
         }
     }
+}
+
+// Reconstructs the ResolvedProject that the previous successful scan
+// recorded for this source file, but only if that scan reached a git-backed
+// identity. Returns None for cached path-identity rows (there's nothing to
+// prefer over a fresh path-fallback) or when any of the required columns
+// are missing.
+fn cached_git_project(previous: &StoredScanCacheRecord) -> Option<ResolvedProject> {
+    if previous.project_identity_kind.as_deref() != Some("git") {
+        return None;
+    }
+    let canonical_key = previous.project_canonical_key.clone()?;
+    let display_name = previous.project_display_name.clone()?;
+    let root_path = PathBuf::from(previous.project_root_path.clone()?);
+    let git_root_path = previous.project_git_root_path.clone().map(PathBuf::from);
+    Some(ResolvedProject {
+        identity_kind: ProjectIdentityKind::Git,
+        canonical_key,
+        display_name,
+        root_path,
+        git_root_path,
+        git_origin: previous.project_git_origin.clone(),
+        identity_reason: previous.project_identity_reason.clone(),
+    })
 }
 
 fn resolve_project_with_memo(
