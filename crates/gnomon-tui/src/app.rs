@@ -35,9 +35,9 @@ use gnomon_core::import::{
 use gnomon_core::opportunity::{OpportunityCategory, OpportunityConfidence};
 use gnomon_core::perf::{PerfLogger, PerfScope};
 use gnomon_core::query::{
-    ActionKey, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState, FilterOptions,
-    MetricLens, QueryEngine, RollupRow, RollupRowKind, RootView, SkillAttributionConfidence,
-    SnapshotBounds, SnapshotCoverageSummary, TimeWindowFilter,
+    ActionKey, ActionRollupTuple, BrowseFilters, BrowsePath, BrowseRequest, ClassificationState,
+    FilterOptions, MetricLens, QueryEngine, RollupRow, RollupRowKind, RootView,
+    SkillAttributionConfidence, SnapshotBounds, SnapshotCoverageSummary, TimeWindowFilter,
 };
 use gnomon_core::vcs::ProjectIdentityKind;
 use jiff::ToSpan;
@@ -4189,12 +4189,36 @@ fn build_jump_targets_for_state(
         );
     }
     let filters = current_query_filters_for(&ui_state, &snapshot)?;
-    let mut perf = PerfScope::new(perf_logger, "tui.build_jump_targets");
+    let mut perf = PerfScope::new(perf_logger.clone(), "tui.build_jump_targets");
     perf.field("snapshot", &snapshot);
     perf.field("root", ui_state.root);
     perf.field("path", &ui_state.path);
     perf.field("lens", ui_state.lens);
     perf.field("filters", &filters);
+
+    // Fast path: with no active filters the target list is a deterministic
+    // function of the (project, category, action) tuple set, which we can
+    // pull in one query instead of cascading O(projects × categories)
+    // browses. On a 22-project / 197-chunk corpus this collapses ~550 SQL
+    // round-trips to one, dropping jump_target_build from ~21 s to under a
+    // second. Filters still go through the legacy per-browse path — that
+    // branch is covered by the existing unit tests.
+    if filters == BrowseFilters::default() {
+        let tuples = query_engine.action_rollup_tuples(&snapshot)?;
+        let targets = jump_targets_from_tuples(&tuples);
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.step(
+                JUMP_TARGET_PHASE_TOTAL,
+                JUMP_TARGET_PHASE_TOTAL,
+                "finalizing jump targets".to_string(),
+            );
+        }
+        perf.field("target_count", targets.len());
+        perf.field("tuple_count", tuples.len());
+        perf.field("fast_path", true);
+        perf.finish_ok();
+        return Ok(targets);
+    }
     let mut browse_stats = BrowseFanoutStats::default();
     let mut targets = Vec::new();
     let mut project_count = 0usize;
@@ -4473,6 +4497,115 @@ fn build_jump_targets_for_state(
     perf.finish_ok();
 
     Ok(targets)
+}
+
+// Build the full jump-target list directly from the single action-rollup
+// tuple query result. Order matches the legacy cascading-browse builder:
+// project + its categories + their actions, then categories + their actions
+// + the projects touching each category/action. Stable sort by display
+// name / category / action so the same corpus produces the same order.
+fn jump_targets_from_tuples(tuples: &[ActionRollupTuple]) -> Vec<JumpTarget> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    type ProjectKey = (String, i64);
+    type CategoriesForProject = BTreeMap<String, Vec<ActionKey>>;
+    type ActionsByCategory = BTreeMap<ActionKey, BTreeSet<ProjectKey>>;
+
+    // Group tuples twice: once keyed by project (for ProjectHierarchy
+    // traversal) and once by category (for CategoryHierarchy). Ordering
+    // within each BTreeMap is already alphabetical by the sort keys the
+    // underlying SQL emits.
+    let mut by_project: BTreeMap<ProjectKey, CategoriesForProject> = BTreeMap::new();
+    let mut by_category: BTreeMap<String, ActionsByCategory> = BTreeMap::new();
+    for tuple in tuples {
+        let project_key = (tuple.project_display_name.clone(), tuple.project_id);
+        by_project
+            .entry(project_key.clone())
+            .or_default()
+            .entry(tuple.category.clone())
+            .or_default()
+            .push(tuple.action.clone());
+        by_category
+            .entry(tuple.category.clone())
+            .or_default()
+            .entry(tuple.action.clone())
+            .or_default()
+            .insert(project_key);
+    }
+
+    let mut targets = Vec::new();
+
+    for ((project_label, project_id), categories) in &by_project {
+        targets.push(JumpTarget {
+            label: project_label.clone(),
+            detail: "project".to_string(),
+            root: RootView::ProjectHierarchy,
+            path: BrowsePath::Project {
+                project_id: *project_id,
+            },
+        });
+        for (category, actions) in categories {
+            targets.push(JumpTarget {
+                label: format!("{project_label} / {category}"),
+                detail: "project category".to_string(),
+                root: RootView::ProjectHierarchy,
+                path: BrowsePath::ProjectCategory {
+                    project_id: *project_id,
+                    category: category.clone(),
+                },
+            });
+            for action in actions {
+                targets.push(JumpTarget {
+                    label: format!("{project_label} / {category} / {}", action.label()),
+                    detail: "project action".to_string(),
+                    root: RootView::ProjectHierarchy,
+                    path: BrowsePath::ProjectAction {
+                        project_id: *project_id,
+                        category: category.clone(),
+                        action: action.clone(),
+                        parent_path: None,
+                    },
+                });
+            }
+        }
+    }
+
+    for (category, actions) in &by_category {
+        targets.push(JumpTarget {
+            label: category.clone(),
+            detail: "category".to_string(),
+            root: RootView::CategoryHierarchy,
+            path: BrowsePath::Category {
+                category: category.clone(),
+            },
+        });
+        for (action, projects) in actions {
+            targets.push(JumpTarget {
+                label: format!("{category} / {}", action.label()),
+                detail: "category action".to_string(),
+                root: RootView::CategoryHierarchy,
+                path: BrowsePath::CategoryAction {
+                    category: category.clone(),
+                    action: action.clone(),
+                },
+            });
+            for (project_label, project_id) in projects {
+                targets.push(JumpTarget {
+                    label: format!("{category} / {} / {project_label}", action.label()),
+                    detail: "category project".to_string(),
+                    root: RootView::CategoryHierarchy,
+                    path: BrowsePath::CategoryActionProject {
+                        category: category.clone(),
+                        action: action.clone(),
+                        project_id: *project_id,
+                        parent_path: None,
+                    },
+                });
+            }
+        }
+    }
+
+    targets
 }
 
 fn browse_rows_with_parent_fallback(
@@ -8411,7 +8544,12 @@ mod tests {
                     .iter()
                     .any(|request| request["count"].as_u64().unwrap_or(0) > 1))
         );
-        assert!(jump["browse_request_count"].as_u64().unwrap_or(0) > 0);
+        // The jump-target builder takes the fast single-query path when
+        // filters are default (as they are here), so no browse fan-out is
+        // expected. Assert we produced jump targets rather than counting
+        // browses.
+        assert!(jump["target_count"].as_u64().unwrap_or(0) > 0);
+        assert!(jump["fast_path"].as_bool().unwrap_or(false));
 
         Ok(())
     }

@@ -556,117 +556,41 @@ fn browse_level_label(path: &BrowsePath) -> &'static str {
     }
 }
 
+// Mirrors the TUI jump-to navigator's work: with no filters the target list
+// is a pure function of the (project, category, action) tuple set, pulled
+// in one query via `action_rollup_tuples`. Replacing the old O(projects ×
+// categories) cascading-browse walker here keeps the benchmark aligned with
+// what the TUI actually runs.
 fn build_jump_target_count(engine: &QueryEngine<'_>, snapshot: &SnapshotBounds) -> Result<usize> {
-    let filters = BrowseFilters::default();
-    let mut target_count = 0usize;
+    let tuples = engine.action_rollup_tuples(snapshot)?;
 
-    let project_root_rows = run_browse(
-        engine,
-        BrowseRequest {
-            snapshot: snapshot.clone(),
-            root: RootView::ProjectHierarchy,
-            lens: MetricLens::UncachedInput,
-            filters: filters.clone(),
-            path: BrowsePath::Root,
-        },
-    )?;
+    let mut projects = std::collections::BTreeSet::<i64>::new();
+    let mut project_categories = std::collections::BTreeSet::<(i64, String)>::new();
+    let mut categories = std::collections::BTreeSet::<String>::new();
+    let mut category_actions = std::collections::BTreeSet::<(String, ActionKey)>::new();
+    let mut category_action_projects =
+        std::collections::BTreeSet::<(String, ActionKey, i64)>::new();
 
-    for project in &project_root_rows {
-        let Some(project_id) = project.project_id else {
-            continue;
-        };
-        target_count += 1;
-
-        let categories = run_browse(
-            engine,
-            BrowseRequest {
-                snapshot: snapshot.clone(),
-                root: RootView::ProjectHierarchy,
-                lens: MetricLens::UncachedInput,
-                filters: filters.clone(),
-                path: BrowsePath::Project { project_id },
-            },
-        )?;
-
-        for category in &categories {
-            let Some(category_name) = category.category.clone() else {
-                continue;
-            };
-            target_count += 1;
-
-            let actions = run_browse(
-                engine,
-                BrowseRequest {
-                    snapshot: snapshot.clone(),
-                    root: RootView::ProjectHierarchy,
-                    lens: MetricLens::UncachedInput,
-                    filters: filters.clone(),
-                    path: BrowsePath::ProjectCategory {
-                        project_id,
-                        category: category_name,
-                    },
-                },
-            )?;
-
-            target_count += actions.len();
-        }
+    let mut project_action_total = 0usize;
+    for tuple in &tuples {
+        projects.insert(tuple.project_id);
+        project_categories.insert((tuple.project_id, tuple.category.clone()));
+        categories.insert(tuple.category.clone());
+        category_actions.insert((tuple.category.clone(), tuple.action.clone()));
+        category_action_projects.insert((
+            tuple.category.clone(),
+            tuple.action.clone(),
+            tuple.project_id,
+        ));
+        project_action_total += 1;
     }
 
-    let category_root_rows = run_browse(
-        engine,
-        BrowseRequest {
-            snapshot: snapshot.clone(),
-            root: RootView::CategoryHierarchy,
-            lens: MetricLens::UncachedInput,
-            filters,
-            path: BrowsePath::Root,
-        },
-    )?;
-
-    for category in &category_root_rows {
-        let Some(category_name) = category.category.clone() else {
-            continue;
-        };
-        target_count += 1;
-
-        let actions = run_browse(
-            engine,
-            BrowseRequest {
-                snapshot: snapshot.clone(),
-                root: RootView::CategoryHierarchy,
-                lens: MetricLens::UncachedInput,
-                filters: BrowseFilters::default(),
-                path: BrowsePath::Category {
-                    category: category_name.clone(),
-                },
-            },
-        )?;
-
-        for action in &actions {
-            let Some(action_key) = action.action.clone() else {
-                continue;
-            };
-            target_count += 1;
-
-            let projects = run_browse(
-                engine,
-                BrowseRequest {
-                    snapshot: snapshot.clone(),
-                    root: RootView::CategoryHierarchy,
-                    lens: MetricLens::UncachedInput,
-                    filters: BrowseFilters::default(),
-                    path: BrowsePath::CategoryAction {
-                        category: category_name.clone(),
-                        action: action_key,
-                    },
-                },
-            )?;
-
-            target_count += projects.len();
-        }
-    }
-
-    Ok(target_count)
+    Ok(projects.len()
+        + project_categories.len()
+        + project_action_total
+        + categories.len()
+        + category_actions.len()
+        + category_action_projects.len())
 }
 
 #[derive(Debug, Clone)]
