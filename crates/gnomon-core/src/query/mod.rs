@@ -222,6 +222,17 @@ impl ClassificationState {
     }
 }
 
+// One row from `action_rollup_tuples`. A distinct (project_id, category,
+// action) triple in the current snapshot. Used by the TUI jump-to navigator
+// to enumerate targets without cascading per-entity browses.
+#[derive(Debug, Clone)]
+pub struct ActionRollupTuple {
+    pub project_id: i64,
+    pub project_display_name: String,
+    pub category: String,
+    pub action: ActionKey,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ActionKey {
     pub classification_state: ClassificationState,
@@ -931,6 +942,63 @@ impl<'conn> QueryEngine<'conn> {
         perf.field("action_count", options.actions.len());
         perf.finish_ok();
         Ok(options)
+    }
+
+    // Returns every distinct (project, category, action) tuple covered by the
+    // snapshot. The TUI's jump-to navigator uses this to assemble its target
+    // list in O(1) SQL queries instead of O(projects × categories) browses.
+    pub fn action_rollup_tuples(
+        &self,
+        snapshot: &SnapshotBounds,
+    ) -> Result<Vec<ActionRollupTuple>> {
+        let mut perf = self.perf_scope("query.action_rollup_tuples");
+        perf.field("snapshot", snapshot);
+
+        let mut tuples = Vec::new();
+        if snapshot.max_publish_seq > 0 {
+            let max_publish_seq = i64::try_from(snapshot.max_publish_seq)
+                .context("snapshot publish_seq overflowed i64")?;
+            let mut stmt = self
+                .conn
+                .prepare(FILTER_OPTIONS_PROJECT_CATEGORY_ACTION_SQL)
+                .context("unable to prepare action-rollup tuple query")?;
+            let rows = stmt.query_map([max_publish_seq], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })?;
+            for row in rows {
+                let (
+                    project_id,
+                    project_display_name,
+                    category,
+                    classification_state,
+                    normalized_action,
+                    command_family,
+                    base_command,
+                ) = row.context("unable to read action-rollup tuple row")?;
+                tuples.push(ActionRollupTuple {
+                    project_id,
+                    project_display_name,
+                    category,
+                    action: ActionKey {
+                        classification_state: parse_classification_state(&classification_state)?,
+                        normalized_action,
+                        command_family,
+                        base_command,
+                    },
+                });
+            }
+        }
+        perf.field("tuple_count", tuples.len());
+        perf.finish_ok();
+        Ok(tuples)
     }
 
     pub fn browse(&self, request: &BrowseRequest) -> Result<Vec<RollupRow>> {
