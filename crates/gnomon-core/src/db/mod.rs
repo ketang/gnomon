@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
-pub const INITIAL_SCHEMA_VERSION: u32 = 14;
+pub const INITIAL_SCHEMA_VERSION: u32 = 15;
 pub const DEFAULT_DB_FILENAME: &str = "usage.sqlite3";
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -27,7 +27,6 @@ pub const SHARD_ID_STRIDE: i64 = 1_000_000_000;
 pub const SHARD_DATA_TABLES: &[&str] = &[
     "conversation",
     "stream",
-    "record",
     "message",
     "message_part",
     "turn",
@@ -49,7 +48,6 @@ pub const SHARD_DATA_TABLES: &[&str] = &[
 const SHARD_AUTOINCREMENT_TABLES: &[&str] = &[
     "conversation",
     "stream",
-    "record",
     "message",
     "message_part",
     "turn",
@@ -421,7 +419,7 @@ mod tests {
         reset_sqlite_database, shard_path_for_index, sqlite_sidecar_path,
     };
 
-    const REQUIRED_TABLES: [&str; 21] = [
+    const REQUIRED_TABLES: [&str; 20] = [
         "project",
         "source_file",
         "scan_source_cache",
@@ -432,7 +430,6 @@ mod tests {
         "skill_invocation",
         "conversation",
         "stream",
-        "record",
         "message",
         "message_part",
         "turn",

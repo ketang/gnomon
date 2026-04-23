@@ -114,11 +114,11 @@ pub const IMPORT_CHUNK_UNIT: &str = "project x day";
 /// - `text_value` — transcript text used for skill confirmation heuristics
 /// ## v5 changes
 ///
-/// The `record` table is no longer populated during import. This eliminates
-/// ~490K INSERTs per full corpus import. (The `imported_record_count`
-/// aggregate that previously tracked the JSONL-line count was dropped in
-/// v7 — it had no product consumer and its compute path was a silent
-/// no-op under p4 sharding.)
+/// The `record` table stopped being populated during import, eliminating
+/// ~490K INSERTs per full corpus import. (The table was dropped entirely
+/// in v8, along with the `imported_record_count` aggregate that had
+/// tracked its row count — neither had a product consumer and their
+/// compute paths were silent no-ops under p4 sharding.)
 pub const IMPORT_SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

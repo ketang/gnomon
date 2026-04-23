@@ -359,7 +359,6 @@ fn count_rows(db_path: &Path) -> Result<Vec<(String, i64)>> {
         "import_chunk",
         "conversation",
         "stream",
-        "record",
         "message",
         "message_part",
         "turn",

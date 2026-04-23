@@ -152,7 +152,6 @@ const SUBSET_EXPECTATIONS: CorpusExpectations = CorpusExpectations {
     message_part_count: 60_791,
     turn_count: 2_699,
     action_count: 17_800,
-    record_count: 0,
     history_event_count: 0,
     import_warning_count: 7,
     imported_message_count_sum: 42_965,
@@ -183,7 +182,6 @@ struct CorpusExpectations {
     message_part_count: i64,
     turn_count: i64,
     action_count: i64,
-    record_count: i64,
     history_event_count: i64,
     import_warning_count: i64,
     imported_message_count_sum: i64,
@@ -217,7 +215,6 @@ struct DatabaseCounts {
     startup_chunk_count: i64,
     conversation_count: i64,
     stream_count: i64,
-    record_count: i64,
     message_count: i64,
     message_part_count: i64,
     turn_count: i64,
@@ -719,7 +716,6 @@ fn full_corpus_import_all_matches_expected_database_shape() -> Result<()> {
     assert_eq!(counts.startup_chunk_count, 0);
     assert!(counts.conversation_count > SUBSET_EXPECTATIONS.conversation_count);
     assert_eq!(counts.stream_count, counts.conversation_count);
-    assert_eq!(counts.record_count, 0);
     assert!(counts.message_count > SUBSET_EXPECTATIONS.message_count);
     assert!(counts.message_part_count > SUBSET_EXPECTATIONS.message_part_count);
     assert!(counts.turn_count > SUBSET_EXPECTATIONS.turn_count);
@@ -869,7 +865,6 @@ fn load_database_counts(conn: &Connection, _db_path: &Path) -> Result<DatabaseCo
         // so these queries return aggregated totals across all shards.
         conversation_count: query_count(conn, "SELECT COUNT(*) FROM conversation")?,
         stream_count: query_count(conn, "SELECT COUNT(*) FROM stream")?,
-        record_count: query_count(conn, "SELECT COUNT(*) FROM record")?,
         message_count: query_count(conn, "SELECT COUNT(*) FROM message")?,
         message_part_count: query_count(conn, "SELECT COUNT(*) FROM message_part")?,
         turn_count: query_count(conn, "SELECT COUNT(*) FROM turn")?,
@@ -961,7 +956,6 @@ fn assert_database_counts(counts: &DatabaseCounts, expectations: CorpusExpectati
     assert_eq!(counts.startup_chunk_count, expectations.startup_chunk_count);
     assert_eq!(counts.conversation_count, expectations.conversation_count);
     assert_eq!(counts.stream_count, expectations.stream_count);
-    assert_eq!(counts.record_count, expectations.record_count);
     assert_eq!(counts.message_count, expectations.message_count);
     assert_eq!(counts.message_part_count, expectations.message_part_count);
     assert_eq!(counts.turn_count, expectations.turn_count);
