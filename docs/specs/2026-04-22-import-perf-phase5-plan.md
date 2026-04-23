@@ -283,30 +283,93 @@ the phase-4 process lesson that caught C1's empty `"rows": []`.
 
 ---
 
+## 7. Phase-5 candidate log
+
+### J1 — single-query `jump_target_build` — **KEPT**
+
+Commit: `555b8b9` on `import-perf-p5-j1`, merged via `ff3c114`.
+
+Problem: the TUI jump-to navigator (`g` key) was walking the hierarchy
+via cascading browses — one project-root browse, one browse per project,
+one per `(project, category)`, and the symmetric category-hierarchy walk.
+On the full 22-project / 197-chunk corpus that's ~550 round-trips
+through the UNION-ALL shard views; bench median was 21 067 ms.
+
+Fix: every target is a pure function of the distinct
+`(project_id, category, action)` tuple set, which is already what
+`FILTER_OPTIONS_PROJECT_CATEGORY_ACTION_SQL` returns. New
+`QueryEngine::action_rollup_tuples` exposes the raw tuples; the TUI
+rebuilds the target list in memory when filters are default. Filtered
+jumps keep the legacy per-browse walk.
+
+Measurement (full corpus, 5 iters):
+
+| scenario | before | after |
+| --- | ---: | ---: |
+| `jump_target_build` | 21 067 ms | **4 ms** |
+
+Other scenarios within noise. Gates ✓. TUI render smoke ✓.
+
+---
+
+## 8. Post-J1 profile notes
+
+Cold full-corpus import wall time is 9258 ms (perf-log snapshot after
+J1). Share (cum across calls, then divided by observed parallelism):
+
+| phase | cum ms | approx wall share |
+| --- | ---: | ---: |
+| `import.normalize_jsonl` (parallel × shards) | 7530 | ~2.7 s |
+| `import.build_actions` (parallel × shards) | 7096 | ~2.5 s |
+| `import.chunk_shard_commit` | 6236 | ~2.2 s |
+| `import.rebuild_path_rollups` | 2601 | ~0.9 s |
+| `import.parse_phase` | 1442 | ~0.5 s |
+| `import.scan_source` | 386 | 0.4 s |
+
+No single outlier. The import path is now roughly balanced; further
+gains are incremental unless we attack shard imbalance (A1) or the
+per-shard serial commit (architectural).
+
+The remaining single-digit-percentage optimizations from §5 are still
+all valid, but none should be expected to beat J1's headline. Priorities
+from here are debatable — the user should steer which direction(s) to
+push: UX (more query-side polishing), cold-import wall time (mostly
+architectural), or correctness (R1, I1, I2).
+
+---
+
 ## RESUME HERE
 
-**Phase**: Phase 5 — new plan; no candidate started yet.
+**Phase**: Phase 5 — J1 landed (KEPT). No candidate currently in
+flight.
 
 **Long-lived branch (from phase 4)**: `import-perf-p4`
 **Long-lived worktree**: `.worktrees/import-perf-p4`
 
-**Tip of `import-perf-p4`** (post phase-4 follow-ups):
+**Tip of `import-perf-p4`** (post J1 merge):
 
+- `ff3c114` Merge branch 'import-perf-p5-j1' into import-perf-p4
+- `555b8b9` J1: single-query jump_target_build, 21 s → 4 ms
+- `17f804e` Add phase-5 plan capturing current architecture and backlog
 - `ec00593` Merge branch 'import-perf-p4-malformed-restore-fix'
 - `78fc57e` Purge shard rows when a stale source_file is removed during scan
 - `d8f59cf` Merge branch 'import-perf-p4-c1'
 - `8af6967` Fix sharded-import correctness regressions surfaced by a diverse corpus
 
-**Unmerged to main**: `import-perf-p4` is still ahead of `main`. The
-phase-4 log's `pending_user_approvals` list showed `p4 → main` as open;
-that's still open and a separate decision from starting phase-5 work.
+**Pushed to remote** (`origin/import-perf-p4`): yes, up to `ff3c114`.
+`p4 → main` merge still open.
 
-**Next action**: choose a candidate from Section 5 and spin its branch.
-`J1` (jump_target_build cache) has the largest visible UX win and is a
-clean scope. `R1` (`imported_record_count_sum` fix) is the cheapest
-correctness win. Either is a reasonable start.
+**Kept preserved experiment branches**: `import-perf-p4-a7` (jwalk,
+relevant to W1), `import-perf-p4-a8` (chunk-level `path_node` cache,
+relevant to P1). All other phase-4 experiment branches and their
+worktrees were cleaned up.
 
-**Do not** re-derive state from `git status` or `git log --oneline`; the
-phase-4 follow-up commits land on `import-perf-p4` between now and
-whenever this plan gets resumed. Use `git log import-perf-p4 ^main` to
-see the delta.
+**Next action**: pick a phase-5 candidate from §5. With J1 landed the
+remaining headroom is in the single-digit-percent range (see §8);
+consider whether that's worth more cycles vs. shifting to correctness
+(R1, I1, I2) or the architectural questions (A1, A2).
+
+**Do not** re-derive state from `git status` or `git log --oneline`.
+Use `git log import-perf-p4 ^main` for the p4 delta and
+`git log import-perf-p4 ^import-perf-p5-<slug>` for per-candidate
+deltas.
