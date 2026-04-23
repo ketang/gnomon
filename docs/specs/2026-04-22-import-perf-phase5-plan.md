@@ -146,24 +146,20 @@ scariest number in this phase.
 Carry these into phase 5 explicitly; every future plan decision should
 account for them.
 
-- **`imported_record_count_sum` is always 0 for transcript imports.**
-  Pre-existing since well before phase 4. Transcripts don't populate the
-  `record` table; the `recompute_chunk_counts` aggregate reads from
-  `history_event + codex_rollout_record + codex_session_index_entry`, and
-  transcripts add nothing to any of those. Any downstream that wanted
-  "records imported across all chunks" is wrong. Integration tests assert
-  `imported_record_count_sum: 0` to accommodate rather than fix.
+- ~~**`imported_record_count_sum` is always 0 for transcript imports.**~~
+  Resolved by **R1** (`67f9d85`): column dropped via migration 0019
+  rather than plumbed through. No product consumer, transcript "records"
+  were semantically ambiguous.
 - **`publish_seq` is non-deterministic** across runs under parallel
   sharded import (it's assigned in shard-writer completion order).
   Integration tests now sort `chunk_day_sequence` before comparison.
   Any external consumer that assumes `publish_seq` is stable across
-  rebuilds will drift.
-- **Corrupt-transcript identity flip.** When a file's content lacks a
-  `cwd`, project identity falls back to path-based, which creates a
-  transient new project while the corruption is live. Final counts are
-  now clean (phase-4 follow-up fix routes cleanup through the shard),
-  but a concurrent reader mid-corruption would see the transient
-  project in the manifest.
+  rebuilds will drift. Addressed by the **I2** candidate in §5.3.
+- ~~**Corrupt-transcript identity flip.**~~ Resolved by **I1** (`aec8cf1`):
+  `resolve_candidate_source_file` now reuses the scan-source cache's
+  last successful git-backed identity when a re-scan's content loses
+  its `cwd`, so the transient new-project flip no longer occurs. The
+  earlier shard-row purge safety net stays in place.
 - **Shard size imbalance.** Projects hash by `id % 9`. The current `.claude`
   corpus has "kapow" ≈3× the next-largest project, so one shard does 3×
   the work on bulk imports. Current id seeding makes rebalancing a
@@ -188,11 +184,9 @@ decide KEPT or REVERTED.
 > publishes, so the first `g` press after import is instant. Worst-case
 > acceptable latency target: <500 ms.
 
-**R1 — Fix `imported_record_count_sum = 0`.**
-> Transcripts need a source of truth for "records imported". Either wire
-> transcript normalize to populate `record`, or change the aggregate
-> definition in `recompute_chunk_counts` to something transcript imports
-> actually update. Small code, visible bug.
+**R1 — Fix `imported_record_count_sum = 0`.** **KEPT** (see §7).
+> Resolved by dropping the column rather than plumbing a counter: no
+> product consumer and no clean semantic for transcripts. Migration 0019.
 
 **S1 revisit — retry `simd-json` under sharding.**
 > Reverted pre-sharding because parse was <5% of wall time. Sharding
@@ -228,11 +222,10 @@ decide KEPT or REVERTED.
 
 ### 5.3 Small (leftover housekeeping)
 
-**I1 — Project-identity cache for corrupt files.**
-> Remember the last successful (non-path) project identity per
-> `source_file` row; prefer it when a re-scan's content no longer
-> provides a `cwd`. Eliminates the transient-new-project flip that
-> required the shard-purge fix.
+**I1 — Project-identity cache for corrupt files.** **KEPT** (see §7).
+> Reuse cached git-backed identity in `resolve_candidate_source_file`
+> when content stops yielding a `cwd`; new `reused_cached_project` scan
+> warning records the carry-forward.
 
 **I2 — Deterministic `publish_seq`.**
 > Serial "publish" step at chunk finalize time, outside the per-shard
@@ -255,10 +248,10 @@ decide KEPT or REVERTED.
 > convention. Non-trivial design; defer unless the kapow-style imbalance
 > becomes a real bottleneck.
 
-**A2 — Drop or wire up `record` table.**
-> Currently unused for transcript imports but occupies schema +
-> AUTOINCREMENT seeding in every shard. Either populate it (intersects
-> R1 above) or remove it and simplify the schema.
+**A2 — Drop or wire up `record` table.** **KEPT** (see §7).
+> Dropped via migration 0020. Removed from SHARD_DATA_TABLES,
+> SHARD_AUTOINCREMENT_TABLES, the read-view list, and the integration
+> harness. Distinct from `codex_rollout_record` (arrives via p4→main).
 
 ---
 
@@ -312,6 +305,78 @@ Other scenarios within noise. Gates ✓. TUI render smoke ✓.
 
 ---
 
+### R1 — drop `imported_record_count` column — **KEPT**
+
+Commit: `67f9d85` on `import-perf-p4` (landed directly, branch
+`import-perf-p5-r1` points at the same commit).
+
+Problem: §4's first listed correctness gap. The column was always 0
+for transcript imports — writes ran on the shard connection where
+`import_chunk` is empty, and `compute_shard_counts` overwrote the
+value from `SELECT COUNT(*) FROM history_event WHERE import_chunk_id
+= ?` which was always zero for transcripts. No product consumer.
+
+Fix: delete the column via migration 0019 rather than plumb a real
+counter. Dropped the Rust `ChunkCounts.imported_record_count` field,
+the CLI/normalize writers, and the integration-test assertion that
+accommodated the known-zero value. Bumps `INITIAL_SCHEMA_VERSION`
+13 → 14.
+
+Gates: fmt ✓, clippy -D warnings ✓, workspace tests (370) ✓,
+integration tests (7/7) ✓.
+
+---
+
+### I1 — project-identity cache for corrupt files — **KEPT**
+
+Commit: `aec8cf1` on `import-perf-p4` (branch `import-perf-p5-i1` at
+same commit).
+
+Problem: §4's third gap. When a transcript's content transiently
+stopped yielding a `cwd`, identity fell through to `vcs::path_project`
+and a transient new project appeared in the manifest until the file
+recovered. The p4-c1 shard-row purge cleaned up final state, but
+concurrent readers mid-corruption saw the flip.
+
+Fix: in `resolve_candidate_source_file`, if current content produces
+no `cwd` but the scan-source cache remembers a successful git-backed
+resolution, reuse that identity. New `reused_cached_project` scan
+warning records the carry-forward. Purge safety net remains.
+
+Verified end-to-end on the 10-project integration corpus: corrupting
+the bento mutation target no longer changes its `source_file` id or
+`project_id`; main-DB project count stays at 11 through the
+corrupt→restore cycle.
+
+Gates: fmt ✓, clippy -D warnings ✓, workspace tests (370) ✓,
+integration tests (7/7) ✓.
+
+---
+
+### A2 — drop the unused `record` table — **KEPT**
+
+Commit: `a2752c5` on `import-perf-p4` (branch `import-perf-p5-a2` at
+same commit).
+
+Problem: `record` was the per-JSONL-line raw mirror for transcripts
+in the original schema. The v5 import-schema change stopped populating
+it (~490K INSERTs avoided per full-corpus import); nothing has
+written or read rows since. Schema cost: a table + two indexes per
+shard (16 extra objects), a TEMP VIEW unioning nine empty shard
+tables, nine `sqlite_sequence` rows seeded at shard-stride offsets.
+
+Fix: migration 0020 drops the table and its two indexes. Removed from
+`SHARD_DATA_TABLES`, `SHARD_AUTOINCREMENT_TABLES`, the read-view list,
+the required-tables guard, the bench harness summary, and the
+integration test expectations. Bumps `INITIAL_SCHEMA_VERSION` 14 → 15.
+Distinct from `codex_rollout_record` / `codex_rollout_event` (the
+active Codex raw mirror tables) — those arrive via p4→main.
+
+Gates: fmt ✓, clippy -D warnings ✓, workspace tests (370) ✓,
+integration tests (7/7) ✓.
+
+---
+
 ## 8. Post-J1 profile notes
 
 Cold full-corpus import wall time is 9258 ms (perf-log snapshot after
@@ -340,34 +405,54 @@ architectural), or correctness (R1, I1, I2).
 
 ## RESUME HERE
 
-**Phase**: Phase 5 — J1 landed (KEPT). No candidate currently in
-flight.
+**Phase**: Phase 5 — J1, R1, I1, A2 landed (KEPT). No candidate currently
+in flight.
 
 **Long-lived branch (from phase 4)**: `import-perf-p4`
 **Long-lived worktree**: `.worktrees/import-perf-p4`
 
-**Tip of `import-perf-p4`** (post J1 merge):
+**Tip of `import-perf-p4`**:
 
-- `ff3c114` Merge branch 'import-perf-p5-j1' into import-perf-p4
+- `a2752c5` A2: drop the unused record table
+- `aec8cf1` I1: reuse cached project identity when content loses its cwd
+- `67f9d85` R1: drop the dead imported_record_count column
+- `cd8e5f4` Phase-5 plan: log J1 outcome and post-J1 profile
 - `555b8b9` J1: single-query jump_target_build, 21 s → 4 ms
 - `17f804e` Add phase-5 plan capturing current architecture and backlog
-- `ec00593` Merge branch 'import-perf-p4-malformed-restore-fix'
-- `78fc57e` Purge shard rows when a stale source_file is removed during scan
-- `d8f59cf` Merge branch 'import-perf-p4-c1'
-- `8af6967` Fix sharded-import correctness regressions surfaced by a diverse corpus
 
-**Pushed to remote** (`origin/import-perf-p4`): yes, up to `ff3c114`.
+**Pushed to remote** (`origin/import-perf-p4`): yes, up to `a2752c5`.
 `p4 → main` merge still open.
 
-**Kept preserved experiment branches**: `import-perf-p4-a7` (jwalk,
-relevant to W1), `import-perf-p4-a8` (chunk-level `path_node` cache,
-relevant to P1). All other phase-4 experiment branches and their
-worktrees were cleaned up.
+**Resolved phase-5 correctness gaps** (carried from §4):
 
-**Next action**: pick a phase-5 candidate from §5. With J1 landed the
-remaining headroom is in the single-digit-percent range (see §8);
-consider whether that's worth more cycles vs. shifting to correctness
-(R1, I1, I2) or the architectural questions (A1, A2).
+- `imported_record_count_sum` always 0 — resolved by R1.
+- Corrupt-transcript identity flip — resolved by I1.
+- Unused `record` table — resolved by A2 (schema cleanup, not a gap
+  strictly but listed under §5.4 architectural).
+
+**Remaining phase-5 backlog** (from §5):
+
+- Big: S1 revisit (simd-json under sharding), C1 revisit
+  (parallel-classify under sharding).
+- Medium: F1 (FK=ON deferred), P1 (shard-scope `path_node` cache),
+  W1 (parallel fs scan), Q1 (cache `filter_options` across snapshot
+  boundaries).
+- Small: I2 (deterministic `publish_seq`), D1 (doc hygiene — partially
+  done by this update), G1 (delete fully-reverted experiment branches).
+- Architectural: A1 (content-aware sharding).
+
+**Kept preserved experiment branches (reverted)**: `import-perf-p4-a7`
+(jwalk, relevant to W1), `import-perf-p4-a8` (chunk-level `path_node`
+cache, relevant to P1). The `import-perf-p5-{a2,i1,j1,r1}` branches
+point at commits already on p4 and are safe to delete as part of G1.
+
+**Schema version**: `INITIAL_SCHEMA_VERSION = 15` (after R1→14, A2→15).
+
+**Next action**: pick a phase-5 candidate from §5. No single hotspot
+remains in the import path (see §8), so the choice is steering, not
+mechanical. With R1+I1 done, the remaining correctness item is I2
+(deterministic `publish_seq`); Q1 is the cheapest query-side UX win
+left; W1 is the cheapest import-side experiment.
 
 **Do not** re-derive state from `git status` or `git log --oneline`.
 Use `git log import-perf-p4 ^main` for the p4 delta and
