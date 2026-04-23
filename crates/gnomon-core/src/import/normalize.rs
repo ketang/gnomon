@@ -519,16 +519,7 @@ fn write_parsed_history_core(
         insert_history_event(conn, params, value, record.source_line_no)?;
         history_event_count += 1;
     }
-
-    conn.prepare_cached(
-        "
-        UPDATE import_chunk
-        SET imported_record_count = imported_record_count + ?2
-        WHERE id = ?1
-        ",
-    )
-    .and_then(|mut stmt| stmt.execute(params![params.import_chunk_id, history_event_count as i64]))
-    .context("unable to update import chunk counters after history normalization")?;
+    let _ = history_event_count;
 
     Ok(NormalizeJsonlFileOutcome::Imported(
         NormalizeJsonlFileResult {
@@ -867,16 +858,6 @@ fn normalize_history_jsonl_file_core(
         insert_history_event(conn, params, &record, line_no as i64)?;
         history_event_count += 1;
     }
-
-    conn.prepare_cached(
-        "
-        UPDATE import_chunk
-        SET imported_record_count = imported_record_count + ?2
-        WHERE id = ?1
-        ",
-    )
-    .and_then(|mut stmt| stmt.execute(params![params.import_chunk_id, history_event_count as i64]))
-    .context("unable to update import chunk counters after history normalization")?;
 
     Ok(NormalizeJsonlFileOutcome::Imported(
         NormalizeJsonlFileResult {
@@ -1657,17 +1638,15 @@ impl ImportState {
             "
             UPDATE import_chunk
             SET
-                imported_record_count = imported_record_count + ?2,
-                imported_message_count = imported_message_count + ?3,
+                imported_message_count = imported_message_count + ?2,
                 imported_conversation_count = imported_conversation_count + 1,
-                imported_turn_count = imported_turn_count + ?4
+                imported_turn_count = imported_turn_count + ?3
             WHERE id = ?1
             ",
         )
         .and_then(|mut stmt| {
             stmt.execute(params![
                 self.params.import_chunk_id,
-                self.record_count as i64,
                 self.message_count as i64,
                 turn_count as i64
             ])

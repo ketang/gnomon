@@ -8112,7 +8112,6 @@ mod tests {
             "
             UPDATE import_chunk
             SET
-                imported_record_count = 0,
                 imported_message_count = (
                     SELECT COUNT(*)
                     FROM message

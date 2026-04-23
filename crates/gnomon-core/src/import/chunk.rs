@@ -927,7 +927,6 @@ fn prepare_chunk(
                 state,
                 publish_seq,
                 completed_at_utc,
-                imported_record_count,
                 imported_message_count,
                 imported_action_count,
                 imported_conversation_count,
@@ -935,12 +934,11 @@ fn prepare_chunk(
                 last_attempt_phase,
                 last_error_message
             )
-            VALUES (?1, ?2, 'pending', NULL, NULL, 0, 0, 0, 0, 0, ?3, NULL)
+            VALUES (?1, ?2, 'pending', NULL, NULL, 0, 0, 0, 0, ?3, NULL)
             ON CONFLICT(project_id, chunk_day_local) DO UPDATE SET
                 state = 'pending',
                 publish_seq = NULL,
                 completed_at_utc = NULL,
-                imported_record_count = 0,
                 imported_message_count = 0,
                 imported_action_count = 0,
                 imported_conversation_count = 0,
@@ -1083,7 +1081,6 @@ fn begin_chunk_import(
             started_at_utc = CURRENT_TIMESTAMP,
             completed_at_utc = NULL,
             last_error_message = NULL,
-            imported_record_count = 0,
             imported_message_count = 0,
             imported_action_count = 0,
             imported_conversation_count = 0,
@@ -1266,7 +1263,6 @@ fn mark_chunk_failed(
 // Row counts computed from a shard at the end of a chunk import; written back to the
 // main DB's import_chunk row as part of `finalize_chunk_global`.
 struct ChunkCounts {
-    record_count: i64,
     message_count: i64,
     action_count: i64,
     conversation_count: i64,
@@ -1274,14 +1270,6 @@ struct ChunkCounts {
 }
 
 fn compute_shard_counts(conn: &Connection, import_chunk_id: i64) -> Result<ChunkCounts> {
-    let record_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM history_event WHERE import_chunk_id = ?1",
-            [import_chunk_id],
-            |row| row.get(0),
-        )
-        .context("unable to count history_event rows for shard chunk")?;
-
     let message_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM message WHERE import_chunk_id = ?1",
@@ -1325,7 +1313,6 @@ fn compute_shard_counts(conn: &Connection, import_chunk_id: i64) -> Result<Chunk
         .context("unable to count turn rows for shard chunk")?;
 
     Ok(ChunkCounts {
-        record_count,
         message_count,
         action_count,
         conversation_count,
@@ -1365,16 +1352,14 @@ fn finalize_chunk_global(
         "
         UPDATE import_chunk
         SET
-            imported_record_count       = ?2,
-            imported_message_count      = ?3,
-            imported_action_count       = ?4,
-            imported_conversation_count = ?5,
-            imported_turn_count         = ?6
+            imported_message_count      = ?2,
+            imported_action_count       = ?3,
+            imported_conversation_count = ?4,
+            imported_turn_count         = ?5
         WHERE id = ?1
         ",
         params![
             chunk.import_chunk_id,
-            counts.record_count,
             counts.message_count,
             counts.action_count,
             counts.conversation_count,

@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
-pub const INITIAL_SCHEMA_VERSION: u32 = 13;
+pub const INITIAL_SCHEMA_VERSION: u32 = 14;
 pub const DEFAULT_DB_FILENAME: &str = "usage.sqlite3";
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 

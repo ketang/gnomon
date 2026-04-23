@@ -155,7 +155,6 @@ const SUBSET_EXPECTATIONS: CorpusExpectations = CorpusExpectations {
     record_count: 0,
     history_event_count: 0,
     import_warning_count: 7,
-    imported_record_count_sum: 0,
     imported_message_count_sum: 42_965,
     imported_action_count_sum: 17_800,
     imported_conversation_count_sum: 1_119,
@@ -187,7 +186,6 @@ struct CorpusExpectations {
     record_count: i64,
     history_event_count: i64,
     import_warning_count: i64,
-    imported_record_count_sum: i64,
     imported_message_count_sum: i64,
     imported_action_count_sum: i64,
     imported_conversation_count_sum: i64,
@@ -226,7 +224,6 @@ struct DatabaseCounts {
     action_count: i64,
     history_event_count: i64,
     import_warning_count: i64,
-    imported_record_count_sum: i64,
     imported_message_count_sum: i64,
     imported_action_count_sum: i64,
     imported_conversation_count_sum: i64,
@@ -280,8 +277,6 @@ fn subset_corpus_import_all_matches_expected_database_shape() -> Result<()> {
     assert_database_counts(&counts, SUBSET_EXPECTATIONS);
     assert_subset_baseline_signature(database.connection(), &db_path)?;
     assert_query_layer_surfaces_sharded_data(database.connection(), SUBSET_EXPECTATIONS)?;
-    // Pre-existing `imported_record_count_sum = 0` bug — checked last so the assertions
-    // above still run when it trips.
     assert_imported_count_sums(&counts, SUBSET_EXPECTATIONS);
 
     Ok(())
@@ -881,10 +876,6 @@ fn load_database_counts(conn: &Connection, _db_path: &Path) -> Result<DatabaseCo
         action_count: query_count(conn, "SELECT COUNT(*) FROM action")?,
         history_event_count: query_count(conn, "SELECT COUNT(*) FROM history_event")?,
         import_warning_count: query_count(conn, "SELECT COUNT(*) FROM import_warning")?,
-        imported_record_count_sum: query_count(
-            conn,
-            "SELECT COALESCE(SUM(imported_record_count), 0) FROM import_chunk",
-        )?,
         imported_message_count_sum: query_count(
             conn,
             "SELECT COALESCE(SUM(imported_message_count), 0) FROM import_chunk",
@@ -995,13 +986,6 @@ fn assert_database_counts(counts: &DatabaseCounts, expectations: CorpusExpectati
     );
 }
 
-// Aggregate `imported_*_count_sum` asserts are split out because
-// `imported_record_count_sum` has a long-standing pre-existing failure (transcript
-// imports don't emit history_event rows, so `SELECT COUNT(*) FROM history_event`
-// in `compute_shard_counts` returns 0). Until that bug is fixed, this helper
-// panics on transcript-only corpora. Call it LAST in each test so the other
-// assertions (including query-layer checks) still run first.
-#[allow(dead_code)]
 fn assert_imported_count_sums(counts: &DatabaseCounts, expectations: CorpusExpectations) {
     assert_eq!(
         counts.imported_message_count_sum,
@@ -1018,10 +1002,6 @@ fn assert_imported_count_sums(counts: &DatabaseCounts, expectations: CorpusExpec
     assert_eq!(
         counts.imported_turn_count_sum,
         expectations.imported_turn_count_sum
-    );
-    assert_eq!(
-        counts.imported_record_count_sum,
-        expectations.imported_record_count_sum
     );
 }
 
