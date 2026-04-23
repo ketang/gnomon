@@ -2736,13 +2736,12 @@ mod tests {
                 publish_seq,
                 started_at_utc,
                 completed_at_utc,
-                imported_record_count,
                 imported_message_count,
                 imported_action_count,
                 last_attempt_phase,
                 last_error_message
             )
-            VALUES (?1, ?2, ?3, ?4, COALESCE(?5, CURRENT_TIMESTAMP), ?6, 0, 0, 0, ?7, ?8)
+            VALUES (?1, ?2, ?3, ?4, COALESCE(?5, CURRENT_TIMESTAMP), ?6, 0, 0, ?7, ?8)
             ",
             rusqlite::params![
                 project_id,
