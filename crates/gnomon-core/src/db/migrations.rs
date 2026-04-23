@@ -20,5 +20,6 @@ pub fn all() -> Migrations<'static> {
         M::up(include_str!(
             "migrations/0019_drop_imported_record_count.sql"
         )),
+        M::up(include_str!("migrations/0020_drop_record_table.sql")),
     ])
 }
