@@ -138,6 +138,11 @@ struct PreparedChunk {
     chunk_day_local: String,
     import_source_files: Vec<ChunkSourceFile>,
     remove_only_source_files: Vec<ChunkSourceFile>,
+    // Pre-assigned at phase start in deterministic (project_key, chunk_day_local)
+    // order so parallel shard workers never race for the next publish_seq.
+    // 0 means "unassigned"; `assign_phase_publish_seqs` fills it before parallel
+    // execution begins.
+    publish_seq: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -964,6 +969,7 @@ fn prepare_chunk(
         chunk_day_local: chunk.chunk_day_local.clone(),
         import_source_files: chunk.import_source_files.clone(),
         remove_only_source_files: chunk.remove_only_source_files.clone(),
+        publish_seq: 0,
     })
 }
 
@@ -1208,14 +1214,54 @@ fn clear_pending_chunk_rebuild(
     Ok(())
 }
 
-fn publish_import_chunk(conn: &Connection, chunk: &PreparedChunk) -> Result<()> {
-    let next_publish_seq: i64 = conn
+// Pre-assign publish_seq to every chunk in this phase, in deterministic
+// (project_key, chunk_day_local) order, starting from the current
+// `COALESCE(MAX(publish_seq), 0) + 1` of the main DB. Done once before parallel
+// shard execution begins so shard workers never race the main writer for the
+// next sequence number; the resulting publish_seq values are the same across
+// identical import runs.
+//
+// A later phase (Deferred after Startup) sees the prior phase's completed
+// chunks in MAX(publish_seq) and continues from there. Failed chunks in an
+// earlier run have publish_seq = NULL and do not affect the base. Any failed
+// chunk in this phase leaves a gap in the sequence — query SQL already
+// tolerates gaps (`publish_seq IS NOT NULL AND publish_seq <= ?1`).
+fn assign_phase_publish_seqs(
+    main_db_path: &Path,
+    mut chunks: Vec<PreparedChunk>,
+) -> Result<Vec<PreparedChunk>> {
+    let main_db = Database::open_for_import(main_db_path).with_context(|| {
+        format!(
+            "unable to open main db to assign publish seqs {}",
+            main_db_path.display()
+        )
+    })?;
+    let base: i64 = main_db
+        .connection()
         .query_row(
-            "SELECT COALESCE(MAX(publish_seq), 0) + 1 FROM import_chunk",
+            "SELECT COALESCE(MAX(publish_seq), 0) FROM import_chunk",
             [],
             |row| row.get(0),
         )
-        .context("unable to allocate the next import publish sequence")?;
+        .context("unable to read current max publish_seq")?;
+
+    chunks.sort_by(|a, b| {
+        a.project_key
+            .cmp(&b.project_key)
+            .then_with(|| a.chunk_day_local.cmp(&b.chunk_day_local))
+            .then_with(|| a.import_chunk_id.cmp(&b.import_chunk_id))
+    });
+    for (rank, chunk) in chunks.iter_mut().enumerate() {
+        chunk.publish_seq = base + (rank as i64) + 1;
+    }
+    Ok(chunks)
+}
+
+fn publish_import_chunk(conn: &Connection, chunk: &PreparedChunk) -> Result<()> {
+    debug_assert!(
+        chunk.publish_seq > 0,
+        "publish_seq must be assigned by assign_phase_publish_seqs before publish"
+    );
 
     conn.execute(
         "
@@ -1227,7 +1273,7 @@ fn publish_import_chunk(conn: &Connection, chunk: &PreparedChunk) -> Result<()> 
             last_error_message = NULL
         WHERE id = ?1
         ",
-        params![chunk.import_chunk_id, next_publish_seq],
+        params![chunk.import_chunk_id, chunk.publish_seq],
     )
     .with_context(|| {
         format!(
@@ -1729,6 +1775,8 @@ fn run_phase_sharded(
         return Ok(Vec::new());
     }
     let total = chunks.len();
+
+    let chunks = assign_phase_publish_seqs(main_db_path, chunks)?;
 
     // Group chunks by shard_idx → project_id.
     let mut shard_groups: HashMap<usize, ShardImportGroup> = HashMap::new();
@@ -2433,8 +2481,12 @@ mod tests {
         };
         assert_eq!(warnings.len(), 3);
         assert!(warnings[0].contains(&startup_source_path.display().to_string()));
-        assert!(warnings[1].contains(&deferred_one_source_path.display().to_string()));
-        assert!(warnings[2].contains(&deferred_two_source_path.display().to_string()));
+        // Deferred chunks are pre-assigned publish_seq (and thus processed) in
+        // (project_key, chunk_day_local) order. deferred_two (96h old) has an
+        // earlier chunk_day_local than deferred_one (72h), so its warning row
+        // lands first.
+        assert!(warnings[1].contains(&deferred_two_source_path.display().to_string()));
+        assert!(warnings[2].contains(&deferred_one_source_path.display().to_string()));
 
         Ok(())
     }
