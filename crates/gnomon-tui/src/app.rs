@@ -39,6 +39,7 @@ use gnomon_core::query::{
     FilterOptions, MetricLens, QueryEngine, RollupRow, RollupRowKind, RootView,
     SkillAttributionConfidence, SnapshotBounds, SnapshotCoverageSummary, TimeWindowFilter,
 };
+use gnomon_core::sources::SourceProvider;
 use gnomon_core::vcs::ProjectIdentityKind;
 use jiff::ToSpan;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -977,6 +978,7 @@ impl App {
             has_newer_snapshot: false,
             filter_options: FilterOptions {
                 projects: Vec::new(),
+                providers: Vec::new(),
                 models: Vec::new(),
                 categories: Vec::new(),
                 actions: Vec::new(),
@@ -1243,11 +1245,17 @@ impl App {
     }
 
     fn render_table(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let visible_columns = active_columns(
-            area.width,
-            self.ui_state.lens,
-            &self.ui_state.enabled_columns,
-        );
+        let has_rtk = rows_have_rtk_data(&self.raw_rows);
+        let effective_columns: Vec<OptionalColumn> = self
+            .ui_state
+            .enabled_columns
+            .iter()
+            .filter(|c| {
+                has_rtk || !matches!(c, OptionalColumn::RtkSaved | OptionalColumn::GrossWithRtk)
+            })
+            .cloned()
+            .collect();
+        let visible_columns = active_columns(area.width, self.ui_state.lens, &effective_columns);
 
         let header = Row::new(
             visible_columns
@@ -1342,7 +1350,18 @@ impl App {
             )],
             Some(row) => {
                 let mut lines = Vec::new();
+                lines.push(Line::from(vec![
+                    Span::styled("provider ", Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        row.provider_scope.label(),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+
                 if let Some(skill_attribution) = &row.skill_attribution {
+                    lines.push(Line::raw(""));
                     lines.push(Line::from(vec![
                         Span::styled("skill ", Style::default().fg(Color::Green)),
                         Span::styled(
@@ -1450,7 +1469,7 @@ impl App {
                     separator_span(),
                     Span::raw("up/down rows"),
                     separator_span(),
-                    Span::raw("t/m filters"),
+                    Span::raw("t/v/m filters"),
                     separator_span(),
                     Span::raw("p/c/a cycle scope"),
                     separator_span(),
@@ -1904,6 +1923,12 @@ impl App {
             KeyCode::Char('m') => {
                 self.ui_state.model =
                     cycle_option(self.ui_state.model.clone(), &self.filter_options.models);
+                self.enqueue_view_reload("loading view")?;
+                Ok(false)
+            }
+            KeyCode::Char('v') => {
+                self.ui_state.provider =
+                    cycle_option(self.ui_state.provider, &self.filter_options.providers);
                 self.enqueue_view_reload("loading view")?;
                 Ok(false)
             }
@@ -2488,6 +2513,7 @@ impl App {
     fn current_query_filters(&self) -> Result<BrowseFilters> {
         Ok(BrowseFilters {
             time_window: self.ui_state.time_window.to_filter(&self.snapshot)?,
+            provider: self.ui_state.provider,
             model: self.ui_state.model.clone(),
             project_id: self.ui_state.project_id,
             action_category: self.ui_state.action_category.clone(),
@@ -2647,6 +2673,7 @@ impl App {
         let filters = self.current_query_filters()?;
         let relaxed_filters = BrowseFilters {
             time_window: filters.time_window,
+            provider: filters.provider,
             model: filters.model,
             project_id: None,
             action_category: None,
@@ -2791,6 +2818,14 @@ impl App {
     }
     fn filter_summary(&self) -> String {
         let mut parts = vec![format!("time {}", self.ui_state.time_window.label())];
+        parts.push(format!(
+            "provider {}",
+            self.ui_state
+                .provider
+                .map_or("combined".to_string(), |provider| provider
+                    .as_str()
+                    .to_string())
+        ));
         if let Some(model) = &self.ui_state.model {
             parts.push(format!("model {model}"));
         }
@@ -2826,9 +2861,10 @@ impl App {
             .selected_row()
             .map(|row| {
                 format!(
-                    "{} ({}, {} {})",
+                    "{} ({}, provider {}, {} {})",
                     row.label,
                     row_kind_label(row.kind),
+                    row.provider_scope.label(),
                     metric_lens_label(self.ui_state.lens),
                     format_metric(row.metrics.lens_value(self.ui_state.lens))
                 )
@@ -4801,6 +4837,7 @@ fn project_root_for_state(
 ) -> Result<Option<String>> {
     let relaxed_filters = BrowseFilters {
         time_window: filters.time_window.clone(),
+        provider: filters.provider,
         model: filters.model.clone(),
         project_id: None,
         action_category: None,
@@ -4840,6 +4877,7 @@ fn project_root_for_state_with_source(
 ) -> Result<Option<String>> {
     let relaxed_filters = BrowseFilters {
         time_window: filters.time_window.clone(),
+        provider: filters.provider,
         model: filters.model.clone(),
         project_id: None,
         action_category: None,
@@ -4998,6 +5036,7 @@ fn current_query_filters_for(
 ) -> Result<BrowseFilters> {
     Ok(BrowseFilters {
         time_window: ui_state.time_window.to_filter(snapshot)?,
+        provider: ui_state.provider,
         model: ui_state.model.clone(),
         project_id: ui_state.project_id,
         action_category: ui_state.action_category.clone(),
@@ -5017,6 +5056,13 @@ fn sanitize_ui_state(ui_state: &mut PersistedUiState, filter_options: &FilterOpt
             .any(|candidate| candidate == model)
     }) {
         ui_state.model = None;
+    }
+
+    if ui_state
+        .provider
+        .is_some_and(|provider| !filter_options.providers.contains(&provider))
+    {
+        ui_state.provider = None;
     }
 
     if ui_state.project_id.is_some_and(|project_id| {
@@ -5084,6 +5130,8 @@ struct PersistedUiState {
     lens: MetricLens,
     pane_mode: PaneMode,
     time_window: TimeWindowPreset,
+    #[serde(default)]
+    provider: Option<SourceProvider>,
     model: Option<String>,
     project_id: Option<i64>,
     action_category: Option<String>,
@@ -5102,6 +5150,7 @@ impl Default for PersistedUiState {
             lens: MetricLens::UncachedInput,
             pane_mode: PaneMode::Table,
             time_window: TimeWindowPreset::All,
+            provider: None,
             model: None,
             project_id: None,
             action_category: None,
@@ -5149,6 +5198,7 @@ impl PersistedUiState {
 
     fn clear_filters(&mut self) {
         self.time_window = TimeWindowPreset::All;
+        self.provider = None;
         self.model = None;
         self.clear_scoped_filters();
         self.row_filter.clear();
@@ -5510,6 +5560,8 @@ enum OptionalColumn {
     OppPromptYield,
     OppSearchChurn,
     OppToolResultBloat,
+    RtkSaved,
+    GrossWithRtk,
 }
 
 impl OptionalColumn {
@@ -5534,6 +5586,8 @@ impl OptionalColumn {
             Self::OppPromptYield => 16,
             Self::OppSearchChurn => 17,
             Self::OppToolResultBloat => 18,
+            Self::RtkSaved => 19,
+            Self::GrossWithRtk => 20,
         }
     }
 
@@ -5558,6 +5612,8 @@ impl OptionalColumn {
             Self::OppPromptYield => "yield",
             Self::OppSearchChurn => "srch",
             Self::OppToolResultBloat => "bloat",
+            Self::RtkSaved => "rtk saved",
+            Self::GrossWithRtk => "gross+rtk",
         }
     }
 }
@@ -5655,6 +5711,8 @@ fn default_enabled_columns() -> Vec<OptionalColumn> {
         OptionalColumn::GrossInput,
         OptionalColumn::Output,
         OptionalColumn::Items,
+        OptionalColumn::RtkSaved,
+        OptionalColumn::GrossWithRtk,
     ]
 }
 
@@ -5828,6 +5886,16 @@ fn optional_column_spec(column: &OptionalColumn) -> ColumnSpec {
             title: "bloat".to_string(),
             constraint: Constraint::Length(8),
         },
+        OptionalColumn::RtkSaved => ColumnSpec {
+            key: ColumnKey::Optional(OptionalColumn::RtkSaved),
+            title: "rtk saved".to_string(),
+            constraint: Constraint::Length(10),
+        },
+        OptionalColumn::GrossWithRtk => ColumnSpec {
+            key: ColumnKey::Optional(OptionalColumn::GrossWithRtk),
+            title: "gross+rtk".to_string(),
+            constraint: Constraint::Length(10),
+        },
     }
 }
 
@@ -5892,6 +5960,12 @@ fn render_column_value(column: ColumnKey, row: &RollupRow, lens: MetricLens) -> 
         ColumnKey::Optional(OptionalColumn::OppToolResultBloat) => {
             format_category_score(&row.opportunities, OpportunityCategory::ToolResultBloat)
         }
+        ColumnKey::Optional(OptionalColumn::RtkSaved) => {
+            format_metric(row.metrics.rtk_saved_tokens)
+        }
+        ColumnKey::Optional(OptionalColumn::GrossWithRtk) => {
+            format_metric(row.metrics.uncached_input + row.metrics.rtk_saved_tokens)
+        }
     }
 }
 
@@ -5911,6 +5985,10 @@ fn format_category_score(
             }
         })
         .unwrap_or_default()
+}
+
+fn rows_have_rtk_data(rows: &[RollupRow]) -> bool {
+    rows.iter().any(|r| r.metrics.rtk_saved_tokens > 0.0)
 }
 
 fn render_tree_label(row: &TreeRow) -> String {
@@ -6347,7 +6425,7 @@ impl AsRef<str> for JumpMatcherCandidate {
     }
 }
 
-fn cycle_option(current: Option<String>, options: &[String]) -> Option<String> {
+fn cycle_option<T: Clone + PartialEq>(current: Option<T>, options: &[T]) -> Option<T> {
     if options.is_empty() {
         return None;
     }
@@ -7160,6 +7238,7 @@ mod tests {
     };
     use gnomon_core::perf::PerfLogger;
     use gnomon_core::query::{ClassificationState, QueryEngine, SnapshotBounds};
+    use gnomon_core::sources::ConfiguredSources;
     use gnomon_core::validation::{ScaleValidationSpec, run_scale_validation};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -7181,6 +7260,7 @@ mod tests {
             lens: MetricLens::Total,
             pane_mode: PaneMode::Radial,
             time_window: TimeWindowPreset::LastWeek,
+            provider: Some(SourceProvider::Claude),
             model: Some("claude-opus".to_string()),
             project_id: Some(7),
             action_category: Some("editing".to_string()),
@@ -7293,6 +7373,7 @@ mod tests {
                     gross_input: 3.0,
                     output: 0.0,
                     total: 3.0,
+                    rtk_saved_tokens: 0.0,
                 },
                 indicators: gnomon_core::query::MetricIndicators {
                     selected_lens_last_5_hours: 3.0,
@@ -7300,6 +7381,7 @@ mod tests {
                     uncached_input_reference: 3.0,
                 },
                 item_count: 1,
+                provider_scope: gnomon_core::query::ProviderScope::Claude,
                 opportunities: OpportunitySummary::default(),
                 skill_attribution: None,
                 project_id: Some(1),
@@ -7463,6 +7545,7 @@ mod tests {
                 gross_input: 5.0,
                 output: 0.0,
                 total: 5.0,
+                rtk_saved_tokens: 0.0,
             },
             indicators: gnomon_core::query::MetricIndicators {
                 selected_lens_last_5_hours: 5.0,
@@ -7470,6 +7553,7 @@ mod tests {
                 uncached_input_reference: 5.0,
             },
             item_count: 1,
+            provider_scope: gnomon_core::query::ProviderScope::Claude,
             opportunities: OpportunitySummary::default(),
             skill_attribution: None,
             project_id: Some(1),
@@ -7500,6 +7584,7 @@ mod tests {
                 gross_input: 5.0,
                 output: 0.0,
                 total: 5.0,
+                rtk_saved_tokens: 0.0,
             },
             indicators: gnomon_core::query::MetricIndicators {
                 selected_lens_last_5_hours: 5.0,
@@ -7507,6 +7592,7 @@ mod tests {
                 uncached_input_reference: 5.0,
             },
             item_count: 1,
+            provider_scope: gnomon_core::query::ProviderScope::Claude,
             opportunities: OpportunitySummary::default(),
             skill_attribution: None,
             project_id: Some(1),
@@ -7835,6 +7921,7 @@ mod tests {
                     id: 2,
                     display_name: "project-b".to_string(),
                 }],
+                providers: vec![SourceProvider::Claude],
                 models: Vec::new(),
                 categories: Vec::new(),
                 actions: Vec::new(),
@@ -8461,8 +8548,10 @@ mod tests {
                 config_path: temp.path().join("config.toml"),
                 db_path: validation.db_path.clone(),
                 source_root: validation.source_root.clone(),
+                sources: ConfiguredSources::legacy_claude(&validation.source_root),
                 project_identity: Default::default(),
                 project_filters: Vec::new(),
+                rtk: Default::default(),
             },
             validation.final_snapshot.clone(),
             StartupOpenReason::Last24hReady,
@@ -8587,8 +8676,10 @@ mod tests {
                 config_path: temp.path().join("config.toml"),
                 db_path: validation.db_path.clone(),
                 source_root: validation.source_root.clone(),
+                sources: ConfiguredSources::legacy_claude(&validation.source_root),
                 project_identity: Default::default(),
                 project_filters: Vec::new(),
+                rtk: Default::default(),
             },
             validation.final_snapshot.clone(),
             StartupOpenReason::Last24hReady,
@@ -9079,6 +9170,7 @@ mod tests {
                 gross_input: 6.0,
                 output: 2.0,
                 total: 8.0,
+                rtk_saved_tokens: 0.0,
             },
             indicators: gnomon_core::query::MetricIndicators {
                 selected_lens_last_5_hours: 5.0,
@@ -9086,6 +9178,7 @@ mod tests {
                 uncached_input_reference: 5.0,
             },
             item_count: 1,
+            provider_scope: gnomon_core::query::ProviderScope::Claude,
             opportunities: OpportunitySummary::default(),
             skill_attribution: None,
             project_id: Some(1),
@@ -9118,6 +9211,7 @@ mod tests {
                 gross_input: spec.value,
                 output: 0.0,
                 total: spec.value,
+                rtk_saved_tokens: 0.0,
             },
             indicators: gnomon_core::query::MetricIndicators {
                 selected_lens_last_5_hours: spec.value,
@@ -9125,6 +9219,7 @@ mod tests {
                 uncached_input_reference: spec.value,
             },
             item_count: 1,
+            provider_scope: gnomon_core::query::ProviderScope::Claude,
             opportunities: OpportunitySummary::default(),
             skill_attribution: None,
             project_id: spec.project_id,
@@ -9141,6 +9236,7 @@ mod tests {
                 id: 1,
                 display_name: "project-a".to_string(),
             }],
+            providers: vec![SourceProvider::Claude],
             models: Vec::new(),
             categories: Vec::new(),
             actions: Vec::new(),
@@ -9190,14 +9286,17 @@ mod tests {
     }
 
     fn make_test_config(dir: &std::path::Path) -> RuntimeConfig {
+        let source_root = dir.join("source");
         RuntimeConfig {
             app_name: "gnomon",
             state_dir: dir.to_path_buf(),
             config_path: dir.join("config.toml"),
             db_path: dir.join("test.sqlite3"),
-            source_root: dir.join("source"),
+            source_root: source_root.clone(),
+            sources: ConfiguredSources::legacy_claude(&source_root),
             project_identity: Default::default(),
             project_filters: Vec::new(),
+            rtk: Default::default(),
         }
     }
 
@@ -9988,7 +10087,7 @@ mod tests {
 
         assert!(content.contains("p/c/a cycle scope"));
         assert!(content.contains("Space clear scope/root"));
-        assert!(content.contains("t/m filters"));
+        assert!(content.contains("t/v/m filters"));
         assert!(content.contains("quit"));
         Ok(())
     }
@@ -11056,5 +11155,18 @@ mod tests {
         let loaded = PersistedUiState::load(&path)?.context("missing")?;
         assert_eq!(loaded.opportunity_filter, None);
         Ok(())
+    }
+
+    #[test]
+    fn rtk_columns_hidden_when_no_rtk_data() {
+        let rows: Vec<RollupRow> = vec![];
+        assert!(!rows_have_rtk_data(&rows));
+    }
+
+    #[test]
+    fn rtk_columns_shown_when_rtk_data_present() {
+        let mut row = sample_row("src", None);
+        row.metrics.rtk_saved_tokens = 500.0;
+        assert!(rows_have_rtk_data(&[row]));
     }
 }

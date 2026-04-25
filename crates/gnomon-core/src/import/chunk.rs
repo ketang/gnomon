@@ -15,9 +15,10 @@ use jiff::{Timestamp, ToSpan, tz::TimeZone};
 use rusqlite::{Connection, params};
 
 use super::{
-    IMPORT_SCHEMA_VERSION, NormalizeImportWarning, NormalizeJsonlFileOutcome,
+    ConfiguredSources, IMPORT_SCHEMA_VERSION, NormalizeImportWarning, NormalizeJsonlFileOutcome,
     NormalizeJsonlFileParams, ParseResult, STARTUP_IMPORT_WINDOW_HOURS, STARTUP_OPEN_DEADLINE_SECS,
-    SourceFileKind, normalize::parse_jsonl_file, normalize::write_parsed_file_in_tx,
+    SourceDescriptor, SourceFileKind, normalize::parse_jsonl_file,
+    normalize::write_parsed_file_in_tx,
 };
 use rayon::prelude::*;
 
@@ -66,6 +67,7 @@ impl Drop for StartupImport {
 struct ImportWorkerOptions {
     per_chunk_delay: Duration,
     perf_logger: Option<PerfLogger>,
+    rtk_config: Option<crate::config::RtkConfig>,
 }
 
 #[derive(Debug)]
@@ -164,6 +166,7 @@ impl ImportPhase {
 struct ChunkSourceFile {
     source_file_id: i64,
     relative_path: String,
+    source_provider: super::SourceProvider,
     source_kind: SourceFileKind,
 }
 
@@ -173,6 +176,7 @@ struct SourceFileRow {
     project_id: i64,
     project_key: String,
     relative_path: String,
+    source_provider: String,
     source_kind: String,
     modified_at_utc: Option<String>,
     discovered_at_utc: String,
@@ -281,10 +285,11 @@ pub fn start_startup_import(
     db_path: &Path,
     source_root: &Path,
 ) -> Result<StartupImport> {
-    start_startup_import_with_mode_and_progress(
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    start_startup_import_with_sources_and_mode_and_progress(
         conn,
         db_path,
-        source_root,
+        &sources,
         StartupImportMode::RecentFirst,
         |_| {},
     )
@@ -299,10 +304,11 @@ pub fn start_startup_import_with_progress<F>(
 where
     F: FnMut(&StartupProgressUpdate),
 {
-    start_startup_import_with_mode_and_progress(
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    start_startup_import_with_sources_and_mode_and_progress(
         conn,
         db_path,
-        source_root,
+        &sources,
         StartupImportMode::RecentFirst,
         on_progress,
     )
@@ -318,12 +324,32 @@ pub fn start_startup_import_with_mode_and_progress<F>(
 where
     F: FnMut(&StartupProgressUpdate),
 {
-    let state_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
-    let perf_logger = PerfLogger::from_env(state_dir).ok().flatten();
-    start_startup_import_with_perf_logger(
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    start_startup_import_with_sources_and_mode_and_progress(
         conn,
         db_path,
-        source_root,
+        &sources,
+        import_mode,
+        on_progress,
+    )
+}
+
+pub fn start_startup_import_with_sources_and_mode_and_progress<F>(
+    conn: &Connection,
+    db_path: &Path,
+    sources: &ConfiguredSources,
+    import_mode: StartupImportMode,
+    on_progress: F,
+) -> Result<StartupImport>
+where
+    F: FnMut(&StartupProgressUpdate),
+{
+    let state_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let perf_logger = PerfLogger::from_env(state_dir).ok().flatten();
+    start_startup_import_with_sources_and_perf_logger(
+        conn,
+        db_path,
+        sources,
         import_mode,
         perf_logger,
         on_progress,
@@ -339,6 +365,28 @@ pub fn start_startup_import_with_perf_logger<F>(
     source_root: &Path,
     import_mode: StartupImportMode,
     perf_logger: Option<PerfLogger>,
+    on_progress: F,
+) -> Result<StartupImport>
+where
+    F: FnMut(&StartupProgressUpdate),
+{
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    start_startup_import_with_sources_and_perf_logger(
+        conn,
+        db_path,
+        &sources,
+        import_mode,
+        perf_logger,
+        on_progress,
+    )
+}
+
+pub fn start_startup_import_with_sources_and_perf_logger<F>(
+    conn: &Connection,
+    db_path: &Path,
+    sources: &ConfiguredSources,
+    import_mode: StartupImportMode,
+    perf_logger: Option<PerfLogger>,
     mut on_progress: F,
 ) -> Result<StartupImport>
 where
@@ -348,10 +396,66 @@ where
         perf_logger,
         ..ImportWorkerOptions::default()
     };
-    start_startup_import_with_options(
+    start_startup_import_with_options_and_sources(
         conn,
         db_path,
-        source_root,
+        sources,
+        Duration::from_secs(STARTUP_OPEN_DEADLINE_SECS),
+        import_mode,
+        options,
+        Some(&mut on_progress),
+    )
+}
+
+pub fn start_startup_import_with_rtk<F>(
+    conn: &Connection,
+    db_path: &Path,
+    source_root: &Path,
+    import_mode: StartupImportMode,
+    rtk_config: Option<crate::config::RtkConfig>,
+    mut on_progress: F,
+) -> Result<StartupImport>
+where
+    F: FnMut(&StartupProgressUpdate),
+{
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    let options = ImportWorkerOptions {
+        rtk_config,
+        ..ImportWorkerOptions::default()
+    };
+    start_startup_import_with_options_and_sources(
+        conn,
+        db_path,
+        &sources,
+        Duration::from_secs(STARTUP_OPEN_DEADLINE_SECS),
+        import_mode,
+        options,
+        Some(&mut on_progress),
+    )
+}
+
+pub fn start_startup_import_with_sources_and_mode_and_rtk<F>(
+    conn: &Connection,
+    db_path: &Path,
+    sources: &ConfiguredSources,
+    import_mode: StartupImportMode,
+    rtk_config: Option<crate::config::RtkConfig>,
+    mut on_progress: F,
+) -> Result<StartupImport>
+where
+    F: FnMut(&StartupProgressUpdate),
+{
+    let state_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let perf_logger = PerfLogger::from_env(state_dir).ok().flatten();
+    let options = ImportWorkerOptions {
+        perf_logger,
+        rtk_config,
+        ..ImportWorkerOptions::default()
+    };
+    start_startup_import_with_options_and_sources(
+        conn,
+        db_path,
+        sources,
         Duration::from_secs(STARTUP_OPEN_DEADLINE_SECS),
         import_mode,
         options,
@@ -366,7 +470,8 @@ pub fn import_all(
 ) -> Result<ImportExecutionReport> {
     let state_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
     let perf_logger = PerfLogger::from_env(state_dir).ok().flatten();
-    import_all_with_perf_logger(conn, db_path, source_root, perf_logger)
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    import_all_with_sources_and_perf_logger(conn, db_path, &sources, perf_logger)
 }
 
 /// Like [`import_all`] but accepts an explicit [`PerfLogger`] instead of
@@ -379,6 +484,56 @@ pub fn import_all_with_perf_logger(
     source_root: &Path,
     perf_logger: Option<PerfLogger>,
 ) -> Result<ImportExecutionReport> {
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    import_all_with_sources_and_perf_logger(conn, db_path, &sources, perf_logger)
+}
+
+pub fn import_all_with_sources_and_perf_logger(
+    conn: &Connection,
+    db_path: &Path,
+    sources: &ConfiguredSources,
+    perf_logger: Option<PerfLogger>,
+) -> Result<ImportExecutionReport> {
+    let options = ImportWorkerOptions {
+        perf_logger,
+        ..ImportWorkerOptions::default()
+    };
+    import_all_with_options_and_sources(conn, db_path, sources, options)
+}
+
+pub fn import_all_with_rtk(
+    conn: &Connection,
+    db_path: &Path,
+    source_root: &Path,
+    rtk_config: Option<crate::config::RtkConfig>,
+) -> Result<ImportExecutionReport> {
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    import_all_with_sources_and_rtk(conn, db_path, &sources, rtk_config)
+}
+
+pub fn import_all_with_sources_and_rtk(
+    conn: &Connection,
+    db_path: &Path,
+    sources: &ConfiguredSources,
+    rtk_config: Option<crate::config::RtkConfig>,
+) -> Result<ImportExecutionReport> {
+    let state_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let perf_logger = PerfLogger::from_env(state_dir).ok().flatten();
+    let options = ImportWorkerOptions {
+        perf_logger,
+        rtk_config,
+        ..ImportWorkerOptions::default()
+    };
+    import_all_with_options_and_sources(conn, db_path, sources, options)
+}
+
+fn import_all_with_options_and_sources(
+    conn: &Connection,
+    db_path: &Path,
+    sources: &ConfiguredSources,
+    options: ImportWorkerOptions,
+) -> Result<ImportExecutionReport> {
+    let perf_logger = options.perf_logger.clone();
     let mut import_scope = PerfScope::new(perf_logger.clone(), "import.total");
     let now = Timestamp::now();
     let time_zone = TimeZone::system();
@@ -416,12 +571,12 @@ pub fn import_all_with_perf_logger(
 
     let options = ImportWorkerOptions {
         perf_logger,
-        ..ImportWorkerOptions::default()
+        ..options
     };
 
     // Bench/rebuild path: no progress events; startup chunk failures are fatal.
     let (startup_failures, deferred_failures) =
-        match run_sharded_import(db_path, source_root, prepared, &options, None) {
+        match run_sharded_import(db_path, sources, prepared, &options, None) {
             Ok(result) => result,
             Err(err) => {
                 import_scope.finish_error(&err);
@@ -450,10 +605,32 @@ pub fn import_all_with_perf_logger(
     Ok(report)
 }
 
+#[cfg(test)]
 fn start_startup_import_with_options(
     conn: &Connection,
     db_path: &Path,
     source_root: &Path,
+    wait_timeout: Duration,
+    import_mode: StartupImportMode,
+    worker_options: ImportWorkerOptions,
+    on_progress: Option<&mut dyn FnMut(&StartupProgressUpdate)>,
+) -> Result<StartupImport> {
+    let sources = ConfiguredSources::legacy_claude(source_root);
+    start_startup_import_with_options_and_sources(
+        conn,
+        db_path,
+        &sources,
+        wait_timeout,
+        import_mode,
+        worker_options,
+        on_progress,
+    )
+}
+
+fn start_startup_import_with_options_and_sources(
+    conn: &Connection,
+    db_path: &Path,
+    sources: &ConfiguredSources,
     wait_timeout: Duration,
     import_mode: StartupImportMode,
     worker_options: ImportWorkerOptions,
@@ -520,7 +697,7 @@ fn start_startup_import_with_options(
 
     let (sender, receiver) = mpsc::channel();
     let db_path = db_path.to_path_buf();
-    let source_root = source_root.to_path_buf();
+    let sources = sources.clone();
     let prepared_for_worker = prepared.clone();
     let sender_for_worker = sender;
     let worker = match thread::Builder::new()
@@ -528,7 +705,7 @@ fn start_startup_import_with_options(
         .spawn(move || {
             run_import_worker(
                 &db_path,
-                &source_root,
+                sources,
                 prepared_for_worker,
                 sender_for_worker,
                 &worker_options,
@@ -680,6 +857,8 @@ fn build_import_plan(
         let source_file = ChunkSourceFile {
             source_file_id: row.source_file_id,
             relative_path: row.relative_path.clone(),
+            source_provider: super::SourceProvider::from_db_value(&row.source_provider)
+                .ok_or_else(|| anyhow!("unknown source file provider {}", row.source_provider))?,
             source_kind: SourceFileKind::from_db_value(&row.source_kind)
                 .ok_or_else(|| anyhow!("unknown source file kind {}", row.source_kind))?,
         };
@@ -722,12 +901,30 @@ fn build_import_plan(
     let mut deferred_candidates = Vec::new();
 
     for (descriptor, mut changes) in chunk_changes {
-        changes
-            .import_source_files
-            .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        changes
-            .remove_only_source_files
-            .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        changes.import_source_files.sort_by(|left, right| {
+            (
+                left.source_provider.as_str(),
+                left.source_kind.as_str(),
+                left.relative_path.as_str(),
+            )
+                .cmp(&(
+                    right.source_provider.as_str(),
+                    right.source_kind.as_str(),
+                    right.relative_path.as_str(),
+                ))
+        });
+        changes.remove_only_source_files.sort_by(|left, right| {
+            (
+                left.source_provider.as_str(),
+                left.source_kind.as_str(),
+                left.relative_path.as_str(),
+            )
+                .cmp(&(
+                    right.source_provider.as_str(),
+                    right.source_kind.as_str(),
+                    right.relative_path.as_str(),
+                ))
+        });
 
         let chunk = ChunkCandidate {
             project_id: descriptor.project_id,
@@ -766,6 +963,7 @@ fn load_source_files(conn: &Connection) -> Result<Vec<SourceFileRow>> {
                 source_file.project_id,
                 project.canonical_key,
                 source_file.relative_path,
+                source_file.source_provider,
                 source_file.source_kind,
                 source_file.modified_at_utc,
                 source_file.discovered_at_utc,
@@ -787,13 +985,14 @@ fn load_source_files(conn: &Connection) -> Result<Vec<SourceFileRow>> {
                 project_id: row.get(1)?,
                 project_key: row.get(2)?,
                 relative_path: row.get(3)?,
-                source_kind: row.get(4)?,
-                modified_at_utc: row.get(5)?,
-                discovered_at_utc: row.get(6)?,
-                size_bytes: row.get(7)?,
-                imported_size_bytes: row.get(8)?,
-                imported_modified_at_utc: row.get(9)?,
-                imported_schema_version: row.get(10)?,
+                source_provider: row.get(4)?,
+                source_kind: row.get(5)?,
+                modified_at_utc: row.get(6)?,
+                discovered_at_utc: row.get(7)?,
+                size_bytes: row.get(8)?,
+                imported_size_bytes: row.get(9)?,
+                imported_modified_at_utc: row.get(10)?,
+                imported_schema_version: row.get(11)?,
             })
         })
         .context("unable to enumerate source files for import planning")?;
@@ -1007,14 +1206,14 @@ fn mark_chunks_failed(
 // Finished event.
 fn run_import_worker(
     db_path: &Path,
-    source_root: &Path,
+    sources: ConfiguredSources,
     plan: PreparedImportPlan,
     sender: mpsc::Sender<StartupWorkerEvent>,
     options: &ImportWorkerOptions,
 ) -> Result<()> {
     let mut worker_scope = PerfScope::new(options.perf_logger.clone(), "import.worker_total");
 
-    let result = run_sharded_import(db_path, source_root, plan, options, Some(&sender));
+    let result = run_sharded_import(db_path, &sources, plan, options, Some(&sender));
 
     match &result {
         Ok((startup_failures, deferred_failures)) => {
@@ -1426,7 +1625,7 @@ fn finalize_chunk_global(
 fn import_chunk(
     global_db: &mut Database,
     shard_db: &mut Database,
-    source_root: &Path,
+    sources: &ConfiguredSources,
     chunk: &PreparedChunk,
     phase: ImportPhase,
     options: &ImportWorkerOptions,
@@ -1471,7 +1670,24 @@ fn import_chunk(
             .import_source_files
             .par_iter()
             .map(|source_file| {
-                let path = source_root.join(&source_file.relative_path);
+                let path = sources.resolve_path(
+                    SourceDescriptor::new(source_file.source_provider, source_file.source_kind),
+                    &source_file.relative_path,
+                );
+                let path = match path {
+                    Ok(path) => path,
+                    Err(err) => {
+                        return ParseResult::Warning(NormalizeImportWarning {
+                            code: "missing_source_path",
+                            message: format!(
+                                "unable to resolve source path for provider={} kind={} relative_path={}: {err:#}",
+                                source_file.source_provider.as_str(),
+                                source_file.source_kind.as_str(),
+                                source_file.relative_path
+                            ),
+                        });
+                    }
+                };
                 parse_jsonl_file(&path, source_file.source_kind)
             })
             .collect();
@@ -1527,7 +1743,13 @@ fn import_chunk(
                         project_id: chunk.project_id,
                         source_file_id: source_file.source_file_id,
                         import_chunk_id: chunk.import_chunk_id,
-                        path: source_root.join(&source_file.relative_path),
+                        path: sources.resolve_path(
+                            SourceDescriptor::new(
+                                source_file.source_provider,
+                                source_file.source_kind,
+                            ),
+                            &source_file.relative_path,
+                        )?,
                         perf_logger: options.perf_logger.clone(),
                     };
                     super::normalize::purge_existing_import(&sp, &params)?;
@@ -1560,17 +1782,24 @@ fn import_chunk(
                         project_id: chunk.project_id,
                         source_file_id: source_file.source_file_id,
                         import_chunk_id: chunk.import_chunk_id,
-                        path: source_root.join(&source_file.relative_path),
+                        path: sources.resolve_path(
+                            SourceDescriptor::new(
+                                source_file.source_provider,
+                                source_file.source_kind,
+                            ),
+                            &source_file.relative_path,
+                        )?,
                         perf_logger: options.perf_logger.clone(),
                     };
-                    let (outcome, normalized_messages) =
-                        write_parsed_file_in_tx(&sp, &params, parsed_file, source_file.source_kind)
-                            .with_context(|| {
-                                format!(
-                                    "unable to normalize source file {}",
-                                    source_root.join(&source_file.relative_path).display()
-                                )
-                            })?;
+                    let (outcome, normalized_messages) = write_parsed_file_in_tx(
+                        &sp,
+                        &params,
+                        parsed_file,
+                        SourceDescriptor::new(source_file.source_provider, source_file.source_kind),
+                    )
+                    .with_context(|| {
+                        format!("unable to normalize source file {}", params.path.display())
+                    })?;
                     match outcome {
                         NormalizeJsonlFileOutcome::Imported(result) => {
                             if let Some(conversation_id) = result.conversation_id {
@@ -1585,7 +1814,7 @@ fn import_chunk(
                                 .with_context(|| {
                                     format!(
                                         "unable to build actions for source file {}",
-                                        source_root.join(&source_file.relative_path).display()
+                                        params.path.display()
                                     )
                                 })?;
                             }
@@ -1648,6 +1877,29 @@ fn import_chunk(
             PerfScope::new(options.perf_logger.clone(), "import.finalize_chunk_shard");
         shard_finalize_scope.field("import_chunk_id", chunk.import_chunk_id);
         rebuild_chunk_action_rollups(&tx, chunk.import_chunk_id, options.perf_logger.clone())?;
+        if let Some(rtk_config) = &options.rtk_config {
+            let project_root_path: Option<String> = tx
+                .query_row(
+                    "SELECT root_path FROM project WHERE id = ?1",
+                    params![chunk.project_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            if let Some(root_path) = project_root_path.as_deref()
+                && let Err(err) = crate::import::rtk::match_rtk_savings(
+                    &tx,
+                    chunk.import_chunk_id,
+                    root_path,
+                    &chunk.chunk_day_local,
+                    rtk_config,
+                )
+            {
+                tracing::warn!(
+                    "RTK match phase failed for chunk {}: {err}",
+                    chunk.import_chunk_id
+                );
+            }
+        }
         rebuild_chunk_path_rollups(&tx, chunk.import_chunk_id, options.perf_logger.clone())?;
         let counts = compute_shard_counts(&tx, chunk.import_chunk_id)?;
         shard_finalize_scope.finish_ok();
@@ -1719,14 +1971,14 @@ fn import_chunk(
 // phase 1 and DeferredFailures after phase 2.
 fn run_sharded_import(
     main_db_path: &Path,
-    source_root: &Path,
+    sources: &ConfiguredSources,
     prepared: PreparedImportPlan,
     options: &ImportWorkerOptions,
     progress_sender: Option<&mpsc::Sender<StartupWorkerEvent>>,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let startup_failures = run_phase_sharded(
         main_db_path,
-        source_root,
+        sources,
         prepared.startup_chunks,
         ImportPhase::Startup,
         "rebuilding database",
@@ -1741,7 +1993,7 @@ fn run_sharded_import(
 
     let deferred_failures = run_phase_sharded(
         main_db_path,
-        source_root,
+        sources,
         prepared.deferred_chunks,
         ImportPhase::Deferred,
         "importing older history",
@@ -1764,7 +2016,7 @@ fn run_sharded_import(
 // and reuses it across the phase's chunks for that shard.
 fn run_phase_sharded(
     main_db_path: &Path,
-    source_root: &Path,
+    sources: &ConfiguredSources,
     chunks: Vec<PreparedChunk>,
     phase: ImportPhase,
     progress_label: &'static str,
@@ -1778,7 +2030,6 @@ fn run_phase_sharded(
 
     let chunks = assign_phase_publish_seqs(main_db_path, chunks)?;
 
-    // Group chunks by shard_idx → project_id.
     let mut shard_groups: HashMap<usize, ShardImportGroup> = HashMap::new();
     for chunk in chunks {
         let shard_idx = shard_index_for_project(chunk.project_id);
@@ -1791,7 +2042,7 @@ fn run_phase_sharded(
         let project_entry = group
             .projects
             .iter_mut()
-            .find(|p| p.project_id == chunk.project_id);
+            .find(|project| project.project_id == chunk.project_id);
         match project_entry {
             Some(entry) => entry.chunks.push(chunk),
             None => group.projects.push(ShardProjectEntry {
@@ -1808,7 +2059,6 @@ fn run_phase_sharded(
     let results: Vec<Result<Vec<String>>> = groups
         .into_par_iter()
         .map(|group| {
-            // Both connections are created inside the rayon thread because Connection is !Send.
             let mut global_db = Database::open_for_import(main_db_path).with_context(|| {
                 format!(
                     "unable to open main db for import {}",
@@ -1839,7 +2089,7 @@ fn run_phase_sharded(
                     let result = import_chunk(
                         &mut global_db,
                         &mut shard_db,
-                        source_root,
+                        sources,
                         chunk,
                         phase,
                         options,
@@ -1865,7 +2115,7 @@ fn run_phase_sharded(
         })
         .collect();
 
-    let mut all_failures: Vec<String> = Vec::new();
+    let mut all_failures = Vec::new();
     for result in results {
         all_failures.extend(result?);
     }
@@ -1898,10 +2148,15 @@ mod tests {
 
     use super::{
         ImportWorkerOptions, StartupImportMode, StartupOpenReason, StartupWorkerEvent,
-        build_import_plan, import_all, start_startup_import_with_options,
+        build_import_plan, import_all, import_all_with_sources_and_perf_logger,
+        import_all_with_sources_and_rtk, start_startup_import_with_options,
+        start_startup_import_with_options_and_sources,
+        start_startup_import_with_sources_and_mode_and_rtk,
     };
+    use crate::config::{ProjectIdentityPolicy, RtkConfig};
     use crate::db::Database;
-    use crate::import::scan_source_manifest;
+    use crate::import::{scan_source_manifest, scan_sources_manifest_with_policy};
+    use crate::sources::{ConfiguredSource, ConfiguredSources, SourceFileKind, SourceProvider};
 
     const WAIT_TIMEOUT_MS: u64 = 5;
     const WORKER_DELAY_MS: u64 = 50;
@@ -2046,30 +2301,31 @@ mod tests {
     }
 
     #[test]
-    fn startup_import_opens_when_last_24h_slice_is_ready() -> Result<()> {
+    fn codex_startup_import_opens_when_last_24h_slice_is_ready() -> Result<()> {
         let temp = tempdir()?;
         let db_path = temp.path().join("usage.sqlite3");
         let source_root = temp.path().join("source");
+        let sessions_root = source_root.join("sessions");
         let project_root = temp.path().join("project");
         fs::create_dir_all(&project_root)?;
 
-        let relative_path = "recent/session.jsonl";
-        let source_path = source_root.join(relative_path);
-        let size_bytes = write_session_fixture(&source_path, "session-ready")?;
+        let relative_path = "2026/04/18/rollout-codex-startup-ready.jsonl";
+        let rollout_path = sessions_root.join(relative_path);
+        let size_bytes = copy_codex_rollout_fixture(&rollout_path)?;
 
         let recent = Timestamp::now()
             .checked_sub(1_i64.hours())
-            .context("unable to construct recent test timestamp")?
+            .context("unable to construct recent codex startup test timestamp")?
             .to_string();
 
         let mut db = Database::open_unsharded(&db_path)?;
         let project_id = insert_project_with_root(
             db.connection_mut(),
-            "path:/startup-ready",
-            "startup-ready",
+            "path:/codex-startup-ready",
+            "codex-startup-ready",
             &project_root,
         )?;
-        let _ = insert_seeded_source_file(
+        let _ = insert_seeded_codex_rollout_file(
             db.connection_mut(),
             project_id,
             relative_path,
@@ -2077,10 +2333,16 @@ mod tests {
             size_bytes,
         )?;
 
-        let startup = start_startup_import_with_options(
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Codex,
+            SourceFileKind::Rollout,
+            sessions_root,
+        )]);
+
+        let startup = start_startup_import_with_options_and_sources(
             db.connection(),
             &db_path,
-            &source_root,
+            &sources,
             Duration::from_secs(2),
             StartupImportMode::RecentFirst,
             ImportWorkerOptions::default(),
@@ -2091,8 +2353,9 @@ mod tests {
         assert_eq!(startup.snapshot.max_publish_seq, 1);
         assert_eq!(startup.startup_status_message, None);
         startup.wait_for_completion()?;
+        let read_db = Database::open(&db_path)?;
 
-        let state: (String, Option<i64>) = db.connection().query_row(
+        let state: (String, Option<i64>) = read_db.connection().query_row(
             "SELECT state, publish_seq FROM import_chunk",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -2100,52 +2363,62 @@ mod tests {
         assert_eq!(state.0, "complete");
         assert_eq!(state.1, Some(1));
 
+        let rollout_counts: (i64, i64) = read_db.connection().query_row(
+            "
+            SELECT
+                (SELECT COUNT(*) FROM codex_rollout_session),
+                (SELECT COUNT(*) FROM codex_rollout_event)
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            rollout_counts,
+            (1, 9),
+            "checked-in fixture has one session and nine rollout events"
+        );
+
         Ok(())
     }
 
     #[test]
-    fn startup_timeout_still_allows_background_import_to_finish() -> Result<()> {
+    fn codex_startup_timeout_still_allows_background_import_to_finish() -> Result<()> {
         let temp = tempdir()?;
         let db_path = temp.path().join("usage.sqlite3");
         let source_root = temp.path().join("source");
+        let sessions_root = source_root.join("sessions");
         let project_root = temp.path().join("project");
         fs::create_dir_all(&project_root)?;
 
-        let recent_relative_path = "recent/session.jsonl";
-        let older_relative_path = "older/session.jsonl";
-        let recent_size = write_session_fixture(
-            &source_root.join(recent_relative_path),
-            "session-timeout-recent",
-        )?;
-        let older_size = write_session_fixture(
-            &source_root.join(older_relative_path),
-            "session-timeout-older",
-        )?;
+        let recent_relative_path = "2026/04/18/rollout-codex-startup-timeout-recent.jsonl";
+        let older_relative_path = "2026/04/15/rollout-codex-startup-timeout-older.jsonl";
+        let recent_size = copy_codex_rollout_fixture(&sessions_root.join(recent_relative_path))?;
+        let older_size = copy_codex_rollout_fixture(&sessions_root.join(older_relative_path))?;
 
         let recent = Timestamp::now()
             .checked_sub(1_i64.hours())
-            .context("unable to construct recent startup test timestamp")?
+            .context("unable to construct recent codex startup test timestamp")?
             .to_string();
         let older = Timestamp::now()
             .checked_sub(72_i64.hours())
-            .context("unable to construct older startup test timestamp")?
+            .context("unable to construct older codex startup test timestamp")?
             .to_string();
 
         let mut db = Database::open_unsharded(&db_path)?;
         let project_id = insert_project_with_root(
             db.connection_mut(),
-            "path:/startup-timeout",
-            "startup-timeout",
+            "path:/codex-startup-timeout",
+            "codex-startup-timeout",
             &project_root,
         )?;
-        let _ = insert_seeded_source_file(
+        let _ = insert_seeded_codex_rollout_file(
             db.connection_mut(),
             project_id,
             recent_relative_path,
             &recent,
             recent_size,
         )?;
-        let _ = insert_seeded_source_file(
+        let _ = insert_seeded_codex_rollout_file(
             db.connection_mut(),
             project_id,
             older_relative_path,
@@ -2153,15 +2426,22 @@ mod tests {
             older_size,
         )?;
 
-        let startup = start_startup_import_with_options(
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Codex,
+            SourceFileKind::Rollout,
+            sessions_root,
+        )]);
+
+        let startup = start_startup_import_with_options_and_sources(
             db.connection(),
             &db_path,
-            &source_root,
+            &sources,
             Duration::from_millis(WAIT_TIMEOUT_MS),
             StartupImportMode::RecentFirst,
             ImportWorkerOptions {
                 per_chunk_delay: Duration::from_millis(WORKER_DELAY_MS),
                 perf_logger: None,
+                rtk_config: None,
             },
             None,
         )?;
@@ -2178,62 +2458,65 @@ mod tests {
             Some(("rebuilding database", 1, 1))
         );
         startup.wait_for_completion()?;
+        let read_db = Database::open(&db_path)?;
 
-        let complete_count: i64 = db.connection().query_row(
+        let complete_count: i64 = read_db.connection().query_row(
             "SELECT COUNT(*) FROM import_chunk WHERE state = 'complete'",
             [],
             |row| row.get(0),
         )?;
         assert_eq!(complete_count, 2);
 
+        let rollout_session_count: i64 = read_db.connection().query_row(
+            "SELECT COUNT(*) FROM codex_rollout_session",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rollout_session_count, 2);
+
         Ok(())
     }
 
     #[test]
-    fn startup_full_import_waits_for_deferred_chunks_before_opening() -> Result<()> {
+    fn codex_startup_full_import_waits_for_deferred_chunks_before_opening() -> Result<()> {
         const WORKER_DELAY_MS: u64 = 75;
 
         let temp = tempdir()?;
         let db_path = temp.path().join("usage.sqlite3");
         let source_root = temp.path().join("source");
+        let sessions_root = source_root.join("sessions");
         let project_root = temp.path().join("project");
         fs::create_dir_all(&project_root)?;
 
-        let recent_relative_path = "recent/session.jsonl";
-        let older_relative_path = "older/session.jsonl";
-        let recent_size = write_session_fixture(
-            &source_root.join(recent_relative_path),
-            "session-full-import-recent",
-        )?;
-        let older_size = write_session_fixture(
-            &source_root.join(older_relative_path),
-            "session-full-import-older",
-        )?;
+        let recent_relative_path = "2026/04/18/rollout-codex-full-import-recent.jsonl";
+        let older_relative_path = "2026/04/15/rollout-codex-full-import-older.jsonl";
+        let recent_size = copy_codex_rollout_fixture(&sessions_root.join(recent_relative_path))?;
+        let older_size = copy_codex_rollout_fixture(&sessions_root.join(older_relative_path))?;
 
         let recent = Timestamp::now()
             .checked_sub(1_i64.hours())
-            .context("unable to construct recent startup test timestamp")?
+            .context("unable to construct recent codex full-import test timestamp")?
             .to_string();
         let older = Timestamp::now()
             .checked_sub(72_i64.hours())
-            .context("unable to construct older startup test timestamp")?
+            .context("unable to construct older codex full-import test timestamp")?
             .to_string();
 
         let mut db = Database::open_unsharded(&db_path)?;
         let project_id = insert_project_with_root(
             db.connection_mut(),
-            "path:/startup-full-import",
-            "startup-full-import",
+            "path:/codex-startup-full-import",
+            "codex-startup-full-import",
             &project_root,
         )?;
-        let _ = insert_seeded_source_file(
+        let _ = insert_seeded_codex_rollout_file(
             db.connection_mut(),
             project_id,
             recent_relative_path,
             &recent,
             recent_size,
         )?;
-        let _ = insert_seeded_source_file(
+        let _ = insert_seeded_codex_rollout_file(
             db.connection_mut(),
             project_id,
             older_relative_path,
@@ -2241,15 +2524,22 @@ mod tests {
             older_size,
         )?;
 
-        let startup = start_startup_import_with_options(
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Codex,
+            SourceFileKind::Rollout,
+            sessions_root,
+        )]);
+
+        let startup = start_startup_import_with_options_and_sources(
             db.connection(),
             &db_path,
-            &source_root,
+            &sources,
             Duration::from_millis(1),
             StartupImportMode::Full,
             ImportWorkerOptions {
                 per_chunk_delay: Duration::from_millis(WORKER_DELAY_MS),
                 perf_logger: None,
+                rtk_config: None,
             },
             None,
         )?;
@@ -2259,13 +2549,24 @@ mod tests {
         assert!(startup.startup_status_message.is_none());
         assert!(startup.deferred_status_message.is_none());
         assert!(startup.startup_progress_update.is_none());
+        let read_db = Database::open(&db_path)?;
 
-        let complete_count: i64 = db.connection().query_row(
+        let complete_count: i64 = read_db.connection().query_row(
             "SELECT COUNT(*) FROM import_chunk WHERE state = 'complete'",
             [],
             |row| row.get(0),
         )?;
         assert_eq!(complete_count, 2);
+
+        let rollout_event_count: i64 = read_db.connection().query_row(
+            "SELECT COUNT(*) FROM codex_rollout_event",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            rollout_event_count, 18,
+            "two copies of the nine-event fixture should each import fully"
+        );
 
         Ok(())
     }
@@ -2670,6 +2971,312 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn import_all_imports_codex_rollout_raw_sessions_without_blocking_claude_imports() -> Result<()>
+    {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let claude_root = temp.path().join(".claude");
+        let claude_projects = claude_root.join("projects");
+        let claude_history = claude_root.join("history.jsonl");
+        let project_root = temp.path().join("project");
+        let project_cwd = project_root.join("workspace");
+        fs::create_dir_all(&project_cwd)?;
+        gix::init(&project_root)?;
+        let _ = write_session_fixture_with_cwd(
+            &claude_projects.join("project/session.jsonl"),
+            "claude-session",
+            &project_cwd,
+        )?;
+        fs::write(
+            &claude_history,
+            "{\"sessionId\":\"claude-history-1\",\"timestamp\":\"2026-04-18T12:00:00Z\",\"display\":\"hello\"}\n",
+        )?;
+
+        let codex_root = codex_fixture_root();
+        let sources = ConfiguredSources::new(vec![
+            ConfiguredSource::directory(
+                SourceProvider::Claude,
+                SourceFileKind::Transcript,
+                claude_projects,
+            ),
+            ConfiguredSource::file(
+                SourceProvider::Claude,
+                SourceFileKind::History,
+                claude_history,
+            ),
+            ConfiguredSource::directory(
+                SourceProvider::Codex,
+                SourceFileKind::Rollout,
+                codex_root.join("sessions"),
+            ),
+            ConfiguredSource::file(
+                SourceProvider::Codex,
+                SourceFileKind::History,
+                codex_root.join("history.jsonl"),
+            ),
+            ConfiguredSource::file(
+                SourceProvider::Codex,
+                SourceFileKind::SessionIndex,
+                codex_root.join("session_index.jsonl"),
+            ),
+        ]);
+
+        let mut db = Database::open(&db_path)?;
+        let scan_report = scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+        assert_eq!(scan_report.discovered_source_files, 5);
+
+        let import_report =
+            import_all_with_sources_and_perf_logger(db.connection(), &db_path, &sources, None)?;
+        assert_eq!(import_report.deferred_failure_count, 0);
+        assert!(import_report.deferred_failure_summary.is_none());
+
+        let second_import_report =
+            import_all_with_sources_and_perf_logger(db.connection(), &db_path, &sources, None)?;
+        assert_eq!(second_import_report.deferred_failure_count, 0);
+        assert!(second_import_report.deferred_failure_summary.is_none());
+
+        let counts: (i64, i64, i64, i64, i64, i64) = db.connection().query_row(
+            "
+            SELECT
+                (SELECT COUNT(*) FROM source_file WHERE imported_schema_version = ?1),
+                (SELECT COUNT(*) FROM conversation),
+                (SELECT COUNT(*) FROM history_event),
+                (SELECT COUNT(*) FROM codex_rollout_session),
+                (SELECT COUNT(*) FROM codex_rollout_event),
+                (SELECT COUNT(*) FROM codex_session_index_entry)
+            ",
+            params![crate::import::IMPORT_SCHEMA_VERSION],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        assert_eq!(counts.0, 5);
+        assert_eq!(counts.1, 2);
+        assert_eq!(counts.2, 2);
+        assert_eq!(counts.3, 1);
+        assert_eq!(counts.4, 9);
+        assert_eq!(counts.5, 1);
+
+        let codex_shared_counts: (i64, i64, i64, i64) = db.connection().query_row(
+            "
+            SELECT
+                (SELECT COUNT(*)
+                 FROM conversation c
+                 JOIN source_file sf ON sf.id = c.source_file_id
+                 WHERE sf.source_provider = 'codex' AND sf.source_kind = 'rollout'),
+                (SELECT COUNT(*)
+                 FROM message m
+                 JOIN conversation c ON c.id = m.conversation_id
+                 JOIN source_file sf ON sf.id = c.source_file_id
+                 WHERE sf.source_provider = 'codex' AND sf.source_kind = 'rollout'),
+                (SELECT COUNT(*)
+                 FROM turn t
+                 JOIN conversation c ON c.id = t.conversation_id
+                 JOIN source_file sf ON sf.id = c.source_file_id
+                 WHERE sf.source_provider = 'codex' AND sf.source_kind = 'rollout'),
+                (SELECT COUNT(*)
+                 FROM action a
+                 JOIN turn t ON t.id = a.turn_id
+                 JOIN conversation c ON c.id = t.conversation_id
+                 JOIN source_file sf ON sf.id = c.source_file_id
+                 WHERE sf.source_provider = 'codex' AND sf.source_kind = 'rollout')
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(codex_shared_counts, (1, 5, 1, 3));
+
+        let codex_tool_row: (String, Option<i64>, Option<i64>) = db.connection().query_row(
+            "
+            SELECT mp.tool_name, m.input_tokens, m.output_tokens
+            FROM message_part mp
+            JOIN message m ON m.id = mp.message_id
+            JOIN conversation c ON c.id = m.conversation_id
+            JOIN source_file sf ON sf.id = c.source_file_id
+            WHERE sf.source_provider = 'codex'
+                AND sf.source_kind = 'rollout'
+                AND mp.part_kind = 'tool_use'
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(codex_tool_row.0, "Bash");
+        assert_eq!(codex_tool_row.1, Some(123));
+        assert_eq!(codex_tool_row.2, Some(45));
+
+        let codex_history_row: (Option<String>, Option<String>, Option<String>) =
+            db.connection().query_row(
+                "
+                SELECT session_id, raw_project, display_text
+                FROM history_event he
+                JOIN source_file sf ON sf.id = he.source_file_id
+                WHERE sf.source_provider = 'codex' AND sf.source_kind = 'history'
+                ",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        assert_eq!(codex_history_row.0.as_deref(), Some("codex-session-1"));
+        assert_eq!(
+            codex_history_row.1.as_deref(),
+            Some("/tmp/redacted/project-a")
+        );
+        assert_eq!(
+            codex_history_row.2.as_deref(),
+            Some("Investigate failing test")
+        );
+
+        let session_index_row: (Option<String>, Option<String>) = db.connection().query_row(
+            "
+            SELECT session_id, rollout_relative_path
+            FROM codex_session_index_entry
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(session_index_row.0.as_deref(), Some("codex-session-1"));
+        assert_eq!(
+            session_index_row.1.as_deref(),
+            Some("2026/04/18/rollout-2026-04-18T12-00-00Z.jsonl")
+        );
+
+        let rollout_row: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = db.connection().query_row(
+            "
+                SELECT
+                    crs.session_id,
+                    crs.raw_cwd_path,
+                    crs.cli_version,
+                    crs.model_name,
+                    p.root_path
+                FROM codex_rollout_session crs
+                JOIN project p ON p.id = crs.project_id
+                ",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(rollout_row.0.as_deref(), Some("codex-session-1"));
+        assert_eq!(rollout_row.1.as_deref(), Some("/tmp/redacted/project-a"));
+        assert_eq!(rollout_row.2.as_deref(), Some("0.0.0-test"));
+        assert_eq!(rollout_row.3.as_deref(), Some("gpt-5.4-codex"));
+        assert_eq!(rollout_row.4, "/tmp/redacted/project-a");
+
+        Ok(())
+    }
+
+    #[test]
+    fn import_all_with_sources_imports_checked_in_claude_fixture_corpus() -> Result<()> {
+        use crate::import::test_fixtures::claude_fixture_sources;
+
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let sources = claude_fixture_sources();
+
+        let mut db = Database::open(&db_path)?;
+        let scan_report = scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+        assert_eq!(scan_report.discovered_source_files, 2);
+
+        let import_report =
+            import_all_with_sources_and_perf_logger(db.connection(), &db_path, &sources, None)?;
+        assert_eq!(import_report.deferred_failure_count, 0);
+        assert!(import_report.deferred_failure_summary.is_none());
+
+        let counts: (i64, i64, i64, i64) = db.connection().query_row(
+            "
+            SELECT
+                (SELECT COUNT(*) FROM source_file WHERE imported_schema_version = ?1),
+                (SELECT COUNT(*) FROM conversation),
+                (SELECT COUNT(*) FROM message),
+                (SELECT COUNT(*) FROM history_event)
+            ",
+            params![crate::import::IMPORT_SCHEMA_VERSION],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(counts.0, 2, "both fixture files should be imported");
+        assert_eq!(counts.1, 1, "fixture yields a single conversation");
+        assert_eq!(
+            counts.2, 2,
+            "fixture yields one user + one assistant message"
+        );
+        assert_eq!(counts.3, 1, "fixture yields one history event");
+
+        let conversation_row: (String, String, String) = db.connection().query_row(
+            "
+            SELECT sf.source_provider, sf.source_kind, sf.relative_path
+            FROM conversation c
+            JOIN source_file sf ON sf.id = c.source_file_id
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(conversation_row.0, "claude");
+        assert_eq!(conversation_row.1, "transcript");
+        assert_eq!(
+            conversation_row.2,
+            "-tmp-redacted-project-a/session-claude-fixture-01.jsonl"
+        );
+
+        let history_row: (Option<String>, Option<String>) = db.connection().query_row(
+            "
+            SELECT session_id, display_text
+            FROM history_event he
+            JOIN source_file sf ON sf.id = he.source_file_id
+            WHERE sf.source_provider = 'claude' AND sf.source_kind = 'history'
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(history_row.0.as_deref(), Some("claude-fixture-session-01"));
+        assert_eq!(history_row.1.as_deref(), Some("Inspect the project"));
+
+        let reimport_report =
+            import_all_with_sources_and_perf_logger(db.connection(), &db_path, &sources, None)?;
+        assert_eq!(reimport_report.deferred_failure_count, 0);
+        assert!(reimport_report.deferred_failure_summary.is_none());
+        let post_reimport_counts: (i64, i64) = db.connection().query_row(
+            "SELECT (SELECT COUNT(*) FROM conversation), (SELECT COUNT(*) FROM message)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            post_reimport_counts,
+            (1, 2),
+            "reimport is a no-op on unchanged fixture"
+        );
+
+        Ok(())
+    }
+
     fn insert_project(
         conn: &mut Connection,
         canonical_key: &str,
@@ -2722,10 +3329,12 @@ mod tests {
             INSERT INTO source_file (
                 project_id,
                 relative_path,
+                source_provider,
+                source_kind,
                 modified_at_utc,
                 size_bytes
             )
-            VALUES (?1, ?2, ?3, ?4)
+            VALUES (?1, ?2, 'claude', 'transcript', ?3, ?4)
             RETURNING id
             ",
             params![project_id, relative_path, modified_at_utc, size_bytes],
@@ -2820,5 +3429,1220 @@ mod tests {
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<rusqlite::Result<BTreeMap<_, _>>>()
             .context("unable to collect conversation ids by relative path")
+    }
+
+    fn codex_fixture_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("codex")
+    }
+
+    fn copy_codex_rollout_fixture(dest: &Path) -> Result<i64> {
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let source = codex_fixture_root()
+            .join("sessions")
+            .join("2026")
+            .join("04")
+            .join("18")
+            .join("rollout-2026-04-18T12-00-00Z.jsonl");
+        fs::copy(&source, dest).with_context(|| {
+            format!(
+                "unable to copy codex rollout fixture {} -> {}",
+                source.display(),
+                dest.display()
+            )
+        })?;
+        let size = fs::metadata(dest)
+            .with_context(|| format!("unable to stat copied rollout at {}", dest.display()))?
+            .len();
+        i64::try_from(size).context("copied rollout fixture size exceeded i64")
+    }
+
+    fn insert_seeded_codex_rollout_file(
+        conn: &mut Connection,
+        project_id: i64,
+        relative_path: &str,
+        modified_at_utc: &str,
+        size_bytes: i64,
+    ) -> Result<i64> {
+        conn.query_row(
+            "
+            INSERT INTO source_file (
+                project_id,
+                relative_path,
+                source_provider,
+                source_kind,
+                modified_at_utc,
+                size_bytes
+            )
+            VALUES (?1, ?2, 'codex', 'rollout', ?3, ?4)
+            RETURNING id
+            ",
+            params![project_id, relative_path, modified_at_utc, size_bytes],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("unable to insert a seeded codex rollout source file")
+    }
+
+    fn write_truncated_codex_rollout_fixture(path: &Path) -> Result<i64> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let source_path = codex_fixture_root()
+            .join("sessions")
+            .join("2026")
+            .join("04")
+            .join("18")
+            .join("rollout-2026-04-18T12-00-00Z.jsonl");
+        let contents = fs::read_to_string(&source_path).with_context(|| {
+            format!(
+                "unable to read codex rollout fixture {}",
+                source_path.display()
+            )
+        })?;
+        let lines: Vec<&str> = contents.split_inclusive('\n').collect();
+        if lines.len() < 3 {
+            anyhow::bail!(
+                "codex rollout fixture {} is unexpectedly short; task 04 truncation helper needs \
+                 at least three lines to keep a valid prefix before the truncated line",
+                source_path.display()
+            );
+        }
+        let prefix: String = lines[..2].concat();
+        let truncated_tail = "{\"type\":\"user_message\",\"id\":\"user-truncated";
+        let written = format!("{prefix}{truncated_tail}");
+        fs::write(path, &written).with_context(|| format!("unable to write {}", path.display()))?;
+        i64::try_from(written.len()).context("truncated codex rollout fixture size exceeded i64")
+    }
+
+    fn write_codex_rollout_without_session_meta_fixture(path: &Path) -> Result<i64> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let source_path = codex_fixture_root()
+            .join("sessions")
+            .join("2026")
+            .join("04")
+            .join("18")
+            .join("rollout-2026-04-18T12-00-00Z.jsonl");
+        let contents = fs::read_to_string(&source_path).with_context(|| {
+            format!(
+                "unable to read codex rollout fixture {}",
+                source_path.display()
+            )
+        })?;
+        let lines: Vec<&str> = contents.split_inclusive('\n').collect();
+        if lines.is_empty() || !lines[0].contains("\"type\":\"session_meta\"") {
+            anyhow::bail!(
+                "codex rollout fixture {} did not start with a session_meta record; task 04 helper \
+                 relies on dropping the first line to remove session metadata",
+                source_path.display()
+            );
+        }
+        let written: String = lines[1..].concat();
+        fs::write(path, &written).with_context(|| format!("unable to write {}", path.display()))?;
+        i64::try_from(written.len())
+            .context("session-meta-less codex rollout fixture size exceeded i64")
+    }
+
+    fn write_malformed_codex_session_index_fixture(path: &Path) -> Result<i64> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = concat!(
+            "{\"session_id\":\"codex-session-1\",\"rollout_path\":\"sessions/2026/04/18/",
+            "rollout-2026-04-18T12-00-00Z.jsonl\",\"ts\":\"2026-04-18T12:00:00Z\"}\n",
+            "{\"session_id\":\"codex-session-2\",\"rollout_path\":\"sessions/2026/04/18/",
+            "rollout-2026-04-18T12-30-00Z.jsonl\",\"ts\":",
+        );
+        fs::write(path, content).with_context(|| format!("unable to write {}", path.display()))?;
+        i64::try_from(content.len()).context("malformed session index fixture size exceeded i64")
+    }
+
+    fn write_minimal_codex_rollout_fixture(path: &Path, session_id: &str) -> Result<i64> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = format!(
+            concat!(
+                "{{\"type\":\"session_meta\",\"session_id\":\"{session_id}\",",
+                "\"cli_version\":\"0.0.0-minimal\",\"cwd\":\"/tmp/redacted/project-a\",",
+                "\"model\":\"gpt-5.4-codex\"}}\n",
+                "{{\"type\":\"user_message\",\"id\":\"{session_id}-user\",",
+                "\"text\":\"rewritten content\"}}\n",
+            ),
+            session_id = session_id,
+        );
+        fs::write(path, &content).with_context(|| format!("unable to write {}", path.display()))?;
+        i64::try_from(content.len()).context("minimal codex rollout fixture size exceeded i64")
+    }
+
+    fn codex_rollout_event_counts_by_relative_path(
+        conn: &Connection,
+    ) -> Result<BTreeMap<String, i64>> {
+        let mut stmt = conn.prepare(
+            "
+            SELECT source_file.relative_path, COUNT(codex_rollout_event.id)
+            FROM source_file
+            LEFT JOIN codex_rollout_event
+                ON codex_rollout_event.source_file_id = source_file.id
+            WHERE source_file.source_provider = 'codex'
+                AND source_file.source_kind = 'rollout'
+            GROUP BY source_file.relative_path
+            ORDER BY source_file.relative_path
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<BTreeMap<_, _>>>()
+            .context("unable to collect codex rollout event counts by relative path")
+    }
+
+    #[test]
+    fn codex_import_completes_when_rollout_is_truncated_and_records_warning() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let sessions_root = source_root.join("sessions");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root)?;
+
+        let relative_path = "2026/04/18/rollout-codex-truncated.jsonl";
+        let rollout_path = sessions_root.join(relative_path);
+        let size_bytes = write_truncated_codex_rollout_fixture(&rollout_path)?;
+
+        let recent = Timestamp::now()
+            .checked_sub(1_i64.hours())
+            .context("unable to construct recent codex truncated test timestamp")?
+            .to_string();
+
+        let mut db = Database::open(&db_path)?;
+        let project_id = insert_project_with_root(
+            db.connection_mut(),
+            "path:/codex-truncated",
+            "codex-truncated",
+            &project_root,
+        )?;
+        let _ = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            relative_path,
+            &recent,
+            size_bytes,
+        )?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Codex,
+            SourceFileKind::Rollout,
+            sessions_root,
+        )]);
+
+        let startup = start_startup_import_with_options_and_sources(
+            db.connection(),
+            &db_path,
+            &sources,
+            Duration::from_secs(2),
+            StartupImportMode::RecentFirst,
+            ImportWorkerOptions::default(),
+            None,
+        )?;
+        startup.wait_for_completion()?;
+
+        let counts: (i64, i64) = db.connection().query_row(
+            "
+            SELECT
+                COUNT(*) FILTER (WHERE state = 'complete'),
+                COUNT(*) FILTER (WHERE state = 'failed')
+            FROM import_chunk
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(counts, (1, 0));
+
+        let warnings: Vec<String> = {
+            let mut stmt = db
+                .connection()
+                .prepare("SELECT message FROM import_warning ORDER BY id")?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains(&rollout_path.display().to_string()),
+            "warning should mention the truncated rollout path; got: {}",
+            warnings[0]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_import_completes_when_session_index_is_malformed_and_records_warning() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let sessions_root = source_root.join("sessions");
+        let session_index_path = source_root.join("session_index.jsonl");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root)?;
+
+        let rollout_relative_path = "2026/04/18/rollout-codex-good-alongside-bad-index.jsonl";
+        let rollout_path = sessions_root.join(rollout_relative_path);
+        let rollout_size = copy_codex_rollout_fixture(&rollout_path)?;
+        let _ = write_malformed_codex_session_index_fixture(&session_index_path)?;
+
+        let recent = Timestamp::now()
+            .checked_sub(1_i64.hours())
+            .context("unable to construct recent codex session-index test timestamp")?
+            .to_string();
+
+        let mut db = Database::open(&db_path)?;
+        let project_id = insert_project_with_root(
+            db.connection_mut(),
+            "path:/codex-session-index-malformed",
+            "codex-session-index-malformed",
+            &project_root,
+        )?;
+        let _ = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            rollout_relative_path,
+            &recent,
+            rollout_size,
+        )?;
+
+        let sources = ConfiguredSources::new(vec![
+            ConfiguredSource::directory(
+                SourceProvider::Codex,
+                SourceFileKind::Rollout,
+                sessions_root,
+            ),
+            ConfiguredSource::file(
+                SourceProvider::Codex,
+                SourceFileKind::SessionIndex,
+                session_index_path.clone(),
+            ),
+        ]);
+
+        scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+        let report =
+            import_all_with_sources_and_perf_logger(db.connection(), &db_path, &sources, None)?;
+        assert_eq!(report.deferred_failure_count, 0);
+
+        let failed_count: i64 = db.connection().query_row(
+            "SELECT COUNT(*) FROM import_chunk WHERE state = 'failed'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(failed_count, 0);
+
+        let warnings: Vec<String> = {
+            let mut stmt = db
+                .connection()
+                .prepare("SELECT message FROM import_warning ORDER BY id")?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mentions_index = warnings
+            .iter()
+            .any(|w| w.contains(&session_index_path.display().to_string()));
+        assert!(
+            mentions_index,
+            "expected an import_warning mentioning {}; saw: {:?}",
+            session_index_path.display(),
+            warnings
+        );
+
+        let rollout_session_count: i64 =
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM codex_rollout_session", [], |row| {
+                    row.get(0)
+                })?;
+        assert_eq!(
+            rollout_session_count, 1,
+            "rollout should still import when the session index is malformed"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_import_tolerates_rollout_missing_session_meta() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let sessions_root = source_root.join("sessions");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root)?;
+
+        let relative_path = "2026/04/18/rollout-codex-without-session-meta.jsonl";
+        let rollout_path = sessions_root.join(relative_path);
+        let size_bytes = write_codex_rollout_without_session_meta_fixture(&rollout_path)?;
+
+        let recent = Timestamp::now()
+            .checked_sub(1_i64.hours())
+            .context("unable to construct recent codex missing-meta test timestamp")?
+            .to_string();
+
+        let mut db = Database::open(&db_path)?;
+        let project_id = insert_project_with_root(
+            db.connection_mut(),
+            "path:/codex-missing-session-meta",
+            "codex-missing-session-meta",
+            &project_root,
+        )?;
+        let _ = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            relative_path,
+            &recent,
+            size_bytes,
+        )?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Codex,
+            SourceFileKind::Rollout,
+            sessions_root,
+        )]);
+
+        let startup = start_startup_import_with_options_and_sources(
+            db.connection(),
+            &db_path,
+            &sources,
+            Duration::from_secs(2),
+            StartupImportMode::RecentFirst,
+            ImportWorkerOptions::default(),
+            None,
+        )?;
+        startup.wait_for_completion()?;
+
+        let counts: (i64, i64) = db.connection().query_row(
+            "
+            SELECT
+                COUNT(*) FILTER (WHERE state = 'complete'),
+                COUNT(*) FILTER (WHERE state = 'failed')
+            FROM import_chunk
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(counts, (1, 0));
+
+        let session_row: (
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = db.connection().query_row(
+            "
+                SELECT COUNT(*), MAX(cli_version), MAX(originator), MAX(model_provider), \
+                 MAX(model_name)
+                FROM codex_rollout_session
+                ",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(
+            session_row.0, 1,
+            "rollout without session_meta should still yield one codex_rollout_session row"
+        );
+        assert!(
+            session_row.1.is_none()
+                && session_row.2.is_none()
+                && session_row.3.is_none()
+                && session_row.4.is_none(),
+            "session metadata fields should be NULL when session_meta is absent; got {session_row:?}"
+        );
+
+        let event_count: i64 =
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM codex_rollout_event", [], |row| {
+                    row.get(0)
+                })?;
+        assert!(
+            event_count >= 1,
+            "remaining non-meta rollout lines should import as events; got {event_count}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_import_plan_reimports_rollouts_when_import_schema_version_changes() -> Result<()> {
+        let temp = tempdir()?;
+        let mut db = Database::open(temp.path().join("usage.sqlite3"))?;
+        let tz = TimeZone::get("America/Chicago")?;
+        let now: Timestamp = "2026-04-18T18:00:00Z".parse()?;
+
+        let project_id = insert_project(
+            db.connection_mut(),
+            "path:/codex-schema-bump",
+            "codex-schema-bump",
+        )?;
+        let relative_path = "2026/04/18/rollout-codex-schema.jsonl";
+        let modified_at_utc = "2026-04-18T15:00:00Z";
+        let source_file_id = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            relative_path,
+            modified_at_utc,
+            4096,
+        )?;
+
+        db.connection_mut().execute(
+            "
+            UPDATE source_file
+            SET
+                imported_size_bytes = size_bytes,
+                imported_modified_at_utc = modified_at_utc,
+                imported_schema_version = 0
+            WHERE id = ?1
+            ",
+            [source_file_id],
+        )?;
+
+        let plan = build_import_plan(db.connection(), now, &tz)?;
+        let planned_projects: Vec<i64> = plan
+            .startup_chunks
+            .iter()
+            .map(|chunk| chunk.project_id)
+            .chain(plan.deferred_chunks.iter().map(|chunk| chunk.project_id))
+            .collect();
+        assert!(
+            planned_projects.contains(&project_id),
+            "codex rollout should be replanned when imported_schema_version is stale; \
+             plan: {planned_projects:?}"
+        );
+
+        db.connection_mut().execute(
+            "
+            UPDATE source_file
+            SET imported_schema_version = ?2
+            WHERE id = ?1
+            ",
+            params![source_file_id, crate::import::IMPORT_SCHEMA_VERSION],
+        )?;
+
+        let settled_plan = build_import_plan(db.connection(), now, &tz)?;
+        assert!(settled_plan.startup_chunks.is_empty());
+        assert!(settled_plan.deferred_chunks.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_import_reimports_rollout_when_mtime_changes_and_preserves_unchanged_rollouts()
+    -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let sessions_root = source_root.join("sessions");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root)?;
+
+        let first_relative_path = "2026/04/18/rollout-codex-mtime-first.jsonl";
+        let second_relative_path = "2026/04/18/rollout-codex-mtime-second.jsonl";
+        let first_path = sessions_root.join(first_relative_path);
+        let second_path = sessions_root.join(second_relative_path);
+        let _ = copy_codex_rollout_fixture(&first_path)?;
+        let _ = copy_codex_rollout_fixture(&second_path)?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Codex,
+            SourceFileKind::Rollout,
+            sessions_root.clone(),
+        )]);
+
+        let mut db = Database::open(&db_path)?;
+        scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+        let initial_report =
+            import_all_with_sources_and_perf_logger(db.connection(), &db_path, &sources, None)?;
+        assert_eq!(initial_report.deferred_failure_count, 0);
+
+        let original_counts = codex_rollout_event_counts_by_relative_path(db.connection())?;
+        let original_first = original_counts
+            .get(first_relative_path)
+            .copied()
+            .expect("first rollout event count row should exist after initial import");
+        let original_second = original_counts
+            .get(second_relative_path)
+            .copied()
+            .expect("second rollout event count row should exist after initial import");
+        assert_eq!(
+            (original_first, original_second),
+            (9, 9),
+            "both rollouts should import all nine events from the checked-in fixture"
+        );
+
+        thread::sleep(Duration::from_millis(1100));
+        let _ = write_minimal_codex_rollout_fixture(&first_path, "codex-mtime-rewritten")?;
+
+        scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+        let second_report =
+            import_all_with_sources_and_perf_logger(db.connection(), &db_path, &sources, None)?;
+        assert_eq!(second_report.deferred_failure_count, 0);
+
+        let updated_counts = codex_rollout_event_counts_by_relative_path(db.connection())?;
+        assert_eq!(
+            updated_counts.get(first_relative_path).copied(),
+            Some(2),
+            "rewritten rollout should be reimported with only the two new records as events; full \
+             counts: {updated_counts:?}"
+        );
+        assert_eq!(
+            updated_counts.get(second_relative_path).copied(),
+            Some(original_second),
+            "untouched rollout should keep its nine event rows; full counts: {updated_counts:?}"
+        );
+
+        let rewritten_session_id: Option<String> = db.connection().query_row(
+            "
+            SELECT crs.session_id
+            FROM codex_rollout_session crs
+            JOIN source_file sf ON sf.id = crs.source_file_id
+            WHERE sf.relative_path = ?1
+            ",
+            [first_relative_path],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            rewritten_session_id.as_deref(),
+            Some("codex-mtime-rewritten"),
+            "rewritten rollout's session_id should reflect the new session_meta record"
+        );
+
+        let _ = original_first;
+        let warnings: Vec<String> = {
+            let mut stmt = db
+                .connection()
+                .prepare("SELECT message FROM import_warning ORDER BY id")?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        assert!(
+            warnings
+                .iter()
+                .all(|w| !w.contains(&first_path.display().to_string())),
+            "rewritten valid rollout should not emit warnings for {}; saw: {:?}",
+            first_path.display(),
+            warnings
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn codex_deferred_import_records_warnings_without_failure_status_updates() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let source_root = temp.path().join("source");
+        let sessions_root = source_root.join("sessions");
+        let project_root = temp.path().join("project");
+        fs::create_dir_all(&project_root)?;
+
+        let startup_relative_path = "2026/04/18/rollout-codex-deferred-startup-bad.jsonl";
+        let deferred_one_relative_path = "2026/04/15/rollout-codex-deferred-older-one-bad.jsonl";
+        let deferred_two_relative_path = "2026/04/15/rollout-codex-deferred-older-two-bad.jsonl";
+        let startup_source_path = sessions_root.join(startup_relative_path);
+        let deferred_one_source_path = sessions_root.join(deferred_one_relative_path);
+        let deferred_two_source_path = sessions_root.join(deferred_two_relative_path);
+        let startup_size = write_truncated_codex_rollout_fixture(&startup_source_path)?;
+        let deferred_one_size = write_truncated_codex_rollout_fixture(&deferred_one_source_path)?;
+        let deferred_two_size = write_truncated_codex_rollout_fixture(&deferred_two_source_path)?;
+
+        let recent = Timestamp::now()
+            .checked_sub(1_i64.hours())
+            .context("unable to construct recent codex deferred-isolation timestamp")?
+            .to_string();
+        let older_one = Timestamp::now()
+            .checked_sub(72_i64.hours())
+            .context("unable to construct older codex deferred-isolation timestamp")?
+            .to_string();
+        let older_two = Timestamp::now()
+            .checked_sub(96_i64.hours())
+            .context("unable to construct second older codex deferred-isolation timestamp")?
+            .to_string();
+
+        let mut db = Database::open(&db_path)?;
+        let project_id = insert_project_with_root(
+            db.connection_mut(),
+            "path:/codex-deferred-isolation",
+            "codex-deferred-isolation",
+            &project_root,
+        )?;
+        let _ = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            startup_relative_path,
+            &recent,
+            startup_size,
+        )?;
+        let _ = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            deferred_one_relative_path,
+            &older_one,
+            deferred_one_size,
+        )?;
+        let _ = insert_seeded_codex_rollout_file(
+            db.connection_mut(),
+            project_id,
+            deferred_two_relative_path,
+            &older_two,
+            deferred_two_size,
+        )?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Codex,
+            SourceFileKind::Rollout,
+            sessions_root,
+        )]);
+
+        let mut startup = start_startup_import_with_options_and_sources(
+            db.connection(),
+            &db_path,
+            &sources,
+            Duration::from_secs(2),
+            StartupImportMode::RecentFirst,
+            ImportWorkerOptions::default(),
+            None,
+        )?;
+        let status_updates = startup
+            .take_status_updates()
+            .context("missing deferred status update receiver")?;
+        loop {
+            match status_updates.recv_timeout(Duration::from_secs(2))? {
+                StartupWorkerEvent::DeferredFailures { .. } => {
+                    panic!("unexpected deferred failure update for codex warning-only imports")
+                }
+                StartupWorkerEvent::Finished => break,
+                StartupWorkerEvent::Progress { .. } | StartupWorkerEvent::StartupSettled { .. } => {
+                    continue;
+                }
+            }
+        }
+        startup.wait_for_completion()?;
+
+        let counts: (i64, i64) = db.connection().query_row(
+            "
+            SELECT
+                COUNT(*) FILTER (WHERE state = 'complete'),
+                COUNT(*) FILTER (WHERE state = 'failed')
+            FROM import_chunk
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(counts, (3, 0));
+
+        let warnings: Vec<String> = {
+            let mut stmt = db
+                .connection()
+                .prepare("SELECT message FROM import_warning ORDER BY id")?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mention_count = |needle: &Path| {
+            let needle = needle.display().to_string();
+            warnings.iter().filter(|w| w.contains(&needle)).count()
+        };
+        assert_eq!(mention_count(&startup_source_path), 1);
+        assert_eq!(mention_count(&deferred_one_source_path), 1);
+        assert_eq!(mention_count(&deferred_two_source_path), 1);
+
+        Ok(())
+    }
+
+    // --- Task 05: RTK-aware `*_with_sources_*` helpers -----------------------
+
+    const RTK_BASH_COMMAND: &str = "cargo test";
+    const RTK_SAVED_TOKENS: i64 = 512;
+    const RTK_SAVINGS_PCT: f64 = 42.5;
+    const RTK_EXEC_TIME_MS: i64 = 137;
+
+    struct RtkTestTimestamps {
+        tool_use: String,
+        tool_result: String,
+        rtk_row: String,
+    }
+
+    /// Builds a triple of event timestamps all pinned to the same local
+    /// calendar day as the test run. The RTK match pipeline derives
+    /// `chunk_day_local` from each source file's filesystem mtime; by using
+    /// timestamps on today's local date for every moving part (action events,
+    /// RTK row, and file mtime — which fs::write sets to "now"), we keep the
+    /// match window aligned regardless of the system time zone.
+    fn rtk_test_timestamps() -> RtkTestTimestamps {
+        let local_date = Timestamp::now()
+            .to_zoned(TimeZone::system())
+            .date()
+            .to_string();
+        RtkTestTimestamps {
+            tool_use: format!("{local_date}T12:00:01Z"),
+            tool_result: format!("{local_date}T12:00:02Z"),
+            rtk_row: format!("{local_date}T12:00:02.500+00:00"),
+        }
+    }
+
+    struct RtkSeedRow {
+        timestamp: String,
+        original_cmd: String,
+        saved_tokens: i64,
+        savings_pct: f64,
+        exec_time_ms: i64,
+        project_path: String,
+    }
+
+    fn write_claude_bash_session_fixture(
+        path: &Path,
+        session_id: &str,
+        cwd: &Path,
+        tool_use_timestamp: &str,
+        tool_result_timestamp: &str,
+        command: &str,
+    ) -> Result<i64> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let content = format!(
+            concat!(
+                "{{\"type\":\"user\",\"uuid\":\"{session_id}-user\",\"timestamp\":\"{user_ts}\",\"sessionId\":\"{session_id}\",\"cwd\":\"{cwd}\",\"message\":{{\"role\":\"user\",\"content\":\"Run the tests\"}}}}\n",
+                "{{\"type\":\"assistant\",\"uuid\":\"{session_id}-assistant\",\"timestamp\":\"{tool_use_ts}\",\"sessionId\":\"{session_id}\",\"message\":{{\"id\":\"msg-{session_id}\",\"role\":\"assistant\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu-{session_id}\",\"name\":\"Bash\",\"input\":{{\"command\":\"{command}\"}}}}],\"usage\":{{\"input_tokens\":3,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":1}},\"model\":\"claude-haiku\",\"stop_reason\":\"tool_use\"}}}}\n",
+                "{{\"type\":\"user\",\"uuid\":\"{session_id}-tool-result\",\"timestamp\":\"{tool_result_ts}\",\"sessionId\":\"{session_id}\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"toolu-{session_id}\",\"content\":\"ok\",\"is_error\":false}}]}}}}\n"
+            ),
+            session_id = session_id,
+            cwd = cwd.display(),
+            user_ts = tool_use_timestamp,
+            tool_use_ts = tool_use_timestamp,
+            tool_result_ts = tool_result_timestamp,
+            command = command,
+        );
+
+        fs::write(path, &content).with_context(|| format!("unable to write {}", path.display()))?;
+        i64::try_from(content.len()).context("fixture size exceeded i64")
+    }
+
+    fn seed_rtk_history_db(rtk_db_path: &Path, rows: &[RtkSeedRow]) -> Result<()> {
+        if let Some(parent) = rtk_db_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let conn = Connection::open(rtk_db_path)
+            .with_context(|| format!("unable to open rtk db at {}", rtk_db_path.display()))?;
+        conn.execute_batch(
+            "
+            CREATE TABLE commands (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp     TEXT NOT NULL,
+                original_cmd  TEXT NOT NULL,
+                saved_tokens  INTEGER NOT NULL,
+                savings_pct   REAL    NOT NULL,
+                exec_time_ms  INTEGER NOT NULL,
+                project_path  TEXT NOT NULL
+            );
+            ",
+        )?;
+        for row in rows {
+            conn.execute(
+                "INSERT INTO commands
+                    (timestamp, original_cmd, saved_tokens, savings_pct, exec_time_ms, project_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    row.timestamp,
+                    row.original_cmd,
+                    row.saved_tokens,
+                    row.savings_pct,
+                    row.exec_time_ms,
+                    row.project_path,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn rtk_config_for_path(rtk_db_path: &Path) -> RtkConfig {
+        RtkConfig {
+            enabled: true,
+            db_path: rtk_db_path.display().to_string(),
+            pre_slack_ms: 2000,
+            post_slack_ms: 30000,
+        }
+    }
+
+    fn fetch_action_rtk_match_rows(conn: &Connection) -> Result<Vec<(i64, i64, f64, i64)>> {
+        let mut stmt = conn.prepare(
+            "SELECT rtk_row_id, saved_tokens, savings_pct, exec_time_ms
+             FROM action_rtk_match
+             ORDER BY action_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    #[test]
+    fn import_all_with_sources_and_rtk_matches_bash_commands_via_configured_sources() -> Result<()>
+    {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let claude_projects = temp.path().join("claude").join("projects");
+        let project_root = temp.path().join("project");
+        let project_cwd = project_root.join("workspace");
+        fs::create_dir_all(&project_cwd)?;
+        gix::init(&project_root)?;
+
+        let ts = rtk_test_timestamps();
+        let _ = write_claude_bash_session_fixture(
+            &claude_projects.join("project/session.jsonl"),
+            "claude-rtk-session",
+            &project_cwd,
+            &ts.tool_use,
+            &ts.tool_result,
+            RTK_BASH_COMMAND,
+        )?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Claude,
+            SourceFileKind::Transcript,
+            claude_projects,
+        )]);
+
+        let rtk_db_path = temp.path().join("rtk").join("history.db");
+        seed_rtk_history_db(
+            &rtk_db_path,
+            &[RtkSeedRow {
+                timestamp: ts.rtk_row.clone(),
+                original_cmd: RTK_BASH_COMMAND.to_string(),
+                saved_tokens: RTK_SAVED_TOKENS,
+                savings_pct: RTK_SAVINGS_PCT,
+                exec_time_ms: RTK_EXEC_TIME_MS,
+                project_path: project_root.display().to_string(),
+            }],
+        )?;
+
+        let mut db = Database::open(&db_path)?;
+        scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+
+        let rtk_config = rtk_config_for_path(&rtk_db_path);
+        let report =
+            import_all_with_sources_and_rtk(db.connection(), &db_path, &sources, Some(rtk_config))?;
+        assert_eq!(report.deferred_failure_count, 0);
+        assert!(report.deferred_failure_summary.is_none());
+
+        let matches = fetch_action_rtk_match_rows(db.connection())?;
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one RTK match for the Claude Bash action via non-legacy \
+             ConfiguredSources"
+        );
+        let (rtk_row_id, saved_tokens, savings_pct, exec_time_ms) = matches[0];
+        assert_eq!(rtk_row_id, 1);
+        assert_eq!(saved_tokens, RTK_SAVED_TOKENS);
+        assert!((savings_pct - RTK_SAVINGS_PCT).abs() < f64::EPSILON);
+        assert_eq!(exec_time_ms, RTK_EXEC_TIME_MS);
+
+        Ok(())
+    }
+
+    #[test]
+    fn import_all_with_sources_and_rtk_no_ops_when_config_disabled_via_configured_sources()
+    -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let claude_projects = temp.path().join("claude").join("projects");
+        let project_root = temp.path().join("project");
+        let project_cwd = project_root.join("workspace");
+        fs::create_dir_all(&project_cwd)?;
+        gix::init(&project_root)?;
+
+        let ts = rtk_test_timestamps();
+        let _ = write_claude_bash_session_fixture(
+            &claude_projects.join("project/session.jsonl"),
+            "claude-rtk-disabled",
+            &project_cwd,
+            &ts.tool_use,
+            &ts.tool_result,
+            RTK_BASH_COMMAND,
+        )?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Claude,
+            SourceFileKind::Transcript,
+            claude_projects,
+        )]);
+
+        let rtk_db_path = temp.path().join("rtk").join("history.db");
+        seed_rtk_history_db(
+            &rtk_db_path,
+            &[RtkSeedRow {
+                timestamp: ts.rtk_row.clone(),
+                original_cmd: RTK_BASH_COMMAND.to_string(),
+                saved_tokens: RTK_SAVED_TOKENS,
+                savings_pct: RTK_SAVINGS_PCT,
+                exec_time_ms: RTK_EXEC_TIME_MS,
+                project_path: project_root.display().to_string(),
+            }],
+        )?;
+
+        let mut db = Database::open(&db_path)?;
+        scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+
+        let mut disabled_config = rtk_config_for_path(&rtk_db_path);
+        disabled_config.enabled = false;
+        let report = import_all_with_sources_and_rtk(
+            db.connection(),
+            &db_path,
+            &sources,
+            Some(disabled_config),
+        )?;
+        assert_eq!(report.deferred_failure_count, 0);
+
+        let matches = fetch_action_rtk_match_rows(db.connection())?;
+        assert!(
+            matches.is_empty(),
+            "disabled RtkConfig must leave action_rtk_match empty even when the RTK db and a \
+             matching action exist"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn start_startup_import_with_sources_and_mode_and_rtk_matches_bash_commands_via_configured_sources()
+    -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let claude_projects = temp.path().join("claude").join("projects");
+        let project_root = temp.path().join("project");
+        let project_cwd = project_root.join("workspace");
+        fs::create_dir_all(&project_cwd)?;
+        gix::init(&project_root)?;
+
+        let ts = rtk_test_timestamps();
+        let _ = write_claude_bash_session_fixture(
+            &claude_projects.join("project/session.jsonl"),
+            "claude-startup-rtk",
+            &project_cwd,
+            &ts.tool_use,
+            &ts.tool_result,
+            RTK_BASH_COMMAND,
+        )?;
+
+        let sources = ConfiguredSources::new(vec![ConfiguredSource::directory(
+            SourceProvider::Claude,
+            SourceFileKind::Transcript,
+            claude_projects,
+        )]);
+
+        let rtk_db_path = temp.path().join("rtk").join("history.db");
+        seed_rtk_history_db(
+            &rtk_db_path,
+            &[RtkSeedRow {
+                timestamp: ts.rtk_row.clone(),
+                original_cmd: RTK_BASH_COMMAND.to_string(),
+                saved_tokens: RTK_SAVED_TOKENS,
+                savings_pct: RTK_SAVINGS_PCT,
+                exec_time_ms: RTK_EXEC_TIME_MS,
+                project_path: project_root.display().to_string(),
+            }],
+        )?;
+
+        let mut db = Database::open(&db_path)?;
+        scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+
+        let rtk_config = rtk_config_for_path(&rtk_db_path);
+        let startup = start_startup_import_with_sources_and_mode_and_rtk(
+            db.connection(),
+            &db_path,
+            &sources,
+            StartupImportMode::Full,
+            Some(rtk_config),
+            |_| {},
+        )?;
+        startup.wait_for_completion()?;
+
+        let matches = fetch_action_rtk_match_rows(db.connection())?;
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected one RTK match after startup import via \
+             start_startup_import_with_sources_and_mode_and_rtk"
+        );
+        let (rtk_row_id, saved_tokens, savings_pct, exec_time_ms) = matches[0];
+        assert_eq!(rtk_row_id, 1);
+        assert_eq!(saved_tokens, RTK_SAVED_TOKENS);
+        assert!((savings_pct - RTK_SAVINGS_PCT).abs() < f64::EPSILON);
+        assert_eq!(exec_time_ms, RTK_EXEC_TIME_MS);
+
+        Ok(())
+    }
+
+    #[test]
+    fn import_all_with_sources_and_rtk_imports_mixed_provider_sources_end_to_end() -> Result<()> {
+        let temp = tempdir()?;
+        let db_path = temp.path().join("usage.sqlite3");
+        let claude_projects = temp.path().join("claude").join("projects");
+        let claude_history = temp.path().join("claude").join("history.jsonl");
+        let project_root = temp.path().join("project");
+        let project_cwd = project_root.join("workspace");
+        fs::create_dir_all(&project_cwd)?;
+        gix::init(&project_root)?;
+
+        let ts = rtk_test_timestamps();
+        let _ = write_claude_bash_session_fixture(
+            &claude_projects.join("project/session.jsonl"),
+            "mixed-claude-session",
+            &project_cwd,
+            &ts.tool_use,
+            &ts.tool_result,
+            RTK_BASH_COMMAND,
+        )?;
+        fs::write(
+            &claude_history,
+            "{\"sessionId\":\"mixed-claude-history\",\"timestamp\":\"2026-03-26T11:00:00Z\",\"display\":\"hello\"}\n",
+        )?;
+
+        let codex_root = codex_fixture_root();
+        let sources = ConfiguredSources::new(vec![
+            ConfiguredSource::directory(
+                SourceProvider::Claude,
+                SourceFileKind::Transcript,
+                claude_projects,
+            ),
+            ConfiguredSource::file(
+                SourceProvider::Claude,
+                SourceFileKind::History,
+                claude_history,
+            ),
+            ConfiguredSource::directory(
+                SourceProvider::Codex,
+                SourceFileKind::Rollout,
+                codex_root.join("sessions"),
+            ),
+            ConfiguredSource::file(
+                SourceProvider::Codex,
+                SourceFileKind::History,
+                codex_root.join("history.jsonl"),
+            ),
+            ConfiguredSource::file(
+                SourceProvider::Codex,
+                SourceFileKind::SessionIndex,
+                codex_root.join("session_index.jsonl"),
+            ),
+        ]);
+
+        let rtk_db_path = temp.path().join("rtk").join("history.db");
+        seed_rtk_history_db(
+            &rtk_db_path,
+            &[RtkSeedRow {
+                timestamp: ts.rtk_row.clone(),
+                original_cmd: RTK_BASH_COMMAND.to_string(),
+                saved_tokens: RTK_SAVED_TOKENS,
+                savings_pct: RTK_SAVINGS_PCT,
+                exec_time_ms: RTK_EXEC_TIME_MS,
+                project_path: project_root.display().to_string(),
+            }],
+        )?;
+
+        let mut db = Database::open(&db_path)?;
+        let scan_report = scan_sources_manifest_with_policy(
+            &mut db,
+            &sources,
+            &ProjectIdentityPolicy::default(),
+            &[],
+        )?;
+        assert_eq!(scan_report.discovered_source_files, 5);
+
+        let rtk_config = rtk_config_for_path(&rtk_db_path);
+        let report =
+            import_all_with_sources_and_rtk(db.connection(), &db_path, &sources, Some(rtk_config))?;
+        assert_eq!(report.deferred_failure_count, 0);
+        assert!(report.deferred_failure_summary.is_none());
+
+        let counts: (i64, i64, i64, i64, i64) = db.connection().query_row(
+            "
+            SELECT
+                (SELECT COUNT(*) FROM source_file WHERE imported_schema_version = ?1),
+                (SELECT COUNT(*) FROM conversation),
+                (SELECT COUNT(*) FROM history_event),
+                (SELECT COUNT(*) FROM codex_rollout_session),
+                (SELECT COUNT(*) FROM codex_session_index_entry)
+            ",
+            params![crate::import::IMPORT_SCHEMA_VERSION],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(counts.0, 5, "all five mixed-provider source files imported");
+        assert_eq!(counts.1, 2, "one Claude + one Codex rollout conversation");
+        assert_eq!(counts.2, 2, "one Claude + one Codex history event");
+        assert_eq!(counts.3, 1, "codex rollout session recorded");
+        assert_eq!(counts.4, 1, "codex session index entry recorded");
+
+        let matches = fetch_action_rtk_match_rows(db.connection())?;
+        assert_eq!(
+            matches.len(),
+            1,
+            "only the Claude Bash action should match the seeded RTK row even when Codex sources \
+             are imported alongside Claude"
+        );
+        let (rtk_row_id, saved_tokens, _savings_pct, exec_time_ms) = matches[0];
+        assert_eq!(rtk_row_id, 1);
+        assert_eq!(saved_tokens, RTK_SAVED_TOKENS);
+        assert_eq!(exec_time_ms, RTK_EXEC_TIME_MS);
+
+        Ok(())
     }
 }

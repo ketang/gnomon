@@ -1,6 +1,6 @@
 # gnomon
 
-`gnomon` is a terminal application for exploring Claude session history and finding the usage patterns that drive the highest token consumption.
+`gnomon` is a terminal application for exploring Claude and Codex session history and finding the usage patterns that drive the highest token consumption.
 
 ## Current Status
 
@@ -13,11 +13,12 @@ This repository is bootstrapped as a Rust workspace with four crates:
 
 The current binary resolves runtime paths, scans the source manifest, schedules
 `project x day` import chunks, normalizes and classifies actions into the
-SQLite cache, imports Claude `history.jsonl` as a first-class source when the
-source root is the default `~/.claude/projects` tree, and opens a pinned TUI
-against the latest published import snapshot. The TUI now includes synchronized
-map and statistics panes, persistent UI state, current-view filtering, global
-jump, and manual snapshot refresh.
+SQLite cache, keeps Claude and Codex raw imports physically separate while
+sharing one normalized browse model, and opens a pinned TUI against the latest
+published import snapshot. The TUI now includes synchronized map and
+statistics panes, persistent UI state, current-view filtering, explicit
+Claude/Codex/combined provider filtering, global jump, and manual snapshot
+refresh.
 Startup prioritizes the last 24 hours of chunks before the UI opens and
 continues older imports in one background worker after launch by default. Use
 `--startup-full-import` when you want the initial TUI snapshot to wait for the
@@ -125,6 +126,7 @@ invocations imported from Claude history.
 
 ```bash
 cargo run -p gnomon -- skills
+cargo run -p gnomon -- skills --provider codex
 cargo run -p gnomon -- skills --path skill --skill planner
 cargo run -p gnomon -- skills --path skill-project --skill planner --project-id 1
 ```
@@ -132,7 +134,9 @@ cargo run -p gnomon -- skills --path skill-project --skill planner --project-id 
 The JSON output now reports both session-associated totals and explicit
 action-attributed totals. Unmatched invocation counts are also included so you
 can see when an explicit skill invocation did not join to a transcript-backed
-session.
+session. `skills`, `report`, and `opportunities` now accept `--provider
+claude|codex`; omitting the flag keeps the explicit combined view and the JSON
+rows report whether the visible scope is `claude`, `codex`, or `mixed`.
 
 ## Web UI
 
@@ -173,9 +177,10 @@ npm run build
 `gnomon` now boots a user config file automatically on first run.
 
 - Linux config path: `~/.config/gnomon/config.toml`
-- Default source root: `~/.claude/projects`
-- When the source root follows the default Claude layout, gnomon also imports
-  the sibling `~/.claude/history.jsonl` file automatically
+- Default Claude transcript root: `~/.claude/projects`
+- When the Claude transcript root follows the default Claude layout, gnomon
+  also imports the sibling `~/.claude/history.jsonl` file automatically
+- Codex sources are opt-in and stay disabled until you configure them
 - Default filter: exclude resolved project roots under `/tmp/`
 
 The generated file starts with sensible defaults and comments. The default
@@ -185,8 +190,15 @@ derived dataset unless you opt back in.
 Example:
 
 ```toml
-[source]
-root = "~/.claude/projects"
+[sources.claude]
+transcript_root = "~/.claude/projects"
+
+# Configure Codex locations explicitly when you want Codex sources scanned.
+#
+# [sources.codex]
+# rollout_root = "~/.codex/sessions"
+# history_file = "~/.codex/history.jsonl"
+# session_index_file = "~/.codex/session_index.jsonl"
 
 [project_identity]
 stale_claude_worktree_recovery = true
@@ -245,7 +257,8 @@ cargo run -p gnomon -- db reset --force
 cargo run -p gnomon -- db rebuild
 ```
 
-Both commands honor the existing `--db` and `--source-root` overrides.
+Both commands honor the existing `--db` override and the legacy Claude
+`--source-root` override.
 `reset` is destructive and requires `--force`; it removes both the derived
 usage database and the persisted browse-cache sidecar.
 `rebuild` clears those persisted cache artifacts and recreates the usage
@@ -269,7 +282,10 @@ reflect the new include/exclude policy.
 Apply the same rebuild step after pulling a version that bumps the importer
 schema version. Import-schema bumps mean `gnomon` now consumes a different
 normalized source-field set, so existing cached rows need reimport to match the
-new contract.
+new contract. The provider-aware source catalog refactor is one such change:
+after pulling a build that introduces `[sources.claude]` and `[sources.codex]`,
+run `db rebuild` once so the cache is reimported with provider and source-kind
+metadata.
 
 Common stale-identity symptoms include:
 
@@ -306,6 +322,7 @@ opening the TUI:
 
 ```bash
 cargo run -p gnomon -- report
+cargo run -p gnomon -- report --provider claude
 cargo run -p gnomon -- report --root category --path category
 cargo run -p gnomon -- report --path project --project-id 1
 ```
@@ -316,6 +333,8 @@ action fields such as `--classification-state` and `--normalized-action`
 supplying the path context when needed.
 Each rollup row now reserves an `opportunities` object in the JSON output so
 future heuristic annotations can ship without changing the hierarchy shape.
+Browse rows also carry a `provider_scope` field so combined views stay explicit
+instead of silently mixing Claude and Codex contributions.
 
 ## Query Benchmarks
 

@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
-pub const INITIAL_SCHEMA_VERSION: u32 = 15;
+pub const INITIAL_SCHEMA_VERSION: u32 = 20;
 pub const DEFAULT_DB_FILENAME: &str = "usage.sqlite3";
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -34,10 +34,14 @@ pub const SHARD_DATA_TABLES: &[&str] = &[
     "action",
     "action_message",
     "action_skill_attribution",
+    "action_rtk_match",
     "path_node",
     "message_path_ref",
     "history_event",
     "skill_invocation",
+    "codex_rollout_session",
+    "codex_rollout_event",
+    "codex_session_index_entry",
     "import_warning",
     "chunk_action_rollup",
     "chunk_path_rollup",
@@ -581,7 +585,7 @@ mod tests {
         // Insert a source_file referencing a project_id that does not exist.
         // Must fail because PRAGMA foreign_keys = ON is set at open time.
         let result = db.connection().execute(
-            "INSERT INTO source_file (project_id, relative_path) VALUES (99999, 'orphan.jsonl')",
+            "INSERT INTO source_file (project_id, relative_path, source_provider, source_kind) VALUES (99999, 'orphan.jsonl', 'claude', 'transcript')",
             [],
         );
 

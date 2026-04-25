@@ -191,7 +191,7 @@ decide KEPT or REVERTED.
 > Resolved by dropping the column rather than plumbing a counter: no
 > product consumer and no clean semantic for transcripts. Migration 0019.
 
-**S1 revisit — retry `simd-json` under sharding.**
+**S2 revisit — retry `simd-json` under sharding.**
 > Reverted pre-sharding because parse was <5% of wall time. Sharding
 > parallelized the DB write path, so parse is now a larger relative share
 > of several shards' wall time. Fresh measurement is cheap.
@@ -450,6 +450,30 @@ assertion, and refreshed `MANIFEST.md` from the mounted tarballs.
 
 Gates: ignored integration harness 7/7 ✓.
 
+### S1 — sync main into p4 — **KEPT**
+
+Commit: `7a98192` on `import-perf-p4-sync-main`.
+
+Problem: `import-perf-p4` had diverged from `main` since 2026-04-18.
+While p4 carried the sharded-import spine plus J1/R1/I1/A2/I2, `main`
+had absorbed the provider-aware source catalog, Codex rollout/session-index
+ingestion, RTK matching, and the expanded Claude/Codex fixture corpora.
+Phase-5 follow-up work could not safely continue until those production
+paths shared one base again.
+
+Fix: keep p4's 9-shard import architecture, deterministic phase-level
+`publish_seq` assignment, cached-project reuse, and record-table cleanup,
+while threading `ConfiguredSources` through the sharded importer and
+absorbing main's provider-aware source descriptors, normalize-side Codex
+matching, Codex rollout/session-index raw tables, RTK match rows, and the
+new fixture/doc corpus. The Codex raw tables and `action_rtk_match` now sit
+on the shard read surface with the rest of the import bulk data, and the
+merged tests were adjusted to use the correct read/write connection shape
+for shard-backed assertions.
+
+Gates: fmt ✓, clippy -D warnings ✓, workspace tests (402) ✓.
+Ignored integration harness handled separately by H1; structural merge only.
+
 ---
 
 ## 8. Post-J1 profile notes
@@ -480,14 +504,16 @@ architectural), or correctness (R1, I1, I2).
 
 ## RESUME HERE
 
-**Phase**: Phase 5 — J1, R1, I1, A2, I2 landed (KEPT). H1 restores the
-fixture-backed integration harness on top of those changes.
+**Phase**: Phase 5 — J1, R1, I1, A2, I2, H1, S1 landed (KEPT). No candidate
+currently in flight.
 
 **Long-lived branch (from phase 4)**: `import-perf-p4`
 **Long-lived worktree**: `.worktrees/import-perf-p4`
 
-**Tip of `import-perf-p4` before H1 lands**:
+**Recent landed commits feeding `import-perf-p4`**:
 
+- `ff414f8` H1: realign import corpus fixtures with live tarballs
+- `7a98192` Merge branch 'main' into import-perf-p4-sync-main
 - `5e8fabc` Merge branch 'import-perf-p5-i2' into import-perf-p4
 - `1478125` I2: pre-assign publish_seq in deterministic order
 - `d86a26b` Phase-5 plan: log R1, I1, A2 outcomes and refresh RESUME HERE
@@ -498,23 +524,22 @@ fixture-backed integration harness on top of those changes.
 - `555b8b9` J1: single-query jump_target_build, 21 s → 4 ms
 - `17f804e` Add phase-5 plan capturing current architecture and backlog
 
-**Pending H1 fix branch**: `import-perf-p4-fixture-fix` at `ff414f8`
-("H1: realign import corpus fixtures with live tarballs").
-
-**Pushed to remote** (`origin/import-perf-p4`): yes, up to `5e8fabc`.
-`p4 → main` merge still open.
+**Pushed to remote** (`origin/import-perf-p4`): yes. `p4 → main` merge
+still open.
 
 **Resolved phase-5 correctness gaps** (carried from §4):
 
 - `imported_record_count_sum` always 0 — resolved by R1.
 - Corrupt-transcript identity flip — resolved by I1.
 - Non-deterministic `publish_seq` — resolved by I2.
+- Fixture-backed ignored integration harness — restored by H1.
+- Structural `main → p4` divergence — resolved by S1 on the sync branch.
 - Unused `record` table — resolved by A2 (schema cleanup, not a gap
   strictly but listed under §5.4 architectural).
 
 **Remaining phase-5 backlog** (from §5):
 
-- Big: S1 revisit (simd-json under sharding), C1 revisit
+- Big: S2 revisit (simd-json under sharding), C1 revisit
   (parallel-classify under sharding).
 - Medium: F1 (FK=ON deferred), P1 (shard-scope `path_node` cache),
   W1 (parallel fs scan), Q1 (cache `filter_options` across snapshot
@@ -528,17 +553,18 @@ fixture-backed integration harness on top of those changes.
 cache, relevant to P1). The `import-perf-p5-{a2,i1,i2,j1,r1}` branches
 point at commits already on p4 and are safe to delete as part of G1.
 
-**Schema version**: `INITIAL_SCHEMA_VERSION = 15` (after R1→14, A2→15).
+**Schema version**: `INITIAL_SCHEMA_VERSION = 20` (provider-aware sources,
+Codex raw imports, RTK match table, R1, and A2 all applied).
 
 **Harness state**: with H1 applied, `cargo test -p gnomon-core --test
 import_corpus_integration -- --include-ignored` is green again against
 the live `~/tmp/gnomon-fixtures/` tarballs. The earlier fixture-divergence
 blocker is closed.
 
-**Next action**: land H1 into `import-perf-p4`, then pick the next
-phase-5 candidate from §5. No single import hotspot remains (see §8), so
-the choice is steering, not mechanical; Q1 is the cheapest query-side UX
-win left, W1 is the cheapest import-side experiment.
+**Next action**: pick the next phase-5 candidate from §5. No single
+import hotspot remains (see §8), so the choice is steering, not
+mechanical; Q1 is the cheapest query-side UX win left, W1 is the
+cheapest import-side experiment.
 
 **Do not** re-derive state from `git status` or `git log --oneline`.
 Use `git log import-perf-p4 ^main` for the p4 delta and
