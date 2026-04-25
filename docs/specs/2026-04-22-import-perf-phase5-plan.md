@@ -430,6 +430,28 @@ same reason. See RESUME HERE for follow-up.
 
 ---
 
+### H1 — refresh fixture expectations against the live tarballs — **KEPT**
+
+Commit: `ff414f8` on `import-perf-p4-fixture-fix`.
+
+Problem: the symlinked tarballs in `~/tmp/gnomon-fixtures/` no longer
+matched the expectations committed on `import-perf-p4`. The subset
+fixture still exposed 1126 transcript source files and the same action
+totals, but scan/import shape had drifted to 12 inserted projects and 98
+chunks; the full fixture likewise drifted from 36 to 37 inserted
+projects. The committed `tests/fixtures/import-corpus/MANIFEST.md` was
+also stale and no longer matched either tarball's sha256 or size stats.
+
+Fix: keep the live tarballs and realign the integration harness to them
+instead of trying to regenerate a historical 10-project subset. Updated
+`SUBSET_EXPECTATIONS`, the subset chunk-day multiset, the path-rollup and
+scan-warning semantic assertions, the full-corpus inserted-project
+assertion, and refreshed `MANIFEST.md` from the mounted tarballs.
+
+Gates: ignored integration harness 7/7 ✓.
+
+---
+
 ## 8. Post-J1 profile notes
 
 Cold full-corpus import wall time is 9258 ms (perf-log snapshot after
@@ -458,13 +480,13 @@ architectural), or correctness (R1, I1, I2).
 
 ## RESUME HERE
 
-**Phase**: Phase 5 — J1, R1, I1, A2, I2 landed (KEPT). No candidate
-currently in flight.
+**Phase**: Phase 5 — J1, R1, I1, A2, I2 landed (KEPT). H1 restores the
+fixture-backed integration harness on top of those changes.
 
 **Long-lived branch (from phase 4)**: `import-perf-p4`
 **Long-lived worktree**: `.worktrees/import-perf-p4`
 
-**Tip of `import-perf-p4`**:
+**Tip of `import-perf-p4` before H1 lands**:
 
 - `5e8fabc` Merge branch 'import-perf-p5-i2' into import-perf-p4
 - `1478125` I2: pre-assign publish_seq in deterministic order
@@ -475,6 +497,9 @@ currently in flight.
 - `cd8e5f4` Phase-5 plan: log J1 outcome and post-J1 profile
 - `555b8b9` J1: single-query jump_target_build, 21 s → 4 ms
 - `17f804e` Add phase-5 plan capturing current architecture and backlog
+
+**Pending H1 fix branch**: `import-perf-p4-fixture-fix` at `ff414f8`
+("H1: realign import corpus fixtures with live tarballs").
 
 **Pushed to remote** (`origin/import-perf-p4`): yes, up to `5e8fabc`.
 `p4 → main` merge still open.
@@ -505,25 +530,15 @@ point at commits already on p4 and are safe to delete as part of G1.
 
 **Schema version**: `INITIAL_SCHEMA_VERSION = 15` (after R1→14, A2→15).
 
-**Known blocker on this branch**: The integration harness
-(`cargo test -p gnomon-core --test import_corpus_integration --
---include-ignored`) is broken on p4 tip for reasons orthogonal to any
-phase-5 candidate. `main` merged `import-testing-parity` which
-regenerated the fixture tarballs in `~/tmp/gnomon-fixtures/` and
-updated `SUBSET_EXPECTATIONS` to a new corpus shape. p4 still references
-the old expectations (`inserted_projects: 11`, etc.) and every ignored
-integration test fails at p4 tip. A full `main → p4` merge has been
-tried and aborted — divergence is too large (1500+ lines in `chunk.rs`
-alone, provider-aware refactor in `normalize.rs`). Absorb the merge on
-its own expedition branch with its own plan before taking on the next
-phase-5 candidate.
+**Harness state**: with H1 applied, `cargo test -p gnomon-core --test
+import_corpus_integration -- --include-ignored` is green again against
+the live `~/tmp/gnomon-fixtures/` tarballs. The earlier fixture-divergence
+blocker is closed.
 
-**Next action**: Resolve the p4↔main fixture divergence so the
-integration harness is green again — it is the single most load-bearing
-expedition issue on this branch. After that, pick a phase-5 candidate
-from §5. No single import hotspot remains (see §8), so the choice is
-steering, not mechanical; Q1 is the cheapest query-side UX win left,
-W1 is the cheapest import-side experiment.
+**Next action**: land H1 into `import-perf-p4`, then pick the next
+phase-5 candidate from §5. No single import hotspot remains (see §8), so
+the choice is steering, not mechanical; Q1 is the cheapest query-side UX
+win left, W1 is the cheapest import-side experiment.
 
 **Do not** re-derive state from `git status` or `git log --oneline`.
 Use `git log import-perf-p4 ^main` for the p4 delta and
