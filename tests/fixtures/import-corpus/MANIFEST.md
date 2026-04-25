@@ -1,20 +1,20 @@
 # Import Perf Corpus Snapshot Manifest
 
-Captured: 2026-04-11T03:37:18Z
+Captured: 2026-04-25T00:00:00Z
 Host: Linux pontoon 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
 Filesystem (this directory): ext2/ext3
 
 ## Full corpus
 - path: full.tar.zst
-- uncompressed_bytes: 1626942271
-- jsonl_file_count: 4549
-- project_count: 52
-- sha256: 5784682a90da345adc90beb5ce13fdb0d10a030de412b63aa3152c0c01c37b30
+- uncompressed_bytes: 1352004701
+- jsonl_file_count: 4344
+- project_count: 62
+- sha256: 7f9a3d110355c3987a945b08f5370421763266640ed00fedf0ff1fbf74c1c16f
 
 ## Subset
 - path: subset.tar.zst
 - selection: largest projects by bytes until >= min(5% full, 100MB)
-- uncompressed_bytes: 784342798
-- jsonl_file_count: 1650
-- project_count: 1
-- sha256: 053ea32815905ee3936e9e596a7e759713defb198257740ad9e45c44ec35ed89
+- uncompressed_bytes: 263087661
+- jsonl_file_count: 1127
+- project_count: 10
+- sha256: a78baa49290551a8a27af565fc3bbb725d1f32f6d1c06c972636bc9b6f345799
