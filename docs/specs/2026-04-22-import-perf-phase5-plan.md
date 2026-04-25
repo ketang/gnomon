@@ -150,11 +150,14 @@ account for them.
   Resolved by **R1** (`67f9d85`): column dropped via migration 0019
   rather than plumbed through. No product consumer, transcript "records"
   were semantically ambiguous.
-- **`publish_seq` is non-deterministic** across runs under parallel
-  sharded import (it's assigned in shard-writer completion order).
-  Integration tests now sort `chunk_day_sequence` before comparison.
-  Any external consumer that assumes `publish_seq` is stable across
-  rebuilds will drift. Addressed by the **I2** candidate in §5.3.
+- ~~**`publish_seq` is non-deterministic** across runs under parallel
+  sharded import (it's assigned in shard-writer completion order).~~
+  Resolved by **I2** (`1478125`, merged via `5e8fabc`): `publish_seq` is
+  pre-assigned at phase start in
+  `(project_key, chunk_day_local, import_chunk_id)` order before parallel
+  shard execution begins, so two independent imports of the same corpus
+  now produce byte-identical `import_chunk` rows. See §7 for the
+  verification run.
 - ~~**Corrupt-transcript identity flip.**~~ Resolved by **I1** (`aec8cf1`):
   `resolve_candidate_source_file` now reuses the scan-source cache's
   last successful git-backed identity when a re-scan's content loses
@@ -227,9 +230,11 @@ decide KEPT or REVERTED.
 > when content stops yielding a `cwd`; new `reused_cached_project` scan
 > warning records the carry-forward.
 
-**I2 — Deterministic `publish_seq`.**
-> Serial "publish" step at chunk finalize time, outside the per-shard
-> write loop. Keeps import parallel, makes publish ordering stable.
+**I2 — Deterministic `publish_seq`.** **KEPT** (see §7).
+> Pre-assigns `publish_seq` at phase start in
+> `(project_key, chunk_day_local, import_chunk_id)` order; shard workers
+> write the pre-assigned value and never race the main writer for the
+> next sequence number.
 
 **D1 — Phase-5 doc updates at end-of-phase.**
 > Don't let the log drift the way phase 4's did. The phase-4 log stops
@@ -377,6 +382,54 @@ integration tests (7/7) ✓.
 
 ---
 
+### I2 — deterministic `publish_seq` — **KEPT**
+
+Commit: `1478125` on `import-perf-p5-i2`, merged into `import-perf-p4`
+via `5e8fabc`.
+
+Problem: §4's second listed correctness gap. `publish_seq` was assigned
+at chunk finalize time with `SELECT COALESCE(MAX(publish_seq), 0) + 1`
+executed from every shard writer as it completed a chunk. Under parallel
+sharded import the sequence that won the race depended on shard-worker
+interleaving, so two independent imports of the same corpus produced
+different `publish_seq` assignments. Integration-test workarounds had
+to sort `chunk_day_sequence` before comparison to hide the drift.
+
+Fix: a new `assign_phase_publish_seqs` runs once at phase start, before
+`run_phase_sharded` fans work out to shard workers. It opens the main
+DB, reads the current `COALESCE(MAX(publish_seq), 0)`, sorts the
+phase's prepared chunks by `(project_key, chunk_day_local, import_chunk_id)`,
+and assigns `base + rank + 1` in place on each `PreparedChunk`. The
+per-chunk `publish_import_chunk` then drops its own `SELECT MAX… + 1`
+and writes the pre-assigned value directly; a `debug_assert!` guards
+against unassigned seqs. The Startup and Deferred phases run serially,
+so the Deferred phase's base read picks up Startup's completed seqs.
+Failed chunks leave gaps — query SQL already tolerates that.
+
+Gates: fmt ✓, clippy -D warnings ✓, workspace tests (370) ✓.
+
+Empirical determinism verification — two independent `import_all` runs
+on the subset corpus into separate fresh main-DB paths (each with its
+own shard directory), import_chunk rows diffed:
+
+```
+Run A: 98 import_chunk rows
+Run B: 98 import_chunk rows
+diff (id, project_id, chunk_day_local, publish_seq, state): 0 rows
+NULL publish_seq on state='complete' rows: 0
+publish_seq sequence: contiguous 1..=98
+```
+
+Integration harness (`cargo test -p gnomon-core --test
+import_corpus_integration -- --include-ignored`) NOT re-run: the p4 tip
+is blocked on an unrelated fixture-divergence issue introduced when
+`main` merged `import-testing-parity` — fixture tarballs regenerated,
+`SUBSET_EXPECTATIONS` on p4 still reference the prior corpus shape. All
+seven ignored tests fail at p4 tip both before and after I2 for the
+same reason. See RESUME HERE for follow-up.
+
+---
+
 ## 8. Post-J1 profile notes
 
 Cold full-corpus import wall time is 9258 ms (perf-log snapshot after
@@ -405,14 +458,17 @@ architectural), or correctness (R1, I1, I2).
 
 ## RESUME HERE
 
-**Phase**: Phase 5 — J1, R1, I1, A2 landed (KEPT). No candidate currently
-in flight.
+**Phase**: Phase 5 — J1, R1, I1, A2, I2 landed (KEPT). No candidate
+currently in flight.
 
 **Long-lived branch (from phase 4)**: `import-perf-p4`
 **Long-lived worktree**: `.worktrees/import-perf-p4`
 
 **Tip of `import-perf-p4`**:
 
+- `5e8fabc` Merge branch 'import-perf-p5-i2' into import-perf-p4
+- `1478125` I2: pre-assign publish_seq in deterministic order
+- `d86a26b` Phase-5 plan: log R1, I1, A2 outcomes and refresh RESUME HERE
 - `a2752c5` A2: drop the unused record table
 - `aec8cf1` I1: reuse cached project identity when content loses its cwd
 - `67f9d85` R1: drop the dead imported_record_count column
@@ -420,13 +476,14 @@ in flight.
 - `555b8b9` J1: single-query jump_target_build, 21 s → 4 ms
 - `17f804e` Add phase-5 plan capturing current architecture and backlog
 
-**Pushed to remote** (`origin/import-perf-p4`): yes, up to `a2752c5`.
+**Pushed to remote** (`origin/import-perf-p4`): yes, up to `5e8fabc`.
 `p4 → main` merge still open.
 
 **Resolved phase-5 correctness gaps** (carried from §4):
 
 - `imported_record_count_sum` always 0 — resolved by R1.
 - Corrupt-transcript identity flip — resolved by I1.
+- Non-deterministic `publish_seq` — resolved by I2.
 - Unused `record` table — resolved by A2 (schema cleanup, not a gap
   strictly but listed under §5.4 architectural).
 
@@ -437,22 +494,36 @@ in flight.
 - Medium: F1 (FK=ON deferred), P1 (shard-scope `path_node` cache),
   W1 (parallel fs scan), Q1 (cache `filter_options` across snapshot
   boundaries).
-- Small: I2 (deterministic `publish_seq`), D1 (doc hygiene — partially
-  done by this update), G1 (delete fully-reverted experiment branches).
+- Small: D1 (doc hygiene — partially done by this update), G1 (delete
+  fully-reverted experiment branches).
 - Architectural: A1 (content-aware sharding).
 
 **Kept preserved experiment branches (reverted)**: `import-perf-p4-a7`
 (jwalk, relevant to W1), `import-perf-p4-a8` (chunk-level `path_node`
-cache, relevant to P1). The `import-perf-p5-{a2,i1,j1,r1}` branches
+cache, relevant to P1). The `import-perf-p5-{a2,i1,i2,j1,r1}` branches
 point at commits already on p4 and are safe to delete as part of G1.
 
 **Schema version**: `INITIAL_SCHEMA_VERSION = 15` (after R1→14, A2→15).
 
-**Next action**: pick a phase-5 candidate from §5. No single hotspot
-remains in the import path (see §8), so the choice is steering, not
-mechanical. With R1+I1 done, the remaining correctness item is I2
-(deterministic `publish_seq`); Q1 is the cheapest query-side UX win
-left; W1 is the cheapest import-side experiment.
+**Known blocker on this branch**: The integration harness
+(`cargo test -p gnomon-core --test import_corpus_integration --
+--include-ignored`) is broken on p4 tip for reasons orthogonal to any
+phase-5 candidate. `main` merged `import-testing-parity` which
+regenerated the fixture tarballs in `~/tmp/gnomon-fixtures/` and
+updated `SUBSET_EXPECTATIONS` to a new corpus shape. p4 still references
+the old expectations (`inserted_projects: 11`, etc.) and every ignored
+integration test fails at p4 tip. A full `main → p4` merge has been
+tried and aborted — divergence is too large (1500+ lines in `chunk.rs`
+alone, provider-aware refactor in `normalize.rs`). Absorb the merge on
+its own expedition branch with its own plan before taking on the next
+phase-5 candidate.
+
+**Next action**: Resolve the p4↔main fixture divergence so the
+integration harness is green again — it is the single most load-bearing
+expedition issue on this branch. After that, pick a phase-5 candidate
+from §5. No single import hotspot remains (see §8), so the choice is
+steering, not mechanical; Q1 is the cheapest query-side UX win left,
+W1 is the cheapest import-side experiment.
 
 **Do not** re-derive state from `git status` or `git log --oneline`.
 Use `git log import-perf-p4 ^main` for the p4 delta and
