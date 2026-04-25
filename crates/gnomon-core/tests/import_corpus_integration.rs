@@ -1059,11 +1059,11 @@ fn lookup_chunk_publish_seq(conn: &Connection, chunk_day_local: &str) -> Result<
 // Data-table queries below route through the TEMP VIEWs configured by `Database::open`,
 // so they return aggregated results across all 9 shards.
 fn load_subset_semantic_counts(conn: &Connection, _db_path: &Path) -> Result<SubsetSemanticCounts> {
-    // ORDER BY chunk_day_local only. Under p4-c1 sharded imports, `publish_seq`
-    // is assigned in parallel-write completion order, so sorting by it (or any
-    // tiebreaker that includes it) makes the sequence non-deterministic across
-    // runs. Sorting by the day alone gives a stable multiset view of "which
-    // chunks exist for which days" — the invariant the assertion actually wants.
+    // Ordered by (chunk_day_local, id). `publish_seq` is now pre-assigned
+    // deterministically before parallel shard execution (see
+    // `assign_phase_publish_seqs` in import/chunk.rs), so ordering is stable
+    // across runs; this assertion only cares about the multiset of (day, chunk)
+    // pairs that were imported.
     let chunk_day_sequence = {
         let mut stmt =
             conn.prepare("SELECT chunk_day_local FROM import_chunk ORDER BY chunk_day_local, id")?;
