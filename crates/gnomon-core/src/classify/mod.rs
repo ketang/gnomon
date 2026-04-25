@@ -1762,8 +1762,8 @@ mod tests {
 
         let source_file_id = conn.query_row(
             "
-            INSERT INTO source_file (project_id, relative_path, size_bytes)
-            VALUES (?1, ?2, 0)
+            INSERT INTO source_file (project_id, relative_path, source_provider, source_kind, size_bytes)
+            VALUES (?1, ?2, 'claude', 'transcript', 0)
             RETURNING id
             ",
             params![project_id, relative_path],

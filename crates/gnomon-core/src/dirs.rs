@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use directories::{BaseDirs, ProjectDirs};
@@ -19,9 +19,23 @@ pub fn default_config_dir() -> Result<PathBuf> {
     Ok(project_dirs()?.config_dir().to_path_buf())
 }
 
-pub fn default_source_root() -> Result<PathBuf> {
+pub fn default_claude_source_root() -> Result<PathBuf> {
     let base_dirs = BaseDirs::new().context("unable to resolve the current home directory")?;
     Ok(base_dirs.home_dir().join(".claude").join("projects"))
+}
+
+pub fn default_claude_history_file_for_projects_root(source_root: &Path) -> Option<PathBuf> {
+    let projects_dir_name = source_root.file_name()?.to_str()?;
+    let claude_dir = source_root.parent()?;
+    let claude_dir_name = claude_dir.file_name()?.to_str()?;
+    if projects_dir_name != "projects" || claude_dir_name != ".claude" {
+        return None;
+    }
+    Some(claude_dir.join("history.jsonl"))
+}
+
+pub fn default_source_root() -> Result<PathBuf> {
+    default_claude_source_root()
 }
 
 #[cfg(test)]

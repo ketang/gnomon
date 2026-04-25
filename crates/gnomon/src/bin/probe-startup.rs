@@ -7,6 +7,7 @@ use gnomon_core::db::Database;
 use gnomon_core::import::StartupOpenReason;
 use gnomon_core::perf::PerfLogger;
 use gnomon_core::query::{BrowsePath, QueryEngine, RootView};
+use gnomon_core::sources::ConfiguredSources;
 use gnomon_tui::{StartupBrowseState, probe_startup};
 
 #[derive(Debug, Parser)]
@@ -54,9 +55,11 @@ fn main() -> Result<()> {
         state_dir,
         config_path: default_state_dir(&cli.db).join("config.toml"),
         db_path: cli.db,
-        source_root,
+        source_root: source_root.clone(),
+        sources: ConfiguredSources::legacy_claude(&source_root),
         project_identity: Default::default(),
         project_filters: Vec::new(),
+        rtk: Default::default(),
     };
     config.ensure_dirs()?;
 

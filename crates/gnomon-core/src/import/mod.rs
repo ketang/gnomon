@@ -79,9 +79,11 @@ pub struct NormalizedMessage {
 
 mod source;
 
+pub use crate::sources::{ConfiguredSources, SourceDescriptor, SourceFileKind, SourceProvider};
 pub use source::{
     ScanReport, ScanWarning, scan_source_manifest, scan_source_manifest_with_perf_logger,
-    scan_source_manifest_with_policy,
+    scan_source_manifest_with_policy, scan_sources_manifest,
+    scan_sources_manifest_with_perf_logger, scan_sources_manifest_with_policy,
 };
 
 pub const STARTUP_IMPORT_WINDOW_HOURS: i64 = 24;
@@ -119,30 +121,7 @@ pub const IMPORT_CHUNK_UNIT: &str = "project x day";
 /// in v8, along with the `imported_record_count` aggregate that had
 /// tracked its row count — neither had a product consumer and their
 /// compute paths were silent no-ops under p4 sharding.)
-pub const IMPORT_SCHEMA_VERSION: i64 = 6;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceFileKind {
-    Transcript,
-    ClaudeHistory,
-}
-
-impl SourceFileKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Transcript => "transcript",
-            Self::ClaudeHistory => "claude_history",
-        }
-    }
-
-    pub fn from_db_value(value: &str) -> Option<Self> {
-        match value {
-            "transcript" => Some(Self::Transcript),
-            "claude_history" => Some(Self::ClaudeHistory),
-            _ => None,
-        }
-    }
-}
+pub const IMPORT_SCHEMA_VERSION: i64 = 10;
 
 /// Stable normalized payload contract for persisted `tool_use` message parts.
 ///
@@ -188,23 +167,30 @@ pub(in crate::import) struct ParsedFile {
 /// A single parsed JSONL line with pre-extracted metadata.
 pub(in crate::import) struct ParsedRecord {
     pub(in crate::import) source_line_no: i64,
-    pub(in crate::import) session_id: Option<String>,
+    /// Transcript records use `Value::Null`; other source kinds retain raw JSON here.
+    pub(in crate::import) value: serde_json::Value,
     pub(in crate::import) recorded_at_utc: Option<String>,
+    pub(in crate::import) extracted_message: Option<normalize::ExtractedMessage>,
+    pub(in crate::import) session_id: Option<String>,
     pub(in crate::import) is_sidechain: bool,
     pub(in crate::import) agent_id: Option<String>,
-    pub(in crate::import) extracted_message: Option<normalize::ExtractedMessage>,
-    /// Populated only for `ClaudeHistory` records; `None` for `Transcript`.
-    pub(in crate::import) history_value: Option<serde_json::Value>,
 }
 
 mod chunk;
 mod normalize;
+pub(crate) mod rtk;
+
+#[cfg(test)]
+mod test_fixtures;
 
 pub use chunk::{
     ImportExecutionReport, StartupImport, StartupImportMode, StartupOpenReason,
     StartupProgressUpdate, StartupWorkerEvent, import_all, import_all_with_perf_logger,
+    import_all_with_rtk, import_all_with_sources_and_perf_logger, import_all_with_sources_and_rtk,
     start_startup_import, start_startup_import_with_mode_and_progress,
     start_startup_import_with_perf_logger, start_startup_import_with_progress,
+    start_startup_import_with_rtk, start_startup_import_with_sources_and_mode_and_progress,
+    start_startup_import_with_sources_and_mode_and_rtk,
 };
 pub use normalize::{
     NormalizeImportWarning, NormalizeJsonlFileOutcome, NormalizeJsonlFileParams,

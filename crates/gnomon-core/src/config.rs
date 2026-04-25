@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use glob::Pattern;
 use serde::{Deserialize, Serialize};
 
+use crate::sources::{ConfiguredSource, ConfiguredSources, SourceFileKind, SourceProvider};
 use crate::{db, dirs};
 
 pub const DEFAULT_CONFIG_FILENAME: &str = "config.toml";
@@ -14,8 +15,15 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# gnomon user configuration
 # Edit this file to control where gnomon reads session history from and which
 # projects should be excluded from import.
 
-[source]
-root = "~/.claude/projects"
+[sources.claude]
+transcript_root = "~/.claude/projects"
+
+# Configure Codex locations explicitly when you want Codex sources scanned.
+#
+# [sources.codex]
+# rollout_root = "~/.codex/sessions"
+# history_file = "~/.codex/history.jsonl"
+# session_index_file = "~/.codex/session_index.jsonl"
 
 [project_identity]
 stale_claude_worktree_recovery = true
@@ -41,24 +49,52 @@ pub struct RuntimeConfig {
     pub state_dir: PathBuf,
     pub config_path: PathBuf,
     pub db_path: PathBuf,
+    // Legacy compatibility field for Claude transcript-root callers.
     pub source_root: PathBuf,
+    pub sources: ConfiguredSources,
     pub project_identity: ProjectIdentityPolicy,
     pub project_filters: Vec<ProjectFilterRule>,
+    pub rtk: RtkConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 struct FileConfig {
     #[serde(default)]
     source: SourceConfig,
     #[serde(default)]
+    sources: SourcesConfig,
+    #[serde(default)]
     project_identity: ProjectIdentityPolicy,
     #[serde(default)]
     project_filters: Vec<ProjectFilterRule>,
+    #[serde(default)]
+    rtk: RtkConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 struct SourceConfig {
     root: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+struct SourcesConfig {
+    #[serde(default)]
+    claude: ClaudeSourcesConfig,
+    #[serde(default)]
+    codex: CodexSourcesConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+struct ClaudeSourcesConfig {
+    transcript_root: Option<String>,
+    history_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+struct CodexSourcesConfig {
+    rollout_root: Option<String>,
+    history_file: Option<String>,
+    session_index_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -157,6 +193,48 @@ impl ProjectFilterRule {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct RtkConfig {
+    #[serde(default = "RtkConfig::default_enabled")]
+    pub enabled: bool,
+    #[serde(default = "RtkConfig::default_db_path")]
+    pub db_path: String,
+    #[serde(default = "RtkConfig::default_pre_slack_ms")]
+    pub pre_slack_ms: u64,
+    #[serde(default = "RtkConfig::default_post_slack_ms")]
+    pub post_slack_ms: u64,
+}
+
+impl RtkConfig {
+    fn default_enabled() -> bool {
+        true
+    }
+    fn default_db_path() -> String {
+        "~/.local/share/rtk/history.db".to_string()
+    }
+    fn default_pre_slack_ms() -> u64 {
+        2000
+    }
+    fn default_post_slack_ms() -> u64 {
+        30000
+    }
+
+    pub fn resolved_db_path(&self) -> Result<PathBuf> {
+        expand_user_path(&self.db_path)
+    }
+}
+
+impl Default for RtkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Self::default_enabled(),
+            db_path: Self::default_db_path(),
+            pre_slack_ms: Self::default_pre_slack_ms(),
+            post_slack_ms: Self::default_post_slack_ms(),
+        }
+    }
+}
+
 impl RuntimeConfig {
     pub fn load(overrides: ConfigOverrides) -> Result<Self> {
         let state_dir = match overrides.state_dir {
@@ -174,20 +252,29 @@ impl RuntimeConfig {
             .unwrap_or_else(|| state_dir.join(db::DEFAULT_DB_FILENAME));
         let source_root = match overrides.source_root {
             Some(path) => path,
-            None => match file_config.source.root {
-                Some(path) => expand_user_path(&path)?,
-                None => dirs::default_source_root()?,
+            None => match file_config
+                .sources
+                .claude
+                .transcript_root
+                .as_deref()
+                .or(file_config.source.root.as_deref())
+            {
+                Some(path) => expand_user_path(path)?,
+                None => dirs::default_claude_source_root()?,
             },
         };
+        let sources = load_sources(&file_config, &source_root)?;
 
         Ok(Self {
             app_name: "gnomon",
             state_dir,
             config_path,
             db_path,
-            source_root,
+            source_root: source_root.clone(),
+            sources,
             project_identity: file_config.project_identity,
             project_filters: file_config.project_filters,
+            rtk: file_config.rtk,
         })
     }
 
@@ -259,6 +346,57 @@ fn expand_user_path(value: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(value))
 }
 
+fn load_sources(
+    file_config: &FileConfig,
+    claude_transcript_root: &Path,
+) -> Result<ConfiguredSources> {
+    let mut sources = vec![ConfiguredSource::directory(
+        SourceProvider::Claude,
+        SourceFileKind::Transcript,
+        claude_transcript_root.to_path_buf(),
+    )];
+
+    if let Some(history_file) = file_config.sources.claude.history_file.as_deref() {
+        sources.push(ConfiguredSource::file(
+            SourceProvider::Claude,
+            SourceFileKind::History,
+            expand_user_path(history_file)?,
+        ));
+    } else if let Some(history_path) =
+        dirs::default_claude_history_file_for_projects_root(claude_transcript_root)
+    {
+        sources.push(ConfiguredSource::file(
+            SourceProvider::Claude,
+            SourceFileKind::History,
+            history_path,
+        ));
+    }
+
+    if let Some(rollout_root) = file_config.sources.codex.rollout_root.as_deref() {
+        sources.push(ConfiguredSource::directory(
+            SourceProvider::Codex,
+            SourceFileKind::Rollout,
+            expand_user_path(rollout_root)?,
+        ));
+    }
+    if let Some(history_file) = file_config.sources.codex.history_file.as_deref() {
+        sources.push(ConfiguredSource::file(
+            SourceProvider::Codex,
+            SourceFileKind::History,
+            expand_user_path(history_file)?,
+        ));
+    }
+    if let Some(session_index_file) = file_config.sources.codex.session_index_file.as_deref() {
+        sources.push(ConfiguredSource::file(
+            SourceProvider::Codex,
+            SourceFileKind::SessionIndex,
+            expand_user_path(session_index_file)?,
+        ));
+    }
+
+    Ok(ConfiguredSources::new(sources))
+}
+
 fn default_true() -> bool {
     true
 }
@@ -272,10 +410,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ConfigOverrides, DEFAULT_CONFIG_FILENAME, ProjectFilterAction, ProjectFilterContext,
-        ProjectFilterMatchOn, ProjectFilterRule, RuntimeConfig,
+        ConfigOverrides, DEFAULT_CONFIG_FILENAME, FileConfig, ProjectFilterAction,
+        ProjectFilterContext, ProjectFilterMatchOn, ProjectFilterRule, RtkConfig, RuntimeConfig,
     };
     use crate::db::DEFAULT_DB_FILENAME;
+    use crate::sources::{ConfiguredSources, SourceFileKind, SourceProvider};
 
     #[test]
     fn load_defaults_uses_platform_dirs() -> Result<()> {
@@ -318,6 +457,13 @@ mod tests {
             config_path: None,
         })?;
         assert_eq!(config.source_root, custom_root);
+        assert_eq!(
+            config
+                .sources
+                .claude_transcript_root()
+                .expect("claude transcript root"),
+            custom_root.as_path()
+        );
         Ok(())
     }
 
@@ -331,8 +477,10 @@ mod tests {
             config_path: state_dir.join(DEFAULT_CONFIG_FILENAME),
             db_path: state_dir.join(DEFAULT_DB_FILENAME),
             source_root: temp.path().join("source"),
+            sources: ConfiguredSources::legacy_claude(&temp.path().join("source")),
             project_identity: Default::default(),
             project_filters: Vec::new(),
+            rtk: Default::default(),
         };
         assert!(
             !state_dir.exists(),
@@ -373,7 +521,10 @@ mod tests {
     fn load_uses_configured_source_root() -> Result<()> {
         let temp = tempdir()?;
         let config_path = temp.path().join("config.toml");
-        fs::write(&config_path, "[source]\nroot = \"/tmp/gnomon-source\"\n")?;
+        fs::write(
+            &config_path,
+            "[sources.claude]\ntranscript_root = \"/tmp/gnomon-source\"\n",
+        )?;
 
         let config = RuntimeConfig::load(ConfigOverrides {
             db_path: None,
@@ -383,6 +534,46 @@ mod tests {
         })?;
 
         assert_eq!(config.source_root, PathBuf::from("/tmp/gnomon-source"));
+        Ok(())
+    }
+
+    #[test]
+    fn load_supports_explicit_codex_source_locations() -> Result<()> {
+        let temp = tempdir()?;
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            concat!(
+                "[sources.claude]\n",
+                "transcript_root = \"/tmp/claude-projects\"\n\n",
+                "[sources.codex]\n",
+                "rollout_root = \"/tmp/codex-sessions\"\n",
+                "history_file = \"/tmp/codex-history.jsonl\"\n",
+                "session_index_file = \"/tmp/codex-session-index.jsonl\"\n",
+            ),
+        )?;
+
+        let config = RuntimeConfig::load(ConfigOverrides {
+            db_path: None,
+            source_root: None,
+            state_dir: Some(temp.path().join("state")),
+            config_path: Some(config_path),
+        })?;
+
+        let descriptors: Vec<(SourceProvider, SourceFileKind)> = config
+            .sources
+            .iter()
+            .map(|source| (source.provider(), source.kind()))
+            .collect();
+        assert_eq!(
+            descriptors,
+            vec![
+                (SourceProvider::Claude, SourceFileKind::Transcript),
+                (SourceProvider::Codex, SourceFileKind::Rollout),
+                (SourceProvider::Codex, SourceFileKind::History),
+                (SourceProvider::Codex, SourceFileKind::SessionIndex),
+            ]
+        );
         Ok(())
     }
 
@@ -403,5 +594,27 @@ mod tests {
 
         assert!(rule.matches(&ctx)?);
         Ok(())
+    }
+
+    #[test]
+    fn rtk_config_defaults_to_enabled_with_standard_db_path() {
+        let cfg = RtkConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.pre_slack_ms, 2000);
+        assert_eq!(cfg.post_slack_ms, 30000);
+    }
+
+    #[test]
+    fn file_config_with_rtk_section_parses_correctly() {
+        let toml = r#"
+[rtk]
+enabled = false
+pre_slack_ms = 5000
+"#;
+        let file_cfg: FileConfig =
+            toml::from_str(toml).expect("rtk config test fixture should parse");
+        assert!(!file_cfg.rtk.enabled);
+        assert_eq!(file_cfg.rtk.pre_slack_ms, 5000);
+        assert_eq!(file_cfg.rtk.post_slack_ms, 30000); // default
     }
 }
