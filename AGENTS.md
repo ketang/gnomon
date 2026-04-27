@@ -1,44 +1,38 @@
 # Agent Instructions
 
-This repository keeps Claude-specific shared-rule imports in `CLAUDE.md`. For
-Codex and other file-scoped agents, this `AGENTS.md` file is the canonical
-project instruction entry point.
+`gnomon` is a Rust workspace for analyzing Claude session history and
+surfacing the usage patterns that drive the highest token consumption.
+
+This file is the canonical project instruction entry point for all coding
+agents. Claude Code reads it via `CLAUDE.md`, which imports this file.
 
 ## Read First
 
-- `README.md` for workspace overview and bootstrap commands
-- `docs/v1-design.md` before architectural changes or feature planning
+- `README.md` for bootstrap commands and human-facing project overview
+- `docs/v1-design.md` for product shape, architecture, and backlog constraints
 - `Cargo.toml` for workspace members, shared dependencies, and lint policy
-
-## Shared Standards
-
-This repository no longer vendors shared agent rules through a separate
-submodule. Use the instructions in this file, `README.md`, and the design and
-workspace files listed above as the canonical project guidance.
 
 ## Repo Facts
 
 - Rust workspace with three crates: `crates/gnomon`, `crates/gnomon-core`, and
   `crates/gnomon-tui`
-- `crates/gnomon-core` owns import, storage, query, classification, and VCS
-  logic
+- `crates/gnomon-core` owns configuration, import, storage, query,
+  classification, and VCS logic
 - `crates/gnomon-tui` owns the interactive terminal UI
 - `crates/gnomon` is the executable entry point
 - `target/` is build output, not source
-- `.worktrees/` is local worktree state, not product source
-
-Do not edit or commit `target/` or `.worktrees/` unless the user explicitly
-asks.
+- `.worktrees/` is local worktree state, not product source. Do not commit or
+  clean it up unless the user explicitly asks.
 
 ## Branch and Issue Workflow
 
 - Do not implement on `main`
 - For any implementation task, automatically create or switch to a dedicated
-  feature branch and linked worktree before making edits
-- Use a feature branch or the existing task branch for every implementation task
-- Use a dedicated worktree for all implementation work. Creating only a feature
-  branch in the repo root is not sufficient; create both the branch and the
-  worktree before touching files.
+  feature branch and linked worktree before making edits. Repo-local worktrees
+  live under `.worktrees/`.
+- Creating only a feature branch in the repo root is not sufficient; create
+  both the branch and the worktree before touching files, regardless of which
+  branch you are on
 - Treat branch and worktree setup as required preflight, not as a step that
   needs user approval
 - Exceptions are limited to read-only tasks and explicit branch-management or
@@ -47,36 +41,62 @@ asks.
   ambiguous, or likely to interfere with existing uncommitted work
 - All parallel work must use separate worktrees
 - Rebase finished feature branches onto `origin/main` before integration
-- Merge finished feature branches into `main` with `git merge --no-ff`
-- Do not fast-forward feature branch integrations into `main`
-- GitHub Issues is the canonical issue tracker for this repo
-- Do not assume `beads`
-- If the user references a GitHub issue, follow that context
+- Merge finished feature branches into `main` with `git merge --no-ff`; do not
+  fast-forward
+- GitHub Issues is the canonical issue tracker for this repo. Do not assume
+  `beads`. If the user references a GitHub issue or branch naming convention,
+  follow that context.
 - Claim implementation work in GitHub Issues by adding the `in-progress` label
-  before editing code when the task is tracked there
-- Remove the `in-progress` label when work is handed off or completed unless the
-  user explicitly asks to leave the issue state unchanged
+  before editing code when the task is tracked there; remove it on handoff or
+  completion unless the user asks otherwise
 - Do not create, materially edit, or close GitHub issues unless the user
   explicitly asks
 
-## Rust Commands
+## Rust Quality Gates
 
-- Format: `cargo fmt --all`
-- Lint: `cargo clippy --workspace --all-targets -- -D warnings`
-- Test: `cargo test --workspace`
-- Build: `cargo build --workspace`
-- CLI smoke test: `cargo run -p gnomon -- --help`
-- Interactive bootstrap: `cargo run -p gnomon`
+For code changes, run:
 
-Press `q` or `Esc` to exit the bootstrap TUI.
+```bash
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo build --workspace
+```
+
+If CLI behavior changed, also smoke-test:
+
+```bash
+cargo run -p gnomon -- --help
+```
+
+Interactive bootstrap: `cargo run -p gnomon` (press `q` or `Esc` to exit).
+
+### Import integration tests (required for perf optimization passes)
+
+Before declaring any import performance optimization pass complete, you MUST
+also run the full integration test suite:
+
+```bash
+cargo test -p gnomon-core --test import_corpus_integration -- --include-ignored
+```
+
+These tests are `#[ignore]`-tagged (they require local corpus fixture tarballs)
+and are **not** included in `cargo test --workspace`. They verify end-to-end
+import correctness, including aggregated counts written to `import_chunk`. A
+change that passes unit tests but corrupts `imported_message_count` (e.g., by
+reading a drained `HashMap`) will only be caught here.
+
+Fixture tarballs live under `tests/fixtures/import-corpus/` in the primary
+checkout or any worktree where they have previously been copied. Copy them
+into your worktree if they are missing before running these tests.
 
 ## Working Agreements
 
-- Match the architecture described in `docs/v1-design.md`
-- If implementation requires changing the agreed design, update
-  `docs/v1-design.md` in the same change
-- Keep `README.md` current when build, run, config, or operator-facing behavior
-  changes
+- Match the architecture described in `docs/v1-design.md`. If implementation
+  requires changing the agreed design, update `docs/v1-design.md` in the same
+  change; do not let code silently diverge from the design doc.
+- Keep `README.md` current when build, run, config, or operator-facing
+  behavior changes
 - Preserve the workspace lint stance from `Cargo.toml`, including
   `unwrap_used = "deny"`, `todo = "deny"`, and `unsafe_code = "forbid"`
 - New behavior should ship with tests
